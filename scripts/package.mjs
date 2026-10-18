@@ -37,6 +37,7 @@ async function sha256(file) {
 for (const file of ['package.json', 'package-lock.json', 'README.md']) await copyFile(path.join(root, file), path.join(stage, file));
 await cp(path.join(root, 'dist'), path.join(stage, 'dist'), { recursive: true });
 await cp(path.join(root, 'docs'), path.join(stage, 'docs'), { recursive: true });
+await cp(path.join(root, 'integrations'), path.join(stage, 'integrations'), { recursive: true });
 for (const file of ['install-user-service.mjs', 'install-autostart.mjs']) {
   await copyFile(path.join(root, 'scripts', file), path.join(stage, 'scripts', file));
 }

@@ -1,4 +1,8 @@
 node_modules/
+__pycache__/
+.venv/
+protocol-results.json
+voice-results.json
 dist/
 release/
 .rele/

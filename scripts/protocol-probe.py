@@ -109,7 +109,9 @@ async def main():
     await site.start()
     provider_port=site._server.sockets[0].getsockname()[1]
     sock=socket.socket(); sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]; sock.close()
-    home=ROOT / ('profile-'+uuid.uuid4().hex[:8]); home.mkdir()
+    # AF_UNIX also applies on native Windows. Keep the isolated profile short
+    # enough for Codex's app-server-control/app-server-control.sock suffix.
+    home=ROOT/'c'; home.mkdir()
     workspace=home/'workspace'; workspace.mkdir()
     config=f'''model="mock-model"
 model_provider="mock_provider"
@@ -298,6 +300,6 @@ async def wait_len(items,count):
     while len(items)<count: await asyncio.sleep(.02)
 
 if __name__=='__main__':
-    with tempfile.TemporaryDirectory(prefix='rele-protocol-') as directory:
+    with tempfile.TemporaryDirectory(prefix='rp-', dir=os.environ.get('RUNNER_TEMP')) as directory:
         ROOT = pathlib.Path(directory)
         asyncio.run(main())

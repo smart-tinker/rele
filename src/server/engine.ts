@@ -86,7 +86,7 @@ export class Engine extends EventEmitter {
         const request = this.store.getRequest(candidate.requestId);
         return !!request && this.sameOrigin(request, message) && this.store.listDeliveries(2000).some(delivery => delivery.approvalId === candidate.id && delivery.status === 'sent');
       });
-    if (approval) {
+    if (approval && (message.endpoint.platform === 'telegram' || (message.text.trim() && !message.audio))) {
       // Record first: after any crash this event cannot become a fresh Codex turn.
       // A crash before resolution leaves the question available in the panel.
       if (this.store.recordInbound(message).duplicate) return;

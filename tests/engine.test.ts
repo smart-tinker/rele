@@ -335,6 +335,44 @@ describe('Engine approvals', () => {
     expect(f.codex.respond).toHaveBeenCalledExactlyOnceWith('approval-rpc', { answers: { target: { answers: ['main'] } } });
     expect(f.store.listRequests()).toHaveLength(1);
   });
+
+  it.each(['expired', 'answered'] as const)('records a late reply to an %s Telegram approval without starting another task', async status => {
+    const f = fixture();
+    const request = await acceptRequest(f, 'telegram');
+    const approval = await requestApproval(f, request, true);
+    const prompt = f.store.listDeliveries().find(row => row.approvalId === approval.id)!;
+    f.store.updateApproval(approval.id, { status });
+    f.store.finishRequest(request.id, { status: 'completed' }, []);
+    const reply = f.message('telegram', 'late-answer', { text: 'main', replyToMessageId: prompt.remoteMessageId });
+    await f.engine.receive(reply);
+    await f.engine.receive(reply);
+    await f.engine.settled();
+    expect(f.store.recordInbound(reply)).toEqual({ duplicate: true });
+    expect(f.store.listRequests()).toHaveLength(1);
+    expect(f.store.getApproval(approval.id)?.status).toBe(status);
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+    expect(f.codex.respond).not.toHaveBeenCalled();
+    expect(f.store.listDeliveries()).toHaveLength(1);
+  });
+
+  it('cancels a rejected approval delivery resolved in Desktop so the final answer can be delivered', async () => {
+    const f = fixture();
+    const request = await acceptRequest(f);
+    f.slack.deliver.mockRejectedValueOnce(new ChannelError('Confirmed rejection'));
+    const approval = await requestApproval(f, request);
+    const prompt = f.store.listDeliveries().find(row => row.approvalId === approval.id)!;
+    expect(prompt.status).toBe('failed');
+    f.codex.notification({ method: 'serverRequest/resolved', params: { threadId: THREAD, requestId: approval.rpcId } });
+    await f.engine.settled();
+    expect(f.store.getDelivery(prompt.id)?.status).toBe('cancelled');
+    expect(f.store.getApproval(approval.id)?.status).toBe('answered');
+    f.codex.complete(request.id, 'Final answer after Desktop confirmation');
+    await f.engine.settled();
+    await f.engine.pump();
+    expect(f.slack.deliver).toHaveBeenCalledTimes(2);
+    expect(f.slack.deliver.mock.calls[1][0]).toMatchObject({ kind: 'answer', body: 'Final answer after Desktop confirmation' });
+    expect(f.codex.respond).not.toHaveBeenCalled();
+  });
 });
 
 describe('Engine restart and outbox', () => {

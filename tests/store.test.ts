@@ -250,7 +250,7 @@ describe('Store queues and approvals', () => {
     expect(store.getApproval(approval.id)?.requestId).toBe(req.id);
   });
 
-  it('finishes requests atomically with the outbox and cancels only unsent approval prompts', () => {
+  it.each(['pending', 'failed'] as const)('finishes requests atomically with the outbox and cancels a %s approval prompt', status => {
     const store = open();
     conversation(store);
     const req = request(store);
@@ -258,6 +258,7 @@ describe('Store queues and approvals', () => {
     const pending = store.addApproval(approvalInput(req.id));
     const answered = store.addApproval({ ...approvalInput(req.id), itemId: 'answered-item', status: 'answered', decision: 'accept' });
     const [prompt] = store.addDeliveries(req.id, [{ key: `approval:${pending.id}`, ordinal: 0, kind: 'approval', body: 'Approve?', approvalId: pending.id }]);
+    if (status === 'failed') { store.claimDelivery(); store.updateDelivery(prompt.id, { status: 'failed' }); }
 
     expect(() => store.finishRequest(req.id, { status: 'completed', turnId: 'turn-1' }, [
       { key: 'answer:0', ordinal: 0, kind: 'answer', body: 'Completed' },
@@ -265,14 +266,14 @@ describe('Store queues and approvals', () => {
     ])).toThrow(/CHECK/);
     expect(store.getRequest(req.id)).toMatchObject({ status: 'waiting_approval', turnId: undefined });
     expect(store.getApproval(pending.id)?.status).toBe('pending');
-    expect(store.getDelivery(prompt.id)?.status).toBe('pending');
+    expect(store.getDelivery(prompt.id)?.status).toBe(status);
     expect(store.listDeliveries()).toHaveLength(1);
 
     const parts: Array<Pick<Delivery, 'key' | 'ordinal' | 'kind' | 'body'>> = [{ key: 'answer:0', ordinal: 0, kind: 'answer', body: 'Completed' }];
     expect(store.finishRequest(req.id, { status: 'completed', turnId: 'turn-1' }, parts).status).toBe('completed');
     expect(store.getApproval(pending.id)?.status).toBe('expired');
     expect(store.getApproval(answered.id)).toMatchObject({ status: 'answered', decision: 'accept' });
-    expect(store.getDelivery(prompt.id)).toMatchObject({ status: 'cancelled', attempts: 0 });
+    expect(store.getDelivery(prompt.id)).toMatchObject({ status: 'cancelled', attempts: status === 'failed' ? 1 : 0 });
     expect(store.claimDelivery()?.key).toBe('answer:0');
     store.finishRequest(req.id, { status: 'completed' }, parts);
     expect(store.listDeliveries()).toHaveLength(2);
@@ -292,10 +293,28 @@ describe('Store queues and approvals', () => {
     ]);
     store.updateDelivery(sending.id, { status: 'sending' });
     store.updateDelivery(uncertain.id, { status: 'uncertain' });
+    store.cancelApprovalDeliveries(firstApproval.id);
+    store.cancelApprovalDeliveries(secondApproval.id);
+    expect(store.getDelivery(sending.id)?.status).toBe('sending');
+    expect(store.getDelivery(uncertain.id)?.status).toBe('uncertain');
     store.finishRequest(req.id, { status: 'completed' }, [{ key: 'answer:0', ordinal: 0, kind: 'answer', body: 'Final answer' }]);
     expect(store.getDelivery(sending.id)?.status).toBe('sending');
     expect(store.getDelivery(uncertain.id)?.status).toBe('uncertain');
     expect(store.claimDelivery()).toBeUndefined();
+  });
+
+  it('finds an old approval reply only in the exact platform, bot, chat and thread', () => {
+    const store = open();
+    conversation(store);
+    const req = request(store);
+    const approval = store.addApproval({ ...approvalInput(req.id), status: 'expired' });
+    const [prompt] = store.addDeliveries(req.id, [{ key: `approval:${approval.id}`, ordinal: 0, kind: 'approval', body: 'Old question', approvalId: approval.id }]);
+    store.updateDelivery(prompt.id, { status: 'sent', remoteMessageId: '500' });
+    expect(store.findReplyApproval(req.origin, '500')?.id).toBe(approval.id);
+    expect(store.findReplyApproval(req.origin, '501')).toBeUndefined();
+    for (const patch of [{ platform: req.origin.platform === 'telegram' ? 'slack' as const : 'telegram' as const }, { accountId: 'different-bot' }, { chatId: 'different-chat' }, { threadId: 'different-thread' }]) {
+      expect(store.findReplyApproval({ ...req.origin, ...patch }, '500')).toBeUndefined();
+    }
   });
 });
 
