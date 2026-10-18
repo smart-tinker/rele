@@ -1,0 +1,41 @@
+{
+  "name": "rele",
+  "version": "0.1.0-rc.1",
+  "private": true,
+  "type": "module",
+  "description": "Local Slack and Telegram gateway for shared Codex conversations",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=24.19.0 <25"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server/main.ts",
+    "dev:web": "vite --host 127.0.0.1",
+    "build": "tsc -p tsconfig.server.json && vite build",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "start": "node dist/server/main.js",
+    "probe:codex": "tsx scripts/probe-codex.ts",
+    "package": "node scripts/package.mjs"
+  },
+  "dependencies": {
+    "@fastify/static": "10.1.6",
+    "fastify": "5.12.7",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "ws": "8.22.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "@types/node": "24.19.2",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@types/ws": "8.18.2",
+    "@vitejs/plugin-react": "5.2.0",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "vite": "7.3.7",
+    "vitest": "4.1.12"
+  }
+}

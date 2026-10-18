@@ -1,0 +1,225 @@
+import {
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import {
+  ConfigStore,
+  defaultConfig,
+  isLocalEndpoint,
+  mergeConfig,
+  publicConfig,
+} from '../src/server/config.js';
+
+const syntheticSecrets = {
+  codex: 'synthetic-codex-secret',
+  telegram: '123456:synthetic_telegram_secret_123456',
+  slackBot: 'SLACK_TOKEN_PLACEHOLDER_6819402',
+  slackApp: 'SLACK_TOKEN_PLACEHOLDER_3378106',
+};
+const directories: string[] = [];
+afterEach(async () => {
+  for (const directory of directories.splice(0))
+    await rm(directory, { recursive: true, force: true });
+});
+async function directory() {
+  const value = await mkdtemp(join(tmpdir(), 'rele-config-test-'));
+  directories.push(value);
+  return value;
+}
+function configured() {
+  return mergeConfig(defaultConfig, {
+    codex: { token: syntheticSecrets.codex },
+    telegram: { enabled: true, token: syntheticSecrets.telegram },
+    slack: {
+      enabled: true,
+      botToken: syntheticSecrets.slackBot,
+      appToken: syntheticSecrets.slackApp,
+    },
+  });
+}
+
+describe('configuration validation and public projection', () => {
+  it('preserves existing secrets for empty fields, replaces explicit values and never mutates defaults', () => {
+    const current = configured();
+    const next = mergeConfig(current, {
+      codex: { token: '' },
+      telegram: { token: '  ', enabled: false },
+      slack: { botToken: '', appToken: '' },
+    });
+    expect(next.codex.token).toBe(syntheticSecrets.codex);
+    expect(next.telegram.token).toBe(syntheticSecrets.telegram);
+    expect(next.telegram.enabled).toBe(false);
+    expect(current.telegram.enabled).toBe(true);
+    expect(defaultConfig.telegram).toEqual({ enabled: false });
+    const replaced = mergeConfig(next, {
+      telegram: { token: '987654:another_synthetic_secret_123456' },
+    });
+    expect(replaced.telegram.token).toBe(
+      '987654:another_synthetic_secret_123456',
+    );
+  });
+
+  it('returns only secret-presence flags to the panel', () => {
+    const value = publicConfig(configured());
+    const serialized = JSON.stringify(value);
+    for (const secret of Object.values(syntheticSecrets))
+      expect(serialized).not.toContain(secret);
+    expect(value.codex).not.toHaveProperty('token');
+    expect(value.telegram).toEqual({ enabled: true, tokenConfigured: true });
+    expect(value.slack).toEqual({
+      enabled: true,
+      botTokenConfigured: true,
+      appTokenConfigured: true,
+    });
+  });
+
+  it.each([
+    { arbitrary: true },
+    { telegram: { enabled: 'true' } },
+    { telegram: { enabled: true } },
+    { slack: { enabled: true, botToken: 'xoxb-test' } },
+    { codex: { transport: 'stdio' } },
+    { codex: { executable: 'codex\nextra' } },
+    {
+      codex: {
+        transport: 'websocket',
+        endpoint: 'wss://example.invalid/codex',
+      },
+    },
+    {
+      codex: {
+        transport: 'websocket',
+        endpoint: 'ws://localhost:4500/?token=secret',
+      },
+    },
+    { voice: { enabled: true, model: 'small' } },
+    { voice: { device: 'auto' } },
+    { voice: { language: 'russian' } },
+    { voice: { shell: 'unexpected' } },
+  ])('rejects unsupported or incomplete settings: %j', (patch) => {
+    expect(() => mergeConfig(defaultConfig, patch)).toThrow();
+  });
+
+  it('accepts a local model directory without requiring any network download', () => {
+    const model = resolve('synthetic-local-model');
+    const value = mergeConfig(defaultConfig, {
+      voice: {
+        enabled: true,
+        python: 'python',
+        model,
+        language: '',
+        device: 'cpu',
+      },
+    });
+    expect(value.voice).toMatchObject({ model, language: '', enabled: true });
+  });
+
+  it.each([
+    'ws://127.0.0.1:4500',
+    'wss://localhost:4500/codex',
+    'ws://[::1]:4500',
+  ])('accepts a loopback app-server endpoint: %s', (endpoint) => {
+    expect(isLocalEndpoint(endpoint)).toBe(true);
+  });
+
+  it.each([
+    'https://127.0.0.1:4500',
+    'ws://localhost.evil.invalid',
+    'ws://user:secret@localhost:4500',
+    'ws://127.0.0.1:4500#token',
+    'ws://127.0.0.1:4500?token=secret',
+    'not-a-url',
+  ])('rejects an endpoint outside the local contract: %s', (endpoint) => {
+    expect(isLocalEndpoint(endpoint)).toBe(false);
+  });
+});
+
+describe('configuration storage and panel credentials', () => {
+  it('shares one complete configuration when several instances initialize the same directory at once', async () => {
+    const root = await directory();
+    const stores = Array.from({ length: 4 }, () => new ConfigStore(root));
+    await Promise.all(stores.map((store) => store.load()));
+    expect(new Set(stores.map((store) => store.panelToken)).size).toBe(1);
+    expect(stores[0].panelToken).toMatch(/^[a-f0-9]{64}$/);
+    const restored = new ConfigStore(root);
+    await restored.load();
+    expect(restored.panelToken).toBe(stores[0].panelToken);
+    expect(restored.config).toEqual(defaultConfig);
+    expect(await readdir(root)).toEqual(['config.json']);
+  });
+
+  it('retains the panel token and settings after reload, with no abandoned temporary file', async () => {
+    const root = await directory();
+    const first = new ConfigStore(root);
+    await first.load();
+    expect(first.panelToken).toMatch(/^[a-f0-9]{64}$/);
+    await first.save(configured());
+    const second = new ConfigStore(root);
+    await second.load();
+    expect(second.panelToken).toBe(first.panelToken);
+    expect(second.config).toEqual(first.config);
+    expect(await readdir(root)).toEqual(['config.json']);
+    if (process.platform !== 'win32') {
+      expect((await stat(root)).mode & 0o777).toBe(0o700);
+      expect((await stat(join(root, 'config.json'))).mode & 0o777).toBe(0o600);
+    }
+  });
+
+  it('requires the exact bearer value and redacts configured secrets from errors', () => {
+    const store = new ConfigStore('unused');
+    store.panelToken = 'a'.repeat(64);
+    store.config = configured();
+    expect(store.authorized(`Bearer ${store.panelToken}`)).toBe(true);
+    for (const header of [
+      undefined,
+      store.panelToken,
+      `Basic ${store.panelToken}`,
+      `Bearer ${'b'.repeat(64)}`,
+      `Bearer ${store.panelToken}x`,
+    ])
+      expect(store.authorized(header)).toBe(false);
+    const message = store.redact(
+      new Error(
+        [store.panelToken, ...Object.values(syntheticSecrets)].join(' / '),
+      ),
+    );
+    expect(message).toBe(Array(5).fill('[скрыто]').join(' / '));
+  });
+
+  it('refuses a corrupted file without overwriting the original settings', async () => {
+    const root = await directory();
+    const file = join(root, 'config.json');
+    const original = '{ invalid synthetic configuration';
+    await writeFile(file, original);
+    await expect(new ConfigStore(root).load()).rejects.toThrow();
+    expect(await readFile(file, 'utf8')).toBe(original);
+  });
+
+  it.runIf(process.platform === 'win32')(
+    'round-trips Windows DPAPI for the current user without storing plaintext secrets',
+    async () => {
+      const root = await directory();
+      const first = new ConfigStore(root);
+      await first.load();
+      await first.save(configured());
+      const raw = await readFile(join(root, 'config.json'), 'utf8');
+      expect(JSON.parse(raw).encoding).toBe('dpapi');
+      for (const secret of [
+        first.panelToken,
+        ...Object.values(syntheticSecrets),
+      ])
+        expect(raw).not.toContain(secret);
+      const restored = new ConfigStore(root);
+      await restored.load();
+      expect(restored.config).toEqual(first.config);
+      expect(restored.authorized(`Bearer ${first.panelToken}`)).toBe(true);
+    },
+  );
+});

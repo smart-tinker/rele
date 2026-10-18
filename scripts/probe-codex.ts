@@ -1,0 +1,46 @@
+import { parseArgs } from 'node:util';
+import { CodexClient, SUPPORTED_CODEX_VERSION } from '../src/server/codex.js';
+
+const { values } = parseArgs({ options: {
+  transport: { type: 'string', default: 'proxy' },
+  executable: { type: 'string', default: 'codex' },
+  endpoint: { type: 'string', default: '' },
+  thread: { type: 'string' },
+  'token-env': { type: 'string' },
+  help: { type: 'boolean' },
+} });
+
+if (values.help) {
+  console.log(`Read-only attachment probe for Rele (tested Codex ${SUPPORTED_CODEX_VERSION}).
+
+npm run probe:codex -- --transport proxy [--executable /path/to/codex] [--endpoint /path/to/socket]
+npm run probe:codex -- --transport websocket --endpoint ws://127.0.0.1:4500 [--token-env CODEX_SERVER_TOKEN]
+
+Optional --thread UUID reads existing thread metadata without resuming it.
+This probe does not create threads, start a daemon, submit model input, or change authentication.
+The runtime PID and CODEX_HOME help compare two attachments; Windows Desktop live verification is separate.`);
+} else {
+  if (!['proxy', 'websocket'].includes(values.transport!)) throw new Error('--transport must be proxy or websocket.');
+  const token = values['token-env'] ? process.env[values['token-env']] : undefined;
+  if (values['token-env'] && !token) throw new Error('The selected token environment variable is empty.');
+  const client = new CodexClient({
+    transport: values.transport as 'proxy' | 'websocket', executable: values.executable!, endpoint: values.endpoint, token,
+  });
+  try {
+    await client.connect();
+    const runtime = client.runtimeInfo();
+    const diagnostics = await client.diagnostics();
+    const threads = await client.listThreads();
+    const thread = values.thread ? await client.readThread(values.thread) : undefined;
+    console.log(JSON.stringify({
+      status: client.status(), runtime, runtimeProcessId: diagnostics.process.id,
+      threadCount: threads.length, ...(thread ? { thread } : {}),
+      checks: { attachedToExistingServer: true, mutatingRequestsSent: false, desktopLiveVerified: false },
+    }, null, 2));
+    if (!client.status().queueSupported) process.exitCode = 2;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(token ? message.split(token).join('[redacted]') : message);
+    process.exitCode = 1;
+  } finally { client.close(); }
+}
