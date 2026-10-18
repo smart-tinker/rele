@@ -274,7 +274,9 @@ test('queue cancels only a selected task, approvals preserve answers, uncertain 
   await expect(uncertainRow.getByRole('button')).toHaveCount(0);
   await expect(uncertainRow).toContainText('Повторная отправка заблокирована');
   await page.getByRole('button', { name: 'Повторить', exact: true }).click();
-  expect(api.mutations.at(-1)?.path).toBe('/api/deliveries/delivery-1/retry');
+  await expect
+    .poll(() => api.mutations.at(-1)?.path)
+    .toBe('/api/deliveries/delivery-1/retry');
 });
 
 test('uncertain launches can be reconciled and only an existing queued submission can be resumed', async ({
