@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir, rm, copyFile, chmod, stat, realpath } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rm, copyFile, chmod, stat, realpath, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:net';
@@ -58,6 +58,13 @@ async function main(): Promise<void> {
   try { store = new Store(database); } catch (error) { lock.close(); throw error; }
   const temporaryRoot = path.join(config.directory, 'temp');
   try { await mkdir(temporaryRoot, { recursive: true, mode: 0o700 }); } catch (error) { store.close(); lock.close(); throw error; }
+  // A previous hard stop cannot run the worker's finally block. Only clean our
+  // own temporary directories after taking the single-instance lock.
+  for (const entry of await readdir(temporaryRoot, { withFileTypes: true })) if (entry.isDirectory() && entry.name.startsWith('voice-')) {
+    await rm(path.join(temporaryRoot, entry.name), { recursive: true, force: true, maxRetries: 2, retryDelay: 100 }).catch(() => {
+      process.stderr.write('Rele: временный аудиофайл занят; очистка будет повторена при следующем запуске.\n');
+    });
+  }
   let codex = new CodexClient(config.config.codex);
   const engine = new Engine(store, codex, { config: () => config.config, temporaryRoot, redact: value => config.redact(value) });
   let shuttingDown = false;

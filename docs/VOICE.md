@@ -18,7 +18,7 @@ py -3.13 -m venv "$env:LOCALAPPDATA\ReleVoice"
 & "$env:LOCALAPPDATA\ReleVoice\Scripts\python.exe" -m pip install -r scripts/voice-requirements.txt
 ```
 
-Зафиксирован faster-whisper 1.2.1. CPU использует int8. Для CUDA нужны совместимые системные библиотеки из документации faster-whisper; CPU достаточно для первого запуска.
+Зафиксирован совместимый набор зависимостей, включая faster-whisper 1.2.1 и PyAV 18.1.0. PyAV 19 изменил используемый интерфейс декодирования и с этой версией faster-whisper несовместим. CPU использует int8. Для CUDA нужны совместимые системные библиотеки из документации faster-whisper; CPU достаточно для первого запуска.
 
 ## Модель
 
@@ -39,7 +39,7 @@ snapshot_download("Systran/faster-whisper-small", local_dir="/absolute/path/to/r
 python scripts/transcribe.py --input /path/to/sample.ogg --model /absolute/path/to/rele-model --language ru --device cpu
 ```
 
-Вывод — JSON с полем `text`. Рабочий процесс задаёт `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, `local_files_only=True`. Неполная модель приводит к ошибке, а не к скрытой загрузке.
+Вывод — JSON с полем `text`. Рабочий процесс получает ограниченное окружение без API credentials, с `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, `local_files_only=True`. Неполная модель приводит к ошибке, а не к скрытой загрузке. Перед удалением аудио Rele дожидается закрытия Python-процесса; оставшиеся после аварийного завершения каталоги очищаются при следующем запуске, если их уже не удерживает процесс.
 
 Первый выпуск: один аудиофайл сообщения, максимум 20 МиБ, до 10 минут обработки. Неразборчивая речь или ошибка модели не запускают Codex. Аудио удаляется; текст остаётся в истории запроса и в Codex.
 

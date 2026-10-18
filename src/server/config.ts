@@ -1,6 +1,6 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, writeFile, rename, chmod, rm } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, rename, chmod, rm, link } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import type { PublicConfig } from '../shared/types.js';
@@ -104,9 +104,9 @@ async function protectWindows(input: string, decrypt: boolean): Promise<string> 
   });
 }
 
-async function atomicWrite(file: string, value: string): Promise<void> {
+async function atomicWrite(file: string, value: string, exclusive = false): Promise<void> {
   const temporary = `${file}.${randomBytes(6).toString('hex')}.tmp`;
-  try { await writeFile(temporary, value, { mode: 0o600, flag: 'wx' }); await rename(temporary, file); await chmod(file, 0o600); }
+  try { await writeFile(temporary, value, { mode: 0o600, flag: 'wx', flush: true }); if (exclusive) await link(temporary, file); else await rename(temporary, file); await chmod(file, 0o600); }
   finally { await rm(temporary, { force: true }); }
 }
 
@@ -130,13 +130,14 @@ export class ConfigStore {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       this.panelToken = randomBytes(32).toString('hex');
-      await this.save(this.config);
+      try { await this.save(this.config, true); }
+      catch (creationError) { if ((creationError as NodeJS.ErrnoException).code === 'EEXIST') await this.load(); else throw creationError; }
     }
   }
-  async save(config: AppConfig): Promise<void> {
+  async save(config: AppConfig, exclusive = false): Promise<void> {
     const value = JSON.stringify({ config, panelToken: this.panelToken });
     const encoding = process.platform === 'win32' ? 'dpapi' : 'plain';
-    await atomicWrite(path.join(this.directory, 'config.json'), JSON.stringify({ version: 1, encoding, value: encoding === 'dpapi' ? await protectWindows(value, false) : value }) + '\n');
+    await atomicWrite(path.join(this.directory, 'config.json'), JSON.stringify({ version: 1, encoding, value: encoding === 'dpapi' ? await protectWindows(value, false) : value }) + '\n', exclusive);
     this.config = structuredClone(config);
   }
   authorized(header: string | undefined): boolean {

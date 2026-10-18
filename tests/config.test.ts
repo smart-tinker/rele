@@ -142,6 +142,19 @@ describe('configuration validation and public projection', () => {
 });
 
 describe('configuration storage and panel credentials', () => {
+  it('shares one complete configuration when several instances initialize the same directory at once', async () => {
+    const root = await directory();
+    const stores = Array.from({ length: 4 }, () => new ConfigStore(root));
+    await Promise.all(stores.map((store) => store.load()));
+    expect(new Set(stores.map((store) => store.panelToken)).size).toBe(1);
+    expect(stores[0].panelToken).toMatch(/^[a-f0-9]{64}$/);
+    const restored = new ConfigStore(root);
+    await restored.load();
+    expect(restored.panelToken).toBe(stores[0].panelToken);
+    expect(restored.config).toEqual(defaultConfig);
+    expect(await readdir(root)).toEqual(['config.json']);
+  });
+
   it('retains the panel token and settings after reload, with no abandoned temporary file', async () => {
     const root = await directory();
     const first = new ConfigStore(root);

@@ -1,1 +1,25 @@
 faster-whisper==1.2.1
+# PyAV 19 removes metadata_errors, which faster-whisper 1.2.1 still passes.
+av==18.1.0
+ctranslate2==4.8.3
+onnxruntime==1.31.0
+huggingface-hub==2.2.0
+tokenizers==0.23.3
+numpy==2.5.4
+tqdm==4.70.1
+# Resolve the tested CPU environment consistently on Python 3.12/3.13.
+anyio==4.15.1
+click==8.5.0
+filelock==4.2.2
+flatbuffers==25.12.19
+fsspec==2026.9.0
+h11==0.16.0
+hf-xet==1.7.0
+httpcore2==2.14.0
+httpx2==2.14.0
+idna==3.20
+packaging==26.3
+protobuf==7.36.2
+PyYAML==6.0.3
+truststore==0.10.5
+typing-extensions==4.16.0

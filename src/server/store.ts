@@ -360,7 +360,7 @@ export class Store {
       const now = new Date().toISOString();
       this.db.prepare('UPDATE requests SET status=?,turn_id=?,error=?,updated_at=? WHERE id=?').run(next.status, next.turnId ?? null, next.error ?? null, now, id);
       this.db.prepare("UPDATE approvals SET status='expired',updated_at=? WHERE request_id=? AND status='pending'").run(now, id);
-      this.db.prepare("UPDATE deliveries SET status='cancelled',updated_at=? WHERE request_id=? AND kind='approval' AND status='pending'").run(now, id);
+      this.db.prepare("UPDATE deliveries SET status='cancelled',updated_at=? WHERE request_id=? AND kind='approval' AND status IN ('pending','failed')").run(now, id);
       this.writeDeliveries(id, parts);
       return this.getRequest(id)!;
     });
@@ -370,6 +370,18 @@ export class Store {
     return row ? toDelivery(row) : undefined;
   }
   listDeliveries(limit = 100): Delivery[] { return this.db.prepare('SELECT * FROM deliveries ORDER BY rowid DESC LIMIT ?').all(limitValue(limit)).map(toDelivery); }
+  findReplyApproval(origin: Pick<Origin, 'platform' | 'accountId' | 'chatId' | 'threadId'>, remoteMessageId: string): Approval | undefined {
+    const row = this.db.prepare(`SELECT a.* FROM deliveries d JOIN approvals a ON a.id=d.approval_id
+      WHERE d.kind='approval' AND d.status='sent' AND d.remote_message_id=?
+        AND json_extract(d.origin,'$.platform')=? AND json_extract(d.origin,'$.accountId')=?
+        AND json_extract(d.origin,'$.chatId')=? AND json_extract(d.origin,'$.threadId')=?
+      ORDER BY d.rowid DESC LIMIT 1`).get(remoteMessageId, origin.platform, origin.accountId, origin.chatId, origin.threadId);
+    return row ? toApproval(row) : undefined;
+  }
+  cancelApprovalDeliveries(approvalId: string): void {
+    this.db.prepare("UPDATE deliveries SET status='cancelled',updated_at=? WHERE approval_id=? AND kind='approval' AND status IN ('pending','failed')")
+      .run(new Date().toISOString(), approvalId);
+  }
   claimDelivery(now: string | number | Date = new Date()): Delivery | undefined {
     const timestamp = new Date(now).toISOString();
     return this.transaction(() => {

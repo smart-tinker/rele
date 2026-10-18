@@ -77,19 +77,24 @@ export class Engine extends EventEmitter {
 
   async receive(message: InboundMessage): Promise<void> {
     if (this.stopped) throw new ChannelError('Rele завершает работу; событие будет доставлено повторно.', true);
-    // A reply to a pending, single non-secret question belongs to that approval.
-    const pending = this.store.listApprovals(1000).filter(approval => approval.status === 'pending' && approval.questions?.length === 1 && !approval.questions[0].isSecret);
-    const approval = pending.find(candidate => {
-      const request = this.store.getRequest(candidate.requestId);
-      if (!request || !this.sameOrigin(request, message)) return false;
-      const delivered = this.store.listDeliveries(2000).find(delivery => delivery.approvalId === candidate.id && delivery.status === 'sent');
-      return message.endpoint.platform === 'slack' ? !!delivered : !!delivered && delivered.remoteMessageId === message.replyToMessageId;
-    });
-    if (approval && message.text.trim() && !message.audio) {
+    // Telegram has an explicit reply target. Even a stale approval reply remains
+    // an approval receipt, never a new agent task. Slack uses its active question.
+    const approval = message.endpoint.platform === 'telegram'
+      ? message.replyToMessageId ? this.store.findReplyApproval(message.endpoint, message.replyToMessageId) : undefined
+      : this.store.listApprovals(1000).find(candidate => {
+        if (candidate.status !== 'pending' || candidate.questions?.length !== 1 || candidate.questions[0].isSecret) return false;
+        const request = this.store.getRequest(candidate.requestId);
+        return !!request && this.sameOrigin(request, message) && this.store.listDeliveries(2000).some(delivery => delivery.approvalId === candidate.id && delivery.status === 'sent');
+      });
+    if (approval) {
       // Record first: after any crash this event cannot become a fresh Codex turn.
       // A crash before resolution leaves the question available in the panel.
       if (this.store.recordInbound(message).duplicate) return;
-      await this.resolveApproval(approval.id, 'accept', { [approval.questions![0].id]: [message.text] });
+      const request = this.store.getRequest(approval.requestId);
+      if (approval.status === 'pending' && request && !terminal(request.status) && this.sameOrigin(request, message)
+          && approval.questions?.length === 1 && !approval.questions[0].isSecret && message.text.trim() && !message.audio) {
+        await this.resolveApproval(approval.id, 'accept', { [approval.questions[0].id]: [message.text] });
+      }
     } else {
       this.store.ingest(message);
     }
@@ -110,6 +115,7 @@ export class Engine extends EventEmitter {
     const request = approval && this.store.getRequest(approval.requestId);
     if (!approval || approval.status !== 'pending' || !request || terminal(request.status) || this.resolutions.has(id)) throw new Error('Подтверждение уже завершено или недоступно.');
     if (!this.codex.status().connected) throw new ChannelError('Codex отключён. Дождитесь повторного подключения.', true);
+    if (!this.codex.status().queueSupported) throw new Error('Подтверждения недоступны для непроверенного runtime Codex.');
     if (this.isMixed(request.id)) throw new Error('Ход изменён другим клиентом. Продолжите подтверждение в Codex.');
     let result: unknown;
     if (approval.method === 'item/tool/requestUserInput') {
@@ -132,7 +138,7 @@ export class Engine extends EventEmitter {
       await this.codex.respond(approval.rpcId, result);
       const current = this.store.getRequest(request.id)!;
       if (current.status === 'waiting_approval') this.store.updateRequest(request.id, { status: 'running' });
-      this.cancelPendingApprovalDeliveries(id);
+      this.store.cancelApprovalDeliveries(id);
     } catch (error) {
       this.store.updateApproval(id, { status: 'expired', decision: 'uncertain' });
       if (!terminal(this.store.getRequest(request.id)!.status)) this.store.updateRequest(request.id, { status: 'uncertain', error: 'Результат подтверждения неизвестен. Проверьте запрос в Codex.' });
@@ -298,7 +304,7 @@ export class Engine extends EventEmitter {
           this.store.setMeta(`mixed:${active.id}`, '1');
           this.store.updateRequest(active.id, { status: 'uncertain', error: mixedMessage });
           for (const approval of this.store.listApprovals(1000)) if (approval.requestId === active.id && approval.status === 'pending') {
-            this.store.updateApproval(approval.id, { status: 'expired' }); this.cancelPendingApprovalDeliveries(approval.id);
+            this.store.updateApproval(approval.id, { status: 'expired' }); this.store.cancelApprovalDeliveries(approval.id);
           }
         }
       }
@@ -309,7 +315,7 @@ export class Engine extends EventEmitter {
         const request = this.store.getRequest(approval.requestId)!;
         if (this.store.getConversation(request.conversationId)?.threadId !== p.threadId) continue;
         this.store.updateApproval(approval.id, { status: 'answered', decision: 'resolved_in_codex' });
-        this.cancelPendingApprovalDeliveries(approval.id);
+        this.store.cancelApprovalDeliveries(approval.id);
         if (request.status === 'waiting_approval') this.store.updateRequest(request.id, { status: 'running' });
       }
     }
@@ -321,6 +327,24 @@ export class Engine extends EventEmitter {
     const request = this.store.activeRequests().find(row => row.turnId === p.turnId && this.store.getConversation(row.conversationId)?.threadId === p.threadId);
     // Desktop requests belong to Desktop. A broadcast is not authorization to answer them.
     if (!request || this.isMixed(request.id)) return;
+    // A foreign user message may have arrived before our own correlation event.
+    // Verify history before publishing approval details outside the local runtime.
+    let location: RequestLocation;
+    try { location = await this.codex.findRequest(p.threadId, request.id); }
+    catch {
+      this.store.updateRequest(request.id, { status: 'uncertain', error: 'Не удалось проверить происхождение подтверждения. Продолжите в Codex.' });
+      this.changed(); return;
+    }
+    if (terminal(this.store.getRequest(request.id)!.status)) return;
+    if (location.mixed) {
+      this.store.setMeta(`mixed:${request.id}`, '1');
+      this.store.updateRequest(request.id, { status: 'uncertain', error: mixedMessage });
+      this.changed(); return;
+    }
+    if (location.state !== 'running' || location.turnId !== p.turnId) {
+      this.store.updateRequest(request.id, { status: 'uncertain', error: 'Подтверждение не совпало с активным ходом запроса. Продолжите в Codex.' });
+      this.changed(); return;
+    }
     const question = event.method === 'item/tool/requestUserInput';
     const command = event.method === 'item/commandExecution/requestApproval';
     const files = event.method === 'item/fileChange/requestApproval';
@@ -354,9 +378,8 @@ export class Engine extends EventEmitter {
   private fail(id: string, error: string): void { this.store.finishRequest(id, { status: 'failed', error }, [{ key: 'terminal:error', ordinal: 0, kind: 'error', body: error }]); }
   private isMixed(id: string): boolean { return this.store.getMeta(`mixed:${id}`) === '1'; }
   private sameOrigin(request: ReleRequest, message: InboundMessage): boolean { const origin = request.origin; return origin.platform === message.endpoint.platform && origin.accountId === message.endpoint.accountId && origin.chatId === message.endpoint.chatId && origin.threadId === message.endpoint.threadId && origin.senderId === message.sender.id; }
-  private cancelPendingApprovalDeliveries(id: string): void { for (const delivery of this.store.listDeliveries(2000)) if (delivery.approvalId === id && delivery.status === 'pending') this.store.updateDelivery(delivery.id, { status: 'cancelled' }); }
   private expireApprovals(): void {
-    for (const approval of this.store.listApprovals(1000)) if (approval.status === 'pending') { this.store.updateApproval(approval.id, { status: 'expired' }); this.cancelPendingApprovalDeliveries(approval.id); }
+    for (const approval of this.store.listApprovals(1000)) if (approval.status === 'pending') { this.store.updateApproval(approval.id, { status: 'expired' }); this.store.cancelApprovalDeliveries(approval.id); }
     this.approvals.clear();
   }
   private connectionChanged(): void {
