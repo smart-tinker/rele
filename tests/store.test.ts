@@ -120,6 +120,19 @@ describe('Store inbox and bindings', () => {
     expect(store.ingest(message(ep, 'rollback-event')).duplicate).toBe(false);
   });
 
+  it('records approval replies durably without ever creating a new request on replay', () => {
+    const path = join(directory(), 'rele.sqlite');
+    const store = open(path);
+    conversation(store);
+    const reply = message(endpoint(), 'approval-reply', { text: 'main', replyToMessageId: 'approval-message' });
+    expect(store.recordInbound(reply)).toEqual({ duplicate: false });
+    expect(store.listRequests()).toHaveLength(0);
+    store.close();
+    const reopened = open(path);
+    expect(reopened.recordInbound(reply)).toEqual({ duplicate: true });
+    expect(reopened.ingest(reply)).toEqual({ duplicate: true, request: null });
+  });
+
   it('keeps the request and delivery origin when endpoints are renamed or bindings move', () => {
     const store = open();
     const ep = endpoint();
@@ -236,6 +249,54 @@ describe('Store queues and approvals', () => {
     expect(() => store.addDeliveries(another.id, [{ key: 'approval:1', ordinal: 0, kind: 'approval', body: 'Approve?', approvalId: approval.id }])).toThrow(/does not belong/);
     expect(store.getApproval(approval.id)?.requestId).toBe(req.id);
   });
+
+  it('finishes requests atomically with the outbox and cancels only unsent approval prompts', () => {
+    const store = open();
+    conversation(store);
+    const req = request(store);
+    store.updateRequest(req.id, { status: 'waiting_approval' });
+    const pending = store.addApproval(approvalInput(req.id));
+    const answered = store.addApproval({ ...approvalInput(req.id), itemId: 'answered-item', status: 'answered', decision: 'accept' });
+    const [prompt] = store.addDeliveries(req.id, [{ key: `approval:${pending.id}`, ordinal: 0, kind: 'approval', body: 'Approve?', approvalId: pending.id }]);
+
+    expect(() => store.finishRequest(req.id, { status: 'completed', turnId: 'turn-1' }, [
+      { key: 'answer:0', ordinal: 0, kind: 'answer', body: 'Completed' },
+      { key: 'answer:1', ordinal: 1, kind: 'invalid' as Delivery['kind'], body: 'Constraint failure' },
+    ])).toThrow(/CHECK/);
+    expect(store.getRequest(req.id)).toMatchObject({ status: 'waiting_approval', turnId: undefined });
+    expect(store.getApproval(pending.id)?.status).toBe('pending');
+    expect(store.getDelivery(prompt.id)?.status).toBe('pending');
+    expect(store.listDeliveries()).toHaveLength(1);
+
+    const parts: Array<Pick<Delivery, 'key' | 'ordinal' | 'kind' | 'body'>> = [{ key: 'answer:0', ordinal: 0, kind: 'answer', body: 'Completed' }];
+    expect(store.finishRequest(req.id, { status: 'completed', turnId: 'turn-1' }, parts).status).toBe('completed');
+    expect(store.getApproval(pending.id)?.status).toBe('expired');
+    expect(store.getApproval(answered.id)).toMatchObject({ status: 'answered', decision: 'accept' });
+    expect(store.getDelivery(prompt.id)).toMatchObject({ status: 'cancelled', attempts: 0 });
+    expect(store.claimDelivery()?.key).toBe('answer:0');
+    store.finishRequest(req.id, { status: 'completed' }, parts);
+    expect(store.listDeliveries()).toHaveLength(2);
+    expect(() => store.finishRequest(req.id, { status: 'failed', error: 'Must roll back' }, [{ ...parts[0], body: 'Changed duplicate' }])).toThrow(/different content/);
+    expect(store.getRequest(req.id)).toMatchObject({ status: 'completed', error: undefined });
+  });
+
+  it('preserves sending and uncertain approval deliveries when a request finishes', () => {
+    const store = open();
+    conversation(store);
+    const req = request(store);
+    const firstApproval = store.addApproval(approvalInput(req.id));
+    const secondApproval = store.addApproval({ ...approvalInput(req.id), itemId: 'another-item' });
+    const [sending, uncertain] = store.addDeliveries(req.id, [
+      { key: 'approval:1', ordinal: 0, kind: 'approval', body: 'First approval', approvalId: firstApproval.id },
+      { key: 'approval:2', ordinal: 1, kind: 'approval', body: 'Second approval', approvalId: secondApproval.id },
+    ]);
+    store.updateDelivery(sending.id, { status: 'sending' });
+    store.updateDelivery(uncertain.id, { status: 'uncertain' });
+    store.finishRequest(req.id, { status: 'completed' }, [{ key: 'answer:0', ordinal: 0, kind: 'answer', body: 'Final answer' }]);
+    expect(store.getDelivery(sending.id)?.status).toBe('sending');
+    expect(store.getDelivery(uncertain.id)?.status).toBe('uncertain');
+    expect(store.claimDelivery()).toBeUndefined();
+  });
 });
 
 describe('Store durability and recovery', () => {
@@ -294,7 +355,7 @@ describe('Store durability and recovery', () => {
     const check = new DatabaseSync(path);
     try {
       expect(check.prepare('PRAGMA journal_mode').get()?.journal_mode).toBe('wal');
-      expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(1);
+      expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(2);
       expect(check.prepare('PRAGMA quick_check').get()?.quick_check).toBe('ok');
       expect(check.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     } finally { check.close(); }

@@ -38,6 +38,9 @@ export class TelegramChannel implements Channel {
   private controller?: AbortController;
   private starting?: Promise<void>;
   private polling?: Promise<void>;
+  private retry?: NodeJS.Timeout;
+  private startupFailures = 0;
+  private stopped = true;
 
   constructor(
     private readonly token: string,
@@ -51,6 +54,9 @@ export class TelegramChannel implements Channel {
   }
 
   async start(): Promise<void> {
+    this.stopped = false;
+    clearTimeout(this.retry);
+    this.retry = undefined;
     if (this.starting) return this.starting;
     if (this.polling && !this.controller?.signal.aborted) return;
     const controller = new AbortController();
@@ -65,6 +71,7 @@ export class TelegramChannel implements Channel {
       const me = object(await this.call('getMe', {}, false, controller.signal));
       const accountId = numericId(me?.id);
       if (!me || !accountId || me.is_bot !== true) throw new ChannelError('Telegram вернул некорректные сведения о боте.');
+      if (accountId !== this.token.split(':', 1)[0]) throw new ChannelError('Telegram сообщил другую учётную запись бота. Проверьте токен.');
       const webhook = object(await this.call('getWebhookInfo', {}, false, controller.signal));
       if (!webhook || typeof webhook.url !== 'string') throw new ChannelError('Не удалось проверить webhook Telegram.');
       if (webhook.url) throw new ChannelError('У бота Telegram уже настроен webhook. Подключите отдельного бота или отключите webhook в прежнем приложении.');
@@ -72,6 +79,7 @@ export class TelegramChannel implements Channel {
       const offset = this.checkpoint.get();
       if (!Number.isSafeInteger(offset) || offset < 0) throw new ChannelError('Не удалось прочитать сохранённую позицию Telegram.');
       this.accountId = accountId;
+      this.startupFailures = 0;
       this.state.name = readableTitle(typeof me.username === 'string' ? `@${me.username}` : me.first_name, 'Бот Telegram');
       this.setStatus(true);
       this.polling = this.poll(controller.signal).finally(() => {
@@ -82,11 +90,22 @@ export class TelegramChannel implements Channel {
       const safe = error instanceof ChannelError ? error : new ChannelError('Не удалось подключить Telegram.');
       this.setStatus(false, safe.message);
       controller.abort();
+      if (safe.retryable && !this.stopped) {
+        const backoff = Math.min(30_000, 1_000 * 2 ** Math.min(this.startupFailures++, 5));
+        this.retry = setTimeout(() => {
+          this.retry = undefined;
+          if (!this.stopped) void this.start().catch(() => {});
+        }, Math.max(backoff, safe.retryAfterMs));
+        this.retry.unref();
+      }
       throw safe;
     }
   }
 
   async stop(): Promise<void> {
+    this.stopped = true;
+    clearTimeout(this.retry);
+    this.retry = undefined;
     this.controller?.abort();
     await Promise.allSettled([this.starting, this.polling].filter((task): task is Promise<void> => Boolean(task)));
     this.setStatus(false, this.state.error);
@@ -109,7 +128,7 @@ export class TelegramChannel implements Channel {
         method: 'POST', redirect: 'error', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal,
       }), signal);
     } catch {
-      throw new ChannelError(sending ? 'Не получено подтверждение отправки Telegram. Проверьте чат перед повтором.' : 'Telegram временно недоступен.', !sending, sending);
+      throw new ChannelError(sending ? 'Не получено подтверждение отправки Telegram. Проверьте чат перед повтором.' : 'Telegram временно недоступен.', !sending, sending, sending ? 30_000 : 1_000);
     }
     try { data = object(await abortable(response.json(), signal)); } catch { data = undefined; }
     if (data?.ok === true && response.ok && 'result' in data) return data.result;
@@ -124,7 +143,7 @@ export class TelegramChannel implements Channel {
         code === 409 ? 'Этот бот Telegram уже используется другим получателем обновлений.' : 'Telegram отклонил запрос. Проверьте чат, тему и права бота.';
       throw new ChannelError(message);
     }
-    throw new ChannelError(sending ? 'Не получено подтверждение отправки Telegram. Проверьте чат перед повтором.' : 'Telegram вернул некорректный ответ.', !sending, sending);
+    throw new ChannelError(sending ? 'Не получено подтверждение отправки Telegram. Проверьте чат перед повтором.' : 'Telegram вернул некорректный ответ.', !sending, sending, sending ? 30_000 : 1_000);
   }
 
   private async poll(signal: AbortSignal): Promise<void> {

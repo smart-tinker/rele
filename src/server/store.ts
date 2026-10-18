@@ -65,6 +65,22 @@ const MIGRATIONS = [String.raw`
   CREATE INDEX deliveries_queue ON deliveries(status, next_attempt_at);
   CREATE INDEX deliveries_request ON deliveries(request_id);
   CREATE TABLE meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL) STRICT;
+`, String.raw`
+  ALTER TABLE deliveries RENAME TO deliveries_v1;
+  CREATE TABLE deliveries (
+    id TEXT PRIMARY KEY NOT NULL, request_id TEXT NOT NULL REFERENCES requests(id),
+    origin TEXT NOT NULL CHECK(json_valid(origin) AND json_type(origin) = 'object'), key TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0), kind TEXT NOT NULL CHECK(kind IN ('answer','error','approval')),
+    body TEXT NOT NULL, approval_id TEXT REFERENCES approvals(id),
+    status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','failed','uncertain','cancelled')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0), remote_message_id TEXT, error TEXT, next_attempt_at TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(request_id, key)
+  ) STRICT;
+  INSERT INTO deliveries(rowid,id,request_id,origin,key,ordinal,kind,body,approval_id,status,attempts,remote_message_id,error,next_attempt_at,created_at,updated_at)
+    SELECT rowid,id,request_id,origin,key,ordinal,kind,body,approval_id,status,attempts,remote_message_id,error,next_attempt_at,created_at,updated_at FROM deliveries_v1 ORDER BY rowid;
+  DROP TABLE deliveries_v1;
+  CREATE INDEX deliveries_queue ON deliveries(status, next_attempt_at);
+  CREATE INDEX deliveries_request ON deliveries(request_id);
 `];
 
 function required(value: string, label: string): void {
@@ -242,17 +258,26 @@ export class Store {
     });
   }
 
-  ingest(message: InboundMessage): { request: ReleRequest | null; duplicate: boolean } {
+  private recordEvent(message: InboundMessage): { duplicate: boolean; requestId?: string } {
     required(message.eventId, 'Event ID'); required(message.sender.id, 'Sender ID'); required(message.messageId, 'Message ID');
+    const endpoint = message.endpoint;
+    const event = this.db.prepare('SELECT request_id FROM inbound_events WHERE platform=? AND account_id=? AND event_id=?')
+      .get(endpoint.platform, endpoint.accountId, message.eventId);
+    if (event) return { duplicate: true, requestId: optional(event.request_id) };
+    this.writeEndpoint(endpoint);
+    this.db.prepare('INSERT INTO inbound_events (platform,account_id,event_id,endpoint_id,payload,created_at) VALUES (?,?,?,?,?,?)')
+      .run(endpoint.platform, endpoint.accountId, message.eventId, endpoint.id, JSON.stringify(message), new Date().toISOString());
+    return { duplicate: false };
+  }
+  recordInbound(message: InboundMessage): { duplicate: boolean } {
+    return this.transaction(() => ({ duplicate: this.recordEvent(message).duplicate }));
+  }
+  ingest(message: InboundMessage): { request: ReleRequest | null; duplicate: boolean } {
     return this.transaction(() => {
       const endpoint = message.endpoint;
-      const event = this.db.prepare('SELECT request_id FROM inbound_events WHERE platform=? AND account_id=? AND event_id=?')
-        .get(endpoint.platform, endpoint.accountId, message.eventId);
-      if (event) return { request: event.request_id === null ? null : this.getRequest(event.request_id as string)!, duplicate: true };
-      this.writeEndpoint(endpoint);
+      const event = this.recordEvent(message);
+      if (event.duplicate) return { request: event.requestId ? this.getRequest(event.requestId)! : null, duplicate: true };
       const now = new Date().toISOString();
-      this.db.prepare('INSERT INTO inbound_events (platform,account_id,event_id,endpoint_id,payload,created_at) VALUES (?,?,?,?,?,?)')
-        .run(endpoint.platform, endpoint.accountId, message.eventId, endpoint.id, JSON.stringify(message), now);
       const row = this.db.prepare(`SELECT bindings.* FROM bindings JOIN conversations ON conversations.id=bindings.conversation_id
         WHERE bindings.endpoint_id=? AND conversations.paused=0`).get(endpoint.id);
       const binding = row ? toBinding(row) : undefined;
@@ -301,7 +326,9 @@ export class Store {
   }
 
   addDeliveries(requestId: string, parts: DeliveryPart[]): Delivery[] {
-    return this.transaction(() => {
+    return this.transaction(() => this.writeDeliveries(requestId, parts));
+  }
+  private writeDeliveries(requestId: string, parts: DeliveryPart[]): Delivery[] {
       const request = this.getRequest(requestId);
       if (!request) throw new Error('Request not found');
       const result: Delivery[] = [];
@@ -322,6 +349,20 @@ export class Store {
         result.push(this.getDelivery(id)!);
       }
       return result;
+  }
+  finishRequest(id: string, patch: { status: 'completed' | 'failed' | 'interrupted' | 'cancelled'; error?: string; turnId?: string }, parts: DeliveryPart[]): ReleRequest {
+    allowedPatch(patch, ['status', 'error', 'turnId']);
+    if (!['completed', 'failed', 'interrupted', 'cancelled'].includes(patch.status)) throw new Error('Finishing a request requires a terminal status');
+    return this.transaction(() => {
+      const current = this.getRequest(id);
+      if (!current) throw new Error('Request not found');
+      const next = { ...current, ...patch };
+      const now = new Date().toISOString();
+      this.db.prepare('UPDATE requests SET status=?,turn_id=?,error=?,updated_at=? WHERE id=?').run(next.status, next.turnId ?? null, next.error ?? null, now, id);
+      this.db.prepare("UPDATE approvals SET status='expired',updated_at=? WHERE request_id=? AND status='pending'").run(now, id);
+      this.db.prepare("UPDATE deliveries SET status='cancelled',updated_at=? WHERE request_id=? AND kind='approval' AND status='pending'").run(now, id);
+      this.writeDeliveries(id, parts);
+      return this.getRequest(id)!;
     });
   }
   getDelivery(id: string): Delivery | undefined {
@@ -334,7 +375,7 @@ export class Store {
     return this.transaction(() => {
       const row = this.db.prepare(`SELECT d.id FROM deliveries d WHERE d.status='pending'
         AND (d.next_attempt_at IS NULL OR d.next_attempt_at<=?)
-        AND NOT EXISTS(SELECT 1 FROM deliveries earlier WHERE earlier.request_id=d.request_id AND earlier.rowid<d.rowid AND earlier.status!='sent')
+        AND NOT EXISTS(SELECT 1 FROM deliveries earlier WHERE earlier.request_id=d.request_id AND earlier.rowid<d.rowid AND earlier.status NOT IN ('sent','cancelled'))
         ORDER BY d.rowid LIMIT 1`).get(timestamp);
       if (!row) return undefined;
       const id = row.id as string;

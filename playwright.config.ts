@@ -12,9 +12,19 @@ export default defineConfig({
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
     viewport: { width: 1536, height: 1024 },
-    launchOptions: process.env.RELE_TEST_BROWSER ? { executablePath: process.env.RELE_TEST_BROWSER } : {},
+    launchOptions: process.env.RELE_TEST_BROWSER
+      ? { executablePath: process.env.RELE_TEST_BROWSER }
+      : {},
   },
-  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'], viewport: { width: 1536, height: 1024 } } }],
+  projects: [
+    {
+      name: 'chromium',
+      use: {
+        ...devices['Desktop Chrome'],
+        viewport: { width: 1536, height: 1024 },
+      },
+    },
+  ],
   webServer: {
     command: 'npm run dev:web -- --port 4174 --strictPort',
     url: 'http://127.0.0.1:4174',

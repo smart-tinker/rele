@@ -74,10 +74,54 @@ function harness(options: { callbacks?: Partial<ChannelCallbacks>; knownEndpoint
 
 afterEach(async () => {
   await Promise.all(channels.splice(0).map((channel) => channel.stop()));
+  vi.useRealTimers();
   for (const path of directories.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
 describe('Telegram connection and incoming events', () => {
+  it('recovers an offline startup with capped backoff without sending any messages', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const h = harness();
+    h.handlers.set('getMe', () => { throw new Error(`Offline ${TOKEN}`); });
+    await expect(h.channel.start()).rejects.toThrow(/недоступен/);
+    expect(h.channel.state.error).not.toContain(TOKEN);
+    let attempts = 1;
+    for (const wait of [1000, 2000, 4000, 8000, 16000, 30000, 30000]) {
+      await vi.advanceTimersByTimeAsync(wait - 1);
+      expect(h.calls).toHaveLength(attempts);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(h.calls).toHaveLength(++attempts);
+    }
+    h.handlers.delete('getMe');
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(h.channel.state).toMatchObject({ connected: true, error: undefined });
+    expect(h.calls.filter(call => call.method === 'getUpdates')).toHaveLength(1);
+    expect(h.calls.some(call => call.method === 'sendMessage')).toBe(false);
+    await h.channel.start();
+    expect(h.calls.filter(call => call.method === 'getUpdates')).toHaveLength(1);
+  });
+
+  it('cancels a startup retry on stop and honors an explicit rate-limit delay', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const h = harness();
+    h.handlers.set('getMe', () => Response.json({ ok: false, error_code: 429, parameters: { retry_after: 4 } }, { status: 429 }));
+    await expect(h.channel.start()).rejects.toThrow(/частоту/);
+    await vi.advanceTimersByTimeAsync(3999);
+    expect(h.calls).toHaveLength(1);
+    await h.channel.stop();
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(h.calls).toHaveLength(1);
+    expect(h.channel.state.connected).toBe(false);
+  });
+
+  it('verifies the bot identity before reading an account-scoped checkpoint', async () => {
+    const h = harness();
+    h.handlers.set('getMe', () => response({ id: 998, is_bot: true, first_name: 'Another bot' }));
+    await expect(h.channel.start()).rejects.toThrow(/другую учётную запись/);
+    expect(h.calls.map(call => call.method)).toEqual(['getMe']);
+    expect(h.offset).toBe(0);
+  });
+
   it('refuses an existing webhook without changing or deleting it', async () => {
     const h = harness();
     h.handlers.set('getWebhookInfo', () => response({ url: 'https://existing.example/private-hook' }));

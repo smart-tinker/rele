@@ -1,0 +1,133 @@
+name: Rele CI and release candidate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rele-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: Verify and package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24.19.0
+          cache: npm
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.13'
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: Install the isolated protocol fixture
+        run: |
+          python -m pip install -r scripts/protocol-requirements.txt
+          npm install --prefix "$RUNNER_TEMP/codex-probe" --ignore-scripts --no-audit --no-fund --no-package-lock @openai/codex@0.163.0
+      - name: Verify the actual Codex protocol without credentials or a real model
+        run: python scripts/protocol-probe.py --codex-prefix "$RUNNER_TEMP/codex-probe" --report protocol-results.json
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+      - name: Build portable runtime and verify the extracted archive
+        run: |
+          npm run package
+          node scripts/smoke-package.mjs
+      - name: Keep diagnostic reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: verification-${{ matrix.os }}
+          path: |
+            protocol-results.json
+            playwright-report/
+            test-results/
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Keep verified portable packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: portable-${{ matrix.os }}
+          path: |
+            release/*.zip
+            release/*.tar.gz
+            release/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  prerelease:
+    name: Publish verified release candidate
+    needs: verify
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24.19.0
+          package-manager-cache: false
+      - name: Accept only an explicit RC version
+        id: candidate
+        run: |
+          node --input-type=module <<'JS'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          const {version} = JSON.parse(readFileSync('package.json', 'utf8'));
+          const candidate = /^\d+\.\d+\.\d+-rc\.\d+$/.test(version);
+          appendFileSync(process.env.GITHUB_OUTPUT, `publish=${candidate}\nversion=${candidate ? version : ''}\n`);
+          if (!candidate) console.log('Stable publishing is disabled until the real Desktop and messenger acceptance gates are closed.');
+          JS
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        if: steps.candidate.outputs.publish == 'true'
+        with:
+          pattern: portable-*
+          path: release-assets
+          merge-multiple: true
+      - name: Create immutable prerelease
+        if: steps.candidate.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELE_CANDIDATE_VERSION: ${{ steps.candidate.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$RELE_CANDIDATE_VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists. Its assets remain immutable; bump the RC version for another candidate."
+            exit 0
+          fi
+          (cd release-assets && sha256sum -c ./*.sha256)
+          cat > release-notes.md <<'NOTES'
+          Rele release candidate for native Windows x64 and Ubuntu Server x64.
+
+          The archives include Node.js 24.19.0 and production dependencies. Extract the matching archive and use start-rele.cmd or start-rele.sh.
+
+          Codex app-server 0.163.0 is the verified protocol version. Rele only attaches to an existing local runtime. The automated protocol fixture uses a local fake model and does not establish live Codex Desktop or real Telegram/Slack compatibility.
+
+          This is a prerelease. The Windows Desktop and authorized messenger acceptance scenarios remain mandatory before a stable release. See docs/PLAN.md and the open acceptance issues.
+          NOTES
+          gh release create "$tag" release-assets/* --target "$GITHUB_SHA" --prerelease --title "Rele $RELE_CANDIDATE_VERSION" --notes-file release-notes.md

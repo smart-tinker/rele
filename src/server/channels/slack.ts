@@ -171,7 +171,7 @@ export class SlackChannel implements Channel {
     const text = String(event.text ?? '').replaceAll(`<@${this.botUserId}>`, '').trim().slice(0, 50_000);
     const endpoint: Endpoint = {
       id, platform: 'slack', accountId: this.accountId, chatId: event.channel, threadId,
-      title: previous?.title ?? readableTitle(event.thread_ts && event.thread_ts !== event.ts ? '' : text, 'Обсуждение Slack'),
+      title: previous?.title ?? readableTitle(text, 'Обсуждение Slack'),
       subtitle: previous?.subtitle ?? `${this.teamName} · ${this.channelNames.get(event.channel) ?? 'Канал Slack'}`,
       url: `slack://channel?team=${encodeURIComponent(this.teamId)}&id=${encodeURIComponent(event.channel)}&message=${encodeURIComponent(threadId)}`,
       people: [...new Map([...(previous?.people ?? []), person].map(value => [value.id, value])).values()], updatedAt: new Date().toISOString(),

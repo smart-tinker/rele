@@ -120,6 +120,9 @@ export class CodexClient extends EventEmitter {
 
   /** Rejoin the existing runtime without overriding its model, sandbox, or instructions. */
   async subscribe(threadId: string): Promise<void> {
+    if (this.version !== SUPPORTED_CODEX_VERSION) {
+      throw new Error(this.state.error || `Для подписки нужен проверенный Codex ${SUPPORTED_CODEX_VERSION}.`);
+    }
     this.subscriptions.add(threadId);
     const existing = this.subscribed.get(threadId);
     if (existing) return existing;
@@ -163,6 +166,7 @@ export class CodexClient extends EventEmitter {
   }
 
   async interrupt(threadId: string, turnId: string): Promise<void> {
+    this.requireQueue();
     await this.call('turn/interrupt', { threadId, turnId });
   }
 
@@ -203,6 +207,7 @@ export class CodexClient extends EventEmitter {
   }
 
   async respond(rpcId: RpcId, result: unknown): Promise<void> {
+    this.requireQueue();
     if (!this.serverRequests.has(rpcId)) throw new Error('Запрос подтверждения Codex уже завершён или соединение изменилось.');
     await this.send({ id: rpcId, result });
     this.serverRequests.delete(rpcId);
