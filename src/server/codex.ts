@@ -5,19 +5,20 @@ import { Duplex } from 'node:stream';
 import type { Socket } from 'node:net';
 import WebSocket from 'ws';
 import type { CodexConnectionState, CodexConnectionTarget, CodexDiscoveryResult, CodexThread } from '../shared/types.js';
+import { SUPPORTED_CODEX_VERSION, SUPPORTED_CODEX_VERSIONS } from '../shared/codex-runtime.js';
 import { isLocalEndpoint, isLocalSocketPath } from './config.js';
 import { discoverCodex } from './codex-discovery.js';
-import { resolveCodexLaunch } from './codex-launch.js';
+import { codexEnvironment, resolveCodexLaunch } from './codex-launch.js';
+import { CodexStdioError, CodexStdioTransport } from './codex-stdio.js';
 
-// Queue semantics and clientId recovery were tested against this exact runtime.
-// A newer CLI installed beside an older Desktop does not upgrade that Desktop's server.
-export const SUPPORTED_CODEX_VERSION = '0.163.0';
+export { SUPPORTED_CODEX_VERSION } from '../shared/codex-runtime.js';
 // An omitted filter silently hides app-server and other persisted sources.
 const THREAD_SOURCES = ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview', 'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown'];
 export interface CodexConfig {
-  transport: 'proxy' | 'websocket';
+  transport: CodexConnectionTarget['transport'];
   executable: string;
   endpoint?: string;
+  codexHome?: string;
   token?: string;
 }
 export type RpcId = string | number;
@@ -49,6 +50,14 @@ export class CodexRpcError extends Error {
   constructor(readonly code: number, message: string) { super(message); this.name = 'CodexRpcError'; }
 }
 
+/** A persisted thread is owned by another runtime; retry the same ID after handoff. */
+export class CodexThreadBusyError extends Error {
+  constructor(readonly threadId: string) {
+    super('Разговор занят другим Codex, например Desktop. Запрос подождёт освобождения этого же разговора.');
+    this.name = 'CodexThreadBusyError';
+  }
+}
+
 // A dropped connection or timeout cannot establish whether a mutating RPC was accepted.
 export class CodexTransportError extends Error {
   readonly uncertain = true;
@@ -67,14 +76,18 @@ export function classifyCodexConnectionFailure(value: string, fallback = 'connec
   return { code: fallback, message: 'Не удалось подключиться к существующему Codex app-server. Проверьте выбранную установку и локальный адрес подключения.' };
 }
 
-/** Attach to an existing app-server. This class never starts a Codex daemon. */
+/** Own a stdio child or attach to an explicit existing server; never start a daemon. */
 export class CodexClient extends EventEmitter {
   private socket?: WebSocket;
   private proxy?: ChildProcessWithoutNullStreams;
+  private stdio?: CodexStdioTransport;
+  private cleanup: Promise<void> = Promise.resolve();
   private pending = new Map<RpcId, PendingCall>();
   private serverRequests = new Set<RpcId>();
   private subscriptions = new Set<string>();
   private subscribed = new Map<string, Promise<void>>();
+  private releasing = new Map<string, Promise<void>>();
+  private closedWaiters = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
   private reconnectTimer?: NodeJS.Timeout;
   private connecting?: Promise<void>;
   private stopped = true;
@@ -84,11 +97,11 @@ export class CodexClient extends EventEmitter {
   private state: CodexConnectionState;
   private discovery?: { at: number; result: CodexDiscoveryResult };
 
-  constructor(private readonly config: CodexConfig, private readonly options: { discover?: typeof discoverCodex } = {}) {
+  constructor(private readonly config: CodexConfig, private readonly options: { discover?: typeof discoverCodex; releaseTimeoutMs?: number } = {}) {
     super();
     this.state = {
-      configured: config.transport === 'proxy' ? !!config.executable : isLocalEndpoint(config.endpoint ?? ''),
-      connected: false, queueSupported: false, desktopVerified: false,
+      configured: config.transport !== 'websocket' ? !!config.executable : isLocalEndpoint(config.endpoint ?? ''),
+      connected: false, queueSupported: false, desktopVerified: false, transport: config.transport,
     };
   }
 
@@ -101,23 +114,23 @@ export class CodexClient extends EventEmitter {
     if (this.config.transport === 'websocket' && !isLocalEndpoint(this.config.endpoint ?? '')) {
       throw new Error('Codex: разрешён только локальный ws:// или wss:// адрес без пароля и параметров.');
     }
-    if (this.config.transport === 'proxy' && !this.config.executable) throw new Error('Укажите исполняемый файл Codex CLI.');
+    if (this.config.transport !== 'websocket' && !this.config.executable) throw new Error('Укажите исполняемый файл Codex CLI.');
     if (this.config.transport === 'proxy' && this.config.endpoint && !isLocalSocketPath(this.config.endpoint)) throw new CodexTransportError('Proxy Codex принимает путь к локальному сокету. WebSocket URL нужно выбрать в режиме WebSocket.', 'invalid-proxy-socket');
     this.stopped = false;
     clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
-    this.connecting = this.open().catch(error => {
-      this.disconnect(this.safeMessage(error), error instanceof CodexTransportError ? error.code : 'connection-failed');
+    this.connecting = this.open().catch(async error => {
+      await this.disconnect(this.safeMessage(error), error instanceof CodexTransportError ? error.code : 'connection-failed');
       this.scheduleReconnect();
       throw error;
     }).finally(() => { this.connecting = undefined; });
     return this.connecting;
   }
 
-  close(): void {
+  close(): Promise<void> {
     this.stopped = true;
     clearTimeout(this.reconnectTimer);
-    this.disconnect('Соединение с Codex закрыто.');
+    return this.disconnect('Соединение с Codex закрыто.');
   }
 
   async listThreads(options: { archived?: boolean } = {}): Promise<CodexThread[]> {
@@ -140,21 +153,83 @@ export class CodexClient extends EventEmitter {
 
   /** Rejoin the existing runtime without overriding its model, sandbox, or instructions. */
   async subscribe(threadId: string): Promise<void> {
-    if (this.version !== SUPPORTED_CODEX_VERSION) {
+    const releasing = this.releasing.get(threadId);
+    if (releasing) await releasing;
+    if (!this.state.connected || !this.isVerifiedVersion()) {
       throw new Error(this.state.error || `Для подписки нужен проверенный Codex ${SUPPORTED_CODEX_VERSION}.`);
     }
     this.subscriptions.add(threadId);
     const existing = this.subscribed.get(threadId);
     if (existing) return existing;
     const subscribing = (async () => {
-      await this.call('thread/resume', { threadId, excludeTurns: true });
-      if (!this.state.queueSupported && this.version === SUPPORTED_CODEX_VERSION) {
+      const response = await this.call<{ thread: { id: string } }>('thread/resume', { threadId, excludeTurns: true });
+      if (response?.thread?.id !== threadId) {
+        const error = new CodexTransportError('Codex вернул другой разговор при возобновлении. Отправка остановлена; исходная связка сохранена.', 'thread-identity-mismatch');
+        await this.disconnect(error.message, error.code);
+        this.scheduleReconnect();
+        throw error;
+      }
+      if (!this.state.queueSupported && this.isVerifiedVersion()) {
         await this.call('thread/queue/list', { threadId, limit: 1 });
         this.setState({ queueSupported: true, error: undefined });
       }
-    })().catch(error => { this.subscribed.delete(threadId); throw error; });
+    })().catch(error => {
+      if (this.subscribed.get(threadId) === subscribing) this.subscribed.delete(threadId);
+      if (error instanceof CodexRpcError && error.code === -32600 && /already has an active writer/iu.test(error.message)) {
+        this.subscriptions.delete(threadId);
+        throw new CodexThreadBusyError(threadId);
+      }
+      throw error;
+    });
     this.subscribed.set(threadId, subscribing);
     return subscribing;
+  }
+
+  /** Release only our managed runtime's writer, and wait for actual thread shutdown. */
+  releaseThread(threadId: string): Promise<void> {
+    if (this.config.transport !== 'managed') return Promise.resolve();
+    const existing = this.releasing.get(threadId);
+    if (existing) return existing;
+    const release = this.releaseManagedThread(threadId).finally(() => {
+      if (this.releasing.get(threadId) === release) this.releasing.delete(threadId);
+    });
+    this.releasing.set(threadId, release);
+    return release;
+  }
+
+  private async releaseManagedThread(threadId: string): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const subscribing = this.subscribed.get(threadId);
+      if (subscribing) await subscribing;
+      this.subscribed.delete(threadId);
+      this.subscriptions.delete(threadId);
+      if (!this.stdio || !this.state.connected) { await this.cleanup; return; }
+      let waiter!: { resolve: () => void; reject: (error: Error) => void };
+      const closed = new Promise<void>((resolve, reject) => {
+        waiter = { resolve, reject };
+        this.closedWaiters.set(threadId, waiter);
+        timer = setTimeout(() => reject(new CodexTransportError('Codex не подтвердил освобождение разговора. Управляемый процесс будет остановлен перед новым подключением.', 'thread-release-timeout')), this.options.releaseTimeoutMs ?? 15_000);
+        timer.unref();
+      });
+      // The closed notification can precede the RPC response. Register its waiter first.
+      void this.call<{ status: string }>('thread/unsubscribe', { threadId }).then(response => {
+        if (response?.status === 'notLoaded') waiter.resolve();
+        else if (!['unsubscribed', 'notSubscribed'].includes(response?.status)) {
+          waiter.reject(new CodexTransportError('Codex вернул неизвестный результат освобождения разговора.', 'invalid-protocol'));
+        }
+      }, error => waiter.reject(error as Error));
+      await closed;
+    } catch (error) {
+      await this.disconnect('Освобождение разговора Codex не подтверждено. Управляемый процесс остановлен; требуется сверка перед продолжением.', 'thread-release-failed');
+      this.scheduleReconnect();
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      this.closedWaiters.delete(threadId);
+      this.subscribed.delete(threadId);
+      this.subscriptions.delete(threadId);
+    }
   }
 
   async enqueue(threadId: string, text: string, clientUserMessageId: string): Promise<{ queuedSubmissionId: string }> {
@@ -233,84 +308,131 @@ export class CodexClient extends EventEmitter {
     this.serverRequests.delete(rpcId);
   }
 
+  async rejectRequest(rpcId: RpcId, message: string): Promise<void> {
+    if (!this.state.connected || !this.isVerifiedVersion()) throw new Error('Для ответа нужен подключённый проверенный Codex.');
+    if (!this.serverRequests.has(rpcId)) throw new Error('Запрос подтверждения Codex уже завершён или соединение изменилось.');
+    await this.send({ id: rpcId, error: { code: -32601, message: this.safeMessage(message) } });
+    this.serverRequests.delete(rpcId);
+  }
+
   private async open(): Promise<void> {
+    // Reconnect must not overlap two owned runtimes, even after an uncertain shutdown.
+    await this.cleanup;
     this.runtime = undefined;
     this.version = undefined;
-    this.setState({ connected: false, queueSupported: false, error: undefined, errorCode: undefined });
-    let target: CodexConnectionTarget = { executable: this.config.executable, transport: this.config.transport, endpoint: this.config.endpoint ?? '' };
-    if (target.transport === 'proxy' && target.executable === 'codex') {
+    this.setState({ connected: false, queueSupported: false, codexHome: undefined, error: undefined, errorCode: undefined });
+    let target: CodexConnectionTarget = { executable: this.config.executable, transport: this.config.transport, endpoint: this.config.endpoint ?? '', ...(this.config.codexHome ? { codexHome: this.config.codexHome } : {}) };
+    if (target.transport !== 'websocket' && target.executable === 'codex') {
       const result = this.discovery && Date.now() - this.discovery.at < 15_000
-        ? this.discovery.result : await (this.options.discover ?? discoverCodex)();
+        ? this.discovery.result : await (this.options.discover ?? discoverCodex)(this.config.codexHome ? { codexHome: this.config.codexHome } : undefined);
       this.discovery = { at: Date.now(), result };
-      const explicitSocketCli = target.endpoint ? result.installations.find(item => item.version && item.connection?.endpoint === target.endpoint)
-        ?? result.installations.find(item => item.version && item.running)
-        ?? result.installations.find(item => item.version) : undefined;
-      if (target.endpoint && explicitSocketCli) target = { ...target, executable: explicitSocketCli.executable };
-      else if (!target.endpoint && result.recommended) target = result.recommended;
-      else {
-        const installation = result.installations.find(item => item.running) ?? result.installations[0];
-        this.setState({ executable: installation?.executable, transport: 'proxy', endpoint: '' });
-        const issue = result.issues.find(item => ['multiple-desktop-servers', 'desktop-stdio', 'socket-not-found', 'desktop-listener-unsupported', 'cli-probe-failed', 'cli-not-confirmed', 'cli-not-found'].includes(item.code)) ?? result.issues[0];
-        throw new CodexTransportError(issue?.message || 'Доступное подключение к общему Codex app-server не найдено.', issue?.code || 'discovery-no-connection');
+      if (target.transport === 'managed') {
+        if (!result.recommendedManaged) {
+          throw new CodexTransportError(`Не найден проверенный Codex для управляемого режима. Нужен ${SUPPORTED_CODEX_VERSIONS.join(' или ')}; выберите установленный CLI в настройках.`, 'managed-cli-unavailable');
+        }
+        target = { ...target, executable: result.recommendedManaged.executable, endpoint: '' };
+      } else {
+        const explicitSocketCli = target.endpoint ? result.installations.find(item => item.version && item.connection?.endpoint === target.endpoint)
+          ?? result.installations.find(item => item.version && item.running)
+          ?? result.installations.find(item => item.version) : undefined;
+        if (target.endpoint && explicitSocketCli) target = { ...target, executable: explicitSocketCli.executable };
+        else if (!target.endpoint && result.recommended) target = { ...result.recommended, ...(this.config.codexHome ? { codexHome: this.config.codexHome } : {}) };
+        else {
+          const installation = result.installations.find(item => item.running) ?? result.installations[0];
+          this.setState({ executable: installation?.executable, transport: 'proxy', endpoint: '' });
+          const issue = result.issues.find(item => ['multiple-desktop-servers', 'desktop-stdio', 'socket-not-found', 'desktop-listener-unsupported', 'cli-probe-failed', 'cli-not-confirmed', 'cli-not-found'].includes(item.code)) ?? result.issues[0];
+          throw new CodexTransportError(issue?.message || 'Доступное подключение к общему Codex app-server не найдено.', issue?.code || 'discovery-no-connection');
+        }
       }
     }
     if (this.stopped) throw new CodexTransportError('Соединение закрыто.');
     this.setState({ executable: target.executable, transport: target.transport, endpoint: target.endpoint });
     let failure: ConnectionFailure | undefined;
-    let options: WebSocket.ClientOptions = { handshakeTimeout: 5_000, maxPayload: 32 * 1024 * 1024, followRedirects: false };
-    if (this.config.token) options.headers = { Authorization: `Bearer ${this.config.token}` };
-    if (target.transport === 'proxy') {
-      if (target.endpoint && !isLocalSocketPath(target.endpoint)) throw new CodexTransportError('Некорректный локальный сокет Codex.', 'invalid-proxy-socket');
-      const launch = await resolveCodexLaunch(target.executable);
+    const diagnostic = (chunk: string) => {
+      diagnosticTail = (diagnosticTail + chunk).slice(-8_192);
+      const classified = classifyCodexConnectionFailure(diagnosticTail);
+      if (classified.code !== 'connection-failed') failure = classified;
+    };
+    let diagnosticTail = '';
+    if (target.transport === 'managed') {
+      const env = codexEnvironment(this.config.codexHome);
+      const launch = await resolveCodexLaunch(target.executable, { env });
       if (this.stopped) throw new CodexTransportError('Соединение закрыто.');
       this.setState({ executable: launch.executable });
-      const args = [...launch.args, 'app-server', 'proxy'];
-      if (target.endpoint) args.push('--sock', target.endpoint);
-      this.proxy = spawn(launch.command, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
-      let diagnosticTail = '';
-      this.proxy.stderr.setEncoding('utf8').on('data', (chunk: string) => {
-        diagnosticTail = (diagnosticTail + chunk).slice(-8_192);
-        const classified = classifyCodexConnectionFailure(diagnosticTail);
-        if (classified.code !== 'connection-failed') failure = classified;
+      const stdio = new CodexStdioTransport(launch.command, [...launch.args, 'app-server', '--listen', 'stdio://', '-c', 'thread_unload_delay_secs=0'], env, {
+        message: raw => { if (this.stdio === stdio) this.receive(raw); },
+        stderr: diagnostic,
+        failure: error => {
+          if (this.stdio !== stdio) return;
+          const details = failure ?? { message: error.message, code: error.code };
+          void this.disconnect(details.message, details.code).catch(() => {});
+          this.scheduleReconnect();
+        },
+        closed: () => {
+          if (this.stdio !== stdio) return;
+          void this.disconnect(failure?.message || 'Управляемый Codex завершился. Неподтверждённые запросы требуют сверки.', failure?.code || 'connection-closed').catch(() => {});
+          this.scheduleReconnect();
+        },
       });
-      const stream = Duplex.from({ readable: this.proxy.stdout, writable: this.proxy.stdin });
-      options = { ...options, createConnection: () => stream as Socket };
+      this.stdio = stdio;
+      try { await stdio.ready; }
+      catch (error) {
+        const details = failure ?? { message: error instanceof CodexStdioError ? error.message : 'Не удалось запустить управляемый Codex.', code: error instanceof CodexStdioError ? error.code : 'cli-unavailable' };
+        throw new CodexTransportError(details.message, details.code);
+      }
+    } else {
+      let options: WebSocket.ClientOptions = { handshakeTimeout: 5_000, maxPayload: 32 * 1024 * 1024, followRedirects: false };
+      if (this.config.token) options.headers = { Authorization: `Bearer ${this.config.token}` };
+      if (target.transport === 'proxy') {
+        if (target.endpoint && !isLocalSocketPath(target.endpoint)) throw new CodexTransportError('Некорректный локальный сокет Codex.', 'invalid-proxy-socket');
+        const env = codexEnvironment(this.config.codexHome);
+        const launch = await resolveCodexLaunch(target.executable, { env });
+        if (this.stopped) throw new CodexTransportError('Соединение закрыто.');
+        this.setState({ executable: launch.executable });
+        const args = [...launch.args, 'app-server', 'proxy'];
+        if (target.endpoint) args.push('--sock', target.endpoint);
+        this.proxy = spawn(launch.command, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env });
+        this.proxy.stderr.setEncoding('utf8').on('data', diagnostic);
+        const stream = Duplex.from({ readable: this.proxy.stdout, writable: this.proxy.stdin });
+        options = { ...options, createConnection: () => stream as Socket };
+      }
+      else if (!isLocalEndpoint(target.endpoint)) throw new CodexTransportError('Codex принимает только локальный WebSocket URL.', 'invalid-endpoint');
+      const socket = new WebSocket(target.transport === 'proxy' ? 'ws://localhost/' : target.endpoint, options);
+      this.socket = socket;
+      socket.on('message', raw => { if (this.socket === socket) this.receive(raw.toString()); });
+      socket.on('error', () => {}); // The handshake and close handlers surface sanitized connection state.
+      socket.on('close', () => {
+        if (this.socket !== socket) return;
+        void this.disconnect(failure?.message || 'Соединение с Codex прервано. Неподтверждённые запросы требуют сверки.', failure?.code).catch(() => {});
+        this.scheduleReconnect();
+      });
+      this.proxy?.once('error', error => {
+        failure = classifyCodexConnectionFailure((error as NodeJS.ErrnoException).code || '', 'cli-unavailable');
+        if (this.socket === socket) socket.terminate();
+      });
+      this.proxy?.once('exit', () => { if (this.socket === socket) socket.terminate(); });
+      await new Promise<void>((resolve, reject) => {
+        socket.once('open', resolve);
+        socket.once('error', error => {
+          const details = failure ?? classifyCodexConnectionFailure(error.message);
+          reject(new CodexTransportError(details.message, details.code));
+        });
+        socket.once('close', () => reject(new CodexTransportError(failure?.message || 'Codex app-server закрыл соединение во время подключения.', failure?.code || 'connection-closed')));
+      });
     }
-    else if (!isLocalEndpoint(target.endpoint)) throw new CodexTransportError('Codex принимает только локальный WebSocket URL.', 'invalid-endpoint');
-    const socket = new WebSocket(target.transport === 'proxy' ? 'ws://localhost/' : target.endpoint, options);
-    this.socket = socket;
-    socket.on('message', raw => { if (this.socket === socket) this.receive(raw.toString()); });
-    socket.on('error', () => {}); // The handshake and close handlers surface sanitized connection state.
-    socket.on('close', () => {
-      if (this.socket !== socket) return;
-      this.disconnect(failure?.message || 'Соединение с Codex прервано. Неподтверждённые запросы требуют сверки.', failure?.code);
-      this.scheduleReconnect();
-    });
-    this.proxy?.once('error', error => {
-      failure = classifyCodexConnectionFailure((error as NodeJS.ErrnoException).code || '', 'cli-unavailable');
-      if (this.socket === socket) socket.terminate();
-    });
-    this.proxy?.once('exit', () => { if (this.socket === socket) socket.terminate(); });
-    await new Promise<void>((resolve, reject) => {
-      socket.once('open', resolve);
-      socket.once('error', error => {
-        const details = failure ?? classifyCodexConnectionFailure(error.message);
-        reject(new CodexTransportError(details.message, details.code));
-      });
-      socket.once('close', () => reject(new CodexTransportError(failure?.message || 'Codex app-server закрыл соединение во время подключения.', failure?.code || 'connection-closed')));
-    });
     this.runtime = await this.call<CodexRuntime>('initialize', {
       clientInfo: { name: 'rele', title: 'Rele', version: '0.1.0' }, capabilities: { experimentalApi: true },
     });
     await this.send({ method: 'initialized' });
-    this.version = this.runtime.userAgent.match(/\/(\d+\.\d+\.\d+)(?:\s|$)/u)?.[1];
-    this.setState({ name: this.version ? `Codex ${this.version}` : 'Codex', connected: true });
-    if (this.version !== SUPPORTED_CODEX_VERSION) {
-      this.setState({ error: `Запись доступна для проверенного Codex ${SUPPORTED_CODEX_VERSION}; подключён ${this.version || 'неизвестный runtime'}.` });
+    if (typeof this.runtime?.userAgent !== 'string' || typeof this.runtime.codexHome !== 'string') throw new CodexTransportError('Codex вернул некорректные сведения о сервере.', 'invalid-protocol');
+    this.version = this.runtime.userAgent.match(/\/(\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?)(?=\s|$)/u)?.[1];
+    this.setState({ name: this.version ? `Codex ${this.version}` : 'Codex', connected: true, codexHome: this.runtime.codexHome });
+    if (!this.isVerifiedVersion()) {
+      this.setState({ error: `Запись доступна для проверенного Codex ${SUPPORTED_CODEX_VERSIONS.join(' или ')}; подключён ${this.version || 'неизвестный runtime'}.` });
     } else {
       await this.probeQueue();
     }
-    for (const threadId of this.subscriptions) {
+    for (const threadId of this.config.transport === 'managed' ? [] : this.subscriptions) {
       try { await this.subscribe(threadId); }
       catch (error) { this.setState({ error: this.safeMessage(error) }); }
     }
@@ -338,6 +460,10 @@ export class CodexClient extends EventEmitter {
     if (!this.state.connected || !this.state.queueSupported) {
       throw new Error(this.state.error || `Для отправки нужна очередь общего Codex app-server ${SUPPORTED_CODEX_VERSION}.`);
     }
+  }
+
+  private isVerifiedVersion(): boolean {
+    return SUPPORTED_CODEX_VERSIONS.some(version => version === this.version);
   }
 
   private async pages<T>(method: string, params: Record<string, unknown>): Promise<T[]> {
@@ -368,6 +494,11 @@ export class CodexClient extends EventEmitter {
   }
 
   private send(value: unknown): Promise<void> {
+    if (this.stdio) {
+      return this.stdio.send(JSON.stringify(value)).catch(error => {
+        throw new CodexTransportError(error instanceof CodexStdioError ? error.message : 'Codex не подтвердил передачу сообщения; требуется сверка.', error instanceof CodexStdioError ? error.code : 'connection-closed');
+      });
+    }
     const socket = this.socket;
     if (!socket || socket.readyState !== WebSocket.OPEN) return Promise.reject(new CodexTransportError('Codex не подключён.'));
     return new Promise((resolve, reject) => socket.send(JSON.stringify(value), error => error
@@ -379,8 +510,13 @@ export class CodexClient extends EventEmitter {
     try {
       message = JSON.parse(raw) as typeof message;
       if (!message || typeof message !== 'object' || Array.isArray(message)) throw new Error('invalid');
+      if (message.id !== undefined && !(typeof message.id === 'string' || typeof message.id === 'number' && Number.isFinite(message.id))) throw new Error('invalid id');
+      if (message.method !== undefined) {
+        if (typeof message.method !== 'string' || !message.method || message.params !== undefined && (!message.params || typeof message.params !== 'object' || Array.isArray(message.params))) throw new Error('invalid method');
+      } else if (message.id === undefined || !Object.hasOwn(message, 'result') && !message.error) throw new Error('invalid response');
+      if (message.error && (typeof message.error !== 'object' || !Number.isInteger(message.error.code) || typeof message.error.message !== 'string')) throw new Error('invalid error');
     } catch {
-      this.disconnect('Codex вернул некорректное сообщение протокола.');
+      void this.disconnect('Codex вернул некорректное сообщение протокола.', 'invalid-protocol').catch(() => {});
       this.scheduleReconnect();
       return;
     }
@@ -391,6 +527,11 @@ export class CodexClient extends EventEmitter {
         this.emit('request', { ...event, id: message.id } satisfies CodexServerRequest);
       } else {
         if (message.method === 'serverRequest/resolved') this.serverRequests.delete(event.params.requestId as RpcId);
+        if (message.method === 'thread/closed' && this.config.transport === 'managed' && typeof event.params.threadId === 'string') {
+          this.subscribed.delete(event.params.threadId);
+          this.subscriptions.delete(event.params.threadId);
+          this.closedWaiters.get(event.params.threadId)?.resolve();
+        }
         this.emit('notification', event satisfies CodexNotification);
       }
       return;
@@ -403,17 +544,28 @@ export class CodexClient extends EventEmitter {
     else pending.resolve(message.result);
   }
 
-  private disconnect(message: string, errorCode?: string): void {
+  private disconnect(message: string, errorCode?: string): Promise<void> {
     const socket = this.socket;
     this.socket = undefined;
     socket?.terminate();
     this.proxy?.kill(); // Only our byte proxy; the shared app-server belongs to Codex.
     this.proxy = undefined;
+    const stdio = this.stdio;
+    this.stdio = undefined;
+    if (stdio) {
+      this.cleanup = Promise.all([this.cleanup, stdio.close()]).then(() => {});
+      void this.cleanup.catch(error => {
+        this.setState({ connected: false, queueSupported: false, error: this.safeMessage(error), errorCode: 'shutdown-timeout' });
+      });
+    }
     this.subscribed.clear();
     this.serverRequests.clear();
-    for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(new CodexTransportError(message)); }
+    for (const waiter of this.closedWaiters.values()) waiter.reject(new CodexTransportError(message, errorCode));
+    this.closedWaiters.clear();
+    for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(new CodexTransportError(message, errorCode)); }
     this.pending.clear();
     this.setState({ connected: false, queueSupported: false, error: message, errorCode });
+    return this.cleanup;
   }
 
   private scheduleReconnect(): void {

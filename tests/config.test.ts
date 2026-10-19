@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   ConfigStore,
   defaultConfig,
+  isLocalCodexHome,
   isLocalEndpoint,
   isLocalSocketPath,
   mergeConfig,
@@ -47,6 +48,37 @@ function configured() {
 }
 
 describe('configuration validation and public projection', () => {
+  it('defaults to a managed server while inheriting the native Codex home', () => {
+    expect(defaultConfig.codex).toEqual({ transport: 'managed', executable: 'codex', endpoint: '' });
+    const selected = mergeConfig(defaultConfig, { codex: { codexHome: resolve('synthetic-codex-home') } });
+    expect(publicConfig(selected).codex.codexHome).toBe(resolve('synthetic-codex-home'));
+    expect(mergeConfig(selected, { codex: { codexHome: '' } }).codex).not.toHaveProperty('codexHome');
+    expect(mergeConfig(selected, { codex: { codexHome: undefined } }).codex).not.toHaveProperty('codexHome');
+    expect(defaultConfig.codex).not.toHaveProperty('codexHome');
+  });
+
+  it('clears the old address only when explicitly switching to a managed server', () => {
+    const current = mergeConfig(defaultConfig, { codex: { transport: 'websocket', endpoint: 'ws://127.0.0.1:4500', codexHome: resolve('native-home') } });
+    expect(mergeConfig(current, { codex: { transport: 'managed' } }).codex).toMatchObject({ transport: 'managed', endpoint: '', codexHome: current.codex.codexHome });
+    expect(mergeConfig(current, { telegram: { enabled: false } }).codex).toEqual(current.codex);
+    expect(() => mergeConfig(defaultConfig, { codex: { endpoint: 'ws://127.0.0.1:4500' } })).toThrow('endpoint');
+    expect(() => mergeConfig(current, { codex: { transport: 'managed', endpoint: 'ws://127.0.0.1:4501' } })).toThrow('endpoint');
+  });
+
+  it('accepts only an absolute local Codex home for the native platform', () => {
+    expect(isLocalCodexHome('C:\\Users\\Example User\\.codex', 'win32')).toBe(true);
+    expect(isLocalCodexHome('C:/Users/Example User/.codex', 'win32')).toBe(true);
+    expect(isLocalCodexHome('/home/example/.codex', 'linux')).toBe(true);
+    for (const home of ['relative', 'C:relative', '\\\\server\\share', '//server/share', '\\\\.\\pipe\\codex', '/home/example/\n.codex', '/home/example/\t.codex', '/home/example/\x7f.codex']) {
+      expect(isLocalCodexHome(home, 'linux')).toBe(false);
+      expect(isLocalCodexHome(home, 'win32')).toBe(false);
+      expect(() => mergeConfig(defaultConfig, { codex: { codexHome: home } })).toThrow();
+    }
+    expect(isLocalCodexHome('/home/example/.codex', 'win32')).toBe(false);
+    expect(isLocalCodexHome('C:\\Users\\Example\\.codex', 'linux')).toBe(false);
+    expect(() => mergeConfig(defaultConfig, { codex: { codexHome: null } })).toThrow('codexHome');
+  });
+
   it('clears the previous hidden WebSocket address when switching back to automatic proxy', () => {
     const websocket = mergeConfig(defaultConfig, { codex: { transport: 'websocket', endpoint: 'ws://127.0.0.1:4500' } });
     const proxy = mergeConfig(websocket, { codex: { transport: 'proxy', executable: 'codex', endpoint: websocket.codex.endpoint } });
@@ -57,11 +89,11 @@ describe('configuration validation and public projection', () => {
   it('preserves an explicit local control socket and refuses URLs or network paths in proxy mode', () => {
     for (const endpoint of ['/home/example/.codex/control.sock', 'C:\\Example User\\.codex\\control.sock', '\\\\.\\pipe\\codex-control']) {
       expect(isLocalSocketPath(endpoint)).toBe(true);
-      expect(mergeConfig(defaultConfig, { codex: { executable: 'custom-cli', endpoint } }).codex).toMatchObject({ executable: 'custom-cli', endpoint });
+      expect(mergeConfig(defaultConfig, { codex: { transport: 'proxy', executable: 'custom-cli', endpoint } }).codex).toMatchObject({ transport: 'proxy', executable: 'custom-cli', endpoint });
     }
     for (const endpoint of ['ws://127.0.0.1:4500', 'relative.sock', '\\\\remote-server\\share\\control.sock', '//remote-server/share/control.sock']) {
       expect(isLocalSocketPath(endpoint)).toBe(false);
-      expect(() => mergeConfig(defaultConfig, { codex: { endpoint } })).toThrow('сокету');
+      expect(() => mergeConfig(defaultConfig, { codex: { transport: 'proxy', endpoint } })).toThrow('сокету');
     }
   });
 
@@ -162,6 +194,7 @@ describe('configuration validation and public projection', () => {
 
 describe('configuration storage and panel credentials', () => {
   it.each([
+    { transport: 'proxy', endpoint: '', restored: '' },
     { transport: 'proxy', endpoint: 'ws://127.0.0.1:4500', restored: '' },
     { transport: 'proxy', endpoint: 'wss://localhost:4500', restored: '' },
     { transport: 'proxy', endpoint: 'C:\\Example User\\control.sock', restored: 'C:\\Example User\\control.sock' },
@@ -171,12 +204,12 @@ describe('configuration storage and panel credentials', () => {
     const first = new ConfigStore(root);
     first.panelToken = 'f'.repeat(64);
     const value = configured();
-    value.codex = { ...value.codex, executable: 'custom-cli', transport: example.transport, endpoint: example.endpoint };
+    value.codex = { ...value.codex, executable: 'custom-cli', transport: example.transport, endpoint: example.endpoint, codexHome: resolve('selected-native-profile') };
     await first.save(value);
     const original = await readFile(join(root, 'config.json'), 'utf8');
     const restored = new ConfigStore(root);
     await restored.load();
-    expect(restored.config.codex).toMatchObject({ executable: 'custom-cli', transport: example.transport, endpoint: example.restored, token: syntheticSecrets.codex });
+    expect(restored.config.codex).toMatchObject({ executable: 'custom-cli', transport: example.transport, endpoint: example.restored, codexHome: value.codex.codexHome, token: syntheticSecrets.codex });
     expect(restored.panelToken).toBe(first.panelToken);
     expect(await readFile(join(root, 'config.json'), 'utf8')).toBe(original);
   }, 15_000);

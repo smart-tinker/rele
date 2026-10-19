@@ -176,7 +176,15 @@ export function Queue({
                           <p>{request.text || request.audio?.name}</p>
                         </details>
                         {request.error && (
-                          <span className="inline-error">{request.error}</span>
+                          <span
+                            className={
+                              request.status === 'queued'
+                                ? 'inline-warning'
+                                : 'inline-error'
+                            }
+                          >
+                            {request.error}
+                          </span>
                         )}
                         {request.status === 'uncertain' && (
                           <span className="inline-warning">

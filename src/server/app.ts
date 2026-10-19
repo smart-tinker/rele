@@ -100,7 +100,9 @@ export function createApp(services: AppServices) {
     });
     return { ok: true };
   });
-  app.get('/api/codex/discovery', async () => (services.discoverCodex ?? discoverCodex)());
+  app.get('/api/codex/discovery', async () => (services.discoverCodex ?? discoverCodex)(
+    config.config.codex.codexHome ? { codexHome: config.config.codex.codexHome } : undefined,
+  ));
   app.get('/api/state', async (): Promise<DashboardState> => ({
     version: services.version,
     codex: services.codex().status(),
@@ -164,8 +166,11 @@ export function createApp(services: AppServices) {
     store.setMeta(`endpoint-alias:${request.params.id}`, title);
     return { ok: true };
   });
-  app.post('/api/codex/connect', async () => { await services.codex().connect(); return { ok: true }; });
   let configuring = false;
+  app.post('/api/codex/connect', async () => {
+    if (configuring) throw new ApiError(409, 'Настройки сохраняются. Дождитесь перезапуска подключения Codex.');
+    await services.codex().connect(); return { ok: true };
+  });
   app.put('/api/config', async request => {
     if (configuring) throw new ApiError(409, 'Настройки уже сохраняются.');
     configuring = true;

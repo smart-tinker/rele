@@ -510,7 +510,7 @@ describe('configuration and execution action API', () => {
   });
 
   it('prevents two concurrent configuration transactions', async () => {
-    const { app, configure } = makeApp();
+    const { app, configure, codex } = makeApp();
     let release!: () => void;
     configure.mockImplementationOnce(
       () =>
@@ -533,6 +533,9 @@ describe('configuration and execution action API', () => {
       headers,
       payload: { telegram: { enabled: false } },
     });
+    const connecting = await app.inject({ method: 'POST', url: '/api/codex/connect', headers });
+    expect(connecting.statusCode).toBe(409);
+    expect(codex.connect).not.toHaveBeenCalled();
     release();
     expect(second.statusCode).toBe(409);
     expect((await first).statusCode).toBe(200);

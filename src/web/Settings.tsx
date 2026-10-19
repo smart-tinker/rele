@@ -1,5 +1,9 @@
 import { useState, type FormEvent } from 'react';
-import type { ConnectionState, DashboardState } from '../shared/types';
+import type {
+  CodexTransport,
+  ConnectionState,
+  DashboardState,
+} from '../shared/types';
 import { ReleApi } from './client';
 import { useAction } from './hooks';
 import { useCodexThreads } from './useCodexThreads';
@@ -408,6 +412,7 @@ export function CodexSettings({
   const [transport, setTransport] = useState(state.config.codex.transport);
   const [executable, setExecutable] = useState(state.config.codex.executable);
   const [endpoint, setEndpoint] = useState(state.config.codex.endpoint);
+  const [codexHome, setCodexHome] = useState(state.config.codex.codexHome ?? '');
   const [token, setToken] = useState('');
   const [selection, setSelection] = useState(
     codexTargetKey(state.config.codex) === codexTargetKey(automaticCodex)
@@ -423,6 +428,13 @@ export function CodexSettings({
   } = useCodexThreads(api, state);
   const [threadQuery, setThreadQuery] = useState('');
   const action = useAction();
+  const chooseMode = (mode: CodexTransport) => {
+    setTransport(mode);
+    setEndpoint('');
+    setToken('');
+    setSelection(mode === 'managed' ? 'auto' : 'manual');
+    if (mode === 'managed') setExecutable(automaticCodex.executable);
+  };
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const result = await action.run(
@@ -434,8 +446,9 @@ export function CodexSettings({
               : {
                   transport,
                   executable: executable.trim(),
-                  endpoint: endpoint.trim(),
+                  endpoint: transport === 'managed' ? '' : endpoint.trim(),
                 }),
+            codexHome: codexHome.trim(),
             ...(selection === 'manual' &&
             transport === 'websocket' &&
             token.trim()
@@ -472,7 +485,7 @@ export function CodexSettings({
     <>
       <PageHeading
         title="Codex"
-        description="Общий сервер разговоров на этом компьютере."
+        description="Существующие разговоры Codex и сервер для Rele."
         actions={
           <Button
             icon="refresh"
@@ -514,49 +527,92 @@ export function CodexSettings({
           <dt>Подключение</dt>
           <dd>
             {state.codex.transport
-              ? state.codex.transport === 'websocket'
-                ? 'WebSocket'
-                : 'Локальный общий сервер'
+              ? state.codex.transport === 'managed'
+                ? 'Сервер Rele'
+                : state.codex.transport === 'websocket'
+                  ? 'WebSocket'
+                  : 'Существующий локальный сервер'
               : 'Пока не определено'}
             {state.codex.endpoint && <span>{state.codex.endpoint}</span>}
           </dd>
         </div>
+        <div>
+          <dt>Профиль Codex</dt>
+          <dd>
+            {state.codex.connected && state.codex.codexHome
+              ? state.codex.codexHome
+              : 'Пока не определён'}
+          </dd>
+        </div>
       </dl>
       <form className="settings-section codex-form" onSubmit={submit}>
-        <h2>Подключение к app-server</h2>
+        <h2>Настройки Codex</h2>
         <div className="form-stack">
+          <Field label="Режим работы">
+            <select
+              value={transport}
+              disabled={action.busy}
+              onChange={(event) =>
+                chooseMode(event.target.value as CodexTransport)
+              }
+            >
+              <option value="managed">Сервер Rele</option>
+              <optgroup label="Дополнительно">
+                <option value="proxy">Существующий локальный сервер</option>
+                <option value="websocket">WebSocket</option>
+              </optgroup>
+            </select>
+          </Field>
+          {transport === 'managed' ? (
+            <div className="codex-mode-copy">
+              <p>
+                Rele самостоятельно запускает Codex. Codex Desktop можно
+                закрыть.
+              </p>
+              <p className="field-hint">
+                При использовании того же профиля история общая. Пока другой
+                клиент удерживает тред, запрос ждёт; после хода Rele освобождает
+                тред. Обновление открытого окна Desktop проверяется отдельно.
+              </p>
+            </div>
+          ) : (
+            <Notice tone="info">
+              {transport === 'proxy'
+                ? 'Rele подключается к уже запущенному локальному серверу Codex.'
+                : 'Rele подключается к уже запущенному серверу Codex по указанному адресу.'}
+              <p>Для самостоятельного запуска Codex перейдите на сервер Rele.</p>
+              <Button
+                disabled={action.busy}
+                onClick={() => chooseMode('managed')}
+              >
+                Перейти на сервер Rele
+              </Button>
+            </Notice>
+          )}
           <CodexDiscovery
             api={api}
+            transport={transport}
             value={selection}
             refreshKey={discoveryRevision}
             disabled={action.busy}
             onChange={(choice) => {
-              if (typeof choice === 'string') setSelection(choice);
+              if (choice === 'auto') chooseMode('managed');
+              else if (choice === 'manual') setSelection(choice);
               else {
                 setSelection(codexTargetKey(choice));
                 setTransport(choice.transport);
                 setExecutable(choice.executable);
-                setEndpoint(choice.endpoint);
+                setEndpoint(
+                  choice.transport === 'managed' ? '' : choice.endpoint,
+                );
+                if (choice.codexHome !== undefined)
+                  setCodexHome(choice.codexHome);
                 setToken('');
               }
             }}
           />
           {selection === 'manual' && (
             <div className="form-stack codex-manual">
-              <Field label="Способ подключения">
-                <select
-                  value={transport}
-                  disabled={action.busy}
-                  onChange={(event) => {
-                    setTransport(event.target.value as 'proxy' | 'websocket');
-                    setEndpoint('');
-                    setToken('');
-                  }}
-                >
-                  <option value="proxy">Локальный общий сервер</option>
-                  <option value="websocket">WebSocket</option>
-                </select>
-              </Field>
               <Field
                 label="Исполняемый файл Codex"
                 hint="Имя команды или полный путь к Codex на этом компьютере."
@@ -569,6 +625,19 @@ export function CodexSettings({
                   placeholder="codex"
                 />
               </Field>
+              {transport === 'proxy' && (
+                <Field
+                  label="Локальный сокет Codex"
+                  hint="Оставьте пустым для стандартного подключения или укажите путь к существующему сокету."
+                >
+                  <input
+                    value={endpoint}
+                    disabled={action.busy}
+                    onChange={(event) => setEndpoint(event.target.value)}
+                    placeholder="Стандартное подключение"
+                  />
+                </Field>
+              )}
               {transport === 'websocket' && (
                 <>
                   <Field label="Адрес app-server">
@@ -600,11 +669,20 @@ export function CodexSettings({
               )}
             </div>
           )}
-          <p className="field-hint">
-            Rele и Codex должны использовать профиль одного пользователя. На
-            Windows совместная работа с установленным Desktop проверяется
-            отдельно. На Ubuntu Server используется CLI.
-          </p>
+          <Field
+            label="Папка профиля Codex"
+            hint="Необязательно. Пусто — CODEX_HOME или профиль пользователя, от которого запущен Rele. Для существующих разговоров выберите тот же профиль, что в Codex Desktop или CLI."
+          >
+            <input
+              value={codexHome}
+              disabled={action.busy}
+              onChange={(event) => setCodexHome(event.target.value)}
+              placeholder="Профиль текущего пользователя"
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </Field>
+          <p className="field-hint">Изменения применятся после сохранения.</p>
           <ActionMessages error={action.error} success={action.success} />
           <div>
             <Button type="submit" busy={action.busy}>
@@ -693,7 +771,7 @@ export function CodexSettings({
               }
             >
               {!state.codex.connected
-                ? 'Выберите найденное подключение или укажите параметры вручную, сохраните настройки и переподключите Codex.'
+                ? 'Выберите Codex для сервера Rele или настройте существующий сервер и сохраните настройки.'
                 : threadsError
                   ? 'Исправьте ошибку подключения и нажмите «Обновить разговоры».'
                   : threadsLoading

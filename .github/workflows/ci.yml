@@ -53,9 +53,19 @@ jobs:
       - name: Install the isolated protocol fixture
         run: |
           python -m pip install -r scripts/protocol-requirements.txt
-          npm install --prefix "$RUNNER_TEMP/codex-probe" --ignore-scripts --no-audit --no-fund --no-package-lock @openai/codex@0.163.0
+          for version in 0.163.0 0.163.0-alpha.10.2; do
+            npm install --prefix "$RUNNER_TEMP/codex-probe-$version" --ignore-scripts --no-audit --no-fund --no-package-lock "@openai/codex@$version"
+          done
       - name: Verify the actual Codex protocol without credentials or a real model
-        run: python scripts/protocol-probe.py --codex-prefix "$RUNNER_TEMP/codex-probe" --report protocol-results.json
+        run: |
+          for version in 0.163.0 0.163.0-alpha.10.2; do
+            python scripts/protocol-probe.py --codex-prefix "$RUNNER_TEMP/codex-probe-$version" --expected-version "$version" --report "protocol-results-$version.json"
+          done
+      - name: Verify managed Rele, shared history, ownership and origin delivery
+        run: |
+          for version in 0.163.0 0.163.0-alpha.10.2; do
+            python scripts/managed-protocol-probe.py --codex-prefix "$RUNNER_TEMP/codex-probe-$version" --expected-version "$version" --report "managed-results-$version.json"
+          done
       - name: Install the pinned local speech environment and public fixture
         run: |
           python -m pip install -r scripts/voice-requirements.txt
@@ -78,7 +88,8 @@ jobs:
         with:
           name: verification-${{ matrix.os }}
           path: |
-            protocol-results.json
+            protocol-results-*.json
+            managed-results-*.json
             voice-results.json
             installer-results.json
             playwright-report/
@@ -152,11 +163,15 @@ jobs:
 
           Recommended Ubuntu Server download: rele-VERSION-linux-x64.deb. Install with sudo apt install ./rele-VERSION-linux-x64.deb. The package uses /opt/rele, /usr/bin/rele, and systemd under the invoking sudo user's account. If installed directly as root, select the Codex owner with sudo rele service install --user NAME. Removal, including purge, keeps user conversation data. See docs/INSTALLATION.md.
 
-          Both installers include Node.js 24.19.0 and production dependencies. Codex discovery checks trusted Desktop backend locations, running process metadata, and local CLI installations. The panel distinguishes missing Codex, unavailable shared transport, and a failed catalog load. Opening the installed application uses an expiring single-use login link. Existing chat bindings and saved tokens survive upgrades. Portable ZIP/TAR packages remain available.
+          Both installers include Node.js 24.19.0 and production dependencies. Codex discovery checks Desktop backend locations, versioned Windows CLI directories, running process metadata, and local CLI installations. Opening the installed application uses an expiring single-use login link. Existing chat bindings and saved tokens survive upgrades. Portable ZIP/TAR packages remain available.
 
-          Codex app-server 0.163.0 is the verified protocol version. Rele only attaches to an existing local runtime. The automated protocol fixture uses a local fake model and does not establish live Codex Desktop or real Telegram/Slack compatibility.
+          New in rc.4: Server Rele is the default mode for a new installation. Rele starts and supervises its own Codex app-server using the selected existing user profile. Existing Codex threads retain their original IDs and names. If another process owns a thread, the incoming request remains queued in Rele. After reconciliation Rele unsubscribes and waits for the thread to close before handing it back. Closing Desktop does not stop the Rele server; Windows still requires the user's logged-in session.
 
-          This is an unsigned prerelease, not a completed real Desktop acceptance. Finding Desktop does not guarantee that its internal app-server exposes a shared listener. Rele never silently starts an independent app-server. The Windows Desktop and authorized messenger acceptance scenarios remain mandatory before a stable release. See docs/PLAN.md and the open acceptance issues.
+          Upgrade from rc.3: saved proxy/WebSocket settings are preserved. Open Codex settings, select Server Rele, choose the recommended installed Codex, check the profile and save. Existing bindings remain. No manual socket or daemon setup is needed for managed mode. External proxy/WebSocket connections remain available under advanced options.
+
+          Exact verified protocol versions: Codex 0.163.0 and 0.163.0-alpha.10.2. Native Windows and Ubuntu CI runs the real Codex protocol and the real Rele engine with isolated profiles, two independent Codex processes, a local fake model and synthetic Slack/Telegram delivery. It checks busy ownership, context handoff, origin routing, child restart and child shutdown.
+
+          This is an unsigned prerelease. Shared persisted history does not establish instant Desktop GUI synchronization or release behavior of a particular Desktop build. Real Windows Desktop and authorized messenger acceptance remain open before stable publishing. Rele does not fork or replace a bound thread when resume fails. See docs/RC4.md and docs/ACCEPTANCE.md.
           NOTES
           sed -i "s/VERSION/$RELE_CANDIDATE_VERSION/g" release-notes.md
           gh release create "$tag" release-assets/* --target "$GITHUB_SHA" --prerelease --title "Rele $RELE_CANDIDATE_VERSION" --notes-file release-notes.md

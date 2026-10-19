@@ -1,5 +1,6 @@
 import { access, readFile } from 'node:fs/promises';
 import path from 'node:path';
+import { isLocalCodexHome } from './config.js';
 
 export interface CodexLaunch {
   command: string;
@@ -21,6 +22,16 @@ export async function fileExists(file: string): Promise<boolean> {
 export function environmentValue(env: NodeJS.ProcessEnv, key: string): string {
   const found = Object.keys(env).find(name => name.toLowerCase() === key.toLowerCase());
   return found ? env[found] || '' : '';
+}
+
+/** Preserve native credentials and storage; only an explicit profile overrides the child environment. */
+export function codexEnvironment(codexHome?: string, env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): NodeJS.ProcessEnv {
+  const result = { ...env };
+  if (codexHome === undefined || codexHome === '') return result;
+  if (!isLocalCodexHome(codexHome, platform)) throw new Error('Профиль Codex должен быть абсолютным локальным путём без сетевых каталогов.');
+  for (const key of Object.keys(result)) if (platform === 'win32' ? key.toUpperCase() === 'CODEX_HOME' : key === 'CODEX_HOME') delete result[key];
+  result.CODEX_HOME = codexHome;
+  return result;
 }
 
 /** The npm batch file is never executed. Only the official package entry is used. */

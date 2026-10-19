@@ -181,16 +181,24 @@ test('disconnected and failing Codex catalogs never appear as empty and can reco
   ).toBeEnabled();
 });
 
-test('discovery separates CLI and runtime versions, saves an explicit candidate, clears old threads and resets WebSocket when switching to proxy', async ({
+test('managed is the default and recommends a usable Desktop executable independently of its external connection', async ({
   page,
-}) => {
+}, testInfo) => {
   const state = fixtureState(true);
-  state.codex.name = 'Codex 0.163.0';
-  state.codex.executable = '/opt/example/current/codex';
-  state.codex.transport = 'proxy';
-  state.codex.endpoint = '';
+  state.config.codex.codexHome = '/profiles/shared';
+  state.codex.codexHome = '/profiles/shared';
   const candidate: CodexConnectionTarget = {
     executable: '/opt/example/desktop/codex',
+    transport: 'managed',
+    endpoint: '',
+  };
+  const otherManaged: CodexConnectionTarget = {
+    executable: '/opt/example/cli/codex',
+    transport: 'managed',
+    endpoint: '',
+  };
+  const external: CodexConnectionTarget = {
+    ...otherManaged,
     transport: 'websocket',
     endpoint: 'ws://127.0.0.1:4500',
   };
@@ -200,21 +208,18 @@ test('discovery separates CLI and runtime versions, saves an explicit candidate,
         executable: candidate.executable,
         name: 'Codex Desktop (пример)',
         source: 'desktop-process',
-        version: '0.170.0',
+        version: '0.164.0-alpha.1',
         running: true,
-        connection: candidate,
+        managedConnection: candidate,
       },
       {
-        executable: '/opt/example/cli/codex',
+        executable: otherManaged.executable,
         name: 'Codex CLI (пример)',
         source: 'path',
-        version: '0.163.0',
+        version: '0.163.0-alpha.10.2',
         running: false,
-        connection: {
-          executable: '/opt/example/cli/codex',
-          transport: 'proxy',
-          endpoint: '',
-        },
+        connection: external,
+        managedConnection: otherManaged,
       },
       {
         executable: '/opt/example/unavailable/codex',
@@ -223,10 +228,15 @@ test('discovery separates CLI and runtime versions, saves an explicit candidate,
         running: false,
       },
     ],
-    recommended: candidate,
+    recommended: external,
+    recommendedManaged: candidate,
     issues: [
       {
-        code: 'example_unavailable',
+        code: 'desktop-stdio',
+        message: 'Пример: внешнее подключение к процессу Desktop недоступно.',
+      },
+      {
+        code: 'probe-failed',
         message: 'Пример: третья установка не отвечает.',
       },
     ],
@@ -265,74 +275,138 @@ test('discovery separates CLI and runtime versions, saves an explicit candidate,
     .getByRole('navigation')
     .getByRole('button', { name: 'Codex', exact: true })
     .click();
+  await expect(page.getByLabel('Режим работы', { exact: true })).toHaveValue('managed');
+  await expect(page.getByRole('radio', { name: /Находить Codex автоматически/ })).toBeChecked();
   await expect(page.getByRole('table')).toContainText(oldThread.name);
   await expect(page.getByLabel('Фактическое подключение Codex')).toContainText(
-    'Codex 0.163.0',
+    'Codex 0.163.0-alpha.10.2',
   );
-  await expect(page.getByText('CLI: 0.170.0', { exact: false })).toBeVisible();
-  await expect(
-    page.getByRole('radio', { name: /Недоступная установка/ }),
-  ).toBeDisabled();
-  await page.getByRole('radio', { name: /Codex Desktop \(пример\)/ }).check();
-  await page
-    .getByRole('button', { name: 'Сохранить Codex', exact: true })
-    .click();
-  await expect
-    .poll(() => api.mutations.at(-1)?.body)
-    .toEqual({ codex: candidate });
+  await expect(page.getByLabel('Фактическое подключение Codex')).toContainText('/profiles/shared');
+  await expect(page.getByText('CLI: 0.164.0-alpha.1', { exact: false })).toBeVisible();
+  await expect(page.getByText(discovery.issues[0].message, { exact: true })).toHaveCount(0);
+  await expect(page.getByText(discovery.issues[1].message, { exact: true })).toBeVisible();
+  await expect(page.getByRole('radio', { name: /Недоступная установка/ })).toBeDisabled();
+  await expect(page.getByRole('radio', { name: /Codex Desktop \(пример\)/ })).toBeEnabled();
+  expect(api.mutations).toEqual([]);
+  await page.getByRole('button', { name: 'Выбрать рекомендуемый', exact: true }).click();
+  await expect(page.getByRole('radio', { name: /Codex Desktop \(пример\)/ })).toBeChecked();
+  await expect(page.getByLabel('Папка профиля Codex', { exact: true })).toHaveValue('/profiles/shared');
+  expect(api.mutations).toEqual([]);
+  await page.getByRole('button', { name: 'Сохранить Codex', exact: true }).click();
+  await expect.poll(() => api.mutations.at(-1)?.body).toEqual({
+    codex: { ...candidate, codexHome: '/profiles/shared' },
+  });
   await expect.poll(() => nextRequested).toBe(true);
   await expect(page.getByText(oldThread.name, { exact: true })).toHaveCount(0);
-  await expect(
-    page.getByRole('heading', { name: 'Загружаем разговоры…', exact: true }),
-  ).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Загружаем разговоры…', exact: true })).toBeVisible();
   release();
   await expect(page.getByRole('table')).toContainText(newThread.name);
+  await expect(page.getByRole('radio', { name: /Codex Desktop \(пример\)/ })).toBeChecked();
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.screenshot({ path: testInfo.outputPath('managed-desktop.png'), fullPage: true });
 
-  await page.getByRole('radio', { name: /Указать параметры вручную/ }).check();
-  await expect(
-    page.getByLabel('Адрес app-server', { exact: true }),
-  ).toHaveValue(candidate.endpoint);
-  await page
-    .getByLabel('Токен app-server', { exact: true })
-    .fill('synthetic-unsaved-websocket-key');
-  await page
-    .getByLabel('Способ подключения', { exact: true })
-    .selectOption('proxy');
-  await expect(
-    page.getByLabel('Адрес app-server', { exact: true }),
-  ).toHaveCount(0);
-  await page
-    .getByRole('button', { name: 'Сохранить Codex', exact: true })
-    .click();
-  await expect
-    .poll(() => api.mutations.at(-1)?.body)
-    .toEqual({
-      codex: {
-        executable: candidate.executable,
-        transport: 'proxy',
-        endpoint: '',
-      },
-    });
-  await page
-    .getByRole('radio', { name: /Находить Codex автоматически/ })
-    .check();
-  await page
-    .getByRole('button', { name: 'Сохранить Codex', exact: true })
-    .click();
-  await expect
-    .poll(() => api.mutations.at(-1)?.body)
-    .toEqual({
-      codex: { executable: 'codex', transport: 'proxy', endpoint: '' },
-    });
-  const readsBefore = api.reads.filter(
-    (path) => path === '/api/codex/discovery',
-  ).length;
-  await page
-    .getByRole('button', { name: 'Повторить поиск', exact: true })
-    .click();
-  await expect
-    .poll(
-      () => api.reads.filter((path) => path === '/api/codex/discovery').length,
-    )
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.getByLabel('Режим работы', { exact: true })).toHaveValue('managed');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.screenshot({ path: testInfo.outputPath('managed-mobile.png'), fullPage: true });
+  await page.getByRole('radio', { name: /Codex CLI \(пример\)/ }).check();
+  await page.getByRole('button', { name: 'Сохранить Codex', exact: true }).click();
+  await expect.poll(() => api.mutations.at(-1)?.body).toEqual({
+    codex: { ...otherManaged, codexHome: '/profiles/shared' },
+  });
+  await page.getByRole('radio', { name: /Находить Codex автоматически/ }).check();
+  await page.getByLabel('Папка профиля Codex', { exact: true }).fill('');
+  await page.getByRole('button', { name: 'Сохранить Codex', exact: true }).click();
+  await expect.poll(() => api.mutations.at(-1)?.body).toEqual({
+    codex: { executable: 'codex', transport: 'managed', endpoint: '', codexHome: '' },
+  });
+  const readsBefore = api.reads.filter((path) => path === '/api/codex/discovery').length;
+  await page.getByRole('button', { name: 'Повторить поиск', exact: true }).click();
+  await expect.poll(() => api.reads.filter((path) => path === '/api/codex/discovery').length)
     .toBeGreaterThan(readsBefore);
+});
+
+for (const transport of ['proxy', 'websocket'] as const) {
+  test(`saved ${transport} stays external until an explicit change and never carries its endpoint into managed mode`, async ({ page }) => {
+    const state = fixtureState(true);
+    const saved: CodexConnectionTarget = {
+      executable: '/opt/example/external/codex',
+      transport,
+      endpoint: transport === 'proxy' ? '/run/example/codex.sock' : 'ws://127.0.0.1:4500',
+      codexHome: '/profiles/legacy',
+    };
+    state.config.codex = { ...saved, tokenConfigured: true };
+    state.codex = { ...state.codex, ...saved };
+    const api = await installApi(page, state);
+    await openPanel(page);
+    await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+    await expect(page.getByLabel('Режим работы', { exact: true })).toHaveValue(transport);
+    await expect(page.getByRole('radio', { name: /Указать параметры вручную/ })).toBeChecked();
+    await expect(page.getByLabel('Исполняемый файл Codex', { exact: true })).toHaveValue(saved.executable);
+    await expect(page.getByLabel(transport === 'proxy' ? 'Локальный сокет Codex' : 'Адрес app-server', { exact: true })).toHaveValue(saved.endpoint);
+    await expect(page.getByLabel('Папка профиля Codex', { exact: true })).toHaveValue('/profiles/legacy');
+    await expect(page.getByRole('button', { name: 'Перейти на сервер Rele', exact: true })).toBeVisible();
+    await expect(page.getByText('CLI: 0.163.0-alpha.10.2', { exact: false })).toBeVisible();
+    expect(api.mutations).toEqual([]);
+    await page.getByRole('button', { name: 'Сохранить Codex', exact: true }).click();
+    await expect.poll(() => api.mutations.at(-1)?.body).toEqual({ codex: saved });
+    if (transport === 'websocket') {
+      await page.getByLabel('Токен app-server', { exact: true }).fill('synthetic-unsaved-websocket-key');
+      await page.getByLabel('Режим работы', { exact: true }).selectOption('proxy');
+      await expect(page.getByLabel('Адрес app-server', { exact: true })).toHaveCount(0);
+      await expect(page.getByLabel('Локальный сокет Codex', { exact: true })).toHaveValue('');
+      await page.getByRole('button', { name: 'Сохранить Codex', exact: true }).click();
+      await expect.poll(() => api.mutations.at(-1)?.body).toEqual({
+        codex: { ...saved, transport: 'proxy', endpoint: '' },
+      });
+    }
+    const writesBefore = api.mutations.length;
+    await page.getByRole('button', { name: 'Перейти на сервер Rele', exact: true }).click();
+    await expect(page.getByLabel('Режим работы', { exact: true })).toHaveValue('managed');
+    await expect(page.getByRole('radio', { name: /Находить Codex автоматически/ })).toBeChecked();
+    await expect(page.getByLabel('Папка профиля Codex', { exact: true })).toHaveValue('/profiles/legacy');
+    expect(api.mutations).toHaveLength(writesBefore);
+    await page.getByRole('button', { name: 'Сохранить Codex', exact: true }).click();
+    await expect.poll(() => api.mutations.at(-1)?.body).toEqual({
+      codex: { executable: 'codex', transport: 'managed', endpoint: '', codexHome: '/profiles/legacy' },
+    });
+  });
+}
+
+test('an actual profile change clears the previous thread catalog even when saved settings are unchanged', async ({ page }) => {
+  const state = fixtureState(true);
+  state.codex.codexHome = '/profiles/first';
+  await installApi(page, state);
+  const firstThread: CodexThread = {
+    id: 'profile-first-thread',
+    name: 'Пример: первый профиль',
+    cwd: '/work/first',
+    preview: '',
+    updatedAt: 1792353600,
+  };
+  const secondThread = { ...firstThread, id: 'profile-second-thread', name: 'Пример: второй профиль' };
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let nextRequested = false;
+  await page.route('**/api/threads?*', async (route) => {
+    const changed = state.codex.codexHome === '/profiles/second';
+    if (changed) {
+      nextRequested = true;
+      await gate;
+    }
+    await route.fulfill({ json: { threads: [changed ? secondThread : firstThread] } });
+  });
+  await openPanel(page);
+  await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  await expect(page.getByRole('table')).toContainText(firstThread.name);
+  await expect(page.getByLabel('Папка профиля Codex', { exact: true })).toHaveValue('');
+  state.codex.codexHome = '/profiles/second';
+  await expect(page.getByLabel('Фактическое подключение Codex')).toContainText('/profiles/second', { timeout: 10000 });
+  await expect.poll(() => nextRequested).toBe(true);
+  await expect(page.getByText(firstThread.name, { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'Загружаем разговоры…', exact: true })).toBeVisible();
+  release();
+  await expect(page.getByRole('table')).toContainText(secondThread.name);
+  await expect(page.getByLabel('Папка профиля Codex', { exact: true })).toHaveValue('');
 });

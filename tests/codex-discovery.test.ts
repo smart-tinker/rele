@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { discoverCodex, runCodexProbe, WINDOWS_CODEX_METADATA_SCRIPT, type CodexDiscoveryOptions } from '../src/server/codex-discovery.js';
-import { resolveCodexLaunch } from '../src/server/codex-launch.js';
+import { codexEnvironment, resolveCodexLaunch } from '../src/server/codex-launch.js';
 
 const win = path.win32;
 const desktop = 'C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.1_x64__example\\app\\resources\\codex.exe';
@@ -65,6 +65,7 @@ describe('Codex installation and existing Desktop discovery', () => {
     const result = await discoverCodex(f.options);
     expect(result.recommended).toBeUndefined();
     expect(result.installations[0].connection).toBeUndefined();
+    expect(result.recommendedManaged).toEqual({ executable: desktop, transport: 'managed', endpoint: '' });
     expect(result.installations.some(item => item.connection?.executable === npmEntry)).toBe(true);
     expect(result.issues.map(item => item.code)).toContain('desktop-stdio');
     expect(f.run.mock.calls.every(([, args]) => args.at(-1) === '--version' || args.includes(WINDOWS_CODEX_METADATA_SCRIPT))).toBe(true);
@@ -103,6 +104,66 @@ describe('Codex installation and existing Desktop discovery', () => {
     expect(result.installations).toHaveLength(1);
     expect(result.installations[0]).toMatchObject({ executable, name: 'Codex CLI', source: 'standard', running: false });
     expect(result.recommended).toEqual({ executable, transport: 'proxy', endpoint: '' });
+  });
+
+  it('finds the versioned Windows CLI while Desktop is closed and prefers supported versions over an older PATH CLI', async () => {
+    const local = 'C:\\Users\\Example User\\AppData\\Local';
+    const root = win.join(local, 'OpenAI', 'Codex', 'bin');
+    const directory = '896a97d617f44716aaf5e6130569dc5c';
+    const executable = win.join(root, directory, 'codex.exe');
+    const f = windowsFixture(undefined, [executable, npmShim, npmEntry]);
+    f.options.env = { ...f.options.env, LOCALAPPDATA: local };
+    f.options.readDirectory = async requested => requested === root ? [directory, '../outside'] : [];
+    f.run.mockImplementation(async (command, args) => {
+      if (args.includes(WINDOWS_CODEX_METADATA_SCRIPT)) return { stdout: JSON.stringify({ processes: [], packages: [], issues: [] }), code: 0 };
+      return { stdout: `codex-cli ${command === executable ? '0.163.0-alpha.10.2' : '0.159.0'}`, code: 0 };
+    });
+    const result = await discoverCodex(f.options);
+    expect(result.installations.find(item => item.executable === executable)).toMatchObject({ version: '0.163.0-alpha.10.2', running: false, managedConnection: { executable, transport: 'managed', endpoint: '' } });
+    expect(result.recommendedManaged).toEqual({ executable, transport: 'managed', endpoint: '' });
+    expect(result.recommended?.executable).toBe(executable);
+    expect(result.issues.map(item => item.code)).toContain('cli-version-unverified');
+    expect(f.run.mock.calls.every(([, args]) => args.at(-1) === '--version' || args.includes(WINDOWS_CODEX_METADATA_SCRIPT))).toBe(true);
+    expect(f.run.mock.calls.some(([command]) => command.includes('outside'))).toBe(false);
+  });
+
+  it('prefers the stable supported managed CLI over a running Desktop alpha without changing the external recommendation', async () => {
+    const metadata = { processes: [{ executable: desktop, processId: 1234, listenKind: 'websocket', listen: 'ws://127.0.0.1:4500' }], packages: [], issues: [] };
+    const f = windowsFixture(metadata, [desktop, npmShim, npmEntry]);
+    f.run.mockImplementation(async (command, args) => args.includes(WINDOWS_CODEX_METADATA_SCRIPT)
+      ? { stdout: JSON.stringify(metadata), code: 0 }
+      : { stdout: `codex-cli ${command === desktop ? '0.163.0-alpha.10.2' : '0.163.0'}`, code: 0 });
+    const result = await discoverCodex(f.options);
+    expect(result.recommendedManaged).toEqual({ executable: npmEntry, transport: 'managed', endpoint: '' });
+    expect(result.recommended).toEqual({ executable: desktop, transport: 'websocket', endpoint: 'ws://127.0.0.1:4500' });
+  });
+
+  it('keeps an unverified CLI available for explicit read-only selection without recommending it', async () => {
+    const f = windowsFixture(undefined, [npmShim, npmEntry]);
+    f.run.mockImplementation(async (_command, args) => args.includes(WINDOWS_CODEX_METADATA_SCRIPT)
+      ? { stdout: JSON.stringify({ processes: [], packages: [], issues: [] }), code: 0 }
+      : { stdout: 'codex-cli 0.159.0', code: 0 });
+    const result = await discoverCodex(f.options);
+    expect(result.installations[0].managedConnection).toEqual({ executable: npmEntry, transport: 'managed', endpoint: '' });
+    expect(result.recommendedManaged).toBeUndefined();
+    expect(result.recommended).toBeUndefined();
+    expect(result.issues.map(item => item.code)).toContain('cli-version-unverified');
+  });
+
+  it('keeps an explicit native profile on both targets without reading or creating profile files', async () => {
+    const codexHome = 'C:\\Users\\Example User\\Selected Codex';
+    const selectedSocket = win.join(codexHome, 'app-server-control', 'app-server-control.sock');
+    const metadata = { processes: [{ executable: desktop, processId: 1234, listenKind: 'unix', socketDefault: true }], packages: [], issues: [] };
+    const f = windowsFixture(metadata, [desktop, selectedSocket]);
+    f.options.env = { ...f.options.env, codex_home: 'C:\\Unselected Codex' };
+    f.options.codexHome = codexHome;
+    const readText = vi.fn(async () => { throw new Error('Profile files must not be read'); });
+    f.options.readText = readText;
+    const result = await discoverCodex(f.options);
+    expect(result.recommended).toEqual({ executable: desktop, transport: 'proxy', endpoint: selectedSocket, codexHome });
+    expect(result.recommendedManaged).toEqual({ executable: desktop, transport: 'managed', endpoint: '', codexHome });
+    expect(readText).not.toHaveBeenCalled();
+    expect(f.options.env.codex_home).toBe('C:\\Unselected Codex');
   });
 
   it('does not expose or use a nonlocal or secret-bearing process address', async () => {
@@ -164,6 +225,7 @@ describe('Codex installation and existing Desktop discovery', () => {
     const result = await discoverCodex({ platform: 'linux', home: '/home/example', env: { PATH: '/opt/codex/bin' }, exists: async file => files.has(file), readDirectory: async root => root.includes('.nvm') ? ['v24.19.0'] : [], run });
     expect(result.installations).toHaveLength(3);
     expect(result.recommended).toEqual({ executable: '/opt/codex/bin/codex', transport: 'proxy', endpoint: '' });
+    expect(result.recommendedManaged).toEqual({ executable: '/opt/codex/bin/codex', transport: 'managed', endpoint: '' });
     expect(run).toHaveBeenCalledTimes(3);
   });
 
@@ -209,4 +271,22 @@ function Get-AppxPackage { [CmdletBinding()] param([string]$Name); @() }
     expect(parsed.processes[5]).toMatchObject({ listenKind: 'unix', socket: null, socketDefault: true });
     expect(result.stdout).not.toMatch(/synthetic-private|synthetic-secret|CommandLine|another-user|synthetic-gui/);
   }, 35_000);
+});
+
+describe('native Codex profile environment', () => {
+  it('inherits the existing environment unless an absolute profile is explicitly selected', () => {
+    const env = { CODEX_HOME: '/home/example/.codex', CODEX_SQLITE_HOME: '/home/example/native-state', OPENAI_API_KEY: 'synthetic-key' };
+    expect(codexEnvironment(undefined, env, 'linux')).toEqual(env);
+    expect(codexEnvironment('', env, 'linux')).toEqual(env);
+    expect(codexEnvironment('/home/example/selected', env, 'linux')).toEqual({ ...env, CODEX_HOME: '/home/example/selected' });
+    expect(env.CODEX_HOME).toBe('/home/example/.codex');
+    expect(() => codexEnvironment('relative-home', env, 'linux')).toThrow('абсолютным');
+  });
+
+  it('replaces Windows environment casing aliases without mutating the service environment', () => {
+    const env = { CODEX_HOME: 'C:\\Old Native', codex_home: 'C:\\Other Native', Path: 'C:\\Tools' };
+    expect(codexEnvironment('C:\\Selected Native', env, 'win32')).toEqual({ CODEX_HOME: 'C:\\Selected Native', Path: 'C:\\Tools' });
+    expect(env).toHaveProperty('codex_home');
+    expect(() => codexEnvironment('\\\\server\\share', env, 'win32')).toThrow('абсолютным');
+  });
 });

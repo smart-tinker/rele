@@ -6,9 +6,9 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { WebSocket, WebSocketServer } from 'ws';
-import { CodexClient, CodexTransportError, classifyCodexConnectionFailure, type CodexNotification } from '../src/server/codex.js';
+import { CodexClient, CodexThreadBusyError, CodexTransportError, classifyCodexConnectionFailure, type CodexNotification } from '../src/server/codex.js';
 
-interface Rpc { id?: string | number; method?: string; params: Record<string, unknown>; result?: unknown }
+interface Rpc { id?: string | number; method?: string; params: Record<string, unknown>; result?: unknown; error?: { code: number; message: string } }
 type Handler = (message: Rpc, socket: WebSocket) => unknown | Promise<unknown>;
 const noResponse = Symbol('no response');
 const threadId = randomUUID();
@@ -17,7 +17,79 @@ const cleanup: Array<() => Promise<void> | void> = [];
 
 afterEach(async () => {
   for (const close of cleanup.splice(0).reverse()) await close();
+  vi.unstubAllEnvs();
 });
+
+async function managedFixture(options: {
+  version?: string;
+  resume?: 'busy' | 'wrong';
+  release?: 'early' | 'delayed' | 'notLoaded' | 'silent';
+  dropAck?: boolean;
+  malformed?: boolean;
+  codexHome?: string;
+  auto?: boolean;
+  releaseTimeoutMs?: number;
+} = {}) {
+  const directory = await mkdtemp(path.join(tmpdir(), 'Rele managed fixture '));
+  cleanup.push(() => rm(directory, { recursive: true, force: true }));
+  const executable = path.join(directory, 'codex.mjs');
+  const log = path.join(directory, 'wire.jsonl');
+  await writeFile(log, '');
+  await writeFile(executable, `
+    import { appendFileSync, writeSync } from 'node:fs';
+    import { createInterface } from 'node:readline';
+    const log = ${JSON.stringify(log)}, options = ${JSON.stringify(options)}, thread = ${JSON.stringify(rawThread)};
+    const record = value => appendFileSync(log, JSON.stringify(value) + '\\n');
+    const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
+    record({ event: 'start', pid: process.pid, argv: process.argv.slice(2), home: process.env.CODEX_HOME, marker: process.env.RELE_CODEX_TEST_MARKER });
+    let released;
+    for await (const line of createInterface({ input: process.stdin })) {
+      const message = JSON.parse(line);
+      record(message);
+      if (!message.method || message.id === undefined) continue;
+      const reply = result => send({ id: message.id, result });
+      switch (message.method) {
+        case 'initialize':
+          if (options.malformed) { writeSync(2, 'synthetic-secret-never-published\\n'); writeSync(1, 'malformed-json\\n'); break; }
+          reply({ userAgent: 'rele/' + (options.version || '0.163.0') + ' (Fixture)', codexHome: process.env.CODEX_HOME || ${JSON.stringify(directory)}, platformFamily: 'fixture', platformOs: process.platform });
+          break;
+        case 'thread/list': reply({ data: [thread], nextCursor: null }); break;
+        case 'thread/queue/list': case 'thread/turns/list': reply({ data: [], nextCursor: null }); break;
+        case 'thread/resume':
+          if (options.resume === 'busy') send({ id: message.id, error: { code: -32600, message: 'thread ' + message.params.threadId + ' already has an active writer' } });
+          else reply({ thread: { ...thread, id: options.resume === 'wrong' ? 'unexpected-fork' : message.params.threadId } });
+          break;
+        case 'thread/queue/add':
+          if (options.dropAck) process.exit(0);
+          reply({ queuedSubmission: { id: 'queued', clientUserMessageId: message.params.clientUserMessageId } });
+          break;
+        case 'thread/unsubscribe':
+          released = message.params.threadId;
+          if (options.release === 'notLoaded') reply({ status: 'notLoaded' });
+          else if (options.release === 'early' || !options.release) {
+            send({ method: 'thread/closed', params: { threadId: released } });
+            reply({ status: 'unsubscribed' });
+          } else reply({ status: 'unsubscribed' });
+          break;
+        case 'thread/read':
+          if (message.params.threadId === 'fixture-release-now') send({ method: 'thread/closed', params: { threadId: released } });
+          reply({ thread });
+          break;
+        default: send({ id: message.id, error: { code: -32601, message: 'Unknown fixture method' } });
+      }
+    }
+  `);
+  const discover = vi.fn().mockResolvedValue({
+    installations: [{ executable, name: 'Installed Codex', source: 'desktop-process', version: '0.163.0', running: true }],
+    recommendedManaged: { executable, transport: 'managed', endpoint: '' },
+    issues: [{ code: 'desktop-stdio', message: 'Desktop has no listener' }],
+  });
+  const client = new CodexClient({ transport: 'managed', executable: options.auto ? 'codex' : executable, codexHome: options.codexHome }, { discover, releaseTimeoutMs: options.releaseTimeoutMs });
+  cleanup.push(() => client.close());
+  const records = async () => (await readFile(log, 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as Rpc & { event?: string; argv?: string[]; home?: string; marker?: string; pid?: number });
+  const calls = async () => (await records()).filter(row => row.method);
+  return { client, executable, directory, discover, records, calls };
+}
 
 async function fixture(handlers: Record<string, Handler> = {}) {
   const calls: Rpc[] = [], responses: Rpc[] = [], sockets: WebSocket[] = [];
@@ -280,6 +352,20 @@ describe('Codex shared-runtime adapter', () => {
     await expect(f.client.respond('peer-approval', { decision: 'accept' })).rejects.toThrow('уже завершён');
   });
 
+  it('rejects a known unsupported interaction once with a JSON-RPC error', async () => {
+    const f = await fixture();
+    await f.client.connect();
+    const request = once(f.client, 'request');
+    f.sockets[0].send(JSON.stringify({ id: 'unsupported-tool', method: 'item/tool/call', params: { threadId } }));
+    await request;
+    await f.client.rejectRequest('unsupported-tool', 'This interaction is not supported by Rele.');
+    await until(() => f.responses.length === 1);
+    expect(f.responses[0]).toEqual({ id: 'unsupported-tool', error: { code: -32601, message: 'This interaction is not supported by Rele.' } });
+    await expect(f.client.rejectRequest('unsupported-tool', 'Retry')).rejects.toThrow('уже завершён');
+    await f.client.releaseThread(threadId);
+    expect(f.calls.some(call => call.method === 'thread/unsubscribe')).toBe(false);
+  });
+
   it('marks a lost enqueue acknowledgment uncertain and never replays it on reconnect', async () => {
     const f = await fixture({ 'thread/queue/add': (_message, socket) => { socket.terminate(); return noResponse; } });
     await f.client.connect();
@@ -295,5 +381,138 @@ describe('Codex shared-runtime adapter', () => {
     const client = new CodexClient({ transport: 'websocket', endpoint, executable: 'codex' });
     await expect(client.connect()).rejects.toThrow('локальный');
     expect(client.status().connected).toBe(false);
+  });
+});
+
+describe('Codex managed runtime', () => {
+  it('owns an NDJSON child, preserves the inherited profile and safely closes that process', async () => {
+    vi.stubEnv('CODEX_HOME', path.join(tmpdir(), 'inherited Codex profile'));
+    vi.stubEnv('RELE_CODEX_TEST_MARKER', 'inherited-sentinel');
+    const f = await managedFixture();
+    await f.client.connect();
+    expect(f.discover).not.toHaveBeenCalled();
+    expect(f.client.status()).toMatchObject({ connected: true, transport: 'managed', executable: f.executable, queueSupported: true, codexHome: process.env.CODEX_HOME, desktopVerified: false });
+    const [start] = await f.records();
+    expect(start).toMatchObject({ argv: ['app-server', '--listen', 'stdio://', '-c', 'thread_unload_delay_secs=0'], home: process.env.CODEX_HOME, marker: 'inherited-sentinel' });
+    expect((await f.client.listThreads())[0].id).toBe(threadId);
+    expect((await f.calls()).some(call => call.method === 'thread/resume')).toBe(false);
+    await f.client.close();
+    expect(() => process.kill(start.pid!, 0)).toThrow();
+  });
+
+  it('chooses a managed CLI independently of the Desktop listener and applies only an explicit profile override', async () => {
+    vi.stubEnv('CODEX_HOME', path.join(tmpdir(), 'original inherited profile'));
+    vi.stubEnv('RELE_CODEX_TEST_MARKER', 'still-inherited');
+    const codexHome = path.join(tmpdir(), 'explicit Codex profile');
+    const f = await managedFixture({ auto: true, codexHome });
+    await f.client.connect();
+    expect(f.discover).toHaveBeenCalledWith({ codexHome });
+    expect(f.client.runtimeInfo()?.codexHome).toBe(codexHome);
+    expect((await f.records())[0]).toMatchObject({ home: codexHome, marker: 'still-inherited' });
+    expect(process.env.CODEX_HOME).toContain('original inherited profile');
+  });
+
+  it.each([
+    ['0.163.0-alpha.10.2', true],
+    ['0.163.0-alpha.10.3', false],
+    ['0.163.0-alpha.10.2.extra', false],
+    ['0.163.0+custom', false],
+  ])('keeps the complete runtime version %s in the exact write gate', async (version, verified) => {
+    const f = await managedFixture({ version });
+    await f.client.connect();
+    expect(f.client.status()).toMatchObject({ name: `Codex ${version}`, queueSupported: verified, desktopVerified: false });
+    if (verified) await expect(f.client.enqueue(threadId, 'Continue this thread', randomUUID())).resolves.toEqual({ queuedSubmissionId: 'queued' });
+    else await expect(f.client.enqueue(threadId, 'Continue this thread', randomUUID())).rejects.toThrow('проверенного Codex');
+    expect((await f.calls()).some(call => call.method === 'thread/queue/add')).toBe(verified);
+  });
+
+  it('reports a busy writer without forking, creating or seeding another conversation', async () => {
+    const f = await managedFixture({ resume: 'busy' });
+    await f.client.connect();
+    const requestId = randomUUID();
+    await expect(f.client.enqueue(threadId, 'Wait for Desktop', requestId)).rejects.toBeInstanceOf(CodexThreadBusyError);
+    await expect(f.client.subscribe(threadId)).rejects.toMatchObject({ threadId });
+    expect(f.client.status().connected).toBe(true);
+    const calls = await f.calls();
+    expect(calls.filter(call => call.method === 'thread/resume').map(call => call.params)).toEqual([
+      { threadId, excludeTurns: true }, { threadId, excludeTurns: true },
+    ]);
+    expect(calls.some(call => ['thread/start', 'thread/fork', 'turn/start', 'thread/queue/add'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it('fails closed when resume returns another thread identity', async () => {
+    const f = await managedFixture({ resume: 'wrong' });
+    await f.client.connect();
+    await expect(f.client.enqueue(threadId, 'Keep the original thread', randomUUID())).rejects.toMatchObject({ code: 'thread-identity-mismatch' });
+    expect(f.client.status().connected).toBe(false);
+    expect((await f.calls()).some(call => ['thread/start', 'thread/fork', 'thread/queue/add'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it('handles thread/closed before the unsubscribe acknowledgment without reloading automatically', async () => {
+    const f = await managedFixture({ release: 'early' });
+    await f.client.connect();
+    await f.client.subscribe(threadId);
+    const released = f.client.releaseThread(threadId);
+    expect(f.client.releaseThread(threadId)).toBe(released);
+    await released;
+    await f.client.readThread(threadId);
+    expect((await f.calls()).filter(call => call.method === 'thread/resume')).toHaveLength(1);
+    expect((await f.calls()).filter(call => call.method === 'thread/unsubscribe')).toHaveLength(1);
+    await f.client.subscribe(threadId);
+    expect((await f.calls()).filter(call => call.method === 'thread/resume')).toHaveLength(2);
+  });
+
+  it('waits for actual closure after the ack and blocks a concurrent subscribe until closure', async () => {
+    const f = await managedFixture({ release: 'delayed' });
+    await f.client.connect();
+    await f.client.subscribe(threadId);
+    let released = false;
+    const release = f.client.releaseThread(threadId).then(() => { released = true; });
+    const subscribe = f.client.subscribe(threadId);
+    await f.client.readThread('fixture-barrier');
+    expect(released).toBe(false);
+    expect((await f.calls()).filter(call => call.method === 'thread/resume')).toHaveLength(1);
+    await f.client.readThread('fixture-release-now');
+    await Promise.all([release, subscribe]);
+    expect((await f.calls()).filter(call => call.method === 'thread/resume')).toHaveLength(2);
+  });
+
+  it('accepts notLoaded as a completed release', async () => {
+    const f = await managedFixture({ release: 'notLoaded' });
+    await f.client.connect();
+    await f.client.releaseThread(threadId);
+    expect(f.client.status().connected).toBe(true);
+  });
+
+  it('stops its own child on a missing close notification before allowing a new runtime', async () => {
+    const f = await managedFixture({ release: 'silent', releaseTimeoutMs: 50 });
+    await f.client.connect();
+    await f.client.subscribe(threadId);
+    const [start] = await f.records();
+    await expect(f.client.releaseThread(threadId)).rejects.toMatchObject({ code: 'thread-release-timeout' });
+    expect(f.client.status().connected).toBe(false);
+    expect(() => process.kill(start.pid!, 0)).toThrow();
+    await f.client.connect();
+    expect((await f.calls()).filter(call => call.method === 'thread/resume')).toHaveLength(1);
+    await f.client.subscribe(threadId);
+    expect((await f.calls()).filter(call => call.method === 'thread/resume')).toHaveLength(2);
+  });
+
+  it('never replays an uncertain submission or reacquires remembered threads during managed reconnect', async () => {
+    const f = await managedFixture({ dropAck: true });
+    await f.client.connect();
+    await expect(f.client.enqueue(threadId, 'Accepted before exit', randomUUID())).rejects.toBeInstanceOf(CodexTransportError);
+    await f.client.connect();
+    expect(f.client.status().connected).toBe(true);
+    const calls = await f.calls();
+    expect(calls.filter(call => call.method === 'thread/resume')).toHaveLength(1);
+    expect(calls.filter(call => call.method === 'thread/queue/add')).toHaveLength(1);
+  });
+
+  it('rejects malformed child output without returning stdout or stderr content', async () => {
+    const f = await managedFixture({ malformed: true });
+    await expect(f.client.connect()).rejects.toMatchObject({ code: 'invalid-protocol' });
+    expect(JSON.stringify(f.client.status())).not.toMatch(/synthetic-secret|malformed-json/u);
+    expect(f.client.status().connected).toBe(false);
   });
 });

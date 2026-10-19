@@ -212,7 +212,10 @@ test('queue cancels only a selected task, approvals preserve answers, uncertain 
 }) => {
   const state = fixtureState();
   state.requests.push(
-    fixtureRequest('request-queued'),
+    {
+      ...fixtureRequest('request-queued'),
+      error: 'Тред занят другим клиентом Codex. Запрос ждёт освобождения треда.',
+    },
     fixtureRequest('request-approval', 'waiting_approval'),
   );
   state.approvals.push({
@@ -264,13 +267,19 @@ test('queue cancels only a selected task, approvals preserve answers, uncertain 
     .getByRole('navigation')
     .getByRole('button', { name: 'Очередь' })
     .click();
+  const waitingRow = page.getByRole('row').filter({ hasText: 'Тред занят' });
+  await expect(waitingRow).toContainText('Запрос ждёт освобождения треда');
+  await expect(waitingRow).toContainText('В очереди');
+  await expect(
+    waitingRow.getByRole('button', { name: 'Отменить', exact: true }),
+  ).toBeEnabled();
   await page.getByLabel('Документацию и примеры').check();
   await page.getByRole('button', { name: 'Отправить ответы' }).click();
   await expect(
     page.getByRole('heading', { name: 'Выберите способ проверки' }),
   ).not.toBeVisible();
   await page.getByRole('button', { name: 'Отменить', exact: true }).click();
-  expect(api.mutations).toContainEqual({
+  await expect.poll(() => api.mutations).toContainEqual({
     method: 'POST',
     path: '/api/requests/request-queued/cancel',
     body: undefined,
