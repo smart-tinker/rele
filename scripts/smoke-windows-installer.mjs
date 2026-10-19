@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { access, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -41,6 +41,10 @@ function powershell(code, options) {
 }
 async function exists(file) {
   try { await access(file); return true; } catch { return false; }
+}
+async function assertSamePath(actual, expected) {
+  const [actualPath, expectedPath] = await Promise.all([realpath(actual), realpath(expected)]);
+  assert.equal(actualPath.toLowerCase(), expectedPath.toLowerCase());
 }
 async function ready(previousPid) {
   for (let attempt = 0; attempt < 300; attempt++) {
@@ -131,23 +135,28 @@ try {
   instance = await ready();
   const initialPid = instance.pid;
   const settings = JSON.parse(await readFile(path.join(application, 'rele-install.json'), 'utf8'));
-  assert.equal(settings.DataDirectory, data);
+  await assertSamePath(settings.DataDirectory, data);
   assert.equal(settings.TaskName, task);
-  assert.equal(settings.CodexHome, codexHome);
+  await assertSamePath(settings.CodexHome, codexHome);
   assert.equal(await exists(legacyStartup), false, 'The known old startup script must be migrated after readiness.');
   const legacyBackup = (await readdir(path.join(data, 'backups'))).find(name => name.startsWith('legacy-startup-'));
   assert.ok(legacyBackup);
   assert.equal(await readFile(path.join(data, 'backups', legacyBackup, 'Rele.cmd'), 'utf8'), legacyContents);
   const configured = await readFile(path.join(data, 'config.json'), 'utf8');
   const taskInfo = JSON.parse(powershell(`
+    function Resolve-UserSid([string]$UserId) {
+      if ([string]::IsNullOrWhiteSpace($UserId)) { throw 'The task must identify its user.' }
+      if ($UserId -match '^S-1-') { return ([System.Security.Principal.SecurityIdentifier]::new($UserId)).Value }
+      return ([System.Security.Principal.NTAccount]::new($UserId)).Translate([System.Security.Principal.SecurityIdentifier]).Value;
+    }
     $task = Get-ScheduledTask -TaskName $env:RELE_SMOKE_TASK;
     [xml]$xml = Export-ScheduledTask -TaskName $env:RELE_SMOKE_TASK;
     [pscustomobject]@{
-      UserId = [string]$xml.Task.Principals.Principal.UserId;
+      UserId = (Resolve-UserSid ([string]$xml.Task.Principals.Principal.UserId));
       CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value;
       LogonType = [string]$xml.Task.Principals.Principal.LogonType;
       RunLevel = [string]$xml.Task.Principals.Principal.RunLevel;
-      TriggerUser = [string]$xml.Task.Triggers.LogonTrigger.UserId;
+      TriggerUser = (Resolve-UserSid ([string]$xml.Task.Triggers.LogonTrigger.UserId));
       Command = [string]$xml.Task.Actions.Exec.Command;
       Arguments = [string]$xml.Task.Actions.Exec.Arguments;
       ExecutionTimeLimit = [string]$xml.Task.Settings.ExecutionTimeLimit;
@@ -158,11 +167,11 @@ try {
   assert.equal(taskInfo.TriggerUser, taskInfo.CurrentUser);
   assert.equal(taskInfo.LogonType, 'InteractiveToken');
   assert.equal(taskInfo.RunLevel, 'LeastPrivilege');
-  assert.equal(taskInfo.Command.toLowerCase(), launcher.toLowerCase());
+  await assertSamePath(taskInfo.Command, launcher);
   assert.equal(taskInfo.Arguments, 'serve');
   assert.equal(taskInfo.ExecutionTimeLimit, 'PT0S');
   assert.ok(Number(taskInfo.RestartCount) > 0);
-  assert.equal(taskInfo.RegistryPath.replace(/\\$/u, '').toLowerCase(), application.toLowerCase());
+  await assertSamePath(taskInfo.RegistryPath, application);
   assert.equal((await fetch(new URL('/api/state', instance.address))).status, 401);
   const login = new URL(run(runtime, [main, 'open', '--print-url']));
   assert.equal(login.origin, new URL(instance.address).origin, 'The explicit browser link must point to this installed instance.');
