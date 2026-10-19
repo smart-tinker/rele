@@ -11,8 +11,10 @@
   "scripts": {
     "dev": "tsx watch src/server/main.ts",
     "dev:web": "vite --host 127.0.0.1",
+    "prebuild": "node scripts/build-process-host.mjs",
     "build": "tsc -p tsconfig.server.json && vite build",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit",
+    "pretest": "node scripts/build-process-host.mjs",
     "test": "vitest run",
     "test:e2e": "playwright test",
     "start": "node dist/server/main.js",

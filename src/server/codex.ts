@@ -555,7 +555,7 @@ export class CodexClient extends EventEmitter {
     if (stdio) {
       this.cleanup = Promise.all([this.cleanup, stdio.close()]).then(() => {});
       void this.cleanup.catch(error => {
-        this.setState({ connected: false, queueSupported: false, error: this.safeMessage(error), errorCode: 'shutdown-timeout' });
+        this.setState({ connected: false, queueSupported: false, error: this.safeMessage(error), errorCode: error instanceof CodexStdioError ? error.code : 'shutdown-timeout' });
       });
     }
     this.subscribed.clear();
