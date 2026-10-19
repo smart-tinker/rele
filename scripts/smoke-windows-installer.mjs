@@ -149,28 +149,37 @@ try {
       if ($UserId -match '^S-1-') { return ([System.Security.Principal.SecurityIdentifier]::new($UserId)).Value }
       return ([System.Security.Principal.NTAccount]::new($UserId)).Translate([System.Security.Principal.SecurityIdentifier]).Value;
     }
-    $task = Get-ScheduledTask -TaskName $env:RELE_SMOKE_TASK;
-    [xml]$xml = Export-ScheduledTask -TaskName $env:RELE_SMOKE_TASK;
+    $scheduler = New-Object -ComObject 'Schedule.Service';
+    $scheduler.Connect();
+    $definition = $scheduler.GetFolder('\\').GetTask($env:RELE_SMOKE_TASK).Definition;
+    if ($definition.Actions.Count -ne 1) { throw 'The task must have exactly one action.' }
+    $action = $definition.Actions.Item(1);
+    if ($action.Type -ne 0) { throw 'The task action must be Exec.' }
+    if ($definition.Triggers.Count -ne 1) { throw 'The task must have exactly one logon trigger.' }
+    $trigger = $definition.Triggers.Item(1);
+    if ($trigger.Type -ne 9) { throw 'The task trigger must be Logon.' }
+    $limit = [string]$definition.Settings.ExecutionTimeLimit;
+    $limitTicks = if ([string]::IsNullOrEmpty($limit)) { 0 } else { [System.Xml.XmlConvert]::ToTimeSpan($limit).Ticks };
     [pscustomobject]@{
-      UserId = (Resolve-UserSid ([string]$xml.Task.Principals.Principal.UserId));
+      UserId = (Resolve-UserSid ([string]$definition.Principal.UserId));
       CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value;
-      LogonType = [string]$xml.Task.Principals.Principal.LogonType;
-      RunLevel = [string]$xml.Task.Principals.Principal.RunLevel;
-      TriggerUser = (Resolve-UserSid ([string]$xml.Task.Triggers.LogonTrigger.UserId));
-      Command = [string]$xml.Task.Actions.Exec.Command;
-      Arguments = [string]$xml.Task.Actions.Exec.Arguments;
-      ExecutionTimeLimit = [string]$xml.Task.Settings.ExecutionTimeLimit;
-      RestartCount = [string]$xml.Task.Settings.RestartOnFailure.Count;
+      LogonType = [int]$definition.Principal.LogonType;
+      RunLevel = [int]$definition.Principal.RunLevel;
+      TriggerUser = (Resolve-UserSid ([string]$trigger.UserId));
+      Command = [string]$action.Path;
+      Arguments = [string]$action.Arguments;
+      ExecutionTimeLimitTicks = $limitTicks;
+      RestartCount = [int]$definition.Settings.RestartCount;
       RegistryPath = (Get-ItemProperty -LiteralPath $env:RELE_SMOKE_REGISTRY).InstallLocation;
     } | ConvertTo-Json -Compress`));
   assert.equal(taskInfo.UserId, taskInfo.CurrentUser);
   assert.equal(taskInfo.TriggerUser, taskInfo.CurrentUser);
-  assert.equal(taskInfo.LogonType, 'InteractiveToken');
-  assert.equal(taskInfo.RunLevel, 'LeastPrivilege');
+  assert.equal(taskInfo.LogonType, 3, 'The task must use the current user interactive token.');
+  assert.equal(taskInfo.RunLevel, 0, 'The task must run with least privilege.');
   await assertSamePath(taskInfo.Command, launcher);
   assert.equal(taskInfo.Arguments, 'serve');
-  assert.equal(taskInfo.ExecutionTimeLimit, 'PT0S');
-  assert.ok(Number(taskInfo.RestartCount) > 0);
+  assert.equal(taskInfo.ExecutionTimeLimitTicks, 0, 'The background task must have no execution time limit.');
+  assert.ok(taskInfo.RestartCount > 0);
   await assertSamePath(taskInfo.RegistryPath, application);
   assert.equal((await fetch(new URL('/api/state', instance.address))).status, 401);
   const login = new URL(run(runtime, [main, 'open', '--print-url']));
