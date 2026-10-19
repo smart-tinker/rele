@@ -5,6 +5,7 @@ import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { findCSharpCompiler } from './build-process-host.mjs';
 
 if (process.platform !== 'win32' || process.arch !== 'x64') throw new Error('Build the Windows installer on a Windows x64 runner.');
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -13,7 +14,7 @@ const version = /^(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?$/u.exec(metadata.version);
 if (!version || version.slice(1).some(part => part && Number(part) > 65535)) throw new Error('Unsupported installer version.');
 const nativeVersion = `${version[1]}.${version[2]}.${version[3]}.${version[4] || '0'}`;
 const stage = path.resolve(process.argv[2] || path.join(root, 'release', `rele-${metadata.version}-windows-x64`));
-for (const file of ['runtime/node.exe', 'dist/server/main.js', 'dist/web/index.html', 'manifest.json']) await access(path.join(stage, file));
+for (const file of ['runtime/node.exe', 'dist/server/main.js', 'dist/web/index.html', 'dist/native/Rele.Process.exe', 'manifest.json']) await access(path.join(stage, file));
 const stagedMetadata = JSON.parse(await readFile(path.join(stage, 'package.json'), 'utf8'));
 if (stagedMetadata.version !== metadata.version) throw new Error('Installer stage and package versions do not match.');
 const output = path.join(root, 'release');
@@ -32,10 +33,7 @@ async function find(candidates, label) {
 }
 
 try {
-  const compiler = await find([
-    path.join(process.env.SystemRoot || 'C:\\Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe'),
-    path.join(process.env.SystemRoot || 'C:\\Windows', 'Microsoft.NET', 'Framework', 'v4.0.30319', 'csc.exe'),
-  ], '.NET Framework C# compiler');
+  const compiler = await findCSharpCompiler();
   const inno = await find([
     process.env.RELE_ISCC,
     path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Inno Setup 6', 'ISCC.exe'),

@@ -37,10 +37,11 @@ async function bounded<T>(promise: Promise<T>, milliseconds: number, message: st
   } finally { clearTimeout(timer); }
 }
 
-test('close waits for the owned root and its grandchild to stop even when the grandchild inherits both output pipes', async () => {
+async function checkProcessTree(rootExits: boolean): Promise<void> {
   const directory = await mkdtemp(path.join(tmpdir(), 'Rele stdio tree '));
   const rootScript = path.join(directory, 'root.cjs');
   const grandchildScript = path.join(directory, 'grandchild.cjs');
+  const exitCommand = JSON.stringify({ fixture: 'exit-root' });
   const grandchildSource = String.raw`
     process.stdout.write(JSON.stringify({ kind: 'grandchild-ready', pid: process.pid, parentPid: process.ppid }) + '\n');
     setInterval(() => {}, 1000);
@@ -48,6 +49,7 @@ test('close waits for the owned root and its grandchild to stop even when the gr
   `;
   const rootSource = `
     const { spawn } = require('node:child_process');
+    const { createInterface } = require('node:readline');
     const report = value => process.stdout.write(JSON.stringify(value) + '\\n');
     report({ kind: 'root', pid: process.pid });
     const grandchild = spawn(process.execPath, [${JSON.stringify(grandchildScript)}], {
@@ -55,6 +57,9 @@ test('close waits for the owned root and its grandchild to stop even when the gr
     });
     grandchild.once('spawn', () => report({ kind: 'grandchild-started', pid: grandchild.pid }));
     grandchild.once('error', () => process.exit(91));
+    createInterface({ input: process.stdin }).on('line', line => {
+      if (line === ${JSON.stringify(exitCommand)}) process.exit(0);
+    });
     process.stdin.on('end', () => process.exit(0));
     process.stdin.resume();
     setTimeout(() => process.exit(92), 30000).unref();
@@ -103,8 +108,14 @@ test('close waits for the owned root and its grandchild to stop even when the gr
     expect(grandchildParentPid).toBe(rootPid);
     expect(grandchildPid).not.toBe(rootPid);
     expect(await Promise.all([...ownedPids].map(isRunning))).toEqual([true, true]);
-    closing = transport.close();
-    await bounded(closing, 16000, 'Transport close did not finish within its shutdown deadline');
+    if (rootExits) {
+      await transport.send(exitCommand);
+      // The guard must stop the orphan and close its pipes before close() or cleanup can help.
+      await expect.poll(() => closed, { timeout: 16000, interval: 20 }).toBe(1);
+    } else {
+      closing = transport.close();
+      await bounded(closing, 16000, 'Transport close did not finish within its shutdown deadline');
+    }
     expect(closed).toBe(1);
     expect(failures).toEqual([]);
     await expect.poll(() => Promise.all([...ownedPids].map(isRunning)), { timeout: 2000, interval: 20 })
@@ -127,4 +138,12 @@ test('close waits for the owned root and its grandchild to stop even when the gr
     try { await bounded(cleanup(), 18000, 'The fixture processes did not finish emergency cleanup'); }
     finally { await rm(directory, { recursive: true, force: true }); }
   }
-}, 45000);
+}
+
+test('close waits for the owned root and its grandchild to stop even when the grandchild inherits both output pipes',
+  () => checkProcessTree(false), 45000);
+
+test.skipIf(process.platform !== 'win32')(
+  'Windows job guard closes the transport and stops an inherited-pipe grandchild when its root exits on its own',
+  () => checkProcessTree(true), 45000,
+);

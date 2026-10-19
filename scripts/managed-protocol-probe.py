@@ -28,6 +28,9 @@ if len(candidates) != 1:
     parser.error('Expected one native binary in the isolated npm prefix.')
 CLI = str(candidates[0].resolve())
 REPO = Path(__file__).resolve().parent.parent
+PROCESS_HOST = REPO / 'dist' / 'native' / 'Rele.Process.exe'
+if os.name == 'nt' and not PROCESS_HOST.is_file():
+    parser.error('Build the Windows process host with npm run prebuild before the managed probe.')
 
 
 class Rpc:
@@ -133,8 +136,11 @@ stream_max_retries=0
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0))
             port = sock.getsockname()[1]
-        process = await asyncio.create_subprocess_exec(CLI, 'app-server', '--listen', f'ws://127.0.0.1:{port}',
-            cwd=workspace, env=env, stdin=asyncio.subprocess.DEVNULL,
+        command = [CLI, 'app-server', '--listen', f'ws://127.0.0.1:{port}']
+        if os.name == 'nt':
+            command = [str(PROCESS_HOST), '--', *command]
+        process = await asyncio.create_subprocess_exec(*command,
+            cwd=workspace, env=env, stdin=asyncio.subprocess.PIPE if os.name == 'nt' else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
         entry = {'process': process, 'drain': asyncio.create_task(drain(process)), 'client': None}
         servers.append(entry)
@@ -153,6 +159,7 @@ stream_max_retries=0
         runtime = await client.call('initialize', {'clientInfo': {'name': name, 'version': '0.0.0'}, 'capabilities': {'experimentalApi': True}})
         await ws.send(json.dumps({'method': 'initialized'}))
         assert f'/{args.expected_version} ' in runtime['userAgent'], runtime
+        entry['runtimePid'] = (await client.call('server/diagnostics', {}))['process']['id']
         return entry
 
     async def stop_source(entry):
@@ -162,19 +169,17 @@ stream_max_retries=0
         process = entry['process']
         if process.returncode is None:
             if os.name == 'nt':
-                # These independent runtimes can also own plugin/git children.
-                # Keep their root alive until Windows has terminated the whole tree.
-                killer = await asyncio.create_subprocess_exec('taskkill.exe', '/PID', str(process.pid), '/T', '/F',
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                # The host owns every native Codex descendant from creation.
+                # EOF requests job termination; zero exit confirms the empty job.
+                process.stdin.close()
                 try:
-                    code = await asyncio.wait_for(killer.wait(), 20)
-                    if code != 0:
-                        raise RuntimeError(f'Isolated source tree shutdown failed: taskkill exit {code}')
-                    await asyncio.wait_for(process.wait(), 8)
-                finally:
-                    if killer.returncode is None:
-                        killer.kill()
-                        await killer.wait()
+                    await asyncio.wait_for(process.wait(), 20)
+                except TimeoutError:
+                    # Releasing the host's private job handle also terminates its
+                    # descendants, but a deadline is never a successful cleanup.
+                    process.kill()
+                    await process.wait()
+                    raise
             else:
                 process.terminate()
                 try:
@@ -182,6 +187,8 @@ stream_max_retries=0
                 except TimeoutError:
                     process.kill()
                     await process.wait()
+        if os.name == 'nt' and process.returncode != 0:
+            raise RuntimeError(f'Isolated source job shutdown failed: host exit {process.returncode}')
         await asyncio.wait_for(asyncio.shield(entry['drain']), 8)
 
     async def source_turn(entry, thread, text):
@@ -215,7 +222,7 @@ stream_max_retries=0
         bridge_drain = asyncio.create_task(drain(bridge))
         ready = await bridge_read()
         assert ready['status']['queueSupported'], ready
-        assert ready['runtimeProcessId'] != source['process'].pid
+        assert ready['runtimeProcessId'] != source['runtimePid']
         assert Path(ready['runtime']['codexHome']).resolve() == home.resolve()
         assert any(row['id'] == thread and row['name'] == name for row in ready['catalog'])
         report['checks']['managed_child_lists_original_id_and_name_without_resuming'] = True

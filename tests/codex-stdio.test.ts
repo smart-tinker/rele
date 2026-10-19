@@ -5,6 +5,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
+import { fileURLToPath } from 'node:url';
 import { CodexStdioTransport, type CodexStdioError } from '../src/server/codex-stdio.js';
 
 const cleanup: Array<() => Promise<void>> = [];
@@ -69,8 +70,7 @@ describe('owned Codex NDJSON transport', () => {
     expect(f.errors).toHaveLength(1);
     expect(f.errors[0]).toMatchObject({ code });
     expect(f.messages).toEqual([]);
-    // These fixtures exit naturally after writing their invalid bytes. Observe
-    // that exit before cleanup rather than racing it with a forced tree kill.
+    // These fixtures exit naturally after writing their invalid bytes.
     await f.closed;
   });
 });
@@ -83,126 +83,143 @@ class FakeProcess extends EventEmitter {
   exitCode: number | null = null;
   signalCode: NodeJS.Signals | null = null;
   constructor(readonly pid: number) { super(); }
-  exit(code = 0): void { this.exitCode = code; this.emit('exit', code, null); }
-  close(code = 0): void {
-    if (this.exitCode === null) this.exit(code);
-    this.emit('close', code, null);
+  exit(code: number | null = 0, signal: NodeJS.Signals | null = null): void {
+    this.exitCode = code;
+    this.signalCode = signal;
+    this.emit('exit', code, signal);
+  }
+  close(code: number | null = 0, signal: NodeJS.Signals | null = null): void {
+    if (this.exitCode === null && this.signalCode === null) this.exit(code, signal);
+    this.emit('close', code, signal);
   }
 }
 
-async function windowsFixture() {
+async function windowsFixture(spawned = true) {
   vi.useFakeTimers();
-  const child = new FakeProcess(1234), helper = new FakeProcess(5678);
-  const spawnProcess = vi.fn().mockImplementation((command: string) => command === 'taskkill.exe' ? helper : child);
-  const stdinEnd = vi.spyOn(child.stdin, 'end');
-  const transport = new CodexStdioTransport('fixture-codex.exe', ['app-server'], {}, {
-    message: () => {}, stderr: () => {}, failure: () => {}, closed: () => {},
-  }, { platform: 'win32', spawnProcess: spawnProcess as unknown as typeof spawn });
-  child.emit('spawn');
-  await transport.ready;
-  return { child, helper, spawnProcess, stdinEnd, transport };
+  const helper = new FakeProcess(1234);
+  const spawnProcess = vi.fn().mockReturnValue(helper);
+  const stdinEnd = vi.spyOn(helper.stdin, 'end');
+  const callbacks = { message: vi.fn(), stderr: vi.fn(), failure: vi.fn(), closed: vi.fn() };
+  const command = 'C:\\Program Files\\node.exe';
+  const args = ['C:\\Local Codex\\codex.mjs', 'app-server', '--listen', 'stdio://', '-c', 'thread_unload_delay_secs=0'];
+  const env = { CODEX_HOME: 'C:\\Users\\Fixture User\\.codex', TEST_ENV: 'inherited' };
+  const transport = new CodexStdioTransport(command, args, env, callbacks, {
+    platform: 'win32', spawnProcess: spawnProcess as unknown as typeof spawn,
+  });
+  if (spawned) {
+    helper.emit('spawn');
+    await transport.ready;
+  }
+  return { helper, spawnProcess, stdinEnd, callbacks, command, args, env, transport };
 }
 
-describe('Windows owned-process shutdown ordering', () => {
-  it('keeps the root alive for delayed tree enumeration and does not interrupt taskkill after two seconds', async () => {
+describe('Windows owned Job lifecycle', () => {
+  it('launches only the packaged guard with exact command, arguments and environment', async () => {
     const f = await windowsFixture();
-    // Model the npm/Codex behavior that caused the race: stdin EOF exits the root
-    // immediately, while a descendant can still own the inherited pipe handles.
-    f.child.stdin.once('finish', () => f.child.exit());
+    expect(f.spawnProcess).toHaveBeenCalledExactlyOnceWith(
+      fileURLToPath(new URL('../dist/native/Rele.Process.exe', import.meta.url)),
+      ['--', f.command, ...f.args],
+      { stdio: ['pipe', 'pipe', 'pipe'], env: f.env, windowsHide: true, detached: false },
+    );
+    await f.transport.send('{"id":1}');
+    expect(f.helper.stdin.read().toString()).toBe('{"id":1}\n');
+    const stopping = f.transport.close();
+    f.helper.close();
+    await stopping;
+    expect(f.spawnProcess).toHaveBeenCalledOnce();
+  });
+
+  it('signals EOF once and waits for helper close after exit without an early forced kill', async () => {
+    const f = await windowsFixture();
     let resolved = false;
     const stopping = f.transport.close();
     expect(f.transport.close()).toBe(stopping);
     const close = stopping.then(() => { resolved = true; });
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(f.spawnProcess).toHaveBeenLastCalledWith('taskkill.exe', ['/PID', '1234', '/T', '/F'], { stdio: 'ignore', windowsHide: true });
-    expect(f.stdinEnd).not.toHaveBeenCalled();
-    expect(f.child.exitCode).toBeNull();
-    expect(f.child.kill).not.toHaveBeenCalled();
-    expect(f.helper.kill).not.toHaveBeenCalled();
-    expect(resolved).toBe(false);
-    f.helper.close(0);
-    await vi.advanceTimersByTimeAsync(0);
     expect(f.stdinEnd).toHaveBeenCalledOnce();
-    expect(resolved).toBe(false); // helper success is not child close
-    f.child.close();
-    await close;
-    expect(resolved).toBe(true);
-  });
-
-  it('continues waiting for taskkill completion if the root closes first', async () => {
-    const f = await windowsFixture();
-    let resolved = false;
-    const close = f.transport.close().then(() => { resolved = true; });
-    f.child.close();
-    await vi.advanceTimersByTimeAsync(3_000);
-    expect(resolved).toBe(false);
+    await vi.advanceTimersByTimeAsync(5_000);
     expect(f.helper.kill).not.toHaveBeenCalled();
-    expect(f.stdinEnd).not.toHaveBeenCalled();
-    f.helper.close(0);
+    expect(resolved).toBe(false);
+    f.helper.exit(0);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(resolved).toBe(false); // exit alone does not establish closed pipes
+    expect(f.callbacks.closed).not.toHaveBeenCalled();
+    f.helper.close();
     await close;
     expect(resolved).toBe(true);
+    expect(f.callbacks.closed).toHaveBeenCalledOnce();
+    expect(f.stdinEnd).toHaveBeenCalledOnce();
+    await expect(f.transport.send('{"id":2}')).rejects.toMatchObject({ code: 'connection-closed' });
   });
 
-  it.each(['error', 'nonzero'] as const)('does not treat taskkill %s as confirmed tree termination', async outcome => {
+  it('accepts a guard that already confirmed an empty Job on natural root exit', async () => {
+    const f = await windowsFixture();
+    f.helper.close(0);
+    await f.transport.close();
+    expect(f.stdinEnd).not.toHaveBeenCalled();
+    expect(f.helper.kill).not.toHaveBeenCalled();
+    expect(f.callbacks.closed).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { name: 'a nonzero exit', code: 13, signal: null },
+    { name: 'a signal', code: null, signal: 'SIGTERM' as const },
+  ])('does not treat $name as confirmed Job termination', async ({ code, signal }) => {
     const f = await windowsFixture();
     const close = f.transport.close();
     const rejected = expect(close).rejects.toMatchObject({ code: 'shutdown-failed' });
-    // Even a root close cannot turn an unsuccessful tree operation into success.
-    f.child.close();
-    if (outcome === 'error') f.helper.emit('error', new Error('synthetic-private-diagnostic'));
-    else f.helper.close(128);
+    f.helper.close(code, signal);
     await rejected;
+    expect(f.helper.kill).not.toHaveBeenCalled();
+    expect(f.transport.close()).toBe(close);
+  });
+
+  it('retains a guard failure that happened before close was requested', async () => {
+    const f = await windowsFixture();
+    f.helper.close(1);
+    const close = f.transport.close();
+    await expect(close).rejects.toMatchObject({ code: 'shutdown-failed' });
+    expect(f.transport.close()).toBe(close);
     expect(f.stdinEnd).not.toHaveBeenCalled();
-    expect(f.child.kill).not.toHaveBeenCalled();
-    expect(f.transport.close()).toBe(close);
-    await expect(close).rejects.not.toThrow('synthetic-private-diagnostic');
   });
 
-  it('keeps shutdown bounded and fails closed while inherited pipes remain open', async () => {
+  it('bounds a stalled guard and retains timeout even if forced termination immediately closes it', async () => {
     const f = await windowsFixture();
+    f.helper.kill.mockImplementation(() => { f.helper.close(0); return true; });
     const close = f.transport.close();
     const rejected = expect(close).rejects.toMatchObject({ code: 'shutdown-timeout' });
-    f.helper.close(0);
-    f.child.exit(); // exit alone is not the close event
-    await vi.advanceTimersByTimeAsync(15_000);
-    await rejected;
-    expect(f.child.kill).not.toHaveBeenCalled();
-    expect(f.transport.close()).toBe(close);
-  });
-
-  it('bounds a stalled taskkill without falling back to terminating only the root', async () => {
-    const f = await windowsFixture();
-    const close = f.transport.close();
-    const rejected = expect(close).rejects.toMatchObject({ code: 'shutdown-timeout' });
-    await vi.advanceTimersByTimeAsync(15_000);
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(f.helper.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
     await rejected;
     expect(f.helper.kill).toHaveBeenCalledOnce();
-    expect(f.child.kill).not.toHaveBeenCalled();
-    expect(f.stdinEnd).not.toHaveBeenCalled();
-  });
-
-  it('does not kill an already-exited root by a potentially reused PID', async () => {
-    const f = await windowsFixture();
-    f.child.exit();
-    let resolved = false;
-    const close = f.transport.close().then(() => { resolved = true; });
-    await vi.advanceTimersByTimeAsync(2_500);
     expect(f.spawnProcess).toHaveBeenCalledOnce();
-    expect(f.child.kill).not.toHaveBeenCalled();
-    expect(f.stdinEnd).not.toHaveBeenCalled();
-    expect(resolved).toBe(false);
-    f.child.close();
-    await close;
+    expect(f.transport.close()).toBe(close);
   });
 
-  it('does not conceal a timeout when the root already exited and descendants keep pipes open', async () => {
+  it('fails bounded cleanup when an exited guard still has open pipes without killing a stale PID', async () => {
     const f = await windowsFixture();
-    f.child.exit();
+    f.helper.exit();
     const close = f.transport.close();
     const rejected = expect(close).rejects.toMatchObject({ code: 'shutdown-timeout' });
     await vi.advanceTimersByTimeAsync(15_000);
     await rejected;
     expect(f.spawnProcess).toHaveBeenCalledOnce();
-    expect(f.child.kill).not.toHaveBeenCalled();
+    expect(f.helper.kill).not.toHaveBeenCalled();
+    expect(f.stdinEnd).not.toHaveBeenCalled();
+    expect(f.callbacks.closed).not.toHaveBeenCalled();
+    f.helper.close();
+  });
+
+  it('reports a safe guard launch failure without a direct-process fallback', async () => {
+    const f = await windowsFixture(false);
+    const rejected = expect(f.transport.ready).rejects.toMatchObject({ code: 'cli-unavailable' });
+    f.helper.emit('error', new Error('synthetic-private-diagnostic'));
+    await rejected;
+    expect(f.callbacks.failure).toHaveBeenCalledOnce();
+    expect(f.callbacks.failure.mock.calls[0][0].message).not.toContain('synthetic-private-diagnostic');
+    f.helper.close(-2);
+    await expect(f.transport.close()).rejects.toMatchObject({ code: 'shutdown-failed' });
+    expect(f.spawnProcess).toHaveBeenCalledOnce();
+    expect(f.helper.kill).not.toHaveBeenCalled();
   });
 });

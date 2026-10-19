@@ -1,0 +1,346 @@
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using Microsoft.Win32.SafeHandles;
+
+// Internal byte-transparent host. Its private Job owns the child before the child can run.
+internal sealed class ProcessHost : IDisposable
+{
+    private const uint KillOnJobClose = 0x2000;
+    private const uint CreateSuspended = 0x00000004;
+    private const uint ExtendedStartupInfoPresent = 0x00080000;
+    private const uint CreateNoWindow = 0x08000000;
+    private const uint WaitObject0 = 0;
+    private const uint WaitTimeout = 258;
+    private const int ShutdownMilliseconds = 10000;
+    private IntPtr job;
+    private IntPtr process;
+    private IntPtr primaryThread;
+    private SafeFileHandle childInput;
+    private bool assigned;
+    private bool stopAttempted;
+    private bool stopped;
+    private readonly ManualResetEvent stopRequested = new ManualResetEvent(false);
+    private string relayFailure;
+
+    private static int Main(string[] args)
+    {
+        using (var host = new ProcessHost())
+        {
+            try
+            {
+                if (args.Length < 2 || args[0] != "--" || String.IsNullOrEmpty(args[1]))
+                    throw new InvalidOperationException("expected -- followed by an executable and its arguments");
+                host.Start(args);
+                host.WaitForStop();
+                host.Stop();
+                if (host.relayFailure != null) throw new InvalidOperationException(host.relayFailure);
+                return 0;
+            }
+            catch (Exception error)
+            {
+                Report(error is InvalidOperationException ? error.Message : "unexpected process host failure");
+                return 1;
+            }
+        }
+    }
+
+    private void Start(string[] args)
+    {
+        job = CreateJobObject(IntPtr.Zero, null); // Unnamed and non-inheritable: only this host owns its lifetime.
+        if (job == IntPtr.Zero) throw Failure("create private job");
+        var limits = new ExtendedLimits();
+        limits.Basic.Flags = KillOnJobClose; // Deliberately no breakaway flags.
+        if (!SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf(typeof(ExtendedLimits))))
+            throw Failure("configure private job");
+
+        var attributes = new SecurityAttributes();
+        attributes.Length = Marshal.SizeOf(typeof(SecurityAttributes));
+        attributes.InheritHandle = true;
+        IntPtr inputRead = IntPtr.Zero;
+        IntPtr inputWrite = IntPtr.Zero;
+        IntPtr output = IntPtr.Zero;
+        IntPtr errorOutput = IntPtr.Zero;
+        IntPtr attributeList = IntPtr.Zero;
+        IntPtr handleList = IntPtr.Zero;
+        bool attributeListInitialized = false;
+        try
+        {
+            if (!CreatePipe(out inputRead, out inputWrite, ref attributes, 0)) throw Failure("create child input pipe");
+            childInput = new SafeFileHandle(inputWrite, true);
+            inputWrite = IntPtr.Zero;
+            if (!SetHandleInformation(childInput, 1, 0)) throw Failure("protect child input writer");
+            output = InheritableStandardHandle(-11);
+            errorOutput = InheritableStandardHandle(-12);
+
+            UIntPtr attributeSize = UIntPtr.Zero;
+            InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref attributeSize);
+            if (attributeSize == UIntPtr.Zero) throw Failure("size inherited handle list");
+            attributeList = Marshal.AllocHGlobal(checked((int)attributeSize.ToUInt64()));
+            if (!InitializeProcThreadAttributeList(attributeList, 1, 0, ref attributeSize))
+                throw Failure("initialize inherited handle list");
+            attributeListInitialized = true;
+            handleList = Marshal.AllocHGlobal(IntPtr.Size * 3);
+            Marshal.WriteIntPtr(handleList, 0, inputRead);
+            Marshal.WriteIntPtr(handleList, IntPtr.Size, output);
+            Marshal.WriteIntPtr(handleList, IntPtr.Size * 2, errorOutput);
+            if (!UpdateProcThreadAttribute(attributeList, 0, new UIntPtr(0x00020002), handleList,
+                new UIntPtr((uint)(IntPtr.Size * 3)), IntPtr.Zero, IntPtr.Zero))
+                throw Failure("set inherited handle list");
+
+            var startup = new StartupInfoEx();
+            startup.Startup.Size = Marshal.SizeOf(typeof(StartupInfoEx));
+            startup.Startup.Flags = 0x100; // STARTF_USESTDHANDLES
+            startup.Startup.Input = inputRead;
+            startup.Startup.Output = output;
+            startup.Startup.Error = errorOutput;
+            startup.AttributeList = attributeList;
+            var commandLine = new StringBuilder();
+            for (int index = 1; index < args.Length; index++)
+            {
+                if (index > 1) commandLine.Append(' ');
+                commandLine.Append(Quote(args[index]));
+            }
+            if (commandLine.Length >= 32767) throw new InvalidOperationException("child command line is too long");
+            ProcessInformation created;
+            // Inherit the environment and working directory unchanged. No shell is involved.
+            if (!CreateProcess(null, commandLine, IntPtr.Zero, IntPtr.Zero, true,
+                CreateSuspended | ExtendedStartupInfoPresent | CreateNoWindow, IntPtr.Zero, null, ref startup, out created))
+                throw Failure("create suspended child");
+            process = created.Process;
+            primaryThread = created.Thread;
+            if (!AssignProcessToJobObject(job, process)) throw Failure("assign suspended child to private job");
+            assigned = true;
+            if (ResumeThread(primaryThread) == UInt32.MaxValue) throw Failure("resume guarded child");
+            Close(ref primaryThread);
+        }
+        finally
+        {
+            if (attributeListInitialized) DeleteProcThreadAttributeList(attributeList);
+            if (attributeList != IntPtr.Zero) Marshal.FreeHGlobal(attributeList);
+            if (handleList != IntPtr.Zero) Marshal.FreeHGlobal(handleList);
+            Close(ref inputRead);
+            Close(ref inputWrite);
+            Close(ref output);
+            Close(ref errorOutput);
+        }
+
+        var relay = new Thread(RelayInput);
+        relay.IsBackground = true;
+        relay.Start();
+    }
+
+    private void RelayInput()
+    {
+        try
+        {
+            var buffer = new byte[65536];
+            IntPtr input = GetStdHandle(-10);
+            while (!stopRequested.WaitOne(0))
+            {
+                uint count;
+                if (!ReadFile(input, buffer, (uint)buffer.Length, out count, IntPtr.Zero))
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    if (error != 109 && error != 38) relayFailure = "read host input failed (Windows error " + error + ")";
+                    break;
+                }
+                if (count == 0) break;
+                while (count > 0 && !stopRequested.WaitOne(0))
+                {
+                    uint written;
+                    if (!WriteFile(childInput, buffer, count, out written, IntPtr.Zero))
+                    {
+                        int error = Marshal.GetLastWin32Error();
+                        if (error != 109 && error != 232) relayFailure = "write child input failed (Windows error " + error + ")";
+                        return;
+                    }
+                    if (written == 0) { relayFailure = "child input made no progress"; return; }
+                    count -= written;
+                    if (count > 0) Array.Copy(buffer, (int)written, buffer, 0, (int)count);
+                }
+            }
+        }
+        catch { relayFailure = "input relay failed"; }
+        finally
+        {
+            // EOF is control for the host. Keep the child's input open until its Job is terminated.
+            stopRequested.Set();
+        }
+    }
+
+    private void WaitForStop()
+    {
+        var handles = new[] { process, stopRequested.SafeWaitHandle.DangerousGetHandle() };
+        uint result = WaitForMultipleObjects((uint)handles.Length, handles, false, UInt32.MaxValue);
+        if (result != WaitObject0 && result != WaitObject0 + 1) throw Failure("wait for child or input closure");
+    }
+
+    private void Stop()
+    {
+        if (stopped) return;
+        stopAttempted = true;
+        var timer = Stopwatch.StartNew();
+        stopRequested.Set();
+        if (assigned)
+        {
+            // Also runs after a natural root exit, while its background descendants may still be alive.
+            if (!TerminateJobObject(job, 1)) throw Failure("terminate private job");
+        }
+        else if (process != IntPtr.Zero && !TerminateProcess(process, 1))
+            throw Failure("terminate unassigned suspended child");
+
+        if (process != IntPtr.Zero)
+        {
+            uint result = WaitForSingleObject(process, Remaining(timer));
+            if (result == WaitTimeout) throw new InvalidOperationException("guarded child shutdown timed out");
+            if (result != WaitObject0) throw Failure("wait for guarded child shutdown");
+        }
+        // Accounting retains a terminated process until references are released. Close our own handles first.
+        Close(ref primaryThread);
+        Close(ref process);
+        if (job != IntPtr.Zero)
+        {
+            while (true)
+            {
+                BasicAccounting accounting;
+                if (!QueryInformationJobObject(job, 1, out accounting, (uint)Marshal.SizeOf(typeof(BasicAccounting)), IntPtr.Zero))
+                    throw Failure("verify private job is empty");
+                if (accounting.ActiveProcesses == 0) break;
+                if (Remaining(timer) == 0) throw new InvalidOperationException("private job shutdown timed out");
+                Thread.Sleep(20);
+            }
+        }
+        stopped = true;
+    }
+
+    private static uint Remaining(Stopwatch timer)
+    {
+        return (uint)Math.Max(0, ShutdownMilliseconds - timer.ElapsedMilliseconds);
+    }
+
+    public void Dispose()
+    {
+        if (!stopped && !stopAttempted)
+        {
+            try { Stop(); }
+            catch { /* Closing the private Job remains the final fail-closed kill, never a successful stop. */ }
+        }
+        Close(ref primaryThread);
+        Close(ref process);
+        Close(ref job);
+        if (childInput != null) childInput.Dispose();
+        // A background relay may be blocked reading the parent's pipe. Process exit closes it without waiting.
+    }
+
+    private static IntPtr InheritableStandardHandle(int kind)
+    {
+        IntPtr result;
+        if (!DuplicateHandle(GetCurrentProcess(), GetStdHandle(kind), GetCurrentProcess(), out result, 0, true, 2))
+            throw Failure("duplicate standard output handle");
+        return result;
+    }
+
+    private static string Quote(string value)
+    {
+        var result = new StringBuilder("\"");
+        int slashes = 0;
+        foreach (char character in value)
+        {
+            if (character == '\\') { slashes++; continue; }
+            if (character == '"') result.Append('\\', slashes * 2 + 1);
+            else result.Append('\\', slashes);
+            result.Append(character);
+            slashes = 0;
+        }
+        return result.Append('\\', slashes * 2).Append('"').ToString();
+    }
+
+    private static InvalidOperationException Failure(string operation)
+    {
+        return new InvalidOperationException(operation + " failed (Windows error " + Marshal.GetLastWin32Error() + ")");
+    }
+
+    private static void Report(string message)
+    {
+        try { Console.Error.WriteLine("Rele process host: " + message + "."); } catch { }
+    }
+
+    private static void Close(ref IntPtr handle)
+    {
+        if (handle != IntPtr.Zero) { CloseHandle(handle); handle = IntPtr.Zero; }
+    }
+
+    [StructLayout(LayoutKind.Sequential)] private struct SecurityAttributes
+    {
+        public int Length;
+        public IntPtr Descriptor;
+        [MarshalAs(UnmanagedType.Bool)] public bool InheritHandle;
+    }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] private struct StartupInfo
+    {
+        public int Size;
+        public string Reserved, Desktop, Title;
+        public uint X, Y, XSize, YSize, XCountChars, YCountChars, FillAttribute, Flags;
+        public ushort ShowWindow, ReservedSize;
+        public IntPtr ReservedBytes, Input, Output, Error;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct StartupInfoEx
+    {
+        public StartupInfo Startup;
+        public IntPtr AttributeList;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct ProcessInformation
+    {
+        public IntPtr Process, Thread;
+        public uint ProcessId, ThreadId;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct BasicLimits
+    {
+        public long PerProcessUserTime, PerJobUserTime;
+        public uint Flags;
+        public UIntPtr MinimumWorkingSet, MaximumWorkingSet;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass, SchedulingClass;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct IoCounters
+    {
+        public ulong ReadOperations, WriteOperations, OtherOperations, ReadBytes, WriteBytes, OtherBytes;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct ExtendedLimits
+    {
+        public BasicLimits Basic;
+        public IoCounters Io;
+        public UIntPtr ProcessMemory, JobMemory, PeakProcessMemory, PeakJobMemory;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct BasicAccounting
+    {
+        public long TotalUserTime, TotalKernelTime, ThisPeriodTotalUserTime, ThisPeriodTotalKernelTime;
+        public uint TotalPageFaultCount, TotalProcesses, ActiveProcesses, TotalTerminatedProcesses;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool SetInformationJobObject(IntPtr job, int type, ref ExtendedLimits info, uint size);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool QueryInformationJobObject(IntPtr job, int type, out BasicAccounting info, uint size, IntPtr returnedLength);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool CreatePipe(out IntPtr read, out IntPtr write, ref SecurityAttributes attributes, uint size);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool SetHandleInformation(SafeFileHandle handle, uint mask, uint flags);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool DuplicateHandle(IntPtr sourceProcess, IntPtr source, IntPtr targetProcess, out IntPtr target, uint access, bool inherit, uint options);
+    [DllImport("kernel32.dll")] private static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr GetStdHandle(int kind);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool InitializeProcThreadAttributeList(IntPtr list, uint count, uint flags, ref UIntPtr size);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, UIntPtr attribute, IntPtr value, UIntPtr size, IntPtr previous, IntPtr returnedSize);
+    [DllImport("kernel32.dll")] private static extern void DeleteProcThreadAttributeList(IntPtr list);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool CreateProcess(string application, StringBuilder commandLine, IntPtr processAttributes, IntPtr threadAttributes, bool inherit, uint flags, IntPtr environment, string directory, ref StartupInfoEx startup, out ProcessInformation information);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern uint ResumeThread(IntPtr thread);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern uint WaitForMultipleObjects(uint count, IntPtr[] handles, bool all, uint milliseconds);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool ReadFile(IntPtr file, byte[] buffer, uint count, out uint read, IntPtr overlapped);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool WriteFile(SafeFileHandle file, byte[] buffer, uint count, out uint written, IntPtr overlapped);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool CloseHandle(IntPtr handle);
+}
