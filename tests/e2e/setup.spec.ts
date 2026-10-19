@@ -133,12 +133,13 @@ test('disconnected and failing Codex catalogs never appear as empty and can reco
 
   state.codex.connected = true;
   state.codex.error = undefined;
-  await page.route('**/api/threads?*', (route) =>
-    route.fulfill({
+  await page.route('**/api/threads?*', (route) => {
+    expect(new URL(route.request().url()).searchParams.get('refresh')).not.toBe('true');
+    return route.fulfill({
       status: 503,
       json: { error: 'Пример: список разговоров временно недоступен.' },
-    }),
-  );
+    });
+  });
   await page
     .getByRole('button', { name: 'Переподключить', exact: true })
     .click();
@@ -261,6 +262,7 @@ test('managed is the default and recommends a usable Desktop executable independ
   });
   let nextRequested = false;
   await page.route('**/api/threads?*', async (route) => {
+    expect(new URL(route.request().url()).searchParams.get('refresh')).not.toBe('true');
     const changed = state.config.codex.executable === candidate.executable;
     if (changed) {
       nextRequested = true;

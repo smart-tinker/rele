@@ -12,8 +12,8 @@ import { codexEnvironment, resolveCodexLaunch } from './codex-launch.js';
 import { CodexStdioError, CodexStdioTransport } from './codex-stdio.js';
 
 export { SUPPORTED_CODEX_VERSION } from '../shared/codex-runtime.js';
-// An omitted filter silently hides app-server and other persisted sources.
-const THREAD_SOURCES = ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview', 'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown'];
+// Keep user conversations from every normal client; technical subagents are not binding targets.
+const THREAD_SOURCES = ['cli', 'vscode', 'exec', 'appServer'];
 export interface CodexConfig {
   transport: CodexConnectionTarget['transport'];
   executable: string;
@@ -39,6 +39,11 @@ interface Page<T> { data: T[]; nextCursor: string | null }
 interface RawThread {
   id: string; name?: string | null; cwd: string; preview: string; updatedAt: number;
   status?: { type: string }; ephemeral?: boolean;
+  source?: string | Record<string, unknown>; parentThreadId?: string | null;
+}
+function isBindableThread(thread: RawThread): boolean {
+  return !thread.ephemeral && !thread.parentThreadId
+    && (thread.source === undefined || typeof thread.source === 'string' && THREAD_SOURCES.includes(thread.source));
 }
 interface PendingCall {
   resolve: (value: unknown) => void;
@@ -133,13 +138,14 @@ export class CodexClient extends EventEmitter {
     return this.disconnect('Соединение с Codex закрыто.');
   }
 
-  async listThreads(options: { archived?: boolean } = {}): Promise<CodexThread[]> {
+  async listThreads(options: { archived?: boolean; refresh?: boolean } = {}): Promise<CodexThread[]> {
     const archived = options.archived === true;
     const rows = await this.pages<RawThread>('thread/list', {
       limit: 100, sortKey: 'updated_at', modelProviders: [], archived,
-      sourceKinds: THREAD_SOURCES,
+      sourceKinds: THREAD_SOURCES, useStateDbOnly: options.refresh !== true,
     });
-    return rows.filter(row => !row.ephemeral).map(row => ({
+    if (options.refresh && !archived && this.isVerifiedVersion() && !this.state.queueSupported) await this.probeQueue(rows);
+    return rows.filter(isBindableThread).map(row => ({
       id: row.id,
       name: row.name?.trim() || row.preview?.replace(/\s+/gu, ' ').trim().slice(0, 100) || 'Без названия',
       cwd: row.cwd, preview: row.preview || '', updatedAt: row.updatedAt, status: row.status?.type, archived,
@@ -439,9 +445,9 @@ export class CodexClient extends EventEmitter {
     this.retry = 0;
   }
 
-  private async probeQueue(): Promise<void> {
-    const threads = await this.call<Page<RawThread>>('thread/list', { limit: 100, modelProviders: [], sortKey: 'updated_at', sourceKinds: THREAD_SOURCES, archived: false });
-    for (const thread of threads.data.filter(row => !row.ephemeral)) {
+  private async probeQueue(rows?: RawThread[]): Promise<void> {
+    const threads = rows ?? (await this.call<Page<RawThread>>('thread/list', { limit: 100, modelProviders: [], sortKey: 'updated_at', sourceKinds: THREAD_SOURCES, archived: false, useStateDbOnly: true })).data;
+    for (const thread of threads.filter(isBindableThread)) {
       try {
         await this.call('thread/queue/list', { threadId: thread.id, limit: 1 });
         this.setState({ queueSupported: true, error: undefined });

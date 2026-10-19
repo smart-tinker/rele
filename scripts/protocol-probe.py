@@ -197,6 +197,12 @@ supports_websockets=false
         history=result(await b.call('thread/turns/list',{'threadId':thread,'limit':10,'itemsView':'full'}))
         assert any(any(it.get('clientId')==qid for it in turn.get('items',[])) for turn in history['data'])
         report['checks']['history_has_recovery_client_id']=True
+        normal_sources=['cli','vscode','exec','appServer']
+        catalog=result(await b.call('thread/list',{'limit':100,'modelProviders':[],
+            'sourceKinds':normal_sources,'useStateDbOnly':True,'archived':False}))
+        assert any(item['id']==thread for item in catalog['data']),catalog
+        assert all(item['source'] in normal_sources and not item.get('parentThreadId') for item in catalog['data']),catalog
+        report['checks']['indexed_normal_source_catalog']=True
         # Native clients can steer an already running Rele turn. The gateway must
         # quarantine such a turn instead of forwarding its mixed final answer.
         steer_hold=asyncio.Event(); next_actions.append(('hold',steer_hold))

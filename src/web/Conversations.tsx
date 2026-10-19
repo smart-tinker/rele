@@ -593,7 +593,10 @@ function NewConversation({
         />
         <span>Показать архивные разговоры</span>
       </label>
-      <Field label="Разговор Codex">
+      <Field
+        label="Разговор Codex"
+        hint="Показаны пользовательские разговоры. Если старого разговора нет, нажмите «Обновить разговоры» для полного перечитывания."
+      >
         <select
           value={threadId}
           required
@@ -679,7 +682,7 @@ function NewConversation({
           icon="refresh"
           busy={threadsLoading}
           disabled={!state.codex.connected}
-          onClick={() => void loadThreads()}
+          onClick={() => void loadThreads(true)}
         >
           Обновить разговоры
         </Button>

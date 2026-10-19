@@ -26,16 +26,19 @@ export function useCodexThreads(
     error: string;
   }>({ key: '', threads: [], loading: connected, error: '' });
   const request = useRef<AbortController | null>(null);
+  const fullRefresh = useRef(false);
 
   useEffect(() => {
     const controller = new AbortController();
+    const refresh = fullRefresh.current;
+    fullRefresh.current = false;
     request.current = controller;
     setResult({ key, threads: [], loading: connected, error: '' });
     if (connected) {
       void Promise.allSettled(
         (includeArchived ? [false, true] : [false]).map(async (archived) => {
           const page = await api.request<{ threads: CodexThread[] }>(
-            `/api/threads?archived=${archived}`,
+            `/api/threads?archived=${archived}${refresh ? '&refresh=true' : ''}`,
             'GET',
             undefined,
             controller.signal,
@@ -68,7 +71,8 @@ export function useCodexThreads(
   return {
     ...current,
     ready: connected && !current.loading && !current.error,
-    reload: () => {
+    reload: (refresh = false) => {
+      fullRefresh.current = refresh;
       request.current?.abort();
       setResult({ key, threads: [], loading: connected, error: '' });
       setRevision((value) => value + 1);

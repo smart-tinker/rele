@@ -416,10 +416,16 @@ export function TelegramCatalogPicker({
       <div className="catalog-instruction">
         <strong>Не хватает чата или темы?</strong>
         <p>
-          В нужном разговоре отправьте боту <code>{info.command} [имя]</code>,
+          В нужном разговоре отправьте боту <code>/rele_register [имя]</code>,
           затем нажмите «Обновить». Имя можно не указывать. Команда добавляет
           разговор в каталог и не запускает Codex.
         </p>
+        {info.command !== '/rele_register' && (
+          <p>
+            Если бот не отвечает в группе, отправьте отдельным сообщением{' '}
+            <code>{info.command} [имя]</code>.
+          </p>
+        )}
         {!botUrl && (
           <p>
             Для выбора группы подключите токен бота в разделе «Подключения».
