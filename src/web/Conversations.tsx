@@ -1,14 +1,14 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { useMemo, useState, type FormEvent } from 'react';
 import type {
   Binding,
-  CodexThread,
   Conversation,
   DashboardState,
   Endpoint,
   Platform,
 } from '../shared/types';
-import { errorText, ReleApi, safeHref } from './client';
+import { ReleApi, safeHref } from './client';
 import { useAction } from './hooks';
+import { useCodexThreads } from './useCodexThreads';
 import {
   AllowedSenders,
   SlackCatalogPicker,
@@ -277,6 +277,7 @@ export function Conversations({
             state={state}
             api={api}
             refresh={refresh}
+            onCodex={() => onNavigate('codex')}
             onCreated={async (id) => {
               await refresh();
               setEditing(id);
@@ -485,17 +486,16 @@ function NewConversation({
   api,
   refresh,
   onCreated,
+  onCodex,
 }: {
   state: DashboardState;
   api: ReleApi;
   refresh: () => Promise<void>;
   onCreated: (id: string) => Promise<void>;
+  onCodex: () => void;
 }) {
   const [name, setName] = useState('');
   const [threadId, setThreadId] = useState('');
-  const [threads, setThreads] = useState<CodexThread[]>([]);
-  const [threadsLoading, setThreadsLoading] = useState(true);
-  const [threadsError, setThreadsError] = useState('');
   const [bindings, setBindings] = useState<Record<Platform, BindingDraft>>({
     telegram: emptyBinding(),
     slack: emptyBinding(),
@@ -503,65 +503,21 @@ function NewConversation({
   const action = useAction();
   const [threadQuery, setThreadQuery] = useState('');
   const [includeArchived, setIncludeArchived] = useState(false);
-  const threadRequest = useRef<AbortController | null>(null);
+  const {
+    threads,
+    loading: threadsLoading,
+    error: threadsError,
+    ready: threadsReady,
+    reload: loadThreads,
+  } = useCodexThreads(api, state, includeArchived);
   const threadOwner = (id: string) =>
     state.conversations.find((item) => item.threadId === id);
-  const selected = threads.find(
-    (item) => item.id === threadId && !item.archived && !threadOwner(item.id),
-  );
-  const loadThreads = async () => {
-    threadRequest.current?.abort();
-    const controller = new AbortController();
-    threadRequest.current = controller;
-    setThreadsLoading(true);
-    setThreadsError('');
-    const results = await Promise.allSettled([
-      api.request<{ threads: CodexThread[] }>(
-        '/api/threads?archived=false',
-        'GET',
-        undefined,
-        controller.signal,
-      ),
-      ...(includeArchived
-        ? [
-            api.request<{ threads: CodexThread[] }>(
-              '/api/threads?archived=true',
-              'GET',
-              undefined,
-              controller.signal,
-            ),
-          ]
-        : []),
-    ]);
-    if (controller.signal.aborted) return;
-    const active = results[0];
-    const archived = results[1];
-    setThreads((current) => [
-      ...(active.status === 'fulfilled'
-        ? active.value.threads.map((thread) => ({ ...thread, archived: false }))
-        : current.filter((thread) => !thread.archived)),
-      ...(includeArchived
-        ? archived?.status === 'fulfilled'
-          ? archived.value.threads.map((thread) => ({
-              ...thread,
-              archived: true,
-            }))
-          : current.filter((thread) => thread.archived)
-        : []),
-    ]);
-    setThreadsError(
-      results
-        .flatMap((result) =>
-          result.status === 'rejected' ? [errorText(result.reason)] : [],
-        )
-        .join(' '),
-    );
-    setThreadsLoading(false);
-  };
-  useEffect(() => {
-    void loadThreads();
-    return () => threadRequest.current?.abort();
-  }, [api, includeArchived]);
+  const selected = threadsReady
+    ? threads.find(
+        (item) =>
+          item.id === threadId && !item.archived && !threadOwner(item.id),
+      )
+    : undefined;
   const filteredThreads = threads.filter(
     (thread) =>
       thread.id === threadId ||
@@ -641,7 +597,7 @@ function NewConversation({
         <select
           value={threadId}
           required
-          disabled={threadsLoading || action.busy}
+          disabled={!threadsReady || action.busy}
           onChange={(event) => {
             const thread = threads.find(
               (item) => item.id === event.target.value,
@@ -653,7 +609,11 @@ function NewConversation({
           <option value="">
             {threadsLoading
               ? 'Загружаем разговоры…'
-              : 'Выберите разговор по названию'}
+              : !state.codex.connected
+                ? 'Сначала подключите Codex'
+                : threadsError
+                  ? 'Не удалось загрузить разговоры'
+                  : 'Выберите разговор по названию'}
           </option>
           {filteredThreads.map((thread) => {
             const occupied = threadOwner(thread.id);
@@ -672,7 +632,7 @@ function NewConversation({
           })}
         </select>
       </Field>
-      {!threadsLoading && (
+      {threadsReady && (
         <p className="field-hint">
           Свободных: {availableThreads.length}. В связках:{' '}
           {threads.filter((thread) => !!threadOwner(thread.id)).length}.
@@ -681,7 +641,7 @@ function NewConversation({
             : ''}
         </p>
       )}
-      {!threadsLoading && !!threadQuery && !filteredThreads.length && (
+      {threadsReady && !!threadQuery && !filteredThreads.length && (
         <p className="field-hint">
           Разговоров с таким названием, папкой или текстом не найдено.
         </p>
@@ -701,7 +661,14 @@ function NewConversation({
         </div>
       )}
       {threadsError && <Notice>{threadsError}</Notice>}
-      {!threadsLoading && !availableThreads.length && (
+      {!state.codex.connected && (
+        <Notice tone="warning">
+          Codex не подключён. Откройте настройки Codex и выберите найденное
+          подключение, затем вернитесь к созданию связки.
+          {state.codex.error && ` ${state.codex.error}`}
+        </Notice>
+      )}
+      {threadsReady && !availableThreads.length && (
         <Notice tone="info">
           Нет свободных разговоров Codex. Создайте разговор в Codex, затем
           обновите список.
@@ -711,10 +678,14 @@ function NewConversation({
         <Button
           icon="refresh"
           busy={threadsLoading}
+          disabled={!state.codex.connected}
           onClick={() => void loadThreads()}
         >
           Обновить разговоры
         </Button>
+        {(!state.codex.connected || threadsError) && (
+          <Button onClick={onCodex}>Настроить Codex</Button>
+        )}
       </div>
       {platforms.map((platform) => (
         <section className="form-section" key={platform}>

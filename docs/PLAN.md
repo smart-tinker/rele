@@ -9,10 +9,10 @@
 | 3. Telegram / Slack | Long polling / Socket Mode, имена, ACL, подтверждения, voice attachments | Автотесты плюс разрешённые настоящие тестовые чаты |
 | 4. Панель | Каталог Codex / Slack, обнаруженные чаты Telegram и регистрация тем, связки по названиям, очередь, доставка, настройки | Браузерные и production smoke сценарии |
 | 5. Надёжность / голос | Корреляция, неопределённые состояния, mixed-turn защита, локальный worker | Автотесты, offline model proof, приёмка на целевых машинах |
-| 6. Установка | Portable runtime, SHA-256, user autostart, backup / restore, CI обеих ОС | Проверка каждого собранного архива |
+| 6. Установка | Windows Setup / native launcher / пользовательская задача; Debian / systemd; portable runtime; SHA-256; backup / restore | Реальные install → restart → upgrade → uninstall smoke обеих ОС плюс архивы |
 | 7. Выпуск | Автоматическая публикация только явного -rc.N после зелёного CI | Stable после фактического закрытия Desktop / messenger условий |
 
-Рабочий кандидат: **0.1.0-rc.2**. Каталог разговоров: [issue #4](https://github.com/smart-tinker/rele/issues/4), [пользовательский сценарий](CATALOG.md). Точные результаты и сборки доступны в GitHub Actions соответствующего commit. Первоначальные плановые варианты заменены проверенными решениями из [ARCHITECTURE.md](ARCHITECTURE.md).
+Рабочий кандидат: **0.1.0-rc.3**. Каталог разговоров: [issue #4](https://github.com/smart-tinker/rele/issues/4), [пользовательский сценарий](CATALOG.md). Установщики и автоматический поиск Codex: [установка](INSTALLATION.md), [issue #8](https://github.com/smart-tinker/rele/issues/8). Точные результаты и сборки доступны в GitHub Actions соответствующего commit. Первоначальные плановые варианты заменены проверенными решениями из [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Принятые ограничения
 

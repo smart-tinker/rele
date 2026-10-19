@@ -33,6 +33,12 @@ export function isLocalEndpoint(value: string): boolean {
   } catch { return false; }
 }
 
+/** An app-server proxy takes a local control socket path, never a WebSocket URL. */
+export function isLocalSocketPath(value: string): boolean {
+  return !!value && value.length <= 4096 && !/[\x00-\x1f]/u.test(value)
+    && (/^\/(?!\/)/u.test(value) || /^[A-Za-z]:[\\/]/u.test(value) || /^\\\\\.\\pipe\\[^\\]+/iu.test(value));
+}
+
 function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Ожидается объект настроек.');
   return value as Record<string, unknown>;
@@ -66,6 +72,9 @@ export function mergeConfig(current: AppConfig, input: unknown): AppConfig {
   }
   if (!['proxy', 'websocket'].includes(next.codex.transport)) throw new Error('Неизвестный транспорт Codex.');
   if (!next.codex.executable || /[\r\n]/u.test(next.codex.executable)) throw new Error('Укажите путь к Codex CLI.');
+  // Older panels submit the now-hidden WebSocket field when switching to proxy.
+  if (next.codex.transport === 'proxy' && current.codex.transport === 'websocket' && next.codex.endpoint === current.codex.endpoint) next.codex.endpoint = '';
+  if (next.codex.transport === 'proxy' && next.codex.endpoint && !isLocalSocketPath(next.codex.endpoint)) throw new Error('Для локального proxy нужен абсолютный путь к сокету, а не WebSocket URL. Для автоматического подключения оставьте адрес пустым.');
   if (next.codex.transport === 'websocket' && !isLocalEndpoint(next.codex.endpoint)) throw new Error('Codex должен использовать локальный ws:// или wss:// адрес без параметров и пароля.');
   if (next.telegram.token && !/^\d+:[A-Za-z0-9_-]{20,}$/u.test(next.telegram.token)) throw new Error('Некорректный токен Telegram.');
   if (next.telegram.enabled && !next.telegram.token) throw new Error('Для Telegram нужен токен бота.');
@@ -124,6 +133,10 @@ export class ConfigStore {
       if (process.platform === 'win32' && envelope.encoding !== 'dpapi') throw new Error('Импорт открытых секретов на Windows требует повторной настройки.');
       const decoded = envelope.encoding === 'dpapi' ? await protectWindows(envelope.value, true) : envelope.value;
       const saved = JSON.parse(decoded) as { config: AppConfig; panelToken: string };
+      // rc.2 could persist the hidden WebSocket field after a switch to proxy.
+      // Repair only that invalid combination in memory; keep valid explicit targets.
+      const legacyCodex = saved?.config?.codex;
+      if (legacyCodex?.transport === 'proxy' && typeof legacyCodex.endpoint === 'string' && /^wss?:\/\//iu.test(legacyCodex.endpoint.trim())) legacyCodex.endpoint = '';
       this.config = mergeConfig(defaultConfig, saved.config);
       if (typeof saved.panelToken !== 'string' || !/^[a-f0-9]{64}$/u.test(saved.panelToken)) throw new Error('Некорректный ключ панели.');
       this.panelToken = saved.panelToken;

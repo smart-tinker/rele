@@ -1,6 +1,7 @@
 import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
 import { existsSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import type { AppConfig, ConfigStore } from './config.js';
 import { mergeConfig, publicConfig } from './config.js';
 import type { Store } from './store.js';
@@ -8,6 +9,7 @@ import type { Engine } from './engine.js';
 import type { CodexClient } from './codex.js';
 import type { DashboardState, Endpoint, Platform } from '../shared/types.js';
 import { ChannelError } from './channels/common.js';
+import { discoverCodex } from './codex-discovery.js';
 
 export interface AppServices {
   store: Store;
@@ -17,6 +19,8 @@ export interface AppServices {
   configure: (next: AppConfig) => Promise<void>;
   version: string;
   webDirectory?: string;
+  shutdown?: () => Promise<void>;
+  discoverCodex?: typeof discoverCodex;
 }
 
 class ApiError extends Error { constructor(readonly statusCode: number, message: string) { super(message); } }
@@ -37,11 +41,15 @@ function localHost(host: string | undefined): boolean {
 export function createApp(services: AppServices) {
   const app = Fastify({ logger: false, bodyLimit: 100_000, requestTimeout: 30_000, trustProxy: false });
   const { store, config, engine } = services;
+  const launchTokens = new Map<string, number>();
+  app.addHook('onClose', async () => { launchTokens.clear(); });
   app.addHook('onRequest', async (request, reply) => {
     if (!localHost(request.headers.host)) return reply.code(403).send({ error: 'Панель доступна только через локальный адрес.' });
     const origin = request.headers.origin;
     if (origin && origin !== `http://${request.headers.host}`) return reply.code(403).send({ error: 'Запрос с другого сайта запрещён.' });
-    if ((request.url === '/api' || request.url.startsWith('/api/')) && request.url.split('?')[0] !== '/api/health' && !config.authorized(request.headers.authorization)) return reply.code(401).send({ error: 'Нужен ключ локальной панели Rele.' });
+    const route = request.url.split('?')[0];
+    const publicRequest = route === '/api/health' || (route === '/api/session/launch' && request.method === 'POST');
+    if ((route === '/api' || route.startsWith('/api/')) && !publicRequest && !config.authorized(request.headers.authorization)) return reply.code(401).send({ error: 'Нужен ключ локальной панели Rele.' });
   });
   app.addHook('onSend', async (request, reply, payload) => {
     reply.header('X-Content-Type-Options', 'nosniff');
@@ -65,6 +73,34 @@ export function createApp(services: AppServices) {
   });
 
   app.get('/api/health', async () => ({ ok: true, version: services.version }));
+  app.get('/api/instance', async () => ({ pid: process.pid, version: services.version }));
+  app.post('/api/session/launch-token', async () => {
+    const now = Date.now();
+    for (const [token, expires] of launchTokens) if (expires <= now) launchTokens.delete(token);
+    // A launcher link grants local panel access once, for at most one minute.
+    // Bound the map even when an authenticated launcher is called repeatedly.
+    while (launchTokens.size >= 16) launchTokens.delete(launchTokens.keys().next().value!);
+    const token = randomBytes(32).toString('base64url');
+    launchTokens.set(token, now + 60_000);
+    return { token, expiresInSeconds: 60 };
+  });
+  app.post('/api/session/launch', async request => {
+    const body = object(request.body); fields(body, ['token']);
+    const token = string(body.token, 'одноразовая ссылка', 128);
+    const expires = launchTokens.get(token);
+    launchTokens.delete(token);
+    if (!expires || expires <= Date.now()) throw new ApiError(401, 'Ссылка недействительна или истекла. Откройте Rele заново.');
+    return { key: config.panelToken };
+  });
+  app.post('/api/shutdown', async (_request, reply) => {
+    if (!services.shutdown) throw new ApiError(503, 'Управление завершением недоступно в этом режиме.');
+    // Finish the authenticated response before closing the HTTP listener.
+    reply.raw.once('finish', () => {
+      void services.shutdown!().catch(() => { process.stderr.write('Rele: не удалось штатно завершить фоновый процесс.\n'); });
+    });
+    return { ok: true };
+  });
+  app.get('/api/codex/discovery', async () => (services.discoverCodex ?? discoverCodex)());
   app.get('/api/state', async (): Promise<DashboardState> => ({
     version: services.version,
     codex: services.codex().status(),

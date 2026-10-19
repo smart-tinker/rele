@@ -13,6 +13,7 @@ import {
   ConfigStore,
   defaultConfig,
   isLocalEndpoint,
+  isLocalSocketPath,
   mergeConfig,
   publicConfig,
 } from '../src/server/config.js';
@@ -46,6 +47,24 @@ function configured() {
 }
 
 describe('configuration validation and public projection', () => {
+  it('clears the previous hidden WebSocket address when switching back to automatic proxy', () => {
+    const websocket = mergeConfig(defaultConfig, { codex: { transport: 'websocket', endpoint: 'ws://127.0.0.1:4500' } });
+    const proxy = mergeConfig(websocket, { codex: { transport: 'proxy', executable: 'codex', endpoint: websocket.codex.endpoint } });
+    expect(proxy.codex).toMatchObject({ transport: 'proxy', executable: 'codex', endpoint: '' });
+    expect(websocket.codex.endpoint).toBe('ws://127.0.0.1:4500');
+  });
+
+  it('preserves an explicit local control socket and refuses URLs or network paths in proxy mode', () => {
+    for (const endpoint of ['/home/example/.codex/control.sock', 'C:\\Example User\\.codex\\control.sock', '\\\\.\\pipe\\codex-control']) {
+      expect(isLocalSocketPath(endpoint)).toBe(true);
+      expect(mergeConfig(defaultConfig, { codex: { executable: 'custom-cli', endpoint } }).codex).toMatchObject({ executable: 'custom-cli', endpoint });
+    }
+    for (const endpoint of ['ws://127.0.0.1:4500', 'relative.sock', '\\\\remote-server\\share\\control.sock', '//remote-server/share/control.sock']) {
+      expect(isLocalSocketPath(endpoint)).toBe(false);
+      expect(() => mergeConfig(defaultConfig, { codex: { endpoint } })).toThrow('сокету');
+    }
+  });
+
   it('preserves existing secrets for empty fields, replaces explicit values and never mutates defaults', () => {
     const current = configured();
     const next = mergeConfig(current, {
@@ -142,6 +161,26 @@ describe('configuration validation and public projection', () => {
 });
 
 describe('configuration storage and panel credentials', () => {
+  it.each([
+    { transport: 'proxy', endpoint: 'ws://127.0.0.1:4500', restored: '' },
+    { transport: 'proxy', endpoint: 'wss://localhost:4500', restored: '' },
+    { transport: 'proxy', endpoint: 'C:\\Example User\\control.sock', restored: 'C:\\Example User\\control.sock' },
+    { transport: 'websocket', endpoint: 'ws://127.0.0.1:4500', restored: 'ws://127.0.0.1:4500' },
+  ] as const)('loads an rc.2 configuration while preserving valid connection targets: $transport $endpoint', async example => {
+    const root = await directory();
+    const first = new ConfigStore(root);
+    first.panelToken = 'f'.repeat(64);
+    const value = configured();
+    value.codex = { ...value.codex, executable: 'custom-cli', transport: example.transport, endpoint: example.endpoint };
+    await first.save(value);
+    const original = await readFile(join(root, 'config.json'), 'utf8');
+    const restored = new ConfigStore(root);
+    await restored.load();
+    expect(restored.config.codex).toMatchObject({ executable: 'custom-cli', transport: example.transport, endpoint: example.restored, token: syntheticSecrets.codex });
+    expect(restored.panelToken).toBe(first.panelToken);
+    expect(await readFile(join(root, 'config.json'), 'utf8')).toBe(original);
+  }, 15_000);
+
   it('shares one complete configuration when several instances initialize the same directory at once', async () => {
     const root = await directory();
     const stores = Array.from({ length: 4 }, () => new ConfigStore(root));

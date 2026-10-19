@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+case "$1" in
+  upgrade)
+    /opt/rele/runtime/node /opt/rele/scripts/linux-service.mjs --package-before-upgrade
+    ;;
+  remove|deconfigure)
+    /opt/rele/runtime/node /opt/rele/scripts/linux-service.mjs --package-remove
+    ;;
+esac

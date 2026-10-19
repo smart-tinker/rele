@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { copyFile, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -66,6 +66,66 @@ afterEach(async () => {
 });
 
 describe('CLI lifecycle and durable backup', () => {
+  it('opens a running instance with a single-use link and stops it without losing data', async () => {
+    const { config } = await fixture();
+    expect((await result(launch(config.directory, ['stop']))).code).toBe(0);
+    const server = launch(config.directory);
+    const address = await ready(server);
+    const status = await result(launch(config.directory, ['status', '--wait']));
+    expect(status.code, status.errors).toBe(0);
+    expect(JSON.parse(status.output)).toMatchObject({ running: true, pid: server.child.pid, address: new URL(address).origin });
+    expect(status.output).not.toContain(config.panelToken);
+    const opened = await result(launch(config.directory, ['open', '--print-url']));
+    expect(opened.code, opened.errors).toBe(0);
+    expect(opened.output).not.toContain(config.panelToken);
+    const link = new URL(opened.output.trim());
+    expect(link.origin).toBe(new URL(address).origin);
+    const token = new URLSearchParams(link.hash.slice(1)).get('rele-launch');
+    expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    const exchange = () => fetch(new URL('/api/session/launch', address), {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token }),
+    });
+    const login = await exchange();
+    expect(login.status).toBe(200);
+    expect(await login.json()).toEqual({ key: config.panelToken });
+    expect((await exchange()).status).toBe(401);
+    const stopped = await result(launch(config.directory, ['stop']));
+    expect(stopped.code, stopped.errors).toBe(0);
+    expect((await result(server)).code).toBe(0);
+    expect((await result(launch(config.directory, ['stop']))).code).toBe(0);
+    expect((await result(launch(config.directory, ['status']))).code).toBe(1);
+    const saved = new ConfigStore(config.directory);
+    await saved.load();
+    expect(saved.panelToken).toBe(config.panelToken);
+    expect(await readFile(join(config.directory, 'rele.sqlite'))).not.toHaveLength(0);
+    await ready(launch(config.directory));
+  }, 60_000);
+
+  it('rejects a non-local instance address before sending a panel key or stopping anything', async () => {
+    const { config } = await fixture();
+    await writeFile(join(config.directory, 'instance.json'), JSON.stringify({ pid: process.pid, address: 'https://example.com', version: 'test' }));
+    for (const command of ['open', 'stop']) {
+      const attempted = await result(launch(config.directory, [command, '--print-url']));
+      expect(attempted.code).toBe(1);
+      expect(attempted.errors).toMatch(/Некорректный локальный адрес/u);
+      expect(attempted.errors + attempted.output).not.toContain(config.panelToken);
+    }
+  }, 30_000);
+
+  it('refuses to stop a live instance whose PID does not match its authenticated identity', async () => {
+    const { config } = await fixture();
+    const server = launch(config.directory);
+    const address = await ready(server);
+    const file = join(config.directory, 'instance.json');
+    const marker = JSON.parse(await readFile(file, 'utf8'));
+    await writeFile(file, JSON.stringify({ ...marker, pid: process.pid }));
+    const attempted = await result(launch(config.directory, ['stop']));
+    expect(attempted.code).toBe(1);
+    expect(attempted.errors).toMatch(/не совпадает/u);
+    expect((await fetch(new URL('/api/health', address))).status).toBe(200);
+    await writeFile(file, JSON.stringify(marker));
+  }, 30_000);
+
   it('rejects a second owner of the data directory and releases its lock after a killed process', async () => {
     const { config } = await fixture();
     const first = launch(config.directory);

@@ -3,11 +3,18 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type FormEvent,
   type ReactNode,
 } from 'react';
-import { ReleApi, initialToken, saveToken } from './client';
+import {
+  ReleApi,
+  exchangeLaunchToken,
+  errorText,
+  saveToken,
+  type InitialSession,
+} from './client';
 import { useDashboard } from './hooks';
 import { Conversations } from './Conversations';
 import { Deliveries, Queue } from './Activity';
@@ -51,17 +58,42 @@ class ErrorBoundary extends Component<
   }
 }
 
-export function App() {
+export function App({ initialSession }: { initialSession: InitialSession }) {
   return (
     <ErrorBoundary>
-      <Session />
+      <Session initial={initialSession} />
     </ErrorBoundary>
   );
 }
 
-function Session() {
-  const [token, setToken] = useState(initialToken);
+function Session({ initial }: { initial: InitialSession }) {
+  const [token, setToken] = useState(initial.token);
   const [authError, setAuthError] = useState('');
+  const [launching, setLaunching] = useState(initial.launchToken !== undefined);
+  const launchRequest = useRef<Promise<string> | null>(null);
+  useEffect(() => {
+    if (initial.launchToken === undefined) return;
+    let active = true;
+    // StrictMode runs effects twice; a one-time link must be redeemed only once.
+    launchRequest.current ??= exchangeLaunchToken(initial.launchToken);
+    void launchRequest.current.then(
+      (next) => {
+        if (!active) return;
+        saveToken(next);
+        setToken(next);
+        setAuthError('');
+        setLaunching(false);
+      },
+      (cause) => {
+        if (!active) return;
+        setAuthError(errorText(cause));
+        setLaunching(false);
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, [initial.launchToken]);
   const signOut = useCallback(() => {
     saveToken('');
     setToken('');
@@ -83,16 +115,18 @@ function Session() {
       onSignOut={signOut}
     />
   ) : (
-    <SignIn error={authError} onSignIn={signIn} />
+    <SignIn error={authError} onSignIn={signIn} launching={launching} />
   );
 }
 
 function SignIn({
   error,
   onSignIn,
+  launching,
 }: {
   error: string;
   onSignIn: (token: string) => void;
+  launching: boolean;
 }) {
   const [token, setToken] = useState('');
   const submit = (event: FormEvent) => {
@@ -115,13 +149,24 @@ function SignIn({
               autoFocus
               autoComplete="off"
               required
+              disabled={launching}
               value={token}
               onChange={(event) => setToken(event.target.value)}
               placeholder="Токен доступа"
             />
           </Field>
           {error && <Notice>{error}</Notice>}
-          <Button type="submit" variant="primary" disabled={!token.trim()}>
+          {launching && (
+            <p className="field-hint" role="status">
+              Проверяем одноразовую ссылку…
+            </p>
+          )}
+          <Button
+            type="submit"
+            variant="primary"
+            disabled={!token.trim()}
+            busy={launching}
+          >
             Открыть Rele
           </Button>
         </form>

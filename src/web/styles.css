@@ -1198,6 +1198,72 @@ tbody tr:hover {
 .codex-form > h2 {
   margin-bottom: 23px;
 }
+.codex-runtime {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+  gap: 16px;
+  margin: 20px 0;
+  padding: 20px 24px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-size: 13px;
+}
+.codex-runtime dt {
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.codex-runtime dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.codex-runtime dd span {
+  display: block;
+  margin-top: 4px;
+}
+.codex-discovery {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+.codex-discovery legend {
+  font-weight: 600;
+  margin-bottom: 16px;
+}
+.discovery-heading {
+  margin: 8px 0 0;
+}
+.discovery-heading h3 {
+  margin: 0;
+  font-size: 14px;
+}
+.discovery-options {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.discovery-option {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+.discovery-option:has(input:checked) {
+  border-color: var(--accent);
+}
+.discovery-option .status {
+  margin-top: 8px;
+}
+.discovery-path {
+  overflow-wrap: anywhere;
+}
+.codex-manual {
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
 .threads-section {
   margin-top: 34px;
 }

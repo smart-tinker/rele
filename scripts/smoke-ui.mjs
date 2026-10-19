@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { chromium, expect } from '@playwright/test';
 import { ConfigStore, mergeConfig } from '../dist/server/config.js';
 
@@ -19,6 +20,43 @@ const browserErrors = [];
 const bearerFailures = [];
 let server;
 let browser;
+const runFile = promisify(execFile);
+
+async function launchUrl(address) {
+  let output;
+  try {
+    output = await runFile(
+      process.execPath,
+      ['dist/server/main.js', 'open', '--print-url'],
+      {
+        cwd: root,
+        env: { ...process.env, RELE_DATA_DIR: directory, RELE_PORT: '0' },
+        windowsHide: true,
+        timeout: 15000,
+        maxBuffer: 65536,
+      },
+    );
+  } catch (cause) {
+    throw new Error(
+      `Opening the production panel failed: ${config.redact(String(cause.stderr || cause.message))}`,
+    );
+  }
+  const url = new URL(output.stdout.trim());
+  assert.equal(url.origin + url.pathname, address);
+  assert.equal(url.search, '');
+  const fragment = new URLSearchParams(url.hash.slice(1));
+  assert.deepEqual([...fragment.keys()], ['rele-launch']);
+  assert.ok(
+    fragment.get('rele-launch'),
+    'CLI did not return a one-time launch credential',
+  );
+  assert.equal(
+    url.href.includes(config.panelToken),
+    false,
+    'CLI put the permanent panel key in the launch URL',
+  );
+  return url.href;
+}
 
 async function start() {
   const child = spawn(process.execPath, ['dist/server/main.js'], {
@@ -94,11 +132,12 @@ async function state(address) {
   return value;
 }
 
-async function pageFor(address) {
+async function pageFor(address, launch = false) {
   const context = await browser.newContext({
     viewport: { width: 1536, height: 1024 },
   });
   const page = await context.newPage();
+  const launchRequests = [];
   page.on('pageerror', (error) => browserErrors.push(error.message));
   page.on('console', (message) => {
     if (
@@ -108,9 +147,21 @@ async function pageFor(address) {
       browserErrors.push(message.text());
   });
   page.on('request', (request) => {
-    if (new URL(request.url()).pathname.startsWith('/api/')) {
+    const url = new URL(request.url());
+    if (url.pathname.startsWith('/api/')) {
+      if (
+        url.pathname === '/api/session/launch' &&
+        request.method() === 'POST'
+      ) {
+        launchRequests.push(request);
+        if (request.headers().authorization)
+          bearerFailures.push('Launch exchange sent an Authorization header');
+        return;
+      }
       if (request.headers().authorization !== `Bearer ${config.panelToken}`)
-        bearerFailures.push(new URL(request.url()).pathname);
+        bearerFailures.push(url.pathname);
+      if (request.url().includes(config.panelToken))
+        bearerFailures.push('An API URL exposed the panel credential');
     }
   });
   const response = await page.goto(address);
@@ -124,7 +175,10 @@ async function pageFor(address) {
     page.getByRole('heading', { name: 'Вход в панель', exact: true }),
   ).toBeVisible();
   await page.goto('about:blank');
-  await page.goto(`${address}#token=${config.panelToken}`);
+  const loginUrl = launch
+    ? await launchUrl(address)
+    : `${address}#token=${config.panelToken}`;
+  await page.goto(loginUrl);
   await expect(
     page.getByRole('heading', { name: 'Связки', exact: true }),
   ).toBeVisible();
@@ -132,7 +186,70 @@ async function pageFor(address) {
   await expect(
     page.getByRole('heading', { name: 'Создайте первую связку', exact: true }),
   ).toBeVisible();
+  if (launch) {
+    assert.equal(
+      launchRequests.length,
+      1,
+      'One-time login was exchanged more than once',
+    );
+    assert.equal(
+      launchRequests[0].postDataJSON().token ===
+        new URLSearchParams(new URL(loginUrl).hash.slice(1)).get('rele-launch'),
+      true,
+      'UI did not exchange the CLI launch credential',
+    );
+    await page.reload();
+    await expect(
+      page.getByRole('heading', { name: 'Связки', exact: true }),
+    ).toBeVisible();
+    await expect(page).toHaveURL(address);
+    assert.equal(
+      launchRequests.length,
+      1,
+      'Reload reused the one-time login link',
+    );
+  }
   return { context, page };
+}
+
+async function catalogUnavailable(page, address) {
+  let reason = '';
+  await expect
+    .poll(async () => {
+      reason = (await state(address)).codex.error || '';
+      return reason;
+    })
+    .not.toBe('');
+  await page
+    .getByRole('navigation')
+    .getByRole('button', { name: 'Codex', exact: true })
+    .click();
+  await expect(page.getByText(reason, { exact: true }).first()).toBeVisible();
+  await expect(
+    page.getByRole('heading', { name: 'Codex не подключён', exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText('Список разговоров пока пуст', { exact: true }),
+  ).toHaveCount(0);
+  await page
+    .getByRole('navigation')
+    .getByRole('button', { name: 'Связки', exact: true })
+    .click();
+  await page
+    .getByRole('button', { name: 'Новая связка', exact: true })
+    .first()
+    .click();
+  const dialog = page.getByRole('dialog');
+  await expect(
+    dialog.getByLabel('Разговор Codex', { exact: true }),
+  ).toBeDisabled();
+  await expect(
+    dialog.getByText('Codex не подключён.', { exact: false }),
+  ).toBeVisible();
+  await expect(
+    dialog.getByText('Нет свободных разговоров Codex.', { exact: false }),
+  ).toHaveCount(0);
+  await dialog.getByRole('button', { name: 'Закрыть', exact: true }).click();
 }
 
 try {
@@ -156,7 +273,8 @@ try {
       ? { executablePath: process.env.RELE_TEST_BROWSER }
       : {},
   );
-  const first = await pageFor(address);
+  const first = await pageFor(address, true);
+  await catalogUnavailable(first.page, address);
   await first.page
     .getByRole('navigation')
     .getByRole('button', { name: 'Подключения', exact: true })
@@ -231,6 +349,8 @@ try {
       productionJavaScript: true,
       csp: true,
       bearer: true,
+      oneTimeBrowserLogin: true,
+      catalogConnectionError: true,
       emptyState: true,
       configWriteOnly: true,
       configSurvivesRestart: true,

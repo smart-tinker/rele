@@ -1,6 +1,7 @@
 import type { Page } from '@playwright/test';
 import type {
   CodexThread,
+  CodexDiscoveryResult,
   CatalogChat,
   CatalogPage,
   Conversation,
@@ -13,6 +14,27 @@ import type {
 
 // Entirely fictional data. Never imported by the production application.
 export const panelToken = 'rele-e2e-synthetic-panel-token';
+export function fixtureDiscovery(): CodexDiscoveryResult {
+  const connection = {
+    executable: '/opt/example/codex',
+    transport: 'proxy' as const,
+    endpoint: '',
+  };
+  return {
+    installations: [
+      {
+        executable: connection.executable,
+        name: 'Codex CLI (пример)',
+        source: 'path',
+        version: '0.163.0',
+        running: false,
+        connection,
+      },
+    ],
+    recommended: connection,
+    issues: [],
+  };
+}
 const now = '2026-10-18T20:00:00.000Z';
 export const threads: CodexThread[] = [
   {
@@ -193,6 +215,7 @@ export function fixtureRequest(
 }
 
 interface CatalogFixture {
+  discovery?: CodexDiscoveryResult;
   telegram?: { botUrl?: string; command: string };
   chats?: CatalogPage<CatalogChat>[];
   threads?: Record<string, CatalogPage<Endpoint>[]>;
@@ -238,6 +261,10 @@ export async function installApi(
     if (request.method() === 'GET') reads.push(url.pathname + url.search);
     if (request.method() === 'GET' && url.pathname === '/api/state') {
       await route.fulfill({ json: state });
+      return;
+    }
+    if (request.method() === 'GET' && url.pathname === '/api/codex/discovery') {
+      await route.fulfill({ json: catalog.discovery ?? fixtureDiscovery() });
       return;
     }
     if (request.method() === 'GET' && url.pathname === '/api/threads') {

@@ -2,22 +2,75 @@ import type { DashboardState } from '../shared/types';
 
 const TOKEN_KEY = 'rele.panelToken';
 
-export function initialToken(): string {
+export interface InitialSession {
+  token: string;
+  launchToken?: string;
+}
+
+export function initialSession(): InitialSession {
   const fragment = new URLSearchParams(window.location.hash.slice(1));
+  const launchToken = fragment.get('rele-launch');
   const supplied = fragment.get('token');
-  if (supplied !== null) {
+  if (launchToken !== null || supplied !== null) {
     window.history.replaceState(
       null,
       '',
       window.location.pathname + window.location.search,
     );
+  }
+  if (launchToken !== null) {
+    saveToken('');
+    return { token: '', launchToken };
+  }
+  if (supplied !== null) {
     saveToken(supplied);
-    return supplied;
+    return { token: supplied };
   }
   try {
-    return window.sessionStorage.getItem(TOKEN_KEY) ?? '';
+    return { token: window.sessionStorage.getItem(TOKEN_KEY) ?? '' };
   } catch {
-    return '';
+    return { token: '' };
+  }
+}
+
+export async function exchangeLaunchToken(token: string): Promise<string> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 10000);
+  try {
+    const response = await fetch('/api/session/launch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+      signal: controller.signal,
+      cache: 'no-store',
+      credentials: 'same-origin',
+    });
+    const payload = await response.json().catch(() => undefined);
+    if (!response.ok) {
+      if ([400, 401, 403, 410].includes(response.status))
+        throw new ApiError(
+          'Ссылка для входа истекла или уже использована. Откройте Rele ещё раз ярлыком или командой запуска либо введите токен панели.',
+          response.status,
+        );
+      throw new ApiError(
+        'Не удалось открыть Rele по ссылке. Запустите приложение ещё раз либо введите токен панели.',
+        response.status,
+      );
+    }
+    if (typeof payload?.key !== 'string' || !payload.key)
+      throw new ApiError(
+        'Rele не вернул ключ доступа. Откройте приложение ещё раз.',
+        0,
+      );
+    return payload.key;
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(
+      'Нет связи с Rele. Проверьте, что приложение запущено, и откройте его ещё раз либо введите токен панели.',
+      0,
+    );
+  } finally {
+    window.clearTimeout(timeout);
   }
 }
 

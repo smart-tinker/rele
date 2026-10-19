@@ -1,9 +1,12 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { WebSocket, WebSocketServer } from 'ws';
-import { CodexClient, CodexTransportError, type CodexNotification } from '../src/server/codex.js';
+import { CodexClient, CodexTransportError, classifyCodexConnectionFailure, type CodexNotification } from '../src/server/codex.js';
 
 interface Rpc { id?: string | number; method?: string; params: Record<string, unknown>; result?: unknown }
 type Handler = (message: Rpc, socket: WebSocket) => unknown | Promise<unknown>;
@@ -61,6 +64,99 @@ async function until(predicate: () => boolean): Promise<void> {
 }
 
 describe('Codex shared-runtime adapter', () => {
+  it('automatically resolves the default CLI to a discovered existing Desktop server and keeps version gates', async () => {
+    const f = await fixture({ initialize: () => ({ userAgent: 'rele/0.164.0 (Windows)', codexHome: '/isolated', platformFamily: 'windows', platformOs: 'windows' }) });
+    const recommended = { executable: 'C:\\Example Desktop\\resources\\codex.exe', transport: 'websocket' as const, endpoint: f.endpoint };
+    const discover = vi.fn().mockResolvedValue({ installations: [], recommended, issues: [] });
+    const client = new CodexClient({ transport: 'proxy', executable: 'codex' }, { discover });
+    cleanup.push(() => client.close());
+    await client.connect();
+    expect(discover).toHaveBeenCalledOnce();
+    expect(client.status()).toMatchObject({ ...recommended, connected: true, queueSupported: false, desktopVerified: false, name: 'Codex 0.164.0' });
+    expect((await client.listThreads()).map(thread => thread.id)).toEqual([threadId]);
+    await expect(client.enqueue(threadId, 'Test', randomUUID())).rejects.toThrow('0.163.0');
+    expect(f.calls.some(call => ['turn/start', 'thread/queue/add'].includes(call.method || ''))).toBe(false);
+  });
+
+  it('reports a discovered stdio-only Desktop without spawning another app-server', async () => {
+    const executable = 'C:\\Example Desktop\\resources\\codex.exe';
+    const discover = vi.fn().mockResolvedValue({
+      installations: [{ executable, name: 'Codex из Desktop', source: 'desktop-process', version: '0.163.0', running: true, processId: 42 }],
+      issues: [{ code: 'desktop-stdio', executable, message: 'Desktop найден, общий сокет не обнаружен.' }],
+    });
+    const client = new CodexClient({ transport: 'proxy', executable: 'codex' }, { discover });
+    cleanup.push(() => client.close());
+    await expect(client.connect()).rejects.toMatchObject({ code: 'desktop-stdio' });
+    expect(client.status()).toMatchObject({ executable, connected: false, errorCode: 'desktop-stdio', desktopVerified: false });
+    await expect(client.connect()).rejects.toMatchObject({ code: 'desktop-stdio' });
+    expect(discover).toHaveBeenCalledOnce();
+  });
+
+  it('preserves an explicit WebSocket target without invoking installation discovery', async () => {
+    const f = await fixture();
+    const discover = vi.fn().mockRejectedValue(new Error('Discovery must not be called'));
+    const client = new CodexClient({ transport: 'websocket', executable: '/custom/codex', endpoint: f.endpoint }, { discover });
+    cleanup.push(() => client.close());
+    await client.connect();
+    expect(discover).not.toHaveBeenCalled();
+    expect(client.status()).toMatchObject({ executable: '/custom/codex', endpoint: f.endpoint, connected: true });
+  });
+
+  it('only launches proxy for an explicit CLI, preserves its socket and categorizes stderr without exposing it', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'Rele proxy fixture '));
+    cleanup.push(() => rm(directory, { recursive: true, force: true }));
+    const script = path.join(directory, 'codex-fixture.mjs');
+    const record = path.join(directory, 'arguments.json');
+    const endpoint = path.join(directory, 'existing-control.sock');
+    await writeFile(script, `import { writeFileSync, writeSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(record)}, JSON.stringify(process.argv.slice(2)));\nwriteSync(2, "error: unrecognized subcommand 'proxy'; synthetic-secret-must-never-appear\\n");\nprocess.exit(1);\n`);
+    const discover = vi.fn().mockRejectedValue(new Error('Must not discover a custom executable'));
+    const client = new CodexClient({ transport: 'proxy', executable: script, endpoint }, { discover });
+    cleanup.push(() => client.close());
+    await expect(client.connect()).rejects.toMatchObject({ code: 'proxy-unsupported' });
+    expect(discover).not.toHaveBeenCalled();
+    expect(JSON.parse(await readFile(record, 'utf8'))).toEqual(['app-server', 'proxy', '--sock', endpoint]);
+    expect(client.status()).toMatchObject({ connected: false, executable: script, endpoint, errorCode: 'proxy-unsupported' });
+    expect(JSON.stringify(client.status())).not.toContain('synthetic-secret');
+  });
+
+  it('rejects a stale WebSocket URL in proxy configuration before discovery or launch', async () => {
+    const discover = vi.fn();
+    const client = new CodexClient({ transport: 'proxy', executable: 'codex', endpoint: 'ws://127.0.0.1:4500' }, { discover });
+    cleanup.push(() => client.close());
+    await expect(client.connect()).rejects.toMatchObject({ code: 'invalid-proxy-socket' });
+    expect(discover).not.toHaveBeenCalled();
+  });
+
+  it('auto-resolves only the executable when an operator configured an explicit proxy socket', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'Rele selected socket '));
+    cleanup.push(() => rm(directory, { recursive: true, force: true }));
+    const executable = path.join(directory, 'codex-fixture.mjs');
+    const record = path.join(directory, 'arguments.json');
+    const endpoint = path.join(directory, 'operator-selected.sock');
+    await writeFile(executable, `import { writeFileSync, writeSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(record)}, JSON.stringify(process.argv.slice(2)));\nwriteSync(2, "No such file or directory (os error 2)\\n");\nprocess.exit(1);\n`);
+    const discover = vi.fn().mockResolvedValue({
+      installations: [{ executable, name: 'Codex', source: 'desktop-process', version: '0.163.0', running: true }],
+      recommended: { executable, transport: 'websocket', endpoint: 'ws://127.0.0.1:45678' }, issues: [],
+    });
+    const client = new CodexClient({ transport: 'proxy', executable: 'codex', endpoint }, { discover });
+    cleanup.push(() => client.close());
+    await expect(client.connect()).rejects.toMatchObject({ code: 'shared-server-unavailable' });
+    expect(discover).toHaveBeenCalledOnce();
+    expect(JSON.parse(await readFile(record, 'utf8'))).toEqual(['app-server', 'proxy', '--sock', endpoint]);
+    expect(client.status()).toMatchObject({ executable, transport: 'proxy', endpoint });
+  });
+
+  it.each([
+    ['No such file or directory (os error 2)', 'shared-server-unavailable'],
+    ['Access is denied (os error 5)', 'access-denied'],
+    ['spawn ENOENT', 'cli-unavailable'],
+    ['Unexpected server response: 401', 'authentication-failed'],
+  ])('classifies a connection failure using a fixed safe message: %s', (input, code) => {
+    const result = classifyCodexConnectionFailure(`${input} synthetic-private-token-and-path`);
+    expect(result.code).toBe(code);
+    expect(result.message).not.toContain('synthetic-private');
+  });
+
   it('initializes the experimental protocol and lists paginated names without resuming threads', async () => {
     const f = await fixture({
       'thread/list': message => message.params.cursor

@@ -1,0 +1,212 @@
+import path from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
+import { discoverCodex, runCodexProbe, WINDOWS_CODEX_METADATA_SCRIPT, type CodexDiscoveryOptions } from '../src/server/codex-discovery.js';
+import { resolveCodexLaunch } from '../src/server/codex-launch.js';
+
+const win = path.win32;
+const desktop = 'C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.1_x64__example\\app\\resources\\codex.exe';
+const desktopGui = win.join(win.dirname(win.dirname(desktop)), 'Codex.exe');
+const npmRoot = 'C:\\Users\\Example User\\AppData\\Roaming\\npm';
+const npmShim = win.join(npmRoot, 'codex.cmd');
+const npmPackage = win.join(npmRoot, 'node_modules', '@openai', 'codex');
+const npmEntry = win.join(npmPackage, 'bin', 'codex.js');
+const socket = 'C:\\Users\\Example User\\.codex\\app-server-control\\app-server-control.sock';
+
+function windowsFixture(metadata: object = { processes: [], packages: [], issues: [] }, extra: string[] = []) {
+  const files = new Set(extra.map(value => win.normalize(value).toLowerCase()));
+  const run = vi.fn<CodexDiscoveryOptions['run'] extends ((...args: infer A) => infer R) | undefined ? (...args: A) => R : never>(async (command, args) => {
+    if (args.includes(WINDOWS_CODEX_METADATA_SCRIPT)) return { stdout: JSON.stringify(metadata), code: 0 };
+    if (args.at(-1) !== '--version') throw new Error('Only version probes are allowed');
+    return { stdout: 'codex-cli 0.163.0\n', code: 0 };
+  });
+  const options: CodexDiscoveryOptions = {
+    platform: 'win32', home: 'C:\\Users\\Example User',
+    env: { Path: npmRoot, SystemRoot: 'C:\\Windows', APPDATA: win.dirname(npmRoot) },
+    exists: async file => files.has(win.normalize(file).toLowerCase()),
+    readText: async file => {
+      if (win.normalize(file).toLowerCase() === win.join(npmPackage, 'package.json').toLowerCase()) return JSON.stringify({ name: '@openai/codex' });
+      throw new Error('No file');
+    },
+    readDirectory: async () => [], run,
+  };
+  return { options, files, run };
+}
+
+describe('Codex installation and existing Desktop discovery', () => {
+  it('prefers an existing Desktop WebSocket and only returns filtered process metadata', async () => {
+    const f = windowsFixture({
+      processes: [{ executable: desktop, processId: 1234, listenKind: 'websocket', listen: 'ws://127.0.0.1:45678', commandLine: 'synthetic-private-arguments', auth: 'synthetic-secret' }],
+      packages: [{ name: 'OpenAI.Codex', location: win.dirname(win.dirname(win.dirname(desktop))) }], issues: [],
+    }, [desktop, desktopGui, npmShim, npmEntry]);
+    const result = await discoverCodex(f.options);
+    expect(result.recommended).toEqual({ executable: desktop, transport: 'websocket', endpoint: 'ws://127.0.0.1:45678' });
+    expect(result.installations).toContainEqual(expect.objectContaining({ executable: desktop, source: 'desktop-process', version: '0.163.0', running: true, processId: 1234 }));
+    expect(JSON.stringify(result)).not.toMatch(/synthetic-private|synthetic-secret|commandLine|auth/);
+    expect(f.run.mock.calls.filter(([, args]) => args.at(-1) === '--version')).toHaveLength(2);
+    expect(f.run.mock.calls.some(([command]) => command === desktopGui || command === npmShim)).toBe(false);
+    expect(f.run.mock.calls.find(([command]) => command === process.execPath)?.[1]).toEqual([npmEntry, '--version']);
+  });
+
+  it('finds MSIX resources while skipping the GUI and Windows application alias', async () => {
+    const aliasRoot = 'C:\\Users\\Example User\\AppData\\Local\\Microsoft\\WindowsApps';
+    const alias = win.join(aliasRoot, 'codex.exe');
+    const f = windowsFixture({ processes: [], packages: [{ name: 'OpenAI.Codex', location: win.dirname(win.dirname(win.dirname(desktop))) }], issues: [] }, [desktop, desktopGui, alias]);
+    f.options.env = { Path: `${win.dirname(desktopGui)};${aliasRoot}` };
+    const result = await discoverCodex(f.options);
+    expect(result.installations).toHaveLength(1);
+    expect(result.installations[0]).toMatchObject({ executable: desktop, source: 'desktop-install', running: false });
+    expect(result.recommended).toEqual({ executable: desktop, transport: 'proxy', endpoint: '' });
+    expect(f.run.mock.calls.filter(([, args]) => args.at(-1) === '--version').map(([command]) => command)).toEqual([desktop]);
+    expect(result.issues.map(item => item.code)).toContain('shared-socket-not-found');
+  });
+
+  it.each(['stdio', 'unspecified'])('reports a Desktop %s connection without choosing an unrelated PATH runtime', async listenKind => {
+    const f = windowsFixture({ processes: [{ executable: desktop, processId: 1234, listenKind }], packages: [], issues: [] }, [desktop, npmShim, npmEntry, socket]);
+    const result = await discoverCodex(f.options);
+    expect(result.recommended).toBeUndefined();
+    expect(result.installations[0].connection).toBeUndefined();
+    expect(result.installations.some(item => item.connection?.executable === npmEntry)).toBe(true);
+    expect(result.issues.map(item => item.code)).toContain('desktop-stdio');
+    expect(f.run.mock.calls.every(([, args]) => args.at(-1) === '--version' || args.includes(WINDOWS_CODEX_METADATA_SCRIPT))).toBe(true);
+  });
+
+  it('uses an explicit existing control socket and reports a missing one', async () => {
+    const f = windowsFixture({ processes: [{ executable: desktop, processId: 1234, listenKind: 'unspecified', socket }], packages: [], issues: [] }, [desktop, socket]);
+    expect((await discoverCodex(f.options)).recommended).toEqual({ executable: desktop, transport: 'proxy', endpoint: socket });
+    f.files.delete(socket.toLowerCase());
+    const unavailable = await discoverCodex(f.options);
+    expect(unavailable.recommended).toBeUndefined();
+    expect(unavailable.issues.map(item => item.code)).toContain('socket-not-found');
+  });
+
+  it('attaches an explicit unix listener and only resolves its omitted path against an existing profile socket', async () => {
+    const f = windowsFixture({ processes: [{ executable: desktop, processId: 1234, listenKind: 'unix', socket }], packages: [], issues: [] }, [desktop, socket]);
+    expect((await discoverCodex(f.options)).recommended).toEqual({ executable: desktop, transport: 'proxy', endpoint: socket });
+    f.run.mockImplementation(async (_command, args) => args.includes(WINDOWS_CODEX_METADATA_SCRIPT)
+      ? { stdout: JSON.stringify({ processes: [{ executable: desktop, processId: 1234, listenKind: 'unix', socketDefault: true }], packages: [], issues: [] }), code: 0 }
+      : { stdout: 'codex-cli 0.163.0', code: 0 });
+    const defaultResult = await discoverCodex(f.options);
+    expect(defaultResult.recommended?.endpoint).toBe(socket);
+    expect(defaultResult.issues.map(item => item.code)).toContain('default-socket-profile');
+    f.options.env = { ...f.options.env, CODEX_HOME: 'C:\\Different Profile' };
+    const otherProfile = await discoverCodex(f.options);
+    expect(otherProfile.recommended).toBeUndefined();
+    expect(otherProfile.issues.map(item => item.code)).toContain('socket-not-found');
+  });
+
+  it('finds the Windows standalone installer CLI without claiming it is a Desktop backend', async () => {
+    const local = 'C:\\Users\\Example User\\AppData\\Local';
+    const executable = win.join(local, 'Programs', 'OpenAI', 'Codex', 'bin', 'codex.exe');
+    const f = windowsFixture(undefined, [executable]);
+    f.options.env = { LOCALAPPDATA: local, PATH: '' };
+    const result = await discoverCodex(f.options);
+    expect(result.installations).toHaveLength(1);
+    expect(result.installations[0]).toMatchObject({ executable, name: 'Codex CLI', source: 'standard', running: false });
+    expect(result.recommended).toEqual({ executable, transport: 'proxy', endpoint: '' });
+  });
+
+  it('does not expose or use a nonlocal or secret-bearing process address', async () => {
+    const f = windowsFixture({ processes: [{ executable: desktop, processId: 1234, listenKind: 'websocket', listen: 'ws://127.0.0.1:4500/?token=synthetic-secret', socket: 'ws://remote.invalid/private' }], packages: [], issues: [] }, [desktop]);
+    const result = await discoverCodex(f.options);
+    expect(result.recommended).toBeUndefined();
+    expect(JSON.stringify(result)).not.toMatch(/synthetic-secret|remote\.invalid/);
+    expect(result.issues.map(item => item.code)).toContain('desktop-listener-unsupported');
+  });
+
+  it('requires explicit selection when several Desktop server processes can be attached', async () => {
+    const f = windowsFixture({ processes: [
+      { executable: desktop, processId: 1234, listenKind: 'websocket', listen: 'ws://127.0.0.1:4501' },
+      { executable: desktop, processId: 5678, listenKind: 'websocket', listen: 'ws://127.0.0.1:4502' },
+    ], packages: [], issues: [] }, [desktop]);
+    const result = await discoverCodex(f.options);
+    expect(result.installations).toHaveLength(2);
+    expect(result.recommended).toBeUndefined();
+    expect(result.issues.map(item => item.code)).toContain('multiple-desktop-servers');
+    expect(f.run.mock.calls.filter(([, args]) => args.at(-1) === '--version')).toHaveLength(1);
+  });
+
+  it('keeps an unconfirmed running installation visible and never publishes a failed probe output', async () => {
+    const f = windowsFixture({ processes: [{ executable: desktop, processId: 1234, listenKind: 'websocket', listen: 'ws://127.0.0.1:4500' }], packages: [], issues: [] }, [desktop, npmShim, npmEntry]);
+    f.run.mockImplementation(async (command, args) => {
+      if (args.includes(WINDOWS_CODEX_METADATA_SCRIPT)) return { stdout: JSON.stringify({ processes: [{ executable: desktop, processId: 1234, listenKind: 'websocket', listen: 'ws://127.0.0.1:4500' }], packages: [], issues: [] }), code: 0 };
+      if (command === desktop) throw new Error('synthetic-private-path-or-token');
+      return { stdout: 'codex-cli 0.163.0', code: 0 };
+    });
+    const result = await discoverCodex(f.options);
+    expect(result.installations[0]).toMatchObject({ executable: desktop, running: true });
+    expect(result.installations[0].connection).toBeUndefined();
+    expect(result.recommended).toBeUndefined();
+    expect(result.issues.map(item => item.code)).toContain('cli-probe-failed');
+    expect(JSON.stringify(result)).not.toContain('synthetic-private');
+  });
+
+  it('falls back to the official npm CLI when Windows metadata is unavailable without executing a batch file', async () => {
+    const f = windowsFixture(undefined, [npmShim, npmEntry]);
+    f.run.mockImplementation(async (_command, args) => {
+      if (args.includes(WINDOWS_CODEX_METADATA_SCRIPT)) throw new Error('synthetic-sensitive-WMI-error');
+      return { stdout: 'codex-cli 0.163.0', code: 0 };
+    });
+    const result = await discoverCodex(f.options);
+    expect(result.recommended).toEqual({ executable: npmEntry, transport: 'proxy', endpoint: '' });
+    expect(result.issues.map(item => item.code)).toContain('windows-discovery-unavailable');
+    expect(JSON.stringify(result)).not.toContain('synthetic-sensitive');
+    expect(f.run.mock.calls.some(([command]) => /\.cmd$/i.test(command))).toBe(false);
+    f.options.readText = async () => JSON.stringify({ name: 'unrelated-package' });
+    await expect(resolveCodexLaunch(npmShim, f.options)).rejects.toThrow('Codex CLI');
+  });
+
+  it('discovers a Linux CLI from PATH and standard user installations without running app-server', async () => {
+    const files = new Set(['/opt/codex/bin/codex', '/home/example/.local/bin/codex', '/home/example/.nvm/versions/node/v24.19.0/bin/codex']);
+    const run = vi.fn(async (_command: string, args: string[]) => {
+      expect(args).toEqual(['--version']);
+      return { stdout: 'codex-cli 0.163.0', code: 0 };
+    });
+    const result = await discoverCodex({ platform: 'linux', home: '/home/example', env: { PATH: '/opt/codex/bin' }, exists: async file => files.has(file), readDirectory: async root => root.includes('.nvm') ? ['v24.19.0'] : [], run });
+    expect(result.installations).toHaveLength(3);
+    expect(result.recommended).toEqual({ executable: '/opt/codex/bin/codex', transport: 'proxy', endpoint: '' });
+    expect(run).toHaveBeenCalledTimes(3);
+  });
+
+  it('bounds real child probes by time and output volume', async () => {
+    await expect(runCodexProbe(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], 100)).rejects.toThrow('probe-timeout');
+    await expect(runCodexProbe(process.execPath, ['-e', 'require("node:fs").writeSync(1, "x".repeat(200000))'], 4_000)).rejects.toThrow('probe-output-limit');
+  });
+
+  it.skipIf(process.platform !== 'win32')('parses real PowerShell fixture command lines and emits only allowed same-user metadata', async () => {
+    const fixtures = String.raw`
+function Get-CimInstance {
+  [CmdletBinding()] param([string]$ClassName, [string]$Filter, [string[]]$Property)
+  @(
+    [pscustomobject]@{ ProcessId = 101; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\resources\codex.exe'; CommandLine = '"C:\Program Files\Codex\resources\codex.exe" -c model="synthetic-private-option" app-server --listen "ws://127.0.0.1:45678"' },
+    [pscustomobject]@{ ProcessId = 102; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\resources\codex.exe'; CommandLine = 'codex.exe app-server --listen stdio://' },
+    [pscustomobject]@{ ProcessId = 103; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\resources\codex.exe'; CommandLine = 'codex.exe app-server --listen=ws://localhost:45678/?token=synthetic-secret' },
+    [pscustomobject]@{ ProcessId = 104; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\resources\codex.exe'; CommandLine = 'codex.exe app-server --sock "C:\Example User\control.sock"' },
+    [pscustomobject]@{ ProcessId = 105; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\resources\codex.exe'; CommandLine = 'codex.exe app-server --listen ws://127.0.0.1:5000' },
+    [pscustomobject]@{ ProcessId = 106; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\Codex.exe'; CommandLine = 'Codex.exe --synthetic-gui-argument' },
+    [pscustomobject]@{ ProcessId = 107; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\resources\codex.exe'; CommandLine = 'codex.exe app-server proxy' },
+    [pscustomobject]@{ ProcessId = 108; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\resources\codex.exe'; CommandLine = 'codex.exe app-server --listen "unix://C:\Example User\custom.sock"' },
+    [pscustomobject]@{ ProcessId = 109; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\resources\codex.exe'; CommandLine = 'codex.exe app-server --listen=unix://' }
+  )
+}
+function Invoke-CimMethod {
+  [CmdletBinding()] param($InputObject, [string]$MethodName)
+  [pscustomobject]@{ ReturnValue = 0; Sid = $(if ($InputObject.ProcessId -eq 105) { 'another-user' } else { [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }) }
+}
+function Get-AppxPackage { [CmdletBinding()] param([string]$Name); @() }
+`;
+    // This parser fixture includes cold PowerShell startup on a shared CI runner.
+    // Its deadline is separate from production probe budgets and the limit test above.
+    const result = await runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', fixtures + WINDOWS_CODEX_METADATA_SCRIPT], 25_000);
+    expect(result.code).toBe(0);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.issues).toEqual([]);
+    expect(parsed.processes.map((item: { processId: number }) => item.processId)).toEqual([101, 102, 103, 104, 108, 109]);
+    expect(parsed.processes[0]).toMatchObject({ listenKind: 'websocket', listen: 'ws://127.0.0.1:45678/' });
+    expect(parsed.processes[1]).toMatchObject({ listenKind: 'stdio', listen: null });
+    expect(parsed.processes[2]).toMatchObject({ listenKind: 'unsupported', listen: null });
+    expect(parsed.processes[3]).toMatchObject({ socket: 'C:\\Example User\\control.sock' });
+    expect(parsed.processes[4]).toMatchObject({ listenKind: 'unix', socket: 'C:\\Example User\\custom.sock', socketDefault: false });
+    expect(parsed.processes[5]).toMatchObject({ listenKind: 'unix', socket: null, socketDefault: true });
+    expect(result.stdout).not.toMatch(/synthetic-private|synthetic-secret|CommandLine|another-user|synthetic-gui/);
+  }, 35_000);
+});
