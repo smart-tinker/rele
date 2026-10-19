@@ -6,9 +6,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Engine, type CodexGateway, type EngineOptions } from '../src/server/engine.js';
 import { Store } from '../src/server/store.js';
 import { defaultConfig } from '../src/server/config.js';
-import { CodexTransportError, type CodexNotification, type CodexServerRequest, type RequestLocation } from '../src/server/codex.js';
+import { CodexThreadBusyError, CodexTransportError, type CodexNotification, type CodexServerRequest, type RequestLocation } from '../src/server/codex.js';
 import { ChannelError, type ApprovalAction, type Channel } from '../src/server/channels/common.js';
-import type { Approval, Delivery, Endpoint, InboundMessage, Platform, ReleRequest } from '../src/shared/types.js';
+import type { Approval, CodexConnectionState, Delivery, Endpoint, InboundMessage, Platform, ReleRequest } from '../src/shared/types.js';
 
 const THREAD = 'codex-shared-thread';
 const fixtures: Array<{ engine: Engine; store: Store }> = [];
@@ -27,8 +27,10 @@ class FakeCodex extends EventEmitter implements CodexGateway {
   connected = true;
   queueSupported = true;
   locations = new Map<string, RequestLocation>();
-  status = vi.fn(() => ({ configured: true, connected: this.connected, queueSupported: this.queueSupported, desktopVerified: false }));
+  transport: CodexConnectionState['transport'] = 'websocket';
+  status = vi.fn(() => ({ configured: true, connected: this.connected, queueSupported: this.queueSupported, desktopVerified: false, transport: this.transport }));
   subscribe = vi.fn(async (_threadId: string) => {});
+  releaseThread = vi.fn(async (_threadId: string) => {});
   enqueue = vi.fn(async (_threadId: string, _text: string, clientId: string) => {
     const queuedSubmissionId = `queue-${clientId}`;
     this.locations.set(clientId, { state: 'queued', queuedSubmissionId });
@@ -36,6 +38,7 @@ class FakeCodex extends EventEmitter implements CodexGateway {
   });
   findRequest = vi.fn(async (_threadId: string, clientId: string): Promise<RequestLocation> => this.locations.get(clientId) ?? { state: 'not_found' });
   respond = vi.fn(async (_rpcId: string | number, _result: unknown) => {});
+  rejectRequest = vi.fn(async (_rpcId: string | number, _message: string) => {});
   interrupt = vi.fn(async (_threadId: string, _turnId: string) => {});
   deleteQueued = vi.fn(async (_threadId: string, _queuedSubmissionId: string) => ({ deleted: true }));
   startQueued = vi.fn(async (_threadId: string, _queuedSubmissionId?: string) => ({ turn: { id: 'resumed-turn', status: 'inProgress', items: [] } }));
@@ -126,9 +129,70 @@ afterEach(async () => {
   for (const { engine } of fixtures) await engine.stop();
   for (const { store } of fixtures.splice(0)) store.close();
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
+  vi.useRealTimers();
 });
 
 describe('Engine correlation and queue', () => {
+  it('keeps a busy original thread queued without delivery or resubmission and retries after ownership becomes available', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture();
+    f.codex.transport = 'managed';
+    f.codex.subscribe.mockRejectedValueOnce(new CodexThreadBusyError(THREAD));
+    const request = await acceptRequest(f, 'telegram');
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'queued', origin: request.origin });
+    expect(f.store.getRequest(request.id)?.error).toMatch(/занят|ожида/iu);
+    expect(f.codex.enqueue).not.toHaveBeenCalled();
+    expect(f.store.listDeliveries()).toEqual([]);
+    await f.engine.pump();
+    expect(f.codex.subscribe).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(Date.now() + 5_001);
+    await f.engine.pump();
+    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, request.text, request.id);
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'starting', error: undefined });
+  });
+
+  it('retains a waiting request and its original ID across a Rele restart', async () => {
+    const f = fixture();
+    f.codex.subscribe.mockRejectedValueOnce(new CodexThreadBusyError(THREAD));
+    const request = await acceptRequest(f);
+    await f.engine.stop();
+    const restarted = fixture({ path: f.path });
+    await restarted.engine.pump();
+    expect(restarted.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, request.text, request.id);
+    expect(restarted.store.listRequests()).toHaveLength(1);
+    expect(restarted.store.getRequest(request.id)?.origin).toEqual(request.origin);
+  });
+
+  it('waits for thread release before dispatching the next origin', async () => {
+    const f = fixture();
+    f.codex.transport = 'managed';
+    const closed = deferred<void>();
+    f.codex.releaseThread.mockImplementationOnce(() => closed.promise);
+    const first = await acceptRequest(f, 'slack');
+    await running(f, first);
+    f.codex.complete(first.id, 'First result');
+    await vi.waitFor(() => expect(f.codex.releaseThread).toHaveBeenCalledExactlyOnceWith(THREAD));
+    await f.engine.receive(f.message('telegram'));
+    await f.engine.pump();
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+    closed.resolve();
+    await f.engine.settled();
+    await f.engine.pump();
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(2);
+    expect(f.codex.enqueue.mock.calls[1][0]).toBe(THREAD);
+    expect(f.slack.deliver).toHaveBeenCalledTimes(1);
+    expect(f.telegram.deliver).not.toHaveBeenCalled();
+  });
+
+  it('does not release a thread while an accepted request still needs reconciliation', async () => {
+    const f = fixture();
+    f.codex.enqueue.mockRejectedValueOnce(new CodexTransportError('Lost acknowledgement'));
+    const request = await acceptRequest(f);
+    await f.engine.reconcile(request.id);
+    expect(f.store.getRequest(request.id)?.status).toBe('uncertain');
+    expect(f.codex.releaseThread).not.toHaveBeenCalled();
+  });
+
   it('serializes both origins in one Codex thread and routes each result only to its immutable origin', async () => {
     const f = fixture();
     const slackMessage = f.message('slack');
@@ -174,12 +238,14 @@ describe('Engine correlation and queue', () => {
     });
     await f.engine.receive(f.message('telegram'));
     await vi.waitFor(() => expect(f.store.listRequests()[0]?.status).toBe('completed'));
+    expect(f.codex.releaseThread).not.toHaveBeenCalled();
     acknowledgement.resolve({ queuedSubmissionId: 'early-queue' });
     await f.engine.settled();
     await f.engine.pump();
     expect(f.store.listRequests()[0]).toMatchObject({ status: 'completed', queuedSubmissionId: 'early-queue' });
     expect(f.telegram.deliver).toHaveBeenCalledTimes(1);
     expect(f.slack.deliver).not.toHaveBeenCalled();
+    expect(f.codex.releaseThread).toHaveBeenCalledExactlyOnceWith(THREAD);
   });
 
   it('keeps Desktop turns and their approval requests inside Codex', async () => {
@@ -263,6 +329,54 @@ describe('Engine correlation and queue', () => {
 });
 
 describe('Engine approvals', () => {
+  it.each(['lookup-error', 'mixed', 'wrong-turn', 'already-terminal'] as const)('rejects a managed approval when origin verification is %s', async reason => {
+    const f = fixture();
+    f.codex.transport = 'managed';
+    const request = await acceptRequest(f);
+    await running(f, request);
+    f.codex.findRequest.mockImplementationOnce(async () => {
+      if (reason === 'lookup-error') throw new Error('Cannot read origin');
+      if (reason === 'already-terminal') f.store.finishRequest(request.id, { status: 'cancelled' }, []);
+      return { state: 'running', turnId: reason === 'wrong-turn' ? 'other-turn' : 'turn-1', mixed: reason === 'mixed' };
+    });
+    f.codex.request({ id: 'unverified-approval', method: 'item/commandExecution/requestApproval', params: {
+      threadId: THREAD, turnId: 'turn-1', itemId: 'approval-item', command: 'unverified command',
+    } });
+    await f.engine.settled();
+    expect(f.codex.rejectRequest).toHaveBeenCalledExactlyOnceWith('unverified-approval', expect.stringContaining('cannot authorize'));
+    expect(f.codex.respond).not.toHaveBeenCalled();
+    expect(f.store.listApprovals()).toEqual([]);
+    expect(f.store.listDeliveries()).toEqual([]);
+  });
+
+  it('rejects unsupported interactions in its own server without asking the user to answer them in Desktop', async () => {
+    const f = fixture();
+    f.codex.transport = 'managed';
+    const request = await acceptRequest(f);
+    await running(f, request);
+    f.codex.request({ id: 'unsupported-tool', method: 'item/tool/call', params: {
+      threadId: THREAD, turnId: 'turn-1', callId: 'external-tool', tool: 'desktop-only-tool', arguments: {},
+    } });
+    await f.engine.settled();
+    expect(f.codex.rejectRequest).toHaveBeenCalledWith('unsupported-tool', expect.stringContaining('not supported'));
+    expect(f.store.getRequest(request.id)?.error).toContain('Действие отклонено');
+    expect(f.store.listApprovals()).toEqual([]);
+    expect(f.store.listDeliveries()).toEqual([]);
+  });
+
+  it('does not authorize an unowned request in its own server', async () => {
+    const f = fixture();
+    f.codex.transport = 'managed';
+    f.codex.request({ id: 'unowned-approval', method: 'item/commandExecution/requestApproval', params: {
+      threadId: THREAD, turnId: 'unowned-turn', command: 'not authorized by an inbound Rele message',
+    } });
+    await f.engine.settled();
+    expect(f.codex.rejectRequest).toHaveBeenCalledExactlyOnceWith('unowned-approval', expect.stringContaining('cannot authorize'));
+    expect(f.codex.respond).not.toHaveBeenCalled();
+    expect(f.store.listRequests()).toEqual([]);
+    expect(f.store.listDeliveries()).toEqual([]);
+  });
+
   it('withholds an approval when an earlier Desktop message made the same turn mixed', async () => {
     const f = fixture();
     const request = await acceptRequest(f, 'telegram');

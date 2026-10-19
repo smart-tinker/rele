@@ -99,8 +99,9 @@ async function main(): Promise<void> {
       if (channelsChanged) await Promise.allSettled(Object.values(engine.channels).map(channel => channel.stop()));
       if (codexChanged) {
         const old = codex;
+        await old.close();
         codex = new CodexClient(next.codex);
-        engine.replaceCodex(codex); old.close();
+        engine.replaceCodex(codex);
         void codex.connect().catch(() => {});
       }
       if (channelsChanged) attachChannels();
@@ -116,13 +117,13 @@ async function main(): Promise<void> {
     engine.start(); attachChannels();
     void codex.connect().catch(() => {});
     process.stdout.write(`Rele: ${address}/\nОткрыть панель: rele open. Ключ панели: rele token или npm start -- token.\n`);
-  } catch (error) { await app.close(); await engine.stop(); codex.close(); store.close(); await rm(temporaryInstance, { force: true }); lock.close(); throw error; }
+  } catch (error) { await app.close(); await engine.stop(); await codex.close(); store.close(); await rm(temporaryInstance, { force: true }); lock.close(); throw error; }
   async function shutdown(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     await app.close();
     await Promise.allSettled(Object.values(engine.channels).map(channel => channel.stop()));
-    await engine.stop(); codex.close(); store.close();
+    await engine.stop(); await codex.close(); store.close();
     // Keep the data-directory lock until our marker is removed, so another
     // starting instance cannot have its fresh marker removed by this shutdown.
     await rm(instanceFile, { force: true });

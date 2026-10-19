@@ -1236,6 +1236,18 @@ tbody tr:hover {
 }
 .discovery-heading {
   margin: 8px 0 0;
+  flex-wrap: wrap;
+}
+.discovery-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.codex-mode-copy p {
+  margin: 0;
+}
+.codex-mode-copy p + p {
+  margin-top: 8px;
 }
 .discovery-heading h3 {
   margin: 0;

@@ -2,9 +2,10 @@ import { spawn } from 'node:child_process';
 import { readdir, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { SUPPORTED_CODEX_VERSIONS } from '../shared/codex-runtime.js';
 import type { CodexConnectionTarget, CodexDiscoveryIssue, CodexDiscoveryResult, CodexInstallation } from '../shared/types.js';
 import { isLocalEndpoint, isLocalSocketPath } from './config.js';
-import { environmentValue, fileExists, isDesktopLauncher, resolveCodexLaunch } from './codex-launch.js';
+import { codexEnvironment, environmentValue, fileExists, isDesktopLauncher, resolveCodexLaunch } from './codex-launch.js';
 
 // Command lines are inspected inside this fixed script and never returned. No auth,
 // history, environment, or Codex configuration files are read during discovery.
@@ -85,6 +86,7 @@ export interface CodexDiscoveryOptions {
   platform?: NodeJS.Platform;
   env?: NodeJS.ProcessEnv;
   home?: string;
+  codexHome?: string;
   exists?: (file: string) => Promise<boolean>;
   readText?: (file: string) => Promise<string>;
   readDirectory?: (directory: string) => Promise<string[]>;
@@ -157,10 +159,10 @@ export function discoverCodex(options?: CodexDiscoveryOptions): Promise<CodexDis
 
 async function collectCodex(options: CodexDiscoveryOptions): Promise<CodexDiscoveryResult> {
   const platform = options.platform ?? process.platform;
-  const env = options.env ?? process.env;
+  const env = codexEnvironment(options.codexHome, options.env ?? process.env, platform);
   const home = options.home ?? homedir();
   const paths = platform === 'win32' ? path.win32 : path.posix;
-  const codexHome = environmentValue(env, 'CODEX_HOME') || paths.join(home, '.codex');
+  const codexHome = (platform === 'win32' ? environmentValue(env, 'CODEX_HOME') : env.CODEX_HOME) || paths.join(home, '.codex');
   const defaultSocket = paths.isAbsolute(codexHome) ? paths.join(codexHome, 'app-server-control', 'app-server-control.sock') : undefined;
   const exists = options.exists ?? fileExists;
   const readText = options.readText ?? (file => readFile(file, 'utf8'));
@@ -222,8 +224,14 @@ async function collectCodex(options: CodexDiscoveryOptions): Promise<CodexDiscov
       environmentValue(env, 'ProgramFiles') && paths.join(environmentValue(env, 'ProgramFiles'), 'OpenAI', 'Codex'),
     ].filter(Boolean)) desktopRoot(root);
     if (local) {
-      add(paths.join(local, 'Programs', 'OpenAI', 'Codex', 'bin', 'codex.exe'), 'standard');
-      add(paths.join(local, 'OpenAI', 'Codex', 'bin', 'codex.exe'), 'standard');
+      for (const root of [paths.join(local, 'Programs', 'OpenAI', 'Codex', 'bin'), paths.join(local, 'OpenAI', 'Codex', 'bin')]) {
+        add(paths.join(root, 'codex.exe'), 'standard');
+        try {
+          for (const name of (await readDirectory(root)).filter(name => /^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/u.test(name)).sort().reverse().slice(0, 12)) {
+            add(paths.join(root, name, 'codex.exe'), 'standard');
+          }
+        } catch { /* This optional versioned CLI installation does not exist. */ }
+      }
     }
     if (roaming) add(paths.join(roaming, 'npm', 'codex.cmd'), 'standard');
   }
@@ -283,31 +291,40 @@ async function collectCodex(options: CodexDiscoveryOptions): Promise<CodexDiscov
     if (!found.version) { issues.push({ code: 'cli-not-confirmed', executable: candidate.executable, message: 'Файл найден, но проверка версии не подтвердила Codex CLI.' }); continue; }
     installation.executable = found.executable;
     installation.version = found.version;
+    const profile = options.codexHome ? { codexHome: options.codexHome } : {};
+    installation.managedConnection = { executable: found.executable, transport: 'managed', endpoint: '', ...profile };
+    if (!SUPPORTED_CODEX_VERSIONS.includes(found.version)) issues.push({ code: 'cli-version-unverified', executable: found.executable, message: `Codex ${found.version} не проверен для отправки через Rele. Его можно выбрать явно для чтения тредов.` });
     const process = candidate.process;
     const serverSocket = process?.socket ?? (process?.listenKind === 'unix' && process.socketDefault ? defaultSocket : undefined);
     if (serverSocket && await exists(serverSocket)) {
-      installation.connection = { executable: found.executable, transport: 'proxy', endpoint: serverSocket };
+      installation.connection = { executable: found.executable, transport: 'proxy', endpoint: serverSocket, ...profile };
       if (process?.socketDefault) issues.push({ code: 'default-socket-profile', executable: found.executable, message: 'Сервер объявил unix:// без пути. Найден стандартный сокет профиля Rele; совпадение с нужным runtime Desktop нужно проверить после подключения.' });
     }
-    else if (process?.listenKind === 'websocket' && process.listen) installation.connection = { executable: found.executable, transport: 'websocket', endpoint: process.listen };
+    else if (process?.listenKind === 'websocket' && process.listen) installation.connection = { executable: found.executable, transport: 'websocket', endpoint: process.listen, ...profile };
     else if (process) {
       const code = serverSocket || process.listenKind === 'unix' ? 'socket-not-found' : process.listenKind === 'stdio' || process.listenKind === 'unspecified' ? 'desktop-stdio' : 'desktop-listener-unsupported';
       issues.push({ code, executable: found.executable, message: code === 'socket-not-found'
-        ? 'Desktop запущен, но указанный сокет общего app-server недоступен.'
+        ? 'Desktop запущен, но указанный сокет app-server недоступен для внешнего подключения.'
         : code === 'desktop-stdio'
           ? 'Сервер Desktop найден. Доступный общий сокет или WebSocket не обнаружен; stdio-соединение Desktop нельзя использовать как внешнее подключение Rele.'
           : 'Сервер Desktop найден, но его адрес не подходит для локального подключения Rele.' });
-    } else installation.connection = { executable: found.executable, transport: 'proxy', endpoint: '' };
+    } else installation.connection = { executable: found.executable, transport: 'proxy', endpoint: '', ...profile };
   }
+  const verified = installations.filter(item => item.version && SUPPORTED_CODEX_VERSIONS.includes(item.version))
+    .sort((a, b) => SUPPORTED_CODEX_VERSIONS.indexOf(a.version!) - SUPPORTED_CODEX_VERSIONS.indexOf(b.version!));
+  const recommendedManaged = verified.find(item => item.managedConnection)?.managedConnection;
   const running = installations.filter(item => item.running);
   const attachable = running.filter(item => item.connection);
   let recommended: CodexConnectionTarget | undefined;
-  if (attachable.length === 1) recommended = attachable[0].connection;
+  if (attachable.length === 1 && verified.includes(attachable[0])) recommended = attachable[0].connection;
   else if (attachable.length > 1) issues.push({ code: 'multiple-desktop-servers', message: 'Найдено несколько доступных серверов Desktop. Выберите нужное подключение явно.' });
-  else if (!running.length) recommended = installations.find(item => item.source === 'path' && item.connection)?.connection ?? installations.find(item => item.connection)?.connection;
+  else if (!running.length) {
+    const preferred = verified.filter(item => item.version === verified[0]?.version);
+    recommended = preferred.find(item => item.source === 'path' && item.connection)?.connection ?? preferred.find(item => item.connection)?.connection;
+  }
   if (!installations.length) issues.push({ code: 'cli-not-found', message: 'Codex CLI не найден среди процессов Desktop, установленных пакетов и каталогов CLI. Укажите путь к CLI или установите Codex.' });
   if (recommended?.transport === 'proxy' && !recommended.endpoint) {
-    if (!defaultSocket || !await exists(defaultSocket)) issues.push({ code: 'shared-socket-not-found', message: 'CLI найден, но стандартный сокет общего app-server текущего профиля не обнаружен. Rele проверит подключение без запуска нового сервера.' });
+    if (!defaultSocket || !await exists(defaultSocket)) issues.push({ code: 'shared-socket-not-found', message: 'CLI найден, но стандартный сокет текущего профиля для внешнего подключения не обнаружен. Запуск app-server через Rele не требует этого сокета.' });
   }
-  return { installations, ...(recommended ? { recommended } : {}), issues };
+  return { installations, ...(recommended ? { recommended } : {}), ...(recommendedManaged ? { recommendedManaged } : {}), issues };
 }

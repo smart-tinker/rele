@@ -20,18 +20,21 @@ export function fixtureDiscovery(): CodexDiscoveryResult {
     transport: 'proxy' as const,
     endpoint: '',
   };
+  const managedConnection = { ...connection, transport: 'managed' as const };
   return {
     installations: [
       {
         executable: connection.executable,
         name: 'Codex CLI (пример)',
         source: 'path',
-        version: '0.163.0',
+        version: '0.163.0-alpha.10.2',
         running: false,
         connection,
+        managedConnection,
       },
     ],
     recommended: connection,
+    recommendedManaged: managedConnection,
     issues: [],
   };
 }
@@ -138,12 +141,17 @@ export function fixtureState(empty = false): DashboardState {
         };
       });
   return {
-    version: '0.1.0-rc.1',
+    version: '0.1.0-rc.4',
     codex: {
       configured: true,
       connected: true,
       queueSupported: true,
       desktopVerified: false,
+      name: 'Codex 0.163.0-alpha.10.2',
+      executable: '/opt/example/codex',
+      transport: 'managed',
+      endpoint: '',
+      codexHome: '/home/example/.codex',
     },
     connections: {
       telegram: {
@@ -166,7 +174,7 @@ export function fixtureState(empty = false): DashboardState {
     approvals: [],
     config: {
       codex: {
-        transport: 'proxy',
+        transport: 'managed',
         executable: 'codex',
         endpoint: '',
         tokenConfigured: false,

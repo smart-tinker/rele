@@ -14,6 +14,7 @@ export function useCodexThreads(
     state.codex.executable,
     state.codex.transport,
     state.codex.endpoint,
+    state.codex.codexHome,
     state.codex.name,
     includeArchived,
   ]);

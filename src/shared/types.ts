@@ -153,10 +153,13 @@ export interface ConnectionState {
   accountId?: string;
 }
 
+export type CodexTransport = 'managed' | 'proxy' | 'websocket';
+
 export interface CodexConnectionTarget {
   executable: string;
-  transport: 'proxy' | 'websocket';
+  transport: CodexTransport;
   endpoint: string;
+  codexHome?: string;
 }
 
 export interface CodexInstallation {
@@ -167,6 +170,7 @@ export interface CodexInstallation {
   running: boolean;
   processId?: number;
   connection?: CodexConnectionTarget;
+  managedConnection?: CodexConnectionTarget;
 }
 
 export interface CodexDiscoveryIssue {
@@ -178,6 +182,7 @@ export interface CodexDiscoveryIssue {
 export interface CodexDiscoveryResult {
   installations: CodexInstallation[];
   recommended?: CodexConnectionTarget;
+  recommendedManaged?: CodexConnectionTarget;
   issues: CodexDiscoveryIssue[];
 }
 
@@ -185,13 +190,14 @@ export interface CodexConnectionState extends ConnectionState {
   queueSupported: boolean;
   desktopVerified: boolean;
   executable?: string;
-  transport?: 'proxy' | 'websocket';
+  transport?: CodexTransport;
   endpoint?: string;
+  codexHome?: string;
   errorCode?: string;
 }
 
 export interface PublicConfig {
-  codex: { transport: 'proxy' | 'websocket'; executable: string; endpoint: string; tokenConfigured: boolean };
+  codex: CodexConnectionTarget & { tokenConfigured: boolean };
   telegram: { enabled: boolean; tokenConfigured: boolean };
   slack: { enabled: boolean; botTokenConfigured: boolean; appTokenConfigured: boolean };
   voice: { enabled: boolean; python: string; model: string; language: string; device: 'cpu' | 'cuda' };

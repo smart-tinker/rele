@@ -3,17 +3,17 @@ import { spawn } from 'node:child_process';
 import { mkdir, readFile, writeFile, rename, chmod, rm, link } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import type { PublicConfig } from '../shared/types.js';
+import type { CodexConnectionTarget, PublicConfig } from '../shared/types.js';
 
 export interface AppConfig {
-  codex: { transport: 'proxy' | 'websocket'; executable: string; endpoint: string; token?: string };
+  codex: CodexConnectionTarget & { token?: string };
   telegram: { enabled: boolean; token?: string };
   slack: { enabled: boolean; botToken?: string; appToken?: string };
   voice: PublicConfig['voice'];
 }
 
 export const defaultConfig: AppConfig = {
-  codex: { transport: 'proxy', executable: 'codex', endpoint: '' },
+  codex: { transport: 'managed', executable: 'codex', endpoint: '' },
   telegram: { enabled: false },
   slack: { enabled: false },
   voice: { enabled: false, python: process.platform === 'win32' ? 'python' : 'python3', model: '', language: 'ru', device: 'cpu' },
@@ -39,6 +39,11 @@ export function isLocalSocketPath(value: string): boolean {
     && (/^\/(?!\/)/u.test(value) || /^[A-Za-z]:[\\/]/u.test(value) || /^\\\\\.\\pipe\\[^\\]+/iu.test(value));
 }
 
+export function isLocalCodexHome(value: string, platform: NodeJS.Platform = process.platform): boolean {
+  return !!value && value.length <= 4096 && !/[\x00-\x1f\x7f]/u.test(value)
+    && (platform === 'win32' ? /^[A-Za-z]:[\\/]/u.test(value) : /^\/(?!\/)/u.test(value));
+}
+
 function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Ожидается объект настроек.');
   return value as Record<string, unknown>;
@@ -56,10 +61,16 @@ export function mergeConfig(current: AppConfig, input: unknown): AppConfig {
   for (const section of ['codex', 'telegram', 'slack', 'voice'] as const) {
     if (!(section in patch)) continue;
     const changes = record(patch[section]);
-    const allowed = section === 'codex' ? ['transport', 'executable', 'endpoint', 'token'] : section === 'telegram' ? ['enabled', 'token'] : section === 'slack' ? ['enabled', 'botToken', 'appToken'] : ['enabled', 'python', 'model', 'language', 'device'];
+    const allowed = section === 'codex' ? ['transport', 'executable', 'endpoint', 'codexHome', 'token'] : section === 'telegram' ? ['enabled', 'token'] : section === 'slack' ? ['enabled', 'botToken', 'appToken'] : ['enabled', 'python', 'model', 'language', 'device'];
     for (const [key, value] of Object.entries(changes)) {
       if (!allowed.includes(key)) throw new Error(`Неизвестное поле ${section}.`);
-      if (key === 'enabled') {
+      if (section === 'codex' && key === 'codexHome') {
+        if (value !== undefined && typeof value !== 'string') throw new Error('Некорректное поле codexHome.');
+        if (typeof value === 'string' && /[\x00-\x1f\x7f]/u.test(value)) throw new Error('Путь профиля Codex не должен содержать управляющие символы.');
+        const cleaned = value === undefined ? '' : text(value, key);
+        if (cleaned) next.codex.codexHome = cleaned;
+        else delete next.codex.codexHome;
+      } else if (key === 'enabled') {
         if (typeof value !== 'boolean') throw new Error('enabled должен быть логическим значением.');
         (next[section] as unknown as Record<string, unknown>)[key] = value;
       } else {
@@ -70,8 +81,11 @@ export function mergeConfig(current: AppConfig, input: unknown): AppConfig {
       }
     }
   }
-  if (!['proxy', 'websocket'].includes(next.codex.transport)) throw new Error('Неизвестный транспорт Codex.');
+  if (!['managed', 'proxy', 'websocket'].includes(next.codex.transport)) throw new Error('Неизвестный транспорт Codex.');
   if (!next.codex.executable || /[\r\n]/u.test(next.codex.executable)) throw new Error('Укажите путь к Codex CLI.');
+  if (next.codex.codexHome && !isLocalCodexHome(next.codex.codexHome)) throw new Error('Профиль Codex должен быть абсолютным локальным путём без сетевых каталогов.');
+  if (next.codex.transport === 'managed' && current.codex.transport !== 'managed' && next.codex.endpoint === current.codex.endpoint) next.codex.endpoint = '';
+  if (next.codex.transport === 'managed' && next.codex.endpoint) throw new Error('В режиме Rele не нужен адрес app-server. Оставьте endpoint пустым.');
   // Older panels submit the now-hidden WebSocket field when switching to proxy.
   if (next.codex.transport === 'proxy' && current.codex.transport === 'websocket' && next.codex.endpoint === current.codex.endpoint) next.codex.endpoint = '';
   if (next.codex.transport === 'proxy' && next.codex.endpoint && !isLocalSocketPath(next.codex.endpoint)) throw new Error('Для локального proxy нужен абсолютный путь к сокету, а не WebSocket URL. Для автоматического подключения оставьте адрес пустым.');
@@ -89,7 +103,7 @@ export function mergeConfig(current: AppConfig, input: unknown): AppConfig {
 
 export function publicConfig(config: AppConfig): PublicConfig {
   return {
-    codex: { transport: config.codex.transport, executable: config.codex.executable, endpoint: config.codex.endpoint, tokenConfigured: !!config.codex.token },
+    codex: { transport: config.codex.transport, executable: config.codex.executable, endpoint: config.codex.endpoint, ...(config.codex.codexHome ? { codexHome: config.codex.codexHome } : {}), tokenConfigured: !!config.codex.token },
     telegram: { enabled: config.telegram.enabled, tokenConfigured: !!config.telegram.token },
     slack: { enabled: config.slack.enabled, botTokenConfigured: !!config.slack.botToken, appTokenConfigured: !!config.slack.appToken },
     voice: { ...config.voice },

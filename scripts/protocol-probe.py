@@ -20,7 +20,8 @@ import websockets
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--codex', help='Path to the native Codex binary (codex.exe on Windows).')
-parser.add_argument('--codex-prefix', help='npm install prefix containing @openai/codex 0.163.0.')
+parser.add_argument('--codex-prefix', help='npm install prefix containing the exact @openai/codex version under test.')
+parser.add_argument('--expected-version', default='0.163.0', choices=['0.163.0', '0.163.0-alpha.10.2'])
 parser.add_argument('--report', type=pathlib.Path, help='Write the sanitized fixture result as JSON.')
 args = parser.parse_args()
 if args.codex_prefix:
@@ -152,11 +153,11 @@ supports_websockets=false
                               'capabilities':{'experimentalApi':True}}))
         await ws.send(json.dumps({'method':'initialized'}))
         return client,response
-    report={'cli':'0.163.0','checks':{},'desktopVerified':False}
+    report={'cli':args.expected_version,'checks':{},'desktopVerified':False}
     try:
         a,init_a=await connect('rele_probe_a')
         b,init_b=await connect('rele_probe_b')
-        assert '/0.163.0 ' in init_a['userAgent'], init_a['userAgent']
+        assert f'/{args.expected_version} ' in init_a['userAgent'], init_a['userAgent']
         report['initialize']=init_a
         report['checks']['two_clients_same_home']=init_a['codexHome']==init_b['codexHome']
         thread=result(await a.call('thread/start',{'cwd':str(workspace)}))['thread']['id']

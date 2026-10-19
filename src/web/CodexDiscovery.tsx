@@ -2,15 +2,25 @@ import { useEffect, useState } from 'react';
 import type {
   CodexConnectionTarget,
   CodexDiscoveryResult,
+  CodexTransport,
 } from '../shared/types';
 import { errorText, ReleApi } from './client';
 import { Button, Notice, Status } from './ui';
 
 export const automaticCodex: CodexConnectionTarget = {
-  transport: 'proxy',
+  transport: 'managed',
   executable: 'codex',
   endpoint: '',
 };
+
+const externalConnectionIssues = new Set([
+  'desktop-stdio',
+  'desktop-listener-unsupported',
+  'socket-not-found',
+  'shared-socket-not-found',
+  'default-socket-profile',
+  'multiple-desktop-servers',
+]);
 
 export function codexTargetKey(target: CodexConnectionTarget): string {
   return JSON.stringify([target.transport, target.executable, target.endpoint]);
@@ -22,12 +32,14 @@ export function CodexDiscovery({
   onChange,
   disabled,
   refreshKey,
+  transport,
 }: {
   api: ReleApi;
   value: string;
   onChange: (value: 'auto' | 'manual' | CodexConnectionTarget) => void;
   disabled: boolean;
   refreshKey: number;
+  transport: CodexTransport;
 }) {
   const [discovery, setDiscovery] = useState<CodexDiscoveryResult | null>(null);
   const [loading, setLoading] = useState(true);
@@ -67,35 +79,53 @@ export function CodexDiscovery({
     path: 'Команда в PATH',
     standard: 'Стандартный каталог',
   };
+  const recommended =
+    transport === 'managed'
+      ? discovery?.recommendedManaged
+      : discovery?.recommended?.transport === transport
+        ? discovery.recommended
+        : undefined;
   return (
     <fieldset className="codex-discovery">
       <legend>Выбор Codex</legend>
-      <label className="check-row">
-        <input
-          type="radio"
-          name="codex-target"
-          checked={value === 'auto'}
-          disabled={disabled}
-          onChange={() => onChange('auto')}
-        />
-        <span>
-          <strong>Находить Codex автоматически</strong>
-          <small>
-            Rele проверит доступные установки и выберет подходящее локальное
-            подключение.
-          </small>
-        </span>
-      </label>
+      {transport === 'managed' && (
+        <label className="check-row">
+          <input
+            type="radio"
+            name="codex-target"
+            checked={value === 'auto'}
+            disabled={disabled}
+            onChange={() => onChange('auto')}
+          />
+          <span>
+            <strong>Находить Codex автоматически</strong>
+            <small>
+              Rele выберет подходящий Codex и запустит свой сервер. Можно
+              использовать Codex из установленного Desktop.
+            </small>
+          </span>
+        </label>
+      )}
       <div className="section-heading discovery-heading">
         <h3>Найдено на этом компьютере</h3>
-        <Button
-          icon="refresh"
-          busy={loading}
-          disabled={disabled}
-          onClick={() => setRevision((current) => current + 1)}
-        >
-          Повторить поиск
-        </Button>
+        <div className="discovery-actions">
+          {recommended && (
+            <Button
+              disabled={disabled}
+              onClick={() => onChange(recommended)}
+            >
+              Выбрать рекомендуемый
+            </Button>
+          )}
+          <Button
+            icon="refresh"
+            busy={loading}
+            disabled={disabled}
+            onClick={() => setRevision((current) => current + 1)}
+          >
+            Повторить поиск
+          </Button>
+        </div>
       </div>
       {loading && (
         <p className="field-hint" role="status">
@@ -105,20 +135,24 @@ export function CodexDiscovery({
       {error && <Notice>{error}</Notice>}
       {discovery && !discovery.installations.length && (
         <Notice tone="info">
-          Локальная установка Codex не найдена. Откройте установленный Codex
-          Desktop или установите Codex CLI и повторите поиск. Путь и адрес
-          существующего сервера также можно указать вручную.
+          Локальная установка Codex не найдена. Установите Codex Desktop или
+          Codex CLI и повторите поиск либо укажите путь вручную.
         </Notice>
       )}
       {!!discovery?.installations.length && (
         <div className="discovery-options">
           {discovery.installations.map((installation, index) => {
-            const connection = installation.connection;
-            const recommended =
+            const connection =
+              transport === 'managed'
+                ? installation.managedConnection
+                : installation.connection?.transport === transport
+                  ? installation.connection
+                  : undefined;
+            const isRecommended =
               connection &&
-              discovery.recommended &&
+              recommended &&
               codexTargetKey(connection) ===
-                codexTargetKey(discovery.recommended);
+                codexTargetKey(recommended);
             return (
               <label
                 className="check-row discovery-option"
@@ -151,11 +185,15 @@ export function CodexDiscovery({
                       : {connection.endpoint}
                     </small>
                   )}
-                  {recommended && <Status tone="good">Рекомендуется</Status>}
+                  {connection?.transport === 'managed' && (
+                    <small>Доступен для сервера Rele</small>
+                  )}
+                  {isRecommended && <Status tone="good">Рекомендуется</Status>}
                   {!connection && (
                     <small>
-                      Подключение не определено. Проверьте сообщение ниже или
-                      укажите параметры вручную.
+                      {transport === 'managed'
+                        ? 'Запуск этого Codex не подтверждён. Проверьте сообщение ниже или укажите путь вручную.'
+                        : 'Внешнее подключение этим способом не найдено. Укажите параметры вручную или выберите «Сервер Rele».'}
                     </small>
                   )}
                 </span>
@@ -164,18 +202,24 @@ export function CodexDiscovery({
           })}
         </div>
       )}
-      {discovery?.issues.map((issue, index) => (
-        <Notice key={`${issue.code}:${index}`} tone="warning">
-          {issue.message}
-          {issue.executable && (
-            <div className="discovery-path">{issue.executable}</div>
-          )}
-        </Notice>
-      ))}
+      {discovery?.issues
+        .filter(
+          (issue) =>
+            transport !== 'managed' ||
+            !externalConnectionIssues.has(issue.code),
+        )
+        .map((issue, index) => (
+          <Notice key={`${issue.code}:${index}`} tone="warning">
+            {issue.message}
+            {issue.executable && (
+              <div className="discovery-path">{issue.executable}</div>
+            )}
+          </Notice>
+        ))}
       <p className="field-hint">
-        Найденный файл и версия CLI ещё не подтверждают подключение к серверу.
-        Фактический сервер показан выше после соединения. Если вариантов
-        несколько, выберите нужный.
+        {transport === 'managed'
+          ? 'Это установленные версии Codex. Какая из них запущена для Rele, показано в фактическом подключении после сохранения.'
+          : 'Найденный файл и версия CLI ещё не подтверждают соединение с существующим сервером. Фактическое подключение показано выше.'}
       </p>
       <label className="check-row">
         <input
@@ -188,7 +232,9 @@ export function CodexDiscovery({
         <span>
           <strong>Указать параметры вручную</strong>
           <small>
-            Путь к исполняемому файлу, локальный сервер или WebSocket.
+            {transport === 'managed'
+              ? 'Путь к исполняемому файлу Codex.'
+              : 'Путь к исполняемому файлу или адрес существующего сервера.'}
           </small>
         </span>
       </label>

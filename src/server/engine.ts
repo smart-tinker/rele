@@ -1,13 +1,13 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import type { Approval, ApprovalQuestion, InboundMessage, Platform, ReleRequest } from '../shared/types.js';
-import { CodexClient, CodexRpcError, type CodexNotification, type CodexServerRequest, type RequestLocation } from './codex.js';
+import { CodexClient, CodexRpcError, CodexThreadBusyError, type CodexNotification, type CodexServerRequest, type RequestLocation } from './codex.js';
 import { Store } from './store.js';
 import type { AppConfig } from './config.js';
 import { ChannelError, splitReply, type ApprovalAction, type Channel } from './channels/common.js';
 import { transcribeAudio } from './voice.js';
 
-export type CodexGateway = Pick<CodexClient, 'status' | 'subscribe' | 'enqueue' | 'interrupt' | 'findRequest' | 'respond' | 'deleteQueued' | 'startQueued'> & Pick<EventEmitter, 'on' | 'off'>;
+export type CodexGateway = Pick<CodexClient, 'status' | 'subscribe' | 'releaseThread' | 'enqueue' | 'interrupt' | 'findRequest' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Pick<EventEmitter, 'on' | 'off'>;
 export interface EngineOptions {
   config: () => AppConfig;
   temporaryRoot: string;
@@ -25,6 +25,9 @@ export class Engine extends EventEmitter {
   private tasks = new Set<Promise<unknown>>();
   private dispatching = new Set<string>();
   private reconciling = new Set<string>();
+  private ownedThreads = new Set<string>();
+  private releasing = new Map<string, Promise<void>>();
+  private retryThreadAfter = new Map<string, number>();
   private sending = false;
   private events: Promise<void> = Promise.resolve();
   private abort = new AbortController();
@@ -50,6 +53,7 @@ export class Engine extends EventEmitter {
   replaceCodex(next: CodexGateway): void {
     this.codex.off('notification', this.notification); this.codex.off('request', this.serverRequest); this.codex.off('status', this.connection);
     this.expireApprovals(); this.epoch = randomUUID(); this.connected = false;
+    this.ownedThreads.clear(); this.releasing.clear(); this.retryThreadAfter.clear();
     this.codex = next;
     next.on('notification', this.notification); next.on('request', this.serverRequest); next.on('status', this.connection);
     this.connectionChanged();
@@ -150,7 +154,8 @@ export class Engine extends EventEmitter {
     const request = this.store.getRequest(id);
     if (!request || terminal(request.status)) throw new Error('Запрос уже завершён.');
     if (request.status === 'queued' || request.status === 'transcribing') {
-      this.store.finishRequest(id, { status: 'cancelled' }, []);
+      this.store.finishRequest(id, { status: 'cancelled', error: undefined }, []);
+      await this.releaseIdleThread(request.conversationId);
       this.changed(); return;
     }
     const conversation = this.store.getConversation(request.conversationId)!;
@@ -164,6 +169,7 @@ export class Engine extends EventEmitter {
     } else if (found.state !== 'not_found') {
       this.finishFromHistory(request, found);
     } else throw new Error('Codex пока не подтвердил состояние запроса. Отмена без сверки недоступна.');
+    await this.releaseIdleThread(request.conversationId);
     this.changed();
   }
 
@@ -192,7 +198,9 @@ export class Engine extends EventEmitter {
     this.reconciling.add(id);
     try {
       const conversation = this.store.getConversation(request.conversationId)!;
+      await this.releasing.get(conversation.id);
       await this.codex.subscribe(conversation.threadId);
+      this.ownedThreads.add(conversation.id);
       const found = await this.codex.findRequest(conversation.threadId, id);
       if (terminal(this.store.getRequest(id)!.status)) return;
       if (found.mixed) this.store.setMeta(`mixed:${id}`, '1');
@@ -204,7 +212,11 @@ export class Engine extends EventEmitter {
       } else this.finishFromHistory(request, found);
     } catch (error) {
       if (!terminal(this.store.getRequest(id)!.status)) this.store.updateRequest(id, { status: 'uncertain', error: this.options.redact(error) });
-    } finally { this.reconciling.delete(id); this.changed(); }
+    } finally {
+      this.reconciling.delete(id);
+      await this.releaseIdleThread(request.conversationId);
+      this.changed();
+    }
   }
 
   /** Exposed to deterministic integration tests; the timer uses this same path. */
@@ -212,7 +224,8 @@ export class Engine extends EventEmitter {
     if (this.stopped) return;
     const work: Promise<unknown>[] = [this.deliver()];
     if (!this.suspended && this.codex.status().connected) for (const conversation of this.store.listConversations()) {
-      if (!conversation.paused && !this.dispatching.has(conversation.id)) work.push(this.dispatch(conversation.id));
+      if (!conversation.paused && !this.dispatching.has(conversation.id) && !this.releasing.has(conversation.id)
+          && Date.now() >= (this.retryThreadAfter.get(conversation.id) ?? 0)) work.push(this.dispatch(conversation.id));
     }
     if (this.codex.status().connected && Date.now() - this.lastReconcile > 15_000) {
       this.lastReconcile = Date.now();
@@ -229,11 +242,17 @@ export class Engine extends EventEmitter {
     let attempted = false;
     try {
       const conversation = this.store.getConversation(conversationId)!;
-      if (!this.store.listPendingRequests().some(row => row.conversationId === conversationId)) return;
-      await this.codex.subscribe(conversation.threadId);
+      const waiting = this.store.listPendingRequests().find(row => row.conversationId === conversationId);
+      if (!waiting || this.store.activeRequests().some(row => row.conversationId === conversationId && row.status !== 'queued')) return;
+      const client = this.codex;
+      await client.subscribe(conversation.threadId);
+      if (client !== this.codex) { await client.releaseThread(conversation.threadId); return; }
+      this.ownedThreads.add(conversationId);
       if (!this.codex.status().queueSupported || this.stopped || this.suspended) return;
       request = this.store.claimNextRequest(conversationId);
       if (!request) return;
+      this.retryThreadAfter.delete(conversationId);
+      if (request.error) request = this.store.updateRequest(request.id, { error: undefined });
       if (request.audio) {
         this.store.updateRequest(request.id, { status: 'transcribing' });
         const channel = this.channels[request.origin.platform];
@@ -249,12 +268,43 @@ export class Engine extends EventEmitter {
       // The userMessage and completion notifications may arrive before this ACK.
       this.store.updateRequest(request.id, { queuedSubmissionId: result.queuedSubmissionId });
     } catch (error) {
-      if (request && !terminal(this.store.getRequest(request.id)!.status)) {
+      if (error instanceof CodexThreadBusyError) {
+        // Ownership failed before queue/add: the original request and origin stay durable.
+        const waiting = request ?? this.store.listPendingRequests().find(row => row.conversationId === conversationId);
+        if (waiting && !terminal(this.store.getRequest(waiting.id)!.status)) this.store.updateRequest(waiting.id, { status: 'queued', error: this.options.redact(error) });
+        this.retryThreadAfter.set(conversationId, Date.now() + 5_000);
+      } else if (request && !terminal(this.store.getRequest(request.id)!.status)) {
         if (attempted && !(error instanceof CodexRpcError)) this.store.updateRequest(request.id, { status: 'uncertain', error: this.options.redact(error) });
         else if (this.stopped) this.store.updateRequest(request.id, { status: 'queued' });
         else this.fail(request.id, this.options.redact(error));
+      } else if (!request) {
+        const waiting = this.store.listPendingRequests().find(row => row.conversationId === conversationId);
+        if (waiting) this.store.updateRequest(waiting.id, { error: this.options.redact(error) });
+        this.retryThreadAfter.set(conversationId, Date.now() + 5_000);
       }
-    } finally { this.dispatching.delete(conversationId); this.changed(); }
+    } finally {
+      this.dispatching.delete(conversationId);
+      await this.releaseIdleThread(conversationId);
+      this.changed();
+    }
+  }
+
+  /** Release only after reconciliation and an enqueue ACK have both settled. */
+  private async releaseIdleThread(conversationId: string): Promise<void> {
+    if (this.releasing.has(conversationId)) return this.releasing.get(conversationId);
+    if (!this.ownedThreads.has(conversationId) || this.dispatching.has(conversationId)) return;
+    if ([...this.reconciling].some(id => this.store.getRequest(id)?.conversationId === conversationId)) return;
+    if (this.store.activeRequests().some(row => row.conversationId === conversationId && row.status !== 'queued')) return;
+    const conversation = this.store.getConversation(conversationId);
+    if (!conversation) return;
+    const client = this.codex;
+    const release = client.releaseThread(conversation.threadId).then(() => {
+      if (this.codex === client) this.ownedThreads.delete(conversationId);
+    }).catch(error => {
+      this.emit('diagnostic', this.options.redact(error));
+    }).finally(() => { if (this.releasing.get(conversationId) === release) this.releasing.delete(conversationId); });
+    this.releasing.set(conversationId, release);
+    return release;
   }
 
   private async deliver(): Promise<void> {
@@ -323,33 +373,50 @@ export class Engine extends EventEmitter {
   }
 
   private async onServerRequest(event: CodexServerRequest): Promise<void> {
+    const client = this.codex;
+    const managed = client.status().transport === 'managed';
+    const rejectUnowned = async () => { if (managed) await client.rejectRequest(event.id, 'Rele cannot authorize this request without its original message.'); };
+    const reviewHint = managed ? 'Действие отклонено. Сверьте запрос в панели Rele.' : 'Продолжите в Codex.';
     const p = event.params as Record<string, any>;
     const request = this.store.activeRequests().find(row => row.turnId === p.turnId && this.store.getConversation(row.conversationId)?.threadId === p.threadId);
-    // Desktop requests belong to Desktop. A broadcast is not authorization to answer them.
-    if (!request || this.isMixed(request.id)) return;
+    // An external server may broadcast another client's request. In our own child,
+    // an unowned request has no authorized handler and must receive an explicit error.
+    if (!request || this.isMixed(request.id)) {
+      await rejectUnowned();
+      return;
+    }
     // A foreign user message may have arrived before our own correlation event.
     // Verify history before publishing approval details outside the local runtime.
     let location: RequestLocation;
-    try { location = await this.codex.findRequest(p.threadId, request.id); }
+    try { location = await client.findRequest(p.threadId, request.id); }
     catch {
-      this.store.updateRequest(request.id, { status: 'uncertain', error: 'Не удалось проверить происхождение подтверждения. Продолжите в Codex.' });
+      if (client !== this.codex) return;
+      if (!terminal(this.store.getRequest(request.id)!.status)) this.store.updateRequest(request.id, { status: 'uncertain', error: `Не удалось проверить происхождение подтверждения. ${reviewHint}` });
+      await rejectUnowned();
       this.changed(); return;
     }
-    if (terminal(this.store.getRequest(request.id)!.status)) return;
+    if (client !== this.codex) return;
+    if (terminal(this.store.getRequest(request.id)!.status)) { await rejectUnowned(); return; }
     if (location.mixed) {
       this.store.setMeta(`mixed:${request.id}`, '1');
       this.store.updateRequest(request.id, { status: 'uncertain', error: mixedMessage });
+      await rejectUnowned();
       this.changed(); return;
     }
     if (location.state !== 'running' || location.turnId !== p.turnId) {
-      this.store.updateRequest(request.id, { status: 'uncertain', error: 'Подтверждение не совпало с активным ходом запроса. Продолжите в Codex.' });
+      this.store.updateRequest(request.id, { status: 'uncertain', error: `Подтверждение не совпало с активным ходом запроса. ${reviewHint}` });
+      await rejectUnowned();
       this.changed(); return;
     }
     const question = event.method === 'item/tool/requestUserInput';
     const command = event.method === 'item/commandExecution/requestApproval';
     const files = event.method === 'item/fileChange/requestApproval';
     if (!question && !command && !files) {
-      this.store.updateRequest(request.id, { status: 'waiting_approval', error: 'Codex запросил действие, которое нужно подтвердить в самом Codex.' }); this.changed(); return;
+      if (this.codex.status().transport === 'managed') {
+        await this.codex.rejectRequest(event.id, 'This Codex interaction is not supported by Rele.');
+        this.store.updateRequest(request.id, { error: 'Codex запросил действие, которое Rele пока не поддерживает. Действие отклонено; выполнение можно отменить в панели.' });
+      } else this.store.updateRequest(request.id, { status: 'waiting_approval', error: 'Codex запросил действие, которое нужно подтвердить в самом Codex.' });
+      this.changed(); return;
     }
     const questions: ApprovalQuestion[] | undefined = question && Array.isArray(p.questions) ? p.questions.map((entry: Record<string, any>) => ({ id: String(entry.id), header: String(entry.header ?? ''), question: String(entry.question ?? ''), isSecret: !!entry.isSecret, ...(Array.isArray(entry.options) ? { options: entry.options.map((option: Record<string, any>) => ({ label: String(option.label), description: String(option.description ?? '') })) } : {}) })) : undefined;
     const title = question ? 'Codex ждёт уточнения' : command ? 'Codex запрашивает выполнение команды' : 'Codex запрашивает изменение файлов';
@@ -387,13 +454,19 @@ export class Engine extends EventEmitter {
     const connected = this.codex.status().connected;
     if (!connected && this.connected) {
       this.epoch = randomUUID(); this.expireApprovals();
+      this.ownedThreads.clear(); this.retryThreadAfter.clear();
       for (const request of this.store.activeRequests()) if (['starting', 'running', 'waiting_approval'].includes(request.status)) this.store.updateRequest(request.id, { status: 'uncertain', error: 'Соединение с Codex прервано. Требуется сверка очереди и истории.' });
     }
     if (connected && !this.connected) for (const request of this.store.activeRequests()) if (!['queued', 'transcribing'].includes(request.status)) this.track(this.reconcile(request.id));
     this.connected = connected;
     this.changed();
   }
-  private event(action: () => Promise<void>): void { if (!this.stopped) this.events = this.events.then(action).catch(error => { this.emit('diagnostic', this.options.redact(error)); }); }
+  private event(action: () => Promise<void>): void {
+    const epoch = this.epoch;
+    if (!this.stopped) this.events = this.events.then(() => {
+      if (!this.stopped && this.epoch === epoch) return action();
+    }).catch(error => { this.emit('diagnostic', this.options.redact(error)); });
+  }
   private track<T>(task: Promise<T>): void { this.tasks.add(task); void task.catch(error => this.emit('diagnostic', this.options.redact(error))).finally(() => this.tasks.delete(task)); }
   private changed(): void { this.emit('change'); }
 }

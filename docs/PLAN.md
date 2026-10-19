@@ -1,10 +1,10 @@
 # План первого релиза Rele
 
-Цель стабильного v0.1.0: native Windows и Ubuntu Server, общий локальный Codex runtime и адресные ответы Telegram / Slack. WSL, распределённая установка и отдельный Rele Node исключены.
+Цель стабильного v0.1.0: native Windows и Ubuntu Server, общие исходные треды локального Codex и адресные ответы Telegram / Slack. WSL, распределённая установка и отдельный Rele Node исключены.
 
 | Этап | Реализовано | Условие завершения |
 | --- | --- | --- |
-| 1. Репозиторий и Codex | Репозиторий, рабочий PR, proxy / WebSocket, проверенный протокол 0.163.0 | Реальная Windows Desktop приёмка остаётся открытой |
+| 1. Репозиторий и Codex | Репозиторий, рабочий PR, managed / proxy / WebSocket, точные версии 0.163.0 и 0.163.0-alpha.10.2 | Реальная Windows Desktop приёмка остаётся открытой |
 | 2. Локальное ядро | SQLite inbox/outbox, immutable origin, очередь, backup, recovery | Автоматические тесты и сценарии аварий |
 | 3. Telegram / Slack | Long polling / Socket Mode, имена, ACL, подтверждения, voice attachments | Автотесты плюс разрешённые настоящие тестовые чаты |
 | 4. Панель | Каталог Codex / Slack, обнаруженные чаты Telegram и регистрация тем, связки по названиям, очередь, доставка, настройки | Браузерные и production smoke сценарии |
@@ -12,13 +12,15 @@
 | 6. Установка | Windows Setup / native launcher / пользовательская задача; Debian / systemd; portable runtime; SHA-256; backup / restore | Реальные install → restart → upgrade → uninstall smoke обеих ОС плюс архивы |
 | 7. Выпуск | Автоматическая публикация только явного -rc.N после зелёного CI | Stable после фактического закрытия Desktop / messenger условий |
 
-Рабочий кандидат: **0.1.0-rc.3**. Каталог разговоров: [issue #4](https://github.com/smart-tinker/rele/issues/4), [пользовательский сценарий](CATALOG.md). Установщики и автоматический поиск Codex: [установка](INSTALLATION.md), [issue #8](https://github.com/smart-tinker/rele/issues/8). Точные результаты и сборки доступны в GitHub Actions соответствующего commit. Первоначальные плановые варианты заменены проверенными решениями из [ARCHITECTURE.md](ARCHITECTURE.md).
+Рабочий кандидат: **0.1.0-rc.4**. Каталог разговоров: [issue #4](https://github.com/smart-tinker/rele/issues/4), [пользовательский сценарий](CATALOG.md). Установщики и автоматический поиск Codex: [установка](INSTALLATION.md), [issue #8](https://github.com/smart-tinker/rele/issues/8). Точные результаты и сборки доступны в GitHub Actions соответствующего commit. Первоначальные плановые варианты заменены проверенными решениями из [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Принятые ограничения
 
 - Не использовать turn/start как замену очереди.
 - Не повторять неопределённый queue/add даже с тем же UUID.
-- Не запускать скрытый отдельный app-server при ошибке proxy.
+- Основной managed-режим явно запускает собственный app-server; ошибка внешнего proxy не переключает его на отдельный сервер.
+- Не заменять исходный тред новым или fork при ошибке resume.
+- Не обещать мгновенную синхронизацию Desktop UI по общей папке истории.
 - Не пересылать прямые Desktop / CLI ходы.
 - Не отправлять смешанный Desktop / Rele ответ во внешний канал.
 - Не выдавать fake-adapter tests за настоящую интеграцию.
@@ -28,4 +30,4 @@
 
 Нужны установленный Windows Desktop с разрешённым тестовым проектом, Ubuntu Server с нужным Codex профилем и выделенные тестовые Telegram / Slack подключения. Токены вводятся локально в Rele, а не в issue или исходники.
 
-Issue #1 отслеживает выпуск в целом, issue #2 — реальный общий Windows Desktop runtime.
+Issue #1 отслеживает выпуск в целом, issue #2 — реальные исходные треды Windows Desktop и передачу владения. Контракт rc.4: собственный сервер Rele в общем профиле, сохранение ID, ожидание занятого треда и освобождение после работы; это не присоединение к частному stdio Desktop.
