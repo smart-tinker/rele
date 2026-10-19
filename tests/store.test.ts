@@ -374,10 +374,33 @@ describe('Store durability and recovery', () => {
     const check = new DatabaseSync(path);
     try {
       expect(check.prepare('PRAGMA journal_mode').get()?.journal_mode).toBe('wal');
-      expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(2);
+      expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(3);
       expect(check.prepare('PRAGMA quick_check').get()?.quick_check).toBe('ok');
       expect(check.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     } finally { check.close(); }
+  });
+
+  it('upgrades a v2 database without changing bindings, senders, pending requests or aliases', () => {
+    const path = join(directory(), 'v2.sqlite');
+    const original = open(path);
+    const conv = conversation(original);
+    const req = request(original);
+    original.setMeta('endpoint-alias:slack-1', 'Мой разговор');
+    original.close();
+    const old = new DatabaseSync(path);
+    old.exec('ALTER TABLE endpoints DROP COLUMN catalog; PRAGMA user_version = 2;');
+    old.close();
+    const upgraded = open(path);
+    expect(upgraded.getConversation(conv.id)).toEqual(conv);
+    expect(upgraded.getRequest(req.id)).toEqual(req);
+    expect(upgraded.getMeta('endpoint-alias:slack-1')).toBe('Мой разговор');
+    upgraded.upsertEndpoint({ ...upgraded.getEndpoint('slack-1')!, chatTitle: 'Команда', topicTitle: 'Релиз', available: false, isForum: true });
+    upgraded.upsertEndpoint(endpoint({ title: 'Новое исходное имя' }));
+    upgraded.close();
+    const reopened = open(path);
+    expect(reopened.getEndpoint('slack-1')).toMatchObject({ title: 'Новое исходное имя', chatTitle: 'Команда', topicTitle: 'Релиз', available: false, isForum: true });
+    expect(reopened.getConversation(conv.id)).toEqual(conv);
+    expect(reopened.listRequests()).toHaveLength(1);
   });
 
   it('refuses corrupted, unrelated and future databases without deleting their data', () => {

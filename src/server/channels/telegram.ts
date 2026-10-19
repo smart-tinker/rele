@@ -3,9 +3,11 @@ import type { Approval, AudioAttachment, ConnectionState, Delivery, Endpoint, In
 import { ChannelError, downloadBounded, endpointId, readableTitle, type Channel, type ChannelCallbacks } from './common.js';
 
 type ObjectValue = Record<string, unknown>;
-type TelegramMethod = 'getMe' | 'getWebhookInfo' | 'getUpdates' | 'sendMessage' | 'answerCallbackQuery' | 'getFile';
+type TelegramMethod = 'getMe' | 'getWebhookInfo' | 'getUpdates' | 'getChat' | 'getChatMember' | 'sendMessage' | 'answerCallbackQuery' | 'getFile';
 const MAX_AUDIO_SIZE = 20 * 1024 * 1024;
 const APPROVAL_ACTION = /^rele:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):(accept|decline)$/iu;
+// The request ID only distinguishes this keyboard action, and remains valid after a restart.
+const CHAT_PICKER_REQUEST_ID = 0x52454c45;
 
 function object(value: unknown): ObjectValue | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as ObjectValue : undefined;
@@ -13,12 +15,26 @@ function object(value: unknown): ObjectValue | undefined {
 function numericId(value: unknown): string | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value !== 0 ? String(value) : undefined;
 }
+function routingThreadId(message: ObjectValue | undefined): string | undefined {
+  // In groups, generic reply threads (including those in General) are not forum topics.
+  if (message?.is_topic_message === true) return numericId(message.message_thread_id);
+  return object(message?.chat)?.type === 'private' ? numericId(message?.message_thread_id) ?? '' : '';
+}
 function person(value: unknown): Person | undefined {
   const user = object(value);
   const id = numericId(user?.id);
   if (!user || !id || user.is_bot === true) return undefined;
   const name = [user.first_name, user.last_name].filter((part) => typeof part === 'string').join(' ').trim();
   return { id, name: readableTitle(name || (typeof user.username === 'string' ? `@${user.username}` : ''), 'Участник Telegram') };
+}
+function membership(value: unknown, accountId: string): boolean | undefined {
+  const member = object(value);
+  const user = object(member?.user);
+  if (!member || numericId(user?.id) !== accountId || user?.is_bot !== true) return undefined;
+  if (['creator', 'administrator', 'member'].includes(member.status as string)) return true;
+  if (member.status === 'restricted') return typeof member.is_member === 'boolean' ? member.is_member : undefined;
+  if (member.status === 'left' || member.status === 'kicked') return false;
+  return undefined;
 }
 function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) { void work.catch(() => {}); return Promise.reject(signal.reason); }
@@ -35,6 +51,7 @@ export class TelegramChannel implements Channel {
   private readonly endpoints = new Map<string, Endpoint>();
   private readonly topics = new Map<string, string>();
   private accountId = '';
+  private botUsername?: string;
   private controller?: AbortController;
   private starting?: Promise<void>;
   private polling?: Promise<void>;
@@ -50,7 +67,16 @@ export class TelegramChannel implements Channel {
   ) {
     this.fetcher = options.fetch ?? fetch;
     this.state = { configured: Boolean(token), connected: false };
-    for (const endpoint of options.knownEndpoints ?? []) if (endpoint.platform === 'telegram') this.endpoints.set(endpoint.id, endpoint);
+    for (const endpoint of options.knownEndpoints ?? []) {
+      if (endpoint.platform !== 'telegram') continue;
+      this.endpoints.set(endpoint.id, endpoint);
+      if (endpoint.threadId && endpoint.topicTitle) this.topics.set(endpoint.id, endpoint.topicTitle);
+    }
+  }
+
+  discoveryInfo(): { botUrl?: string; command: string } {
+    return { botUrl: this.botUsername ? `https://t.me/${this.botUsername}?start=rele_chats` : undefined,
+      command: `/rele_register${this.botUsername ? `@${this.botUsername}` : ''}` };
   }
 
   async start(): Promise<void> {
@@ -79,7 +105,9 @@ export class TelegramChannel implements Channel {
       const offset = this.checkpoint.get();
       if (!Number.isSafeInteger(offset) || offset < 0) throw new ChannelError('Не удалось прочитать сохранённую позицию Telegram.');
       this.accountId = accountId;
+      this.botUsername = typeof me.username === 'string' && /^[A-Za-z0-9_]+$/u.test(me.username) ? me.username : undefined;
       this.startupFailures = 0;
+      this.state.accountId = accountId;
       this.state.name = readableTitle(typeof me.username === 'string' ? `@${me.username}` : me.first_name, 'Бот Telegram');
       this.setStatus(true);
       this.polling = this.poll(controller.signal).finally(() => {
@@ -150,7 +178,7 @@ export class TelegramChannel implements Channel {
     let failures = 0;
     while (!signal.aborted) {
       try {
-        const updates = await this.call('getUpdates', { offset: this.checkpoint.get(), timeout: 25, allowed_updates: ['message', 'callback_query'] }, false, signal);
+        const updates = await this.call('getUpdates', { offset: this.checkpoint.get(), timeout: 25, allowed_updates: ['message', 'callback_query', 'my_chat_member'] }, false, signal);
         if (!Array.isArray(updates)) throw new ChannelError('Telegram вернул некорректный список сообщений.', true);
         this.setStatus(true);
         const ordered = updates.map((value) => {
@@ -179,6 +207,16 @@ export class TelegramChannel implements Channel {
   }
 
   private async handleUpdate(update: ObjectValue, signal: AbortSignal): Promise<void> {
+    const changedMembership = object(update.my_chat_member);
+    if (changedMembership) {
+      const chat = object(changedMembership.chat);
+      const chatId = numericId(chat?.id);
+      const available = membership(changedMembership.new_chat_member, this.accountId);
+      if (chat && chatId && ['private', 'group', 'supergroup'].includes(chat.type as string) && available !== undefined) {
+        this.discover(chat, chatId, '', person(changedMembership.from), available);
+      }
+      return;
+    }
     const callback = object(update.callback_query);
     if (callback) { await this.handleAction(callback, signal); return; }
     const message = object(update.message);
@@ -187,16 +225,48 @@ export class TelegramChannel implements Channel {
     const messageId = numericId(message?.message_id);
     if (!message || !chat || !chatId || !messageId || !['private', 'group', 'supergroup'].includes(chat.type as string)) return;
     const sender = person(message.from);
-    const threadId = numericId(message.message_thread_id) ?? '';
-    const topicKey = `${chatId}:${threadId}`;
-    const topic = object(message.forum_topic_created) ?? object(message.forum_topic_edited) ?? object(object(message.reply_to_message)?.forum_topic_created);
-    if (topic && typeof topic.name === 'string' && topic.name.trim()) this.topics.set(topicKey, readableTitle(topic.name, 'Тема Telegram', 128));
-    const endpoint = this.discover(chat, chatId, threadId, sender);
-    this.callbacks.endpoint(endpoint);
+    const threadId = routingThreadId(message);
+    if (threadId === undefined) return;
+    const topicKey = endpointId('telegram', this.accountId, chatId, threadId);
+    const topic = object(message.forum_topic_created) ?? object(message.forum_topic_edited);
+    const previousTopic = object(object(message.reply_to_message)?.forum_topic_created);
+    if (typeof topic?.name === 'string' && topic.name.trim()) this.topics.set(topicKey, readableTitle(topic.name, 'Тема Telegram', 128));
+    else if (!this.topics.has(topicKey) && !this.endpoints.get(topicKey)?.topicTitle && typeof previousTopic?.name === 'string' && previousTopic.name.trim()) {
+      this.topics.set(topicKey, readableTitle(previousTopic.name, 'Тема Telegram', 128));
+    }
+    const text = typeof message.text === 'string' ? message.text : typeof message.caption === 'string' ? message.caption : '';
+    const command = /^\/(rele_register|rele_chats|start)(?:@([A-Za-z0-9_]+))?(?:\s+([\s\S]*))?$/iu.exec(typeof message.text === 'string' ? message.text.trimEnd() : '');
+    const register = command?.[1].toLowerCase() === 'rele_register';
+    const picker = command?.[1].toLowerCase() === 'rele_chats' || (command?.[1].toLowerCase() === 'start' && command[3]?.trim() === 'rele_chats');
+    if ((register || picker) && command?.[2] && command[2].toLowerCase() !== this.botUsername?.toLowerCase()) return;
+    const ownDeparture = numericId(object(message.left_chat_member)?.id) === this.accountId;
+    const hasContent = Boolean(text.trim()) || ['photo', 'voice', 'audio', 'video', 'video_note', 'document', 'sticker', 'animation', 'contact', 'location', 'venue', 'poll', 'dice', 'paid_media', 'story', 'checklist'].some(key => message[key] !== undefined);
+    const generalTopic = !threadId && this.isForum(chat, chatId, threadId) && Boolean(sender) && !message.sender_chat && hasContent &&
+      !ownDeparture && !message.chat_shared && !message.forum_topic_created && !message.forum_topic_edited;
+    if (register && sender && !message.sender_chat && (threadId || generalTopic) && command?.[3]?.trim()) this.topics.set(topicKey, readableTitle(command[3], 'Тема Telegram', 128));
+    const endpoint = this.discover(chat, chatId, threadId, sender, !ownDeparture, generalTopic);
+    if (ownDeparture) return;
+    if (message.chat_shared) {
+      if (chat.type === 'private' && sender?.id === chatId && !message.sender_chat) await this.handleSharedChat(message.chat_shared, sender, signal);
+      return;
+    }
     if (!sender || sender.id === this.accountId || message.sender_chat) return;
+    if (picker || register) {
+      if (picker && (chat.type !== 'private' || sender.id !== chatId)) return;
+      const reply: ObjectValue = { chat_id: chatId,
+        text: picker ? 'Выберите группу, в которой уже есть этот бот. Для отдельной темы отправьте команду регистрации внутри неё.' :
+          `Добавлено в каталог Rele: ${endpoint.title}. ${endpoint.isForum && !threadId && !endpoint.generalTopic ? `Чтобы связать тему с Codex, отправьте ${this.discoveryInfo().command} внутри нужной темы.` : 'Теперь выберите этот чат или тему в панели Rele.'}`,
+        reply_parameters: { message_id: Number(messageId), allow_sending_without_reply: true }, link_preview_options: { is_disabled: true } };
+      if (threadId) reply.message_thread_id = Number(threadId);
+      if (picker) reply.reply_markup = { keyboard: [[{ text: 'Выбрать группу', request_chat: {
+        request_id: CHAT_PICKER_REQUEST_ID, chat_is_channel: false, bot_is_member: true, request_title: true,
+      } }]], resize_keyboard: true, one_time_keyboard: true, selective: true };
+      await this.replyToCommand(reply, chatId, threadId, signal);
+      return;
+    }
+    if (message.forum_topic_created || message.forum_topic_edited) return;
     const audioSource = object(message.voice) ?? object(message.audio) ??
       (typeof object(message.document)?.mime_type === 'string' && (object(message.document)!.mime_type as string).startsWith('audio/') ? object(message.document) : undefined);
-    const text = typeof message.text === 'string' ? message.text : typeof message.caption === 'string' ? message.caption : '';
     let audio: AudioAttachment | undefined;
     if (audioSource && typeof audioSource.file_id === 'string' && audioSource.file_id) {
       audio = { platform: 'telegram', fileId: audioSource.file_id,
@@ -210,22 +280,79 @@ export class TelegramChannel implements Channel {
     await abortable(this.callbacks.message(inbound), signal);
   }
 
-  private discover(chat: ObjectValue, chatId: string, threadId: string, sender?: Person): Endpoint {
+  private remember(endpoint: Endpoint): Endpoint {
+    this.callbacks.endpoint(endpoint);
+    this.endpoints.set(endpoint.id, endpoint);
+    return endpoint;
+  }
+
+  private isForum(chat: ObjectValue, chatId: string, threadId: string): boolean {
+    const knownParent = this.endpoints.get(endpointId('telegram', this.accountId, chatId, ''));
+    const hasKnownTopic = [...this.endpoints.values()].some((endpoint) => endpoint.accountId === this.accountId && endpoint.chatId === chatId && Boolean(endpoint.threadId));
+    return chat.type !== 'private' && (chat.is_forum === true || Boolean(threadId) || knownParent?.isForum === true || hasKnownTopic);
+  }
+
+  private discover(chat: ObjectValue, chatId: string, threadId: string, sender?: Person, available = true, generalTopic = false): Endpoint {
+    const isForum = this.isForum(chat, chatId, threadId);
+    const parent = this.remember(this.describe(chat, chatId, '', sender, available, isForum, generalTopic));
+    for (const existing of this.endpoints.values()) {
+      if (existing.accountId !== this.accountId || existing.chatId !== chatId || !existing.threadId || existing.threadId === threadId) continue;
+      if (existing.available !== available || existing.chatTitle !== parent.chatTitle || existing.isForum !== isForum) {
+        this.remember(this.describe(chat, chatId, existing.threadId, undefined, available, isForum));
+      }
+    }
+    return threadId ? this.remember(this.describe(chat, chatId, threadId, sender, available, isForum)) : parent;
+  }
+
+  private describe(chat: ObjectValue, chatId: string, threadId: string, sender: Person | undefined, available: boolean, isForum: boolean, observedGeneral = false): Endpoint {
     const id = endpointId('telegram', this.accountId, chatId, threadId);
     const existing = this.endpoints.get(id);
+    const parent = this.endpoints.get(endpointId('telegram', this.accountId, chatId, ''));
     const name = chat.type === 'private' ? [chat.first_name, chat.last_name].filter((part) => typeof part === 'string').join(' ').trim() || sender?.name : chat.title;
-    const chatTitle = readableTitle(name, chat.type === 'private' ? 'Личный чат Telegram' : 'Группа Telegram');
-    const topicName = this.topics.get(`${chatId}:${threadId}`);
-    const title = threadId ? topicName ? `${chatTitle} / ${topicName}` : existing?.title ?? `${chatTitle} / Тема без названия` : chatTitle;
+    const chatTitle = readableTitle(name, existing?.chatTitle ?? parent?.chatTitle ?? parent?.title ?? (chat.type === 'private' ? 'Личный чат Telegram' : 'Группа Telegram'));
+    const oldPrefix = `${existing?.chatTitle ?? chatTitle} / `;
+    const generalTopic = !threadId && isForum && (observedGeneral || existing?.generalTopic === true);
+    const topicTitle = threadId || isForum ? this.topics.get(id) ?? existing?.topicTitle ?? (existing?.title.startsWith(oldPrefix) ? existing.title.slice(oldPrefix.length) : undefined) ?? (generalTopic ? 'Общая тема' : undefined) : undefined;
+    const title = threadId || generalTopic ? topicTitle ? `${chatTitle} / ${topicTitle}` : existing?.title ?? `${chatTitle} / Тема без названия` : chatTitle;
     const username = typeof chat.username === 'string' && /^[A-Za-z0-9_]+$/u.test(chat.username) ? chat.username : undefined;
-    const url = username ? `https://t.me/${username}${threadId ? `/${threadId}` : ''}` : existing?.url;
+    const url = chat.type === 'private' && this.botUsername ? `https://t.me/${this.botUsername}` : username ? `https://t.me/${username}${threadId ? `/${threadId}` : ''}` : existing?.url;
     const people = new Map((existing?.people ?? []).map((entry) => [entry.id, entry]));
     if (sender) people.set(sender.id, sender);
-    const endpoint: Endpoint = { id, platform: 'telegram', accountId: this.accountId, chatId, threadId, title,
-      subtitle: threadId ? 'Тема · Telegram' : chat.type === 'private' ? 'Личный чат · Telegram' : 'Группа · Telegram',
+    return { id, platform: 'telegram', accountId: this.accountId, chatId, threadId, title, chatTitle, topicTitle, isForum, generalTopic: generalTopic || undefined, available,
+      subtitle: generalTopic ? 'Общая тема · Telegram' : threadId ? 'Тема · Telegram' : chat.type === 'private' ? 'Личный чат · Telegram' : 'Группа · Telegram',
       url, people: [...people.values()], updatedAt: new Date().toISOString() };
-    this.endpoints.set(id, endpoint);
-    return endpoint;
+  }
+
+  private async handleSharedChat(value: unknown, sender: Person, signal: AbortSignal): Promise<void> {
+    const shared = object(value);
+    const chatId = numericId(shared?.chat_id);
+    if (!shared || shared.request_id !== CHAT_PICKER_REQUEST_ID || !chatId) return;
+    let chat: ObjectValue | undefined;
+    let available: boolean | undefined;
+    try {
+      chat = object(await this.call('getChat', { chat_id: chatId }, false, signal));
+      if (!chat || numericId(chat.id) !== chatId || !['group', 'supergroup'].includes(chat.type as string)) throw new ChannelError('Telegram не подтвердил выбранную группу.');
+      available = membership(await this.call('getChatMember', { chat_id: chatId, user_id: Number(this.accountId) }, false, signal), this.accountId);
+      if (available === undefined) throw new ChannelError('Telegram не подтвердил участие бота в выбранной группе.');
+    } catch (error) {
+      if (signal.aborted || (error instanceof ChannelError && error.retryable)) throw error;
+      this.setStatus(true, error instanceof ChannelError ? error.message : 'Не удалось проверить выбранную группу Telegram.');
+      return;
+    }
+    this.discover(chat, chatId, '', sender, available);
+  }
+
+  private async replyToCommand(payload: ObjectValue, chatId: string, threadId: string, signal: AbortSignal): Promise<void> {
+    try {
+      const result = object(await this.call('sendMessage', payload, true, signal));
+      if (!numericId(result?.message_id) || numericId(object(result?.chat)?.id) !== chatId || routingThreadId(result) !== threadId) {
+        throw new ChannelError('Telegram не подтвердил служебный ответ. Повторите команду в чате при необходимости.', false, true);
+      }
+    } catch (error) {
+      if (signal.aborted || (error instanceof ChannelError && error.retryable)) throw error;
+      // An unknown send outcome must not replay a command automatically.
+      this.setStatus(true, error instanceof ChannelError ? error.message : 'Не удалось ответить на команду Telegram.');
+    }
   }
 
   private async handleAction(query: ObjectValue, signal: AbortSignal): Promise<void> {
@@ -234,11 +361,12 @@ export class TelegramChannel implements Channel {
     const sender = person(query.from);
     const message = object(query.message);
     const chatId = numericId(object(message?.chat)?.id);
+    const threadId = routingThreadId(message);
     let accepted = false;
     try {
-      if (match && sender && chatId) {
+      if (match && sender && chatId && threadId !== undefined) {
         await abortable(this.callbacks.action({ approvalId: match[1], decision: match[2].toLowerCase() as 'accept' | 'decline', platform: 'telegram',
-          accountId: this.accountId, chatId, threadId: numericId(message?.message_thread_id) ?? '', senderId: sender.id }), signal);
+          accountId: this.accountId, chatId, threadId, senderId: sender.id }), signal);
         accepted = true;
       }
     } catch (error) {
@@ -273,7 +401,7 @@ export class TelegramChannel implements Channel {
     }
     const result = object(await this.call('sendMessage', payload, true));
     const sentId = numericId(result?.message_id);
-    if (!sentId || numericId(object(result?.chat)?.id) !== origin.chatId || (origin.threadId && numericId(result?.message_thread_id) !== origin.threadId)) {
+    if (!sentId || numericId(object(result?.chat)?.id) !== origin.chatId || routingThreadId(result) !== origin.threadId) {
       throw new ChannelError('Telegram не подтвердил адрес и номер отправленного сообщения. Проверьте чат перед повтором.', false, true);
     }
     return sentId;

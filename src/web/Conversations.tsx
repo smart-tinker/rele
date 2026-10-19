@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import type {
   Binding,
   CodexThread,
@@ -9,6 +9,11 @@ import type {
 } from '../shared/types';
 import { errorText, ReleApi, safeHref } from './client';
 import { useAction } from './hooks';
+import {
+  AllowedSenders,
+  SlackCatalogPicker,
+  TelegramCatalogPicker,
+} from './CatalogPicker';
 import {
   ActionMessages,
   Button,
@@ -298,115 +303,83 @@ function BindingFields({
   platform,
   value,
   onChange,
-  endpoints,
+  state,
   disabled,
   api,
   refresh,
+  conversationId,
 }: {
   platform: Platform;
   value: BindingDraft;
   onChange: (value: BindingDraft) => void;
-  endpoints: Endpoint[];
+  state: DashboardState;
   disabled: boolean;
   api: ReleApi;
   refresh: () => Promise<void>;
+  conversationId?: string;
 }) {
-  const endpoint = endpoints.find((item) => item.id === value.endpointId);
-  const knownPeople = endpoint?.people ?? [];
-  const unavailable = value.allowedSenderIds.filter(
-    (id) => !knownPeople.some((person) => person.id === id),
-  );
-  const toggle = (id: string, checked: boolean) =>
-    onChange({
-      ...value,
-      allowedSenderIds: checked
-        ? [...new Set([...value.allowedSenderIds, id])]
-        : value.allowedSenderIds.filter((item) => item !== id),
-    });
+  const [loadedEndpoint, setLoadedEndpoint] = useState<Endpoint>();
+  const endpoint =
+    state.endpoints.find((item) => item.id === value.endpointId) ??
+    (loadedEndpoint?.id === value.endpointId ? loadedEndpoint : undefined);
+  const Picker =
+    platform === 'telegram' ? TelegramCatalogPicker : SlackCatalogPicker;
+  const accountId = state.connections[platform].accountId;
+  const differentAccount =
+    endpoint && accountId && endpoint.accountId !== accountId;
   return (
     <>
-      <Field
-        label={`Разговор ${platformLabel(platform)}`}
-        hint={
-          !endpoints.length
-            ? `Пока нет доступных разговоров. Подключите ${platformLabel(platform)} и отправьте сообщение боту в нужный разговор.`
-            : undefined
-        }
-      >
-        <select
-          value={value.endpointId}
-          disabled={disabled}
-          onChange={(event) =>
-            onChange({ endpointId: event.target.value, allowedSenderIds: [] })
-          }
-        >
-          <option value="">Не подключать</option>
-          {endpoints.map((item) => (
-            <option key={item.id} value={item.id}>
-              {item.title}
-              {item.subtitle ? ` · ${item.subtitle}` : ''}
-            </option>
-          ))}
-        </select>
-      </Field>
-      {endpoint && (
-        <EndpointNameEditor
-          key={endpoint.id}
-          endpoint={endpoint}
-          api={api}
-          refresh={refresh}
-          disabled={disabled}
-        />
+      <Picker
+        // Account changes reset catalogs and abort responses from the previous bot.
+        key={accountId ?? platform}
+        state={state}
+        api={api}
+        refresh={refresh}
+        value={value.endpointId}
+        onChange={(next) => {
+          setLoadedEndpoint(next);
+          onChange({ endpointId: next?.id ?? '', allowedSenderIds: [] });
+        }}
+        disabled={disabled}
+        conversationId={conversationId}
+      />
+      {value.endpointId && !endpoint && (
+        <Notice tone="warning">
+          Сохранённый разговор сейчас недоступен. Можно выбрать другой разговор
+          или отвязать подключение.
+        </Notice>
       )}
       {endpoint && (
-        <fieldset className="people-fieldset" disabled={disabled}>
-          <legend>Кто может отправлять запросы</legend>
-          <p className="field-hint">
-            Разрешите хотя бы одного отправителя. Все участники связки
-            используют общий контекст Codex.
-          </p>
-          {knownPeople.length ? (
-            <div className="people-list">
-              {knownPeople.map((person) => (
-                <label className="check-row" key={person.id}>
-                  <input
-                    type="checkbox"
-                    checked={value.allowedSenderIds.includes(person.id)}
-                    onChange={(event) =>
-                      toggle(person.id, event.target.checked)
-                    }
-                  />
-                  <span>{person.name}</span>
-                </label>
-              ))}
-            </div>
-          ) : (
-            <p className="muted">
-              В этом разговоре ещё не замечены отправители. Попросите нужного
-              участника написать боту.
-            </p>
+        <>
+          {(endpoint.available === false || differentAccount) && (
+            <Notice tone="warning">
+              Сохранённый разговор «{endpoint.title}»{' '}
+              {differentAccount
+                ? 'относится к другому подключению'
+                : 'сейчас недоступен'}
+              . Можно выбрать другой разговор или отвязать подключение.
+            </Notice>
           )}
-          {unavailable.length > 0 && (
-            <div className="field-hint">
-              Сохранённые отправители, чьи имена сейчас недоступны:{' '}
-              {unavailable.length}.{' '}
-              <button
-                type="button"
-                className="text-button"
-                onClick={() =>
-                  onChange({
-                    ...value,
-                    allowedSenderIds: value.allowedSenderIds.filter(
-                      (id) => !unavailable.includes(id),
-                    ),
-                  })
-                }
-              >
-                Убрать из доступа
-              </button>
-            </div>
-          )}
-        </fieldset>
+          <EndpointNameEditor
+            key={`name:${endpoint.id}`}
+            endpoint={endpoint}
+            api={api}
+            refresh={refresh}
+            disabled={disabled}
+          />
+          <AllowedSenders
+            key={`people:${accountId ?? platform}:${endpoint.id}`}
+            endpoint={endpoint}
+            accountId={accountId}
+            api={api}
+            refresh={refresh}
+            value={value.allowedSenderIds}
+            onChange={(allowedSenderIds) =>
+              onChange({ ...value, allowedSenderIds })
+            }
+            disabled={disabled}
+          />
+        </>
       )}
     </>
   );
@@ -507,21 +480,6 @@ function EndpointNameEditor({
   );
 }
 
-function availableEndpoints(
-  state: DashboardState,
-  platform: Platform,
-  conversationId?: string,
-): Endpoint[] {
-  const occupied = new Set(
-    state.conversations
-      .filter((item) => item.id !== conversationId)
-      .flatMap((item) => item.bindings.map((binding) => binding.endpointId)),
-  );
-  return state.endpoints.filter(
-    (item) => item.platform === platform && !occupied.has(item.id),
-  );
-}
-
 function NewConversation({
   state,
   api,
@@ -543,32 +501,76 @@ function NewConversation({
     slack: emptyBinding(),
   });
   const action = useAction();
-  const selected = threads.find((item) => item.id === threadId);
-  const loadThreads = async (signal?: AbortSignal) => {
+  const [threadQuery, setThreadQuery] = useState('');
+  const [includeArchived, setIncludeArchived] = useState(false);
+  const threadRequest = useRef<AbortController | null>(null);
+  const threadOwner = (id: string) =>
+    state.conversations.find((item) => item.threadId === id);
+  const selected = threads.find(
+    (item) => item.id === threadId && !item.archived && !threadOwner(item.id),
+  );
+  const loadThreads = async () => {
+    threadRequest.current?.abort();
+    const controller = new AbortController();
+    threadRequest.current = controller;
     setThreadsLoading(true);
     setThreadsError('');
-    try {
-      const result = await api.request<{ threads: CodexThread[] }>(
-        '/api/threads',
+    const results = await Promise.allSettled([
+      api.request<{ threads: CodexThread[] }>(
+        '/api/threads?archived=false',
         'GET',
         undefined,
-        signal,
-      );
-      if (!signal?.aborted) setThreads(result.threads);
-    } catch (cause) {
-      if (!signal?.aborted) setThreadsError(errorText(cause));
-    } finally {
-      if (!signal?.aborted) setThreadsLoading(false);
-    }
+        controller.signal,
+      ),
+      ...(includeArchived
+        ? [
+            api.request<{ threads: CodexThread[] }>(
+              '/api/threads?archived=true',
+              'GET',
+              undefined,
+              controller.signal,
+            ),
+          ]
+        : []),
+    ]);
+    if (controller.signal.aborted) return;
+    const active = results[0];
+    const archived = results[1];
+    setThreads((current) => [
+      ...(active.status === 'fulfilled'
+        ? active.value.threads.map((thread) => ({ ...thread, archived: false }))
+        : current.filter((thread) => !thread.archived)),
+      ...(includeArchived
+        ? archived?.status === 'fulfilled'
+          ? archived.value.threads.map((thread) => ({
+              ...thread,
+              archived: true,
+            }))
+          : current.filter((thread) => thread.archived)
+        : []),
+    ]);
+    setThreadsError(
+      results
+        .flatMap((result) =>
+          result.status === 'rejected' ? [errorText(result.reason)] : [],
+        )
+        .join(' '),
+    );
+    setThreadsLoading(false);
   };
   useEffect(() => {
-    const controller = new AbortController();
-    void loadThreads(controller.signal);
-    return () => controller.abort();
-  }, [api]);
-  const availableThreads = threads.filter(
+    void loadThreads();
+    return () => threadRequest.current?.abort();
+  }, [api, includeArchived]);
+  const filteredThreads = threads.filter(
     (thread) =>
-      !state.conversations.some((item) => item.threadId === thread.id),
+      thread.id === threadId ||
+      `${thread.name} ${thread.cwd} ${thread.preview}`
+        .toLocaleLowerCase('ru')
+        .includes(threadQuery.trim().toLocaleLowerCase('ru')),
+  );
+  const availableThreads = threads.filter(
+    (thread) => !thread.archived && !threadOwner(thread.id),
   );
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -611,6 +613,30 @@ function NewConversation({
           disabled={action.busy}
         />
       </Field>
+      <Field
+        label="Поиск разговоров Codex"
+        hint="Поиск по названию, рабочей папке и фрагменту разговора."
+      >
+        <input
+          type="search"
+          value={threadQuery}
+          onChange={(event) => setThreadQuery(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') event.preventDefault();
+          }}
+          placeholder="Название, папка или текст"
+          disabled={action.busy}
+        />
+      </Field>
+      <label className="check-row">
+        <input
+          type="checkbox"
+          checked={includeArchived}
+          onChange={(event) => setIncludeArchived(event.target.checked)}
+          disabled={action.busy}
+        />
+        <span>Показать архивные разговоры</span>
+      </label>
       <Field label="Разговор Codex">
         <select
           value={threadId}
@@ -629,14 +655,46 @@ function NewConversation({
               ? 'Загружаем разговоры…'
               : 'Выберите разговор по названию'}
           </option>
-          {availableThreads.map((thread) => (
-            <option key={thread.id} value={thread.id}>
-              {thread.name || 'Без названия'}
-              {thread.cwd ? ` · ${thread.cwd}` : ''}
-            </option>
-          ))}
+          {filteredThreads.map((thread) => {
+            const occupied = threadOwner(thread.id);
+            return (
+              <option
+                key={thread.id}
+                value={thread.id}
+                disabled={thread.archived || !!occupied}
+              >
+                {thread.name || 'Без названия'}
+                {thread.cwd ? ` · ${thread.cwd}` : ''}
+                {thread.archived ? ' · Архив' : ''}
+                {occupied ? ` · В связке «${occupied.name}»` : ''}
+              </option>
+            );
+          })}
         </select>
       </Field>
+      {!threadsLoading && (
+        <p className="field-hint">
+          Свободных: {availableThreads.length}. В связках:{' '}
+          {threads.filter((thread) => !!threadOwner(thread.id)).length}.
+          {includeArchived
+            ? ` Архивных: ${threads.filter((thread) => thread.archived).length}.`
+            : ''}
+        </p>
+      )}
+      {!threadsLoading && !!threadQuery && !filteredThreads.length && (
+        <p className="field-hint">
+          Разговоров с таким названием, папкой или текстом не найдено.
+        </p>
+      )}
+      {includeArchived && (
+        <Notice tone="info">
+          Архивные разговоры доступны для просмотра. Чтобы связать такой
+          разговор, сначала разархивируйте его в Codex, затем обновите список.
+        </Notice>
+      )}
+      {selected?.preview && (
+        <p className="catalog-preview">{selected.preview}</p>
+      )}
       {selected?.cwd && (
         <div className="selected-path">
           Рабочая папка: <span>{selected.cwd}</span>
@@ -670,7 +728,7 @@ function NewConversation({
             onChange={(value) =>
               setBindings((current) => ({ ...current, [platform]: value }))
             }
-            endpoints={availableEndpoints(state, platform)}
+            state={state}
             disabled={action.busy}
             api={api}
             refresh={refresh}
@@ -683,7 +741,7 @@ function NewConversation({
           type="submit"
           variant="primary"
           busy={action.busy}
-          disabled={!selected || !name.trim()}
+          disabled={!selected || !name.trim() || threadsLoading}
         >
           Создать связку
         </Button>
@@ -854,7 +912,8 @@ function EditBinding({
         platform={platform}
         value={value}
         onChange={setValue}
-        endpoints={availableEndpoints(state, platform, conversation.id)}
+        state={state}
+        conversationId={conversation.id}
         disabled={action.busy}
         api={api}
         refresh={refresh}

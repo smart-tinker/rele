@@ -1,10 +1,13 @@
 import type { Page } from '@playwright/test';
 import type {
   CodexThread,
+  CatalogChat,
+  CatalogPage,
   Conversation,
   DashboardState,
   Endpoint,
   Platform,
+  Person,
   ReleRequest,
 } from '../../src/shared/types';
 
@@ -40,9 +43,17 @@ export const threads: CodexThread[] = [
     preview: 'Новая задача',
     updatedAt: 1792353600,
   },
+  {
+    id: 'thread-archived',
+    name: 'Пример: архивный проект',
+    cwd: '/work/archive',
+    preview: 'Старая идея приложения',
+    updatedAt: 1792353600,
+    archived: true,
+  },
 ];
 
-function endpoint(
+export function fixtureEndpoint(
   id: string,
   platform: Platform,
   title: string,
@@ -66,13 +77,13 @@ function endpoint(
 
 export function fixtureState(empty = false): DashboardState {
   const endpoints = [
-    endpoint('tg-alpha', 'telegram', 'Команда Альфа', 'Разработка'),
-    endpoint('sl-alpha', 'slack', '#alpha-dev', 'Обсуждение API'),
-    endpoint('tg-docs', 'telegram', 'Документация', 'Общий'),
-    endpoint('tg-support', 'telegram', 'Поддержка', 'Заявки'),
-    endpoint('sl-support', 'slack', '#support', 'Разбор обращений'),
-    endpoint('tg-new', 'telegram', 'Пример: новый чат', 'Разработка'),
-    endpoint('sl-new', 'slack', '#example-new', 'Пример нового треда'),
+    fixtureEndpoint('tg-alpha', 'telegram', 'Команда Альфа', 'Разработка'),
+    fixtureEndpoint('sl-alpha', 'slack', '#alpha-dev', 'Обсуждение API'),
+    fixtureEndpoint('tg-docs', 'telegram', 'Документация', 'Общий'),
+    fixtureEndpoint('tg-support', 'telegram', 'Поддержка', 'Заявки'),
+    fixtureEndpoint('sl-support', 'slack', '#support', 'Разбор обращений'),
+    fixtureEndpoint('tg-new', 'telegram', 'Пример: новый чат', 'Разработка'),
+    fixtureEndpoint('sl-new', 'slack', '#example-new', 'Пример нового треда'),
   ];
   const conversations: Conversation[] = empty
     ? []
@@ -113,8 +124,18 @@ export function fixtureState(empty = false): DashboardState {
       desktopVerified: false,
     },
     connections: {
-      telegram: { configured: true, connected: true, name: 'Пример бота' },
-      slack: { configured: true, connected: true, name: 'Пример workspace' },
+      telegram: {
+        configured: true,
+        connected: true,
+        name: 'Пример бота',
+        accountId: 'telegram-test-account',
+      },
+      slack: {
+        configured: true,
+        connected: true,
+        name: 'Пример workspace',
+        accountId: 'slack-test-account',
+      },
     },
     conversations,
     endpoints,
@@ -171,13 +192,38 @@ export function fixtureRequest(
   };
 }
 
-export async function installApi(page: Page, state = fixtureState()) {
+interface CatalogFixture {
+  telegram?: { botUrl?: string; command: string };
+  chats?: CatalogPage<CatalogChat>[];
+  threads?: Record<string, CatalogPage<Endpoint>[]>;
+  people?: Record<string, CatalogPage<Person>[]>;
+  beforeThreads?: (chatId: string) => Promise<void>;
+}
+
+export async function installApi(
+  page: Page,
+  state = fixtureState(),
+  catalog: CatalogFixture = {},
+) {
   const mutations: Array<{ method: string; path: string; body: unknown }> = [];
+  const reads: string[] = [];
+  const completedThreadChats: string[] = [];
   const sourceTitles = new Map(
     state.endpoints.map((item) => [item.id, item.title]),
   );
   let offline = false;
   let mutationError = '';
+  const catalogPage = <T>(
+    pages: CatalogPage<T>[],
+    cursor: string | null,
+  ): CatalogPage<T> => {
+    const index = cursor
+      ? pages.findIndex(
+          (item, i) => i > 0 && pages[i - 1].nextCursor === cursor,
+        )
+      : 0;
+    return pages[index] ?? { items: [] };
+  };
   await page.route('**/api/**', async (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -189,12 +235,110 @@ export async function installApi(page: Page, state = fixtureState()) {
       await route.fulfill({ status: 401, json: { error: 'Unauthorized' } });
       return;
     }
+    if (request.method() === 'GET') reads.push(url.pathname + url.search);
     if (request.method() === 'GET' && url.pathname === '/api/state') {
       await route.fulfill({ json: state });
       return;
     }
     if (request.method() === 'GET' && url.pathname === '/api/threads') {
-      await route.fulfill({ json: { threads } });
+      await route.fulfill({
+        json: {
+          threads: threads.filter(
+            (thread) =>
+              !!thread.archived ===
+              (url.searchParams.get('archived') === 'true'),
+          ),
+        },
+      });
+      return;
+    }
+    if (
+      request.method() === 'GET' &&
+      url.pathname === '/api/catalog/telegram'
+    ) {
+      await route.fulfill({
+        json: catalog.telegram ?? {
+          botUrl: 'https://t.me/example_rele_bot?startgroup=rele_register',
+          command: '/rele_register@example_rele_bot',
+        },
+      });
+      return;
+    }
+    if (
+      request.method() === 'GET' &&
+      url.pathname === '/api/catalog/slack/chats'
+    ) {
+      const known: CatalogChat[] = [
+        ...new Map(
+          state.endpoints
+            .filter((endpoint) => endpoint.platform === 'slack')
+            .map((endpoint) => [
+              endpoint.chatId,
+              {
+                id: endpoint.chatId,
+                name: endpoint.chatTitle || endpoint.title,
+                subtitle: '',
+                kind: 'channel' as const,
+              },
+            ]),
+        ).values(),
+      ];
+      await route.fulfill({
+        json: catalogPage(
+          catalog.chats ?? [{ items: known }],
+          url.searchParams.get('cursor'),
+        ),
+      });
+      return;
+    }
+    if (
+      request.method() === 'GET' &&
+      url.pathname === '/api/catalog/slack/threads'
+    ) {
+      const chatId = url.searchParams.get('chatId') ?? '';
+      await catalog.beforeThreads?.(chatId);
+      const found = catalogPage(
+        catalog.threads?.[chatId] ?? [
+          {
+            items: state.endpoints.filter(
+              (endpoint) =>
+                endpoint.platform === 'slack' && endpoint.chatId === chatId,
+            ),
+          },
+        ],
+        url.searchParams.get('cursor'),
+      );
+      for (const item of found.items) {
+        if (!state.endpoints.some((endpoint) => endpoint.id === item.id))
+          state.endpoints.push(structuredClone(item));
+      }
+      await route.fulfill({ json: found });
+      completedThreadChats.push(chatId);
+      return;
+    }
+    if (
+      request.method() === 'GET' &&
+      url.pathname === '/api/catalog/slack/people'
+    ) {
+      const endpoint = state.endpoints.find(
+        (item) => item.id === url.searchParams.get('endpointId'),
+      );
+      const found = catalogPage(
+        catalog.people?.[endpoint?.id ?? ''] ?? [
+          { items: endpoint?.people ?? [] },
+        ],
+        url.searchParams.get('cursor'),
+      );
+      if (endpoint)
+        endpoint.people = [
+          ...new Map(
+            [...endpoint.people, ...found.items].map((person) => [
+              person.id,
+              person,
+            ]),
+          ).values(),
+        ];
+      await route.fulfill({ json: found });
       return;
     }
     const body = request.postData()
@@ -327,6 +471,8 @@ export async function installApi(page: Page, state = fixtureState()) {
   });
   return {
     state,
+    reads,
+    completedThreadChats,
     mutations,
     setOffline: (value: boolean) => {
       offline = value;

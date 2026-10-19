@@ -12,6 +12,8 @@ import { isLocalEndpoint } from './config.js';
 // Queue semantics and clientId recovery were tested against this exact runtime.
 // A newer CLI installed beside an older Desktop does not upgrade that Desktop's server.
 export const SUPPORTED_CODEX_VERSION = '0.163.0';
+// An omitted filter silently hides app-server and other persisted sources.
+const THREAD_SOURCES = ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview', 'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown'];
 export interface CodexConfig {
   transport: 'proxy' | 'websocket';
   executable: string;
@@ -104,12 +106,16 @@ export class CodexClient extends EventEmitter {
     this.disconnect('Соединение с Codex закрыто.');
   }
 
-  async listThreads(): Promise<CodexThread[]> {
-    const rows = await this.pages<RawThread>('thread/list', { limit: 100, sortKey: 'updated_at', modelProviders: [] });
+  async listThreads(options: { archived?: boolean } = {}): Promise<CodexThread[]> {
+    const archived = options.archived === true;
+    const rows = await this.pages<RawThread>('thread/list', {
+      limit: 100, sortKey: 'updated_at', modelProviders: [], archived,
+      sourceKinds: THREAD_SOURCES,
+    });
     return rows.filter(row => !row.ephemeral).map(row => ({
       id: row.id,
       name: row.name?.trim() || row.preview?.replace(/\s+/gu, ' ').trim().slice(0, 100) || 'Без названия',
-      cwd: row.cwd, preview: row.preview || '', updatedAt: row.updatedAt, status: row.status?.type,
+      cwd: row.cwd, preview: row.preview || '', updatedAt: row.updatedAt, status: row.status?.type, archived,
     }));
   }
 
@@ -264,7 +270,7 @@ export class CodexClient extends EventEmitter {
   }
 
   private async probeQueue(): Promise<void> {
-    const threads = await this.call<Page<RawThread>>('thread/list', { limit: 100, modelProviders: [], sortKey: 'updated_at' });
+    const threads = await this.call<Page<RawThread>>('thread/list', { limit: 100, modelProviders: [], sortKey: 'updated_at', sourceKinds: THREAD_SOURCES, archived: false });
     for (const thread of threads.data.filter(row => !row.ephemeral)) {
       try {
         await this.call('thread/queue/list', { threadId: thread.id, limit: 1 });

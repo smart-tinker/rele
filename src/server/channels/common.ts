@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
-import type { Approval, AudioAttachment, ConnectionState, Delivery, Endpoint, InboundMessage, Platform } from '../../shared/types.js';
+import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionState, Delivery, Endpoint, InboundMessage, Person, Platform } from '../../shared/types.js';
 
 export interface ApprovalAction {
   approvalId: string;
@@ -25,10 +25,14 @@ export interface Channel {
   stop(): Promise<void>;
   deliver(delivery: Delivery, approval?: Approval): Promise<string>;
   download(audio: AudioAttachment, file: string): Promise<void>;
+  listChats?(cursor?: string): Promise<CatalogPage<CatalogChat>>;
+  listThreads?(chatId: string, cursor?: string): Promise<CatalogPage<Endpoint>>;
+  listPeople?(chatId: string, cursor?: string): Promise<CatalogPage<Person>>;
+  discoveryInfo?(): { botUrl?: string; command: string };
 }
 
 export class ChannelError extends Error {
-  constructor(message: string, readonly retryable = false, readonly uncertain = false, readonly retryAfterMs = 30_000) { super(message); }
+  constructor(message: string, readonly retryable = false, readonly uncertain = false, readonly retryAfterMs = 30_000, readonly statusCode?: number) { super(message); }
 }
 
 export function endpointId(platform: Platform, accountId: string, chatId: string, threadId: string): string {

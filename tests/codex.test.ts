@@ -72,9 +72,22 @@ describe('Codex shared-runtime adapter', () => {
     expect(f.calls[0]).toMatchObject({ method: 'initialize', params: { capabilities: { experimentalApi: true } } });
     const threads = await f.client.listThreads();
     expect(threads.map(thread => thread.name)).toEqual(['Релиз Rele', 'Название из контекста']);
+    for (const call of f.calls.filter(call => call.method === 'thread/list')) {
+      expect(call.params).toMatchObject({ archived: false, sourceKinds: expect.arrayContaining(['cli', 'vscode', 'appServer', 'exec']) });
+    }
     expect(f.calls.some(call => call.method === 'thread/resume')).toBe(false);
     await f.client.readThread(threadId);
     expect(f.calls.at(-1)).toMatchObject({ method: 'thread/read', params: { threadId } });
+  });
+
+  it('lists archived conversations without restoring, resuming or queuing them', async () => {
+    const f = await fixture({
+      'thread/list': message => ({ data: message.params.archived ? [rawThread, { ...rawThread, id: 'temporary', ephemeral: true }] : [], nextCursor: null }),
+    });
+    await f.client.connect();
+    expect(await f.client.listThreads()).toEqual([]);
+    expect(await f.client.listThreads({ archived: true })).toMatchObject([{ id: threadId, archived: true }]);
+    expect(f.calls.some(call => ['thread/unarchive', 'thread/resume', 'thread/queue/add'].includes(call.method ?? ''))).toBe(false);
   });
 
   it('only adds to the queue, preserves early origin events and forwards Desktop steering', async () => {
