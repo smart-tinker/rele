@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 protocol-results.json
 voice-results.json
+installer-results.json
 dist/
 release/
 .rele/

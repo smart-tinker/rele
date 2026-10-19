@@ -17,7 +17,7 @@ jobs:
   verify:
     name: Verify and package (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -62,10 +62,16 @@ jobs:
       - run: npm run test:e2e
       - name: Verify the real production UI and HTTP API
         run: node scripts/smoke-ui.mjs
-      - name: Build portable runtime and verify the extracted archive
+      - name: Build installers and portable runtime, verify the extracted archive
         run: |
           npm run package
           node scripts/smoke-package.mjs
+      - name: Verify the real Windows installer lifecycle
+        if: runner.os == 'Windows'
+        run: node scripts/smoke-windows-installer.mjs
+      - name: Verify the real Debian package and systemd lifecycle
+        if: runner.os == 'Linux'
+        run: node scripts/smoke-linux-installer.mjs
       - name: Keep diagnostic reports
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -74,17 +80,20 @@ jobs:
           path: |
             protocol-results.json
             voice-results.json
+            installer-results.json
             playwright-report/
             test-results/
           if-no-files-found: ignore
           retention-days: 14
-      - name: Keep verified portable packages
+      - name: Keep verified installers and portable packages
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: portable-${{ matrix.os }}
           path: |
             release/*.zip
             release/*.tar.gz
+            release/*-setup.exe
+            release/*.deb
             release/*.sha256
           if-no-files-found: error
           compression-level: 0
@@ -139,14 +148,15 @@ jobs:
           cat > release-notes.md <<'NOTES'
           Rele release candidate for native Windows x64 and Ubuntu Server x64.
 
-          The archives include Node.js 24.19.0 and production dependencies. Extract the matching archive and use start-rele.cmd or start-rele.sh.
+          Recommended Windows download: rele-VERSION-windows-x64-setup.exe. Install under your Codex Desktop account, then open Rele from the Start menu. The installer manages a per-user background task, a native launcher, upgrades with backups, and standard Windows uninstallation. Program files go to LOCALAPPDATA/Programs/Rele; data stays in LOCALAPPDATA/Rele. Close an old portable Rele terminal with Ctrl+C before migrating.
 
-          This candidate adds conversation discovery: searchable Codex conversations and archive browsing, paginated Slack channels/threads/participants, and a bot-token-only Telegram catalog with a native group picker and topic registration command. Catalog reads and registration commands never submit a Codex task. See docs/CATALOG.md.
+          Recommended Ubuntu Server download: rele-VERSION-linux-x64.deb. Install with sudo apt install ./rele-VERSION-linux-x64.deb. The package uses /opt/rele, /usr/bin/rele, and systemd under the invoking sudo user's account. If installed directly as root, select the Codex owner with sudo rele service install --user NAME. Removal, including purge, keeps user conversation data. See docs/INSTALLATION.md.
 
-          Before upgrading from rc.1, create a Rele backup. This release migrates SQLite schema v2 to v3 while preserving bindings and delivery history; rollback requires the pre-upgrade backup.
+          Both installers include Node.js 24.19.0 and production dependencies. Codex discovery checks trusted Desktop backend locations, running process metadata, and local CLI installations. The panel distinguishes missing Codex, unavailable shared transport, and a failed catalog load. Opening the installed application uses an expiring single-use login link. Existing chat bindings and saved tokens survive upgrades. Portable ZIP/TAR packages remain available.
 
           Codex app-server 0.163.0 is the verified protocol version. Rele only attaches to an existing local runtime. The automated protocol fixture uses a local fake model and does not establish live Codex Desktop or real Telegram/Slack compatibility.
 
-          This is a prerelease. The Windows Desktop and authorized messenger acceptance scenarios remain mandatory before a stable release. See docs/PLAN.md and the open acceptance issues.
+          This is an unsigned prerelease, not a completed real Desktop acceptance. Finding Desktop does not guarantee that its internal app-server exposes a shared listener. Rele never silently starts an independent app-server. The Windows Desktop and authorized messenger acceptance scenarios remain mandatory before a stable release. See docs/PLAN.md and the open acceptance issues.
           NOTES
+          sed -i "s/VERSION/$RELE_CANDIDATE_VERSION/g" release-notes.md
           gh release create "$tag" release-assets/* --target "$GITHUB_SHA" --prerelease --title "Rele $RELE_CANDIDATE_VERSION" --notes-file release-notes.md

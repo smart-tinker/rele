@@ -1,0 +1,111 @@
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
+import { ConfigStore, mergeConfig } from '../dist/server/config.js';
+import { Store } from '../dist/server/store.js';
+
+// This test installs a real OS package and unit only on a disposable CI runner.
+if (process.platform !== 'linux' || process.env.CI !== 'true' || !existsSync('/run/systemd/system')) throw new Error('Run the installer smoke only on a disposable Linux CI runner with systemd.');
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const metadata = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
+const artifact = path.resolve(process.argv[2] || path.join(root, 'release', `rele-${metadata.version}-linux-x64.deb`));
+const owner = os.userInfo().username;
+const work = await mkdtemp(path.join(process.env.RUNNER_TEMP || os.tmpdir(), 'Rele Debian smoke '));
+const config = new ConfigStore(path.join(work, 'data'));
+const report = { platform: 'linux', version: metadata.version, passed: [] };
+function run(program, args, allowFailure = false) {
+  const result = spawnSync(program, args, { encoding: 'utf8', timeout: 60_000 });
+  if (result.error) throw result.error;
+  if (result.status !== 0 && !allowFailure) throw new Error(`${program}: ${result.status}\n${result.stdout}\n${result.stderr}`);
+  return result;
+}
+const sudo = args => run('/usr/bin/sudo', ['-n', ...args]);
+const ctl = (...args) => run('/usr/bin/systemctl', args);
+function preserved() {
+  const store = new Store(path.join(config.directory, 'rele.sqlite'));
+  try { assert.equal(store.getMeta('installer:preserve'), 'Bindings and delivery data survive package changes.'); }
+  finally { store.close(); }
+}
+async function healthy(previousPid) {
+  const deadline = Date.now() + 20_000;
+  do {
+    try {
+      const current = JSON.parse(await readFile(path.join(config.directory, 'instance.json'), 'utf8'));
+      assert.equal(current.pid, Number(ctl('show', 'rele.service', '--property=MainPID', '--value').stdout.trim()));
+      if (previousPid) assert.notEqual(current.pid, previousPid);
+      const response = await fetch(new URL('/api/health', current.address), { signal: AbortSignal.timeout(1000) });
+      assert.deepEqual(await response.json(), { ok: true, version: metadata.version });
+      return current;
+    } catch { await delay(200); }
+  } while (Date.now() < deadline);
+  throw new Error('Installed systemd service never became healthy.');
+}
+await config.load();
+await config.save(mergeConfig(config.config, { codex: { executable: path.join(work, 'missing-codex') } }));
+assert.notEqual(run('/usr/bin/dpkg-query', ['-W', '-f=${db:Status-Status}', 'rele'], true).stdout.trim(), 'installed', 'Runner must not already have Rele installed.');
+try {
+  sudo(['/usr/bin/env', `SUDO_USER=${owner}`, `RELE_INSTALL_DATA_DIR=${config.directory}`, `RELE_INSTALL_CODEX_HOME=${path.join(work, 'codex')}`, 'RELE_INSTALL_PORT=0', '/usr/bin/dpkg', '-i', artifact]);
+  assert.equal(ctl('show', 'rele.service', '--property=User', '--value').stdout.trim(), owner);
+  assert.equal(ctl('is-enabled', 'rele.service').stdout.trim(), 'enabled');
+  assert.ok(ctl('show', 'rele.service', '--property=Environment', '--value').stdout.includes('PATH=/opt/rele/runtime:'), 'npm-installed Codex must be able to resolve bundled Node even when no system Node exists.');
+  const installed = await healthy();
+  const store = new Store(path.join(config.directory, 'rele.sqlite'));
+  try { store.setMeta('installer:preserve', 'Bindings and delivery data survive package changes.'); } finally { store.close(); }
+  assert.equal(run('/usr/bin/rele', ['token']).stdout.trim(), config.panelToken);
+  const link = new URL(run('/usr/bin/rele', ['open', '--print-url']).stdout.trim());
+  assert.equal(link.origin, installed.address);
+  assert.ok(link.hash.startsWith('#rele-launch='));
+  assert.ok(!link.href.includes(config.panelToken));
+  report.passed.push('install, same-user service, autostart, health, one-time panel link');
+  sudo(['/usr/bin/rele', 'service', 'restart']);
+  const restarted = await healthy(installed.pid);
+  preserved();
+  report.passed.push('restart and durable data');
+  sudo(['/usr/bin/dpkg', '-i', artifact]);
+  await healthy(restarted.pid);
+  preserved();
+  assert.equal(run('/usr/bin/rele', ['token']).stdout.trim(), config.panelToken);
+  const backups = await readdir(path.join(config.directory, 'backups'));
+  assert.ok(backups.length > 0, 'An upgrade must back up the previous data before replacement.');
+  const backup = new Store(path.join(config.directory, 'backups', backups.at(-1), 'rele.sqlite'));
+  try { assert.equal(backup.getMeta('installer:preserve'), 'Bindings and delivery data survive package changes.'); } finally { backup.close(); }
+  report.passed.push('upgrade, pre-upgrade SQLite backup, preserved panel key');
+  const settings = JSON.parse(await readFile('/etc/rele/service.json', 'utf8'));
+  const goodSettings = path.join(work, 'service-good.json');
+  const missingOwner = path.join(work, 'service-missing-owner.json');
+  await writeFile(goodSettings, JSON.stringify(settings));
+  await writeFile(missingOwner, JSON.stringify({ ...settings, user: 'rele-ci-owner-no-longer-exists' }));
+  sudo(['/usr/bin/install', '-m', '644', missingOwner, '/etc/rele/service.json']);
+  sudo(['/usr/bin/dpkg', '--remove', 'rele']);
+  assert.ok(!existsSync('/usr/bin/rele'));
+  assert.notEqual(run('/usr/bin/systemctl', ['is-active', 'rele.service'], true).status, 0);
+  preserved();
+  assert.ok(existsSync(path.join(config.directory, 'config.json')));
+  report.passed.push('uninstall removes application and service, preserves user data');
+  sudo(['/usr/bin/install', '-m', '644', goodSettings, '/etc/rele/service.json']);
+  sudo(['/usr/bin/dpkg', '-i', artifact]);
+  await healthy();
+  preserved();
+  assert.equal(run('/usr/bin/rele', ['token']).stdout.trim(), config.panelToken);
+  const badSettings = path.join(work, 'service-damaged.json');
+  await writeFile(badSettings, '{damaged-json');
+  sudo(['/usr/bin/install', '-m', '644', badSettings, '/etc/rele/service.json']);
+  sudo(['/usr/bin/dpkg', '--purge', 'rele']);
+  assert.ok(!existsSync('/etc/rele/service.json'));
+  assert.ok(!existsSync('/etc/systemd/system/rele.service.d/rele-user.conf'));
+  preserved();
+  report.passed.push('reinstall resumes saved configuration; remove/purge work with missing owner or damaged service settings and retain user data');
+  await writeFile(path.join(root, 'installer-results.json'), JSON.stringify(report, null, 2) + '\n');
+  console.log('Debian installer verified: install, restart, upgrade, backup, remove, reinstall, purge.');
+} catch (error) {
+  console.error(run('/usr/bin/journalctl', ['-u', 'rele', '--no-pager', '-n', '60'], true).stdout);
+  throw error;
+} finally {
+  run('/usr/bin/sudo', ['-n', '/usr/bin/dpkg', '--purge', 'rele'], true);
+  await rm(work, { recursive: true, force: true });
+}

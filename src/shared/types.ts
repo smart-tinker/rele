@@ -153,6 +153,43 @@ export interface ConnectionState {
   accountId?: string;
 }
 
+export interface CodexConnectionTarget {
+  executable: string;
+  transport: 'proxy' | 'websocket';
+  endpoint: string;
+}
+
+export interface CodexInstallation {
+  executable: string;
+  name: string;
+  source: 'desktop-process' | 'desktop-install' | 'path' | 'standard';
+  version?: string;
+  running: boolean;
+  processId?: number;
+  connection?: CodexConnectionTarget;
+}
+
+export interface CodexDiscoveryIssue {
+  code: string;
+  message: string;
+  executable?: string;
+}
+
+export interface CodexDiscoveryResult {
+  installations: CodexInstallation[];
+  recommended?: CodexConnectionTarget;
+  issues: CodexDiscoveryIssue[];
+}
+
+export interface CodexConnectionState extends ConnectionState {
+  queueSupported: boolean;
+  desktopVerified: boolean;
+  executable?: string;
+  transport?: 'proxy' | 'websocket';
+  endpoint?: string;
+  errorCode?: string;
+}
+
 export interface PublicConfig {
   codex: { transport: 'proxy' | 'websocket'; executable: string; endpoint: string; tokenConfigured: boolean };
   telegram: { enabled: boolean; tokenConfigured: boolean };
@@ -162,7 +199,7 @@ export interface PublicConfig {
 
 export interface DashboardState {
   version: string;
-  codex: ConnectionState & { queueSupported: boolean; desktopVerified: boolean };
+  codex: CodexConnectionState;
   connections: Record<Platform, ConnectionState>;
   conversations: Conversation[];
   endpoints: Endpoint[];

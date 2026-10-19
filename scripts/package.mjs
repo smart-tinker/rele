@@ -69,6 +69,7 @@ await writeFile(path.join(stage, 'manifest.json'), JSON.stringify({
   node: nodeVersion, codexProtocol: '0.163.0', commit,
   nodeBinarySha256: await sha256(nodeBinary), desktopVerified: false,
 }, null, 2) + '\n');
+run(process.execPath, [path.join(root, 'scripts', process.platform === 'win32' ? 'build-windows-installer.mjs' : 'build-linux-installer.mjs'), stage]);
 const archive = path.join(output, name + (process.platform === 'win32' ? '.zip' : '.tar.gz'));
 if (process.platform === 'win32') {
   run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',

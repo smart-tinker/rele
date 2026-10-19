@@ -1,11 +1,13 @@
-import { useEffect, useState, type FormEvent } from 'react';
-import type {
-  CodexThread,
-  ConnectionState,
-  DashboardState,
-} from '../shared/types';
-import { errorText, ReleApi } from './client';
+import { useState, type FormEvent } from 'react';
+import type { ConnectionState, DashboardState } from '../shared/types';
+import { ReleApi } from './client';
 import { useAction } from './hooks';
+import { useCodexThreads } from './useCodexThreads';
+import {
+  automaticCodex,
+  CodexDiscovery,
+  codexTargetKey,
+} from './CodexDiscovery';
 import {
   ActionMessages,
   Button,
@@ -407,43 +409,38 @@ export function CodexSettings({
   const [executable, setExecutable] = useState(state.config.codex.executable);
   const [endpoint, setEndpoint] = useState(state.config.codex.endpoint);
   const [token, setToken] = useState('');
-  const [threads, setThreads] = useState<CodexThread[]>([]);
-  const [threadsLoading, setThreadsLoading] = useState(false);
-  const [threadsError, setThreadsError] = useState('');
+  const [selection, setSelection] = useState(
+    codexTargetKey(state.config.codex) === codexTargetKey(automaticCodex)
+      ? 'auto'
+      : 'manual',
+  );
+  const [discoveryRevision, setDiscoveryRevision] = useState(0);
+  const {
+    threads,
+    loading: threadsLoading,
+    error: threadsError,
+    reload: loadThreads,
+  } = useCodexThreads(api, state);
   const [threadQuery, setThreadQuery] = useState('');
   const action = useAction();
-  const loadThreads = async (signal?: AbortSignal) => {
-    setThreadsLoading(true);
-    setThreadsError('');
-    try {
-      const result = await api.request<{ threads: CodexThread[] }>(
-        '/api/threads',
-        'GET',
-        undefined,
-        signal,
-      );
-      if (!signal?.aborted) setThreads(result.threads);
-    } catch (cause) {
-      if (!signal?.aborted) setThreadsError(errorText(cause));
-    } finally {
-      if (!signal?.aborted) setThreadsLoading(false);
-    }
-  };
-  useEffect(() => {
-    const controller = new AbortController();
-    if (state.codex.connected) void loadThreads(controller.signal);
-    return () => controller.abort();
-  }, [api, state.codex.connected]);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const result = await action.run(
       () =>
         api.request('/api/config', 'PUT', {
           codex: {
-            transport,
-            executable: executable.trim(),
-            endpoint: endpoint.trim(),
-            ...(token.trim() ? { token: token.trim() } : {}),
+            ...(selection === 'auto'
+              ? automaticCodex
+              : {
+                  transport,
+                  executable: executable.trim(),
+                  endpoint: endpoint.trim(),
+                }),
+            ...(selection === 'manual' &&
+            transport === 'websocket' &&
+            token.trim()
+              ? { token: token.trim() }
+              : {}),
           },
         }),
       'Настройки Codex сохранены. Состояние подключения обновится автоматически.',
@@ -451,6 +448,8 @@ export function CodexSettings({
     if (result.ok) {
       setToken('');
       await refresh();
+      loadThreads();
+      setDiscoveryRevision((value) => value + 1);
     }
   };
   const connect = async () => {
@@ -460,7 +459,8 @@ export function CodexSettings({
     );
     if (result.ok) {
       await refresh();
-      await loadThreads();
+      loadThreads();
+      setDiscoveryRevision((value) => value + 1);
     }
   };
   const filtered = threads.filter((thread) =>
@@ -497,61 +497,108 @@ export function CodexSettings({
         </Status>
       </div>
       {state.codex.error && <Notice tone="warning">{state.codex.error}</Notice>}
+      <dl className="codex-runtime" aria-label="Фактическое подключение Codex">
+        <div>
+          <dt>Подключённый сервер</dt>
+          <dd>
+            {state.codex.connected
+              ? state.codex.name || 'Сервер ответил, версия не указана'
+              : 'Нет соединения с сервером'}
+          </dd>
+        </div>
+        <div>
+          <dt>Исполняемый файл</dt>
+          <dd>{state.codex.executable || 'Пока не определён'}</dd>
+        </div>
+        <div>
+          <dt>Подключение</dt>
+          <dd>
+            {state.codex.transport
+              ? state.codex.transport === 'websocket'
+                ? 'WebSocket'
+                : 'Локальный общий сервер'
+              : 'Пока не определено'}
+            {state.codex.endpoint && <span>{state.codex.endpoint}</span>}
+          </dd>
+        </div>
+      </dl>
       <form className="settings-section codex-form" onSubmit={submit}>
         <h2>Подключение к app-server</h2>
         <div className="form-stack">
-          <Field label="Способ подключения">
-            <select
-              value={transport}
-              disabled={action.busy}
-              onChange={(event) =>
-                setTransport(event.target.value as 'proxy' | 'websocket')
+          <CodexDiscovery
+            api={api}
+            value={selection}
+            refreshKey={discoveryRevision}
+            disabled={action.busy}
+            onChange={(choice) => {
+              if (typeof choice === 'string') setSelection(choice);
+              else {
+                setSelection(codexTargetKey(choice));
+                setTransport(choice.transport);
+                setExecutable(choice.executable);
+                setEndpoint(choice.endpoint);
+                setToken('');
               }
-            >
-              <option value="proxy">Локальный общий сервер</option>
-              <option value="websocket">WebSocket</option>
-            </select>
-          </Field>
-          <Field
-            label="Исполняемый файл Codex"
-            hint="Имя команды или полный путь к Codex на этом компьютере."
-          >
-            <input
-              value={executable}
-              disabled={action.busy}
-              required
-              onChange={(event) => setExecutable(event.target.value)}
-              placeholder="codex"
-            />
-          </Field>
-          {transport === 'websocket' && (
-            <>
-              <Field label="Адрес app-server">
-                <input
-                  value={endpoint}
+            }}
+          />
+          {selection === 'manual' && (
+            <div className="form-stack codex-manual">
+              <Field label="Способ подключения">
+                <select
+                  value={transport}
                   disabled={action.busy}
-                  required
-                  onChange={(event) => setEndpoint(event.target.value)}
-                  placeholder="ws://127.0.0.1:4500"
-                />
+                  onChange={(event) => {
+                    setTransport(event.target.value as 'proxy' | 'websocket');
+                    setEndpoint('');
+                    setToken('');
+                  }}
+                >
+                  <option value="proxy">Локальный общий сервер</option>
+                  <option value="websocket">WebSocket</option>
+                </select>
               </Field>
               <Field
-                label="Токен app-server"
-                hint={
-                  state.config.codex.tokenConfigured
-                    ? 'Токен сохранён. Пустое поле оставит его без изменений.'
-                    : 'Заполните, если app-server требует токен.'
-                }
+                label="Исполняемый файл Codex"
+                hint="Имя команды или полный путь к Codex на этом компьютере."
               >
                 <input
-                  type="password"
-                  autoComplete="new-password"
-                  value={token}
+                  value={executable}
                   disabled={action.busy}
-                  onChange={(event) => setToken(event.target.value)}
+                  required
+                  onChange={(event) => setExecutable(event.target.value)}
+                  placeholder="codex"
                 />
               </Field>
-            </>
+              {transport === 'websocket' && (
+                <>
+                  <Field label="Адрес app-server">
+                    <input
+                      value={endpoint}
+                      disabled={action.busy}
+                      required
+                      onChange={(event) => setEndpoint(event.target.value)}
+                      placeholder="ws://127.0.0.1:4500"
+                    />
+                  </Field>
+                  <Field
+                    label="Токен app-server"
+                    hint={
+                      state.config.codex.tokenConfigured
+                        ? 'Токен сохранён. Пустое поле оставит его без изменений.'
+                        : 'Заполните, если app-server требует токен.'
+                    }
+                  >
+                    <input
+                      type="password"
+                      autoComplete="new-password"
+                      value={token}
+                      disabled={action.busy}
+                      onChange={(event) => setToken(event.target.value)}
+                    />
+                  </Field>
+                </>
+              )}
+            </div>
           )}
           <p className="field-hint">
             Rele и Codex должны использовать профиль одного пользователя. На
@@ -572,6 +619,7 @@ export function CodexSettings({
           <Button
             icon="refresh"
             busy={threadsLoading}
+            disabled={!state.codex.connected || action.busy}
             onClick={() => void loadThreads()}
           >
             Обновить разговоры
@@ -633,18 +681,26 @@ export function CodexSettings({
             <EmptyState
               icon="terminal"
               title={
-                threadsLoading
-                  ? 'Загружаем разговоры…'
-                  : threadQuery
-                    ? 'Разговоры не найдены'
-                    : 'Список разговоров пока пуст'
+                !state.codex.connected
+                  ? 'Codex не подключён'
+                  : threadsError
+                    ? 'Не удалось загрузить разговоры'
+                    : threadsLoading
+                      ? 'Загружаем разговоры…'
+                      : threadQuery
+                        ? 'Разговоры не найдены'
+                        : 'Список разговоров пока пуст'
               }
             >
-              {threadsLoading
-                ? 'Получаем названия и рабочие папки из Codex.'
-                : state.codex.connected
-                  ? 'Создайте разговор в Codex и обновите список.'
-                  : 'Настройте подключение к Codex, затем обновите список.'}
+              {!state.codex.connected
+                ? 'Выберите найденное подключение или укажите параметры вручную, сохраните настройки и переподключите Codex.'
+                : threadsError
+                  ? 'Исправьте ошибку подключения и нажмите «Обновить разговоры».'
+                  : threadsLoading
+                    ? 'Получаем названия и рабочие папки из Codex.'
+                    : threadQuery
+                      ? 'Измените поисковый запрос.'
+                      : 'Создайте разговор в Codex и обновите список.'}
             </EmptyState>
           )}
         </div>

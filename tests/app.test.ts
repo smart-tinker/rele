@@ -74,6 +74,8 @@ function makeApp() {
     config.config = next;
   });
   let currentCodex = codex;
+  const shutdown = vi.fn().mockResolvedValue(undefined);
+  const discovery = vi.fn().mockResolvedValue({ installations: [], issues: [{ code: 'not-found', message: 'Codex не найден.' }] });
   const app = createApp({
     store,
     config,
@@ -81,6 +83,8 @@ function makeApp() {
     codex: () => currentCodex,
     configure,
     version: '0.1.0-test',
+    shutdown,
+    discoverCodex: discovery,
   });
   opened.push({ app, store });
   const endpoint: Endpoint = {
@@ -95,8 +99,55 @@ function makeApp() {
     updatedAt: '2026-10-18T20:00:00Z',
   };
   store.upsertEndpoint(endpoint);
-  return { app, store, config, engine, codex, configure, endpoint, replaceCodex: () => { currentCodex = { ...codex }; } };
+  return { app, store, config, engine, codex, configure, endpoint, shutdown, discovery, replaceCodex: () => { currentCodex = { ...codex }; } };
 }
+
+describe('installed application lifecycle', () => {
+  it('exchanges an authenticated launcher link only once, with the same local origin boundary', async () => {
+    const { app } = makeApp();
+    const local = { host: headers.host };
+    expect((await app.inject({ method: 'POST', url: '/api/session/launch-token', headers: local })).statusCode).toBe(401);
+    const minted = await app.inject({ method: 'POST', url: '/api/session/launch-token', headers });
+    expect(minted.statusCode).toBe(200);
+    expect(minted.body).not.toContain(panelToken);
+    const { token } = minted.json();
+    const request = { method: 'POST' as const, url: '/api/session/launch', headers: local, payload: { token } };
+    expect((await app.inject({ ...request, headers: { ...local, origin: 'https://example.com' } })).statusCode).toBe(403);
+    const exchanged = await app.inject(request);
+    expect(exchanged.statusCode).toBe(200);
+    expect(exchanged.json()).toEqual({ key: panelToken });
+    expect(exchanged.headers['cache-control']).toBe('no-store');
+    expect((await app.inject(request)).statusCode).toBe(401);
+    expect((await app.inject({ ...request, payload: { token: panelToken } })).statusCode).toBe(401);
+    expect((await app.inject({ url: '/api/session/launch', headers: local })).statusCode).toBe(401);
+  });
+
+  it('expires a launcher link after one minute', async () => {
+    const { app } = makeApp();
+    const minted = await app.inject({ method: 'POST', url: '/api/session/launch-token', headers });
+    const now = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 60_001);
+    try {
+      const result = await app.inject({ method: 'POST', url: '/api/session/launch', headers: { host: headers.host }, payload: { token: minted.json().token } });
+      expect(result.statusCode).toBe(401);
+      expect(result.body).not.toContain(panelToken);
+    } finally { now.mockRestore(); }
+  });
+
+  it('protects discovery, process identity and graceful shutdown with the existing panel key', async () => {
+    const { app, shutdown, discovery } = makeApp();
+    for (const [method, url] of [['GET', '/api/instance'], ['GET', '/api/codex/discovery'], ['POST', '/api/shutdown']] as const) {
+      expect((await app.inject({ method, url, headers: { host: headers.host } })).statusCode).toBe(401);
+    }
+    expect(shutdown).not.toHaveBeenCalled();
+    expect(discovery).not.toHaveBeenCalled();
+    expect((await app.inject({ url: '/api/instance', headers })).json()).toEqual({ pid: process.pid, version: '0.1.0-test' });
+    expect((await app.inject({ url: '/api/codex/discovery', headers })).json().issues[0].code).toBe('not-found');
+    expect(discovery).toHaveBeenCalledOnce();
+    const response = await app.inject({ method: 'POST', url: '/api/shutdown', headers });
+    expect(response.json()).toEqual({ ok: true });
+    await vi.waitFor(() => expect(shutdown).toHaveBeenCalledOnce());
+  });
+});
 
 describe('local panel request boundary', () => {
   it('exposes only a minimal unauthenticated health response', async () => {

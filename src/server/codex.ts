@@ -1,13 +1,13 @@
 import { EventEmitter } from 'node:events';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { access } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import path from 'node:path';
 import { Duplex } from 'node:stream';
 import type { Socket } from 'node:net';
 import WebSocket from 'ws';
-import type { CodexThread, ConnectionState } from '../shared/types.js';
-import { isLocalEndpoint } from './config.js';
+import type { CodexConnectionState, CodexConnectionTarget, CodexDiscoveryResult, CodexThread } from '../shared/types.js';
+import { isLocalEndpoint, isLocalSocketPath } from './config.js';
+import { discoverCodex } from './codex-discovery.js';
+import { resolveCodexLaunch } from './codex-launch.js';
 
 // Queue semantics and clientId recovery were tested against this exact runtime.
 // A newer CLI installed beside an older Desktop does not upgrade that Desktop's server.
@@ -52,7 +52,19 @@ export class CodexRpcError extends Error {
 // A dropped connection or timeout cannot establish whether a mutating RPC was accepted.
 export class CodexTransportError extends Error {
   readonly uncertain = true;
-  constructor(message: string) { super(message); this.name = 'CodexTransportError'; }
+  constructor(message: string, readonly code?: string) { super(message); this.name = 'CodexTransportError'; }
+}
+
+interface ConnectionFailure { code: string; message: string }
+
+/** Return a fixed diagnostic category, never raw child output or command lines. */
+export function classifyCodexConnectionFailure(value: string, fallback = 'connection-failed'): ConnectionFailure {
+  if (/unrecognized subcommand ['"]?proxy|unknown (?:subcommand|command).*proxy|unexpected argument ['"]?proxy/iu.test(value)) return { code: 'proxy-unsupported', message: 'Найденный Codex CLI не поддерживает подключение app-server proxy. Выберите совместимый CLI или доступный WebSocket существующего сервера.' };
+  if (/permission denied|access is denied|access denied|EACCES|EPERM|os error 5\b/iu.test(value)) return { code: 'access-denied', message: 'Нет доступа к Codex CLI или сокету сервера. Rele и Desktop должны работать под одним Windows-пользователем с доступом к этим файлам.' };
+  if (/unexpected server response: (?:401|403)|unauthori[sz]ed|forbidden/iu.test(value)) return { code: 'authentication-failed', message: 'Существующий app-server отклонил подключение. Проверьте токен сервера в настройках Codex.' };
+  if (/not running|no (?:running|existing).*server|connection refused|ECONNREFUSED|os error (?:2|61|111|10061)\b|control socket.*(?:not found|failed|missing)|No such file or directory/iu.test(value)) return { code: 'shared-server-unavailable', message: 'Codex CLI найден, но доступный общий app-server или его сокет не найден. Проверьте выбранный runtime и его адрес; новый сервер Rele не запускает.' };
+  if (/ENOENT|not a valid Win32 application|ENOEXEC|EINVAL/iu.test(value)) return { code: 'cli-unavailable', message: 'Не удалось запустить выбранный Codex CLI. Проверьте путь к CLI; исполняемый файл интерфейса Desktop для этого не подходит.' };
+  return { code: fallback, message: 'Не удалось подключиться к существующему Codex app-server. Проверьте выбранную установку и локальный адрес подключения.' };
 }
 
 /** Attach to an existing app-server. This class never starts a Codex daemon. */
@@ -69,9 +81,10 @@ export class CodexClient extends EventEmitter {
   private retry = 0;
   private runtime?: CodexRuntime;
   private version?: string;
-  private state: ConnectionState & { queueSupported: boolean; desktopVerified: boolean };
+  private state: CodexConnectionState;
+  private discovery?: { at: number; result: CodexDiscoveryResult };
 
-  constructor(private readonly config: CodexConfig) {
+  constructor(private readonly config: CodexConfig, private readonly options: { discover?: typeof discoverCodex } = {}) {
     super();
     this.state = {
       configured: config.transport === 'proxy' ? !!config.executable : isLocalEndpoint(config.endpoint ?? ''),
@@ -79,7 +92,7 @@ export class CodexClient extends EventEmitter {
     };
   }
 
-  status(): ConnectionState & { queueSupported: boolean; desktopVerified: boolean } { return { ...this.state }; }
+  status(): CodexConnectionState { return { ...this.state }; }
   runtimeInfo(): CodexRuntime | undefined { return this.runtime ? { ...this.runtime } : undefined; }
 
   async connect(): Promise<void> {
@@ -89,11 +102,12 @@ export class CodexClient extends EventEmitter {
       throw new Error('Codex: разрешён только локальный ws:// или wss:// адрес без пароля и параметров.');
     }
     if (this.config.transport === 'proxy' && !this.config.executable) throw new Error('Укажите исполняемый файл Codex CLI.');
+    if (this.config.transport === 'proxy' && this.config.endpoint && !isLocalSocketPath(this.config.endpoint)) throw new CodexTransportError('Proxy Codex принимает путь к локальному сокету. WebSocket URL нужно выбрать в режиме WebSocket.', 'invalid-proxy-socket');
     this.stopped = false;
     clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
     this.connecting = this.open().catch(error => {
-      this.disconnect(this.safeMessage(error));
+      this.disconnect(this.safeMessage(error), error instanceof CodexTransportError ? error.code : 'connection-failed');
       this.scheduleReconnect();
       throw error;
     }).finally(() => { this.connecting = undefined; });
@@ -222,34 +236,68 @@ export class CodexClient extends EventEmitter {
   private async open(): Promise<void> {
     this.runtime = undefined;
     this.version = undefined;
-    this.setState({ connected: false, queueSupported: false, error: undefined });
+    this.setState({ connected: false, queueSupported: false, error: undefined, errorCode: undefined });
+    let target: CodexConnectionTarget = { executable: this.config.executable, transport: this.config.transport, endpoint: this.config.endpoint ?? '' };
+    if (target.transport === 'proxy' && target.executable === 'codex') {
+      const result = this.discovery && Date.now() - this.discovery.at < 15_000
+        ? this.discovery.result : await (this.options.discover ?? discoverCodex)();
+      this.discovery = { at: Date.now(), result };
+      const explicitSocketCli = target.endpoint ? result.installations.find(item => item.version && item.connection?.endpoint === target.endpoint)
+        ?? result.installations.find(item => item.version && item.running)
+        ?? result.installations.find(item => item.version) : undefined;
+      if (target.endpoint && explicitSocketCli) target = { ...target, executable: explicitSocketCli.executable };
+      else if (!target.endpoint && result.recommended) target = result.recommended;
+      else {
+        const installation = result.installations.find(item => item.running) ?? result.installations[0];
+        this.setState({ executable: installation?.executable, transport: 'proxy', endpoint: '' });
+        const issue = result.issues.find(item => ['multiple-desktop-servers', 'desktop-stdio', 'socket-not-found', 'desktop-listener-unsupported', 'cli-probe-failed', 'cli-not-confirmed', 'cli-not-found'].includes(item.code)) ?? result.issues[0];
+        throw new CodexTransportError(issue?.message || 'Доступное подключение к общему Codex app-server не найдено.', issue?.code || 'discovery-no-connection');
+      }
+    }
+    if (this.stopped) throw new CodexTransportError('Соединение закрыто.');
+    this.setState({ executable: target.executable, transport: target.transport, endpoint: target.endpoint });
+    let failure: ConnectionFailure | undefined;
     let options: WebSocket.ClientOptions = { handshakeTimeout: 5_000, maxPayload: 32 * 1024 * 1024, followRedirects: false };
     if (this.config.token) options.headers = { Authorization: `Bearer ${this.config.token}` };
-    if (this.config.transport === 'proxy') {
-      const launch = await proxyLaunch(this.config.executable);
+    if (target.transport === 'proxy') {
+      if (target.endpoint && !isLocalSocketPath(target.endpoint)) throw new CodexTransportError('Некорректный локальный сокет Codex.', 'invalid-proxy-socket');
+      const launch = await resolveCodexLaunch(target.executable);
       if (this.stopped) throw new CodexTransportError('Соединение закрыто.');
+      this.setState({ executable: launch.executable });
       const args = [...launch.args, 'app-server', 'proxy'];
-      if (this.config.endpoint) args.push('--sock', this.config.endpoint);
+      if (target.endpoint) args.push('--sock', target.endpoint);
       this.proxy = spawn(launch.command, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
-      this.proxy.stderr.resume(); // Never publish environment details or secrets from child stderr.
+      let diagnosticTail = '';
+      this.proxy.stderr.setEncoding('utf8').on('data', (chunk: string) => {
+        diagnosticTail = (diagnosticTail + chunk).slice(-8_192);
+        const classified = classifyCodexConnectionFailure(diagnosticTail);
+        if (classified.code !== 'connection-failed') failure = classified;
+      });
       const stream = Duplex.from({ readable: this.proxy.stdout, writable: this.proxy.stdin });
       options = { ...options, createConnection: () => stream as Socket };
     }
-    const socket = new WebSocket(this.config.transport === 'proxy' ? 'ws://localhost/' : this.config.endpoint!, options);
+    else if (!isLocalEndpoint(target.endpoint)) throw new CodexTransportError('Codex принимает только локальный WebSocket URL.', 'invalid-endpoint');
+    const socket = new WebSocket(target.transport === 'proxy' ? 'ws://localhost/' : target.endpoint, options);
     this.socket = socket;
     socket.on('message', raw => { if (this.socket === socket) this.receive(raw.toString()); });
     socket.on('error', () => {}); // The handshake and close handlers surface sanitized connection state.
     socket.on('close', () => {
       if (this.socket !== socket) return;
-      this.disconnect('Соединение с Codex прервано. Неподтверждённые запросы требуют сверки.');
+      this.disconnect(failure?.message || 'Соединение с Codex прервано. Неподтверждённые запросы требуют сверки.', failure?.code);
       this.scheduleReconnect();
     });
-    this.proxy?.once('error', () => { if (this.socket === socket) socket.terminate(); });
+    this.proxy?.once('error', error => {
+      failure = classifyCodexConnectionFailure((error as NodeJS.ErrnoException).code || '', 'cli-unavailable');
+      if (this.socket === socket) socket.terminate();
+    });
     this.proxy?.once('exit', () => { if (this.socket === socket) socket.terminate(); });
     await new Promise<void>((resolve, reject) => {
       socket.once('open', resolve);
-      socket.once('error', () => reject(new CodexTransportError('Не удалось подключиться к существующему Codex app-server. Проверьте его запуск и локальный адрес.')));
-      socket.once('close', () => reject(new CodexTransportError('Codex app-server закрыл соединение во время подключения.')));
+      socket.once('error', error => {
+        const details = failure ?? classifyCodexConnectionFailure(error.message);
+        reject(new CodexTransportError(details.message, details.code));
+      });
+      socket.once('close', () => reject(new CodexTransportError(failure?.message || 'Codex app-server закрыл соединение во время подключения.', failure?.code || 'connection-closed')));
     });
     this.runtime = await this.call<CodexRuntime>('initialize', {
       clientInfo: { name: 'rele', title: 'Rele', version: '0.1.0' }, capabilities: { experimentalApi: true },
@@ -355,7 +403,7 @@ export class CodexClient extends EventEmitter {
     else pending.resolve(message.result);
   }
 
-  private disconnect(message: string): void {
+  private disconnect(message: string, errorCode?: string): void {
     const socket = this.socket;
     this.socket = undefined;
     socket?.terminate();
@@ -365,7 +413,7 @@ export class CodexClient extends EventEmitter {
     this.serverRequests.clear();
     for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(new CodexTransportError(message)); }
     this.pending.clear();
-    this.setState({ connected: false, queueSupported: false, error: message });
+    this.setState({ connected: false, queueSupported: false, error: message, errorCode });
   }
 
   private scheduleReconnect(): void {
@@ -378,7 +426,7 @@ export class CodexClient extends EventEmitter {
     this.reconnectTimer.unref();
   }
 
-  private setState(change: Partial<ConnectionState & { queueSupported: boolean }>): void {
+  private setState(change: Partial<CodexConnectionState>): void {
     this.state = { ...this.state, ...change, desktopVerified: false };
     this.emit('status', this.status());
   }
@@ -396,19 +444,3 @@ function nextPage(cursor: string | null, seen: Set<string>): string | undefined 
   return cursor;
 }
 
-/** Launch the official Windows npm shim without cmd.exe or shell interpolation. */
-async function proxyLaunch(executable: string): Promise<{ command: string; args: string[] }> {
-  if (/\.[cm]?js$/iu.test(executable)) return { command: process.execPath, args: [executable] };
-  if (process.platform !== 'win32') return { command: executable, args: [] };
-  const candidates = path.isAbsolute(executable) || /[\\/]/u.test(executable)
-    ? [path.resolve(executable)]
-    : (process.env.PATH || '').split(path.delimiter).flatMap(directory => path.extname(executable)
-      ? [path.join(directory, executable)] : [path.join(directory, `${executable}.exe`), path.join(directory, `${executable}.cmd`)]);
-  for (const candidate of candidates) {
-    try { await access(candidate); } catch { continue; }
-    if (!/\.(cmd|bat)$/iu.test(candidate)) return { command: candidate, args: [] };
-    const entry = path.join(path.dirname(candidate), 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
-    try { await access(entry); return { command: process.execPath, args: [entry] }; } catch { /* Try another PATH installation. */ }
-  }
-  throw new Error('Не найден Codex CLI для Windows. Укажите codex.exe или установите официальный @openai/codex для текущего пользователя.');
-}

@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir, rm, copyFile, chmod, stat, realpath, readdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rm, copyFile, chmod, stat, realpath, readdir, rename } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:net';
@@ -10,6 +10,7 @@ import { createApp } from './app.js';
 import { TelegramChannel } from './channels/telegram.js';
 import { SlackChannel } from './channels/slack.js';
 import type { ChannelCallbacks } from './channels/common.js';
+import { openPanel, serverStatus, stopServer } from './lifecycle.js';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const version = (JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')) as { version: string }).version;
@@ -18,12 +19,15 @@ const command = process.argv[2] ?? 'serve';
 async function main(): Promise<void> {
   if (['--version', 'version'].includes(command)) { process.stdout.write(`${version}\n`); return; }
   if (['--help', 'help'].includes(command)) {
-    process.stdout.write('Rele — локальный gateway Codex\n\nserve (по умолчанию)  запустить на 127.0.0.1\ntoken                показать ключ локальной панели\nbackup [каталог]     создать снимок базы и настроек\ndiagnostics          показать состояние без секретов\n\nRELE_DATA_DIR — каталог данных; RELE_PORT — локальный порт (по умолчанию 3210).\n'); return;
+    process.stdout.write('Rele — локальный gateway Codex\n\nserve (по умолчанию)  запустить на 127.0.0.1\nopen [--print-url]   открыть панель работающего Rele\nstatus [--wait]      проверить готовность своего Rele\nstop                 штатно остановить свой Rele\ntoken                показать ключ локальной панели\nbackup [каталог]     создать снимок базы и настроек\ndiagnostics          показать состояние без секретов\n\nRELE_DATA_DIR — каталог данных; RELE_PORT — локальный порт (по умолчанию 3210).\n'); return;
   }
-  if (!['serve', 'token', 'backup', 'diagnostics'].includes(command)) throw new Error('Неизвестная команда. Используйте --help.');
+  if (!['serve', 'open', 'status', 'stop', 'token', 'backup', 'diagnostics'].includes(command)) throw new Error('Неизвестная команда. Используйте --help.');
   const config = new ConfigStore(defaultDataDirectory());
   await config.load();
   if (command === 'token') { process.stdout.write(`${config.panelToken}\n`); return; }
+  if (command === 'open') { await openPanel(config, process.argv.includes('--print-url')); return; }
+  if (command === 'stop') { await stopServer(config); return; }
+  if (command === 'status') { await serverStatus(config, process.argv.includes('--wait')); return; }
   const database = path.join(config.directory, 'rele.sqlite');
   if (command === 'backup') {
     const destination = process.argv[3] ? path.resolve(process.argv[3]) : path.join(config.directory, 'backups', new Date().toISOString().replace(/[:.]/gu, '-'));
@@ -102,21 +106,27 @@ async function main(): Promise<void> {
       if (channelsChanged) attachChannels();
     } finally { engine.suspend(false); }
   }
-  app = createApp({ store, config, engine, codex: () => codex, configure, version, webDirectory: path.join(root, 'dist', 'web') });
+  app = createApp({ store, config, engine, codex: () => codex, configure, version, webDirectory: path.join(root, 'dist', 'web'), shutdown });
+  const instanceFile = path.join(config.directory, 'instance.json');
+  const temporaryInstance = path.join(config.directory, `instance-${process.pid}.tmp`);
   try {
     const address = await app.listen({ host: '127.0.0.1', port });
-    await writeFile(path.join(config.directory, 'instance.json'), JSON.stringify({ pid: process.pid, address, version }), { mode: 0o600 });
+    await writeFile(temporaryInstance, JSON.stringify({ pid: process.pid, address, version }), { mode: 0o600 });
+    await rename(temporaryInstance, instanceFile);
     engine.start(); attachChannels();
     void codex.connect().catch(() => {});
-    process.stdout.write(`Rele: ${address}/\nКлюч панели: выполните start-rele token или npm start -- token.\n`);
-  } catch (error) { await app.close(); await engine.stop(); codex.close(); store.close(); lock.close(); throw error; }
+    process.stdout.write(`Rele: ${address}/\nОткрыть панель: rele open. Ключ панели: rele token или npm start -- token.\n`);
+  } catch (error) { await app.close(); await engine.stop(); codex.close(); store.close(); await rm(temporaryInstance, { force: true }); lock.close(); throw error; }
   async function shutdown(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     await app.close();
     await Promise.allSettled(Object.values(engine.channels).map(channel => channel.stop()));
-    await engine.stop(); codex.close(); store.close(); lock.close();
-    await rm(path.join(config.directory, 'instance.json'), { force: true });
+    await engine.stop(); codex.close(); store.close();
+    // Keep the data-directory lock until our marker is removed, so another
+    // starting instance cannot have its fresh marker removed by this shutdown.
+    await rm(instanceFile, { force: true });
+    lock.close();
   }
   process.once('SIGINT', () => { void shutdown(); });
   process.once('SIGTERM', () => { void shutdown(); });

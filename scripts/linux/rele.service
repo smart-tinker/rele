@@ -1,0 +1,19 @@
+[Unit]
+Description=Rele local Codex gateway
+After=network.target
+ConditionPathExists=/etc/rele/service.json
+
+[Service]
+Type=simple
+# The installer writes the selected Codex owner's User= in its drop-in.
+User=nobody
+WorkingDirectory=~
+ExecStart=/opt/rele/runtime/node /opt/rele/dist/server/main.js serve
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=45
+KillMode=mixed
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
