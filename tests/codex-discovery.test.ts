@@ -194,7 +194,9 @@ function Invoke-CimMethod {
 }
 function Get-AppxPackage { [CmdletBinding()] param([string]$Name); @() }
 `;
-    const result = await runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', fixtures + WINDOWS_CODEX_METADATA_SCRIPT], 8_000);
+    // This parser fixture includes cold PowerShell startup on a shared CI runner.
+    // Its deadline is separate from production probe budgets and the limit test above.
+    const result = await runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', fixtures + WINDOWS_CODEX_METADATA_SCRIPT], 25_000);
     expect(result.code).toBe(0);
     const parsed = JSON.parse(result.stdout);
     expect(parsed.issues).toEqual([]);
@@ -206,5 +208,5 @@ function Get-AppxPackage { [CmdletBinding()] param([string]$Name); @() }
     expect(parsed.processes[4]).toMatchObject({ listenKind: 'unix', socket: 'C:\\Example User\\custom.sock', socketDefault: false });
     expect(parsed.processes[5]).toMatchObject({ listenKind: 'unix', socket: null, socketDefault: true });
     expect(result.stdout).not.toMatch(/synthetic-private|synthetic-secret|CommandLine|another-user|synthetic-gui/);
-  });
+  }, 35_000);
 });
