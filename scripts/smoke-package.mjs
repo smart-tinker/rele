@@ -40,7 +40,9 @@ try {
     ? run('cmd.exe', ['/d', '/s', '/c', 'start-rele.cmd --version'], { cwd: extracted, env })
     : run(path.join(extracted, 'start-rele.sh'), ['--version'], { cwd: extracted, env });
   assert.ok(launcher.includes(metadata.version), 'The packaged launcher did not report the version');
-  child = spawn(runtime, ['dist/server/main.js'], { cwd: extracted, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  child = spawn(process.platform === 'win32' ? 'powershell.exe' : path.join(extracted, 'start-rele.sh'),
+    process.platform === 'win32' ? ['-NoProfile', '-NonInteractive', '-Command', '& $env:RELE_SMOKE_LAUNCHER; exit $LASTEXITCODE'] : [],
+    { cwd: extracted, env: { ...env, RELE_SMOKE_LAUNCHER: path.join(extracted, 'start-rele.cmd') }, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   let output = '', errors = '';
   child.stdout.on('data', chunk => { output += chunk.toString(); });
   child.stderr.on('data', chunk => { errors += chunk.toString(); });
@@ -63,6 +65,7 @@ try {
   console.log(JSON.stringify({ package: path.basename(archive), result: 'passed', runtimeBundled: true, launcher: true, health: true, webPage: true, stateRequiresKey: true }));
 } finally {
   if (child && child.exitCode === null) {
+    if (process.platform === 'win32' && child.pid) run('taskkill.exe', ['/PID', String(child.pid), '/T', '/F']);
     child.kill();
     for (let attempt = 0; attempt < 50 && child.exitCode === null; attempt++) await delay(100);
     if (child.exitCode === null) child.kill('SIGKILL');

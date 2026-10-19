@@ -38,7 +38,37 @@ Windows PowerShell:
 
 Откройте `http://127.0.0.1:3210` и введите ключ. Rele и Codex должны работать под тем же Windows-пользователем, что и Desktop.
 
-Ubuntu Server:
+### Если Windows не запускает `start-rele.cmd`
+
+При сообщении «Системе не удается найти указанный путь» проверьте файлы из каталога распакованного Windows-выпуска:
+
+```powershell
+Test-Path -LiteralPath '.\runtime\node.exe' -PathType Leaf
+Test-Path -LiteralPath '.\dist\server\main.js' -PathType Leaf
+```
+
+Если обе проверки вернули `True`, приложение можно запустить напрямую из PowerShell:
+
+```powershell
+& '.\runtime\node.exe' '.\dist\server\main.js'
+```
+
+Оставьте это окно открытым. Во втором PowerShell перейдите в тот же каталог и получите ключ панели:
+
+```powershell
+& '.\runtime\node.exe' '.\dist\server\main.js' token
+```
+
+Если прямой запуск работает, для диагностики `.cmd` сохраните вывод следующих команд из второго окна:
+
+```powershell
+& "$env:SystemRoot\System32\cmd.exe" /d /e:on /v:off /c '.\start-rele.cmd --version'
+Get-Content -LiteralPath '.\start-rele.cmd'
+```
+
+Первая команда проверяет launcher с параметрами командного интерпретатора, заданными только для этого процесса. Она должна вывести версию Rele. [Значение параметров cmd](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/cmd). Если хотя бы одного файла нет, заново распакуйте полный Windows ZIP в отдельный каталог и проверьте его содержимое.
+
+### Ubuntu Server
 
 ```bash
 ./start-rele.sh
