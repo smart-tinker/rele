@@ -87,6 +87,8 @@ try {
   const unknown = spawnSync(installer, [...installArguments, `/LOG=${path.join(temporary, 'blocked-unknown.log')}`], { env, windowsHide: true, timeout: 60_000 });
   if (unknown.error) throw unknown.error;
   assert.notEqual(unknown.status, 0, 'An unknown startup file must require manual review.');
+  assert.match(await readFile(path.join(temporary, 'blocked-unknown.log'), 'utf8'), /В автозагрузке найден Rele\.cmd, который нельзя безопасно перенести/u,
+    'The refusal must identify the unknown startup script, not an unrelated installer error.');
   assert.equal(await readFile(legacyStartup, 'utf8'), legacyContents);
   assert.equal(await exists(path.join(application, 'runtime', 'node.exe')), false);
 
@@ -108,6 +110,8 @@ try {
   const blocked = spawnSync(installer, [...installArguments, `/LOG=${path.join(temporary, 'blocked-legacy.log')}`], { env, windowsHide: true, timeout: 60_000 });
   if (blocked.error) throw blocked.error;
   assert.notEqual(blocked.status, 0);
+  assert.match(await readFile(path.join(temporary, 'blocked-legacy.log'), 'utf8'), /Rele с этим каталогом данных запущен из другой папки/u,
+    'The refusal must identify the previous portable process, not an unrelated installer error.');
   process.kill(legacyProcess.pid, 0);
   assert.equal(await readFile(legacyStartup, 'utf8'), legacyContents);
   assert.equal(await exists(path.join(application, 'runtime', 'node.exe')), false);

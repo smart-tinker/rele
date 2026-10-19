@@ -39,6 +39,17 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - run: npm run build
+      - name: Build installers and portable runtime, verify the extracted archive
+        run: |
+          npm run package
+          node scripts/smoke-package.mjs
+      - name: Verify the real Windows installer lifecycle
+        if: runner.os == 'Windows'
+        run: node scripts/smoke-windows-installer.mjs
+      - name: Verify the real Debian package and systemd lifecycle
+        if: runner.os == 'Linux'
+        run: node scripts/smoke-linux-installer.mjs
       - name: Install the isolated protocol fixture
         run: |
           python -m pip install -r scripts/protocol-requirements.txt
@@ -57,21 +68,10 @@ jobs:
         run: |
           python scripts/transcribe.py --input "$RUNNER_TEMP/voice-fixture/jfk.flac" --model "$RUNNER_TEMP/voice-fixture/tiny" --language en --device cpu > voice-results.json
           python -c 'import json; text=json.load(open("voice-results.json"))["text"]; assert "what your country can do for you" in text.lower()'
-      - run: npm run build
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
       - name: Verify the real production UI and HTTP API
         run: node scripts/smoke-ui.mjs
-      - name: Build installers and portable runtime, verify the extracted archive
-        run: |
-          npm run package
-          node scripts/smoke-package.mjs
-      - name: Verify the real Windows installer lifecycle
-        if: runner.os == 'Windows'
-        run: node scripts/smoke-windows-installer.mjs
-      - name: Verify the real Debian package and systemd lifecycle
-        if: runner.os == 'Linux'
-        run: node scripts/smoke-linux-installer.mjs
       - name: Keep diagnostic reports
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

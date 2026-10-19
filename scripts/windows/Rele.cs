@@ -127,9 +127,26 @@ internal static class Rele
         return options.TryGetValue(key, out value) ? value : fallback;
     }
 
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetLongPathName(string shortPath, StringBuilder longPath, uint bufferLength);
+
+    private static string CanonicalPath(string path)
+    {
+        string full = Path.GetFullPath(path);
+        var buffer = new StringBuilder(260);
+        uint length = GetLongPathName(full, buffer, (uint)buffer.Capacity);
+        if (length >= buffer.Capacity)
+        {
+            buffer = new StringBuilder(checked((int)length));
+            length = GetLongPathName(full, buffer, (uint)buffer.Capacity);
+        }
+        // Existing paths may use an 8.3 alias (for example RUNNER~1); a new install path may not exist yet.
+        return (length > 0 && length < buffer.Capacity ? buffer.ToString() : full).TrimEnd('\\');
+    }
+
     private static bool SamePath(string first, string second)
     {
-        return String.Equals(Path.GetFullPath(first).TrimEnd('\\'), Path.GetFullPath(second).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+        return String.Equals(CanonicalPath(first), CanonicalPath(second), StringComparison.OrdinalIgnoreCase);
     }
 
     private static dynamic TaskFolder()
@@ -143,9 +160,10 @@ internal static class Rele
     {
         dynamic task;
         try { task = folder.GetTask(Config.TaskName); }
-        catch (COMException error)
+        catch (Exception error)
         {
-            if (error.ErrorCode == unchecked((int)0x80070002)) return null;
+            // COM can map this HRESULT to FileNotFoundException instead of COMException.
+            if (error.HResult == unchecked((int)0x80070002)) return null;
             throw;
         }
         dynamic definition = task.Definition;
