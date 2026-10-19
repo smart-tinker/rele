@@ -19,18 +19,19 @@ async function fixture(source: string, maxFrameBytes?: number, expectedMessages 
   const script = path.join(directory, 'server.mjs');
   await writeFile(script, source);
   const messages: string[] = [], errors: CodexStdioError[] = [];
-  let resolveMessage!: () => void, resolveFailure!: () => void;
+  let resolveMessage!: () => void, resolveFailure!: () => void, resolveClosed!: () => void;
   const message = new Promise<void>(resolve => { resolveMessage = resolve; });
   const failure = new Promise<void>(resolve => { resolveFailure = resolve; });
+  const closed = new Promise<void>(resolve => { resolveClosed = resolve; });
   const transport = new CodexStdioTransport(process.execPath, [script], process.env, {
     message: raw => { messages.push(raw); if (messages.length >= expectedMessages) resolveMessage(); },
     stderr: () => {},
     failure: error => { errors.push(error); resolveFailure(); },
-    closed: () => {},
+    closed: resolveClosed,
   }, { maxFrameBytes });
   cleanup.push(() => transport.close());
   await transport.ready;
-  return { transport, messages, errors, message, failure };
+  return { transport, messages, errors, message, failure, closed };
 }
 
 describe('owned Codex NDJSON transport', () => {
@@ -68,6 +69,9 @@ describe('owned Codex NDJSON transport', () => {
     expect(f.errors).toHaveLength(1);
     expect(f.errors[0]).toMatchObject({ code });
     expect(f.messages).toEqual([]);
+    // These fixtures exit naturally after writing their invalid bytes. Observe
+    // that exit before cleanup rather than racing it with a forced tree kill.
+    await f.closed;
   });
 });
 
