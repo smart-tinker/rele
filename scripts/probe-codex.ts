@@ -6,6 +6,7 @@ const { values } = parseArgs({ options: {
   executable: { type: 'string', default: 'codex' },
   endpoint: { type: 'string', default: '' },
   thread: { type: 'string' },
+  archived: { type: 'boolean' },
   'token-env': { type: 'string' },
   help: { type: 'boolean' },
 } });
@@ -17,6 +18,7 @@ npm run probe:codex -- --transport proxy [--executable /path/to/codex] [--endpoi
 npm run probe:codex -- --transport websocket --endpoint ws://127.0.0.1:4500 [--token-env CODEX_SERVER_TOKEN]
 
 Optional --thread UUID reads existing thread metadata without resuming it.
+Optional --archived lists archived metadata without restoring conversations.
 This probe does not create threads, start a daemon, submit model input, or change authentication.
 The runtime PID and CODEX_HOME help compare two attachments; Windows Desktop live verification is separate.`);
 } else {
@@ -30,12 +32,14 @@ The runtime PID and CODEX_HOME help compare two attachments; Windows Desktop liv
     await client.connect();
     const runtime = client.runtimeInfo();
     const diagnostics = await client.diagnostics();
-    const threads = await client.listThreads();
+    const threads = await client.listThreads({ archived: values.archived });
     const thread = values.thread ? await client.readThread(values.thread) : undefined;
     console.log(JSON.stringify({
       status: client.status(), runtime, runtimeProcessId: diagnostics.process.id,
       threadCount: threads.length, ...(thread ? { thread } : {}),
-      checks: { attachedToExistingServer: true, mutatingRequestsSent: false, desktopLiveVerified: false },
+      checks: { attachedToExistingServer: true, mutatingRequestsSent: false, desktopLiveVerified: false,
+        ...(values.thread ? { requestedThreadListed: threads.some(candidate => candidate.id === values.thread) } : {}),
+      },
     }, null, 2));
     if (!client.status().queueSupported) process.exitCode = 2;
   } catch (error) {

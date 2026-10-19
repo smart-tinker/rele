@@ -6,7 +6,8 @@ import { mergeConfig, publicConfig } from './config.js';
 import type { Store } from './store.js';
 import type { Engine } from './engine.js';
 import type { CodexClient } from './codex.js';
-import type { DashboardState, Platform } from '../shared/types.js';
+import type { DashboardState, Endpoint, Platform } from '../shared/types.js';
+import { ChannelError } from './channels/common.js';
 
 export interface AppServices {
   store: Store;
@@ -55,6 +56,11 @@ export function createApp(services: AppServices) {
     const duplicate = /UNIQUE constraint failed|already bound|already linked/u.test(message);
     const code = (error as { statusCode?: unknown }).statusCode;
     const status = duplicate ? 409 : error instanceof ApiError ? error.statusCode : typeof code === 'number' ? code : 400;
+    if (status === 429 && error instanceof ChannelError) {
+      const seconds = Number.isFinite(error.retryAfterMs) ? Math.max(1, Math.ceil(error.retryAfterMs / 1000)) : 30;
+      reply.header('Retry-After', String(seconds));
+      return reply.code(status).send({ error: `${message} Повторите через ${seconds} с.`, retryAfterSeconds: seconds });
+    }
     reply.code(status).send({ error: duplicate ? 'Этот тред или чат уже используется в другой связке.' : message });
   });
 
@@ -68,7 +74,53 @@ export function createApp(services: AppServices) {
     },
     conversations: store.listConversations(), endpoints: store.listEndpoints().map(endpoint => ({ ...endpoint, title: store.getMeta(`endpoint-alias:${endpoint.id}`) || endpoint.title })), requests: store.listRequests(250), deliveries: store.listDeliveries(500), approvals: store.listApprovals(250), config: publicConfig(config.config),
   }));
-  app.get('/api/threads', async () => ({ threads: await services.codex().listThreads() }));
+  app.get('/api/threads', async request => {
+    const query = object(request.query); fields(query, ['archived']);
+    if (query.archived !== undefined && query.archived !== 'true' && query.archived !== 'false') throw new ApiError(400, 'Некорректный фильтр архива Codex.');
+    const codex = services.codex();
+    const threads = await codex.listThreads({ archived: query.archived === 'true' });
+    if (services.codex() !== codex) throw new ApiError(409, 'Подключение Codex изменилось. Обновите список разговоров.');
+    return { threads };
+  });
+  function slackCatalog() {
+    const channel = engine.channels.slack;
+    if (!channel?.state.connected || !channel.listChats || !channel.listThreads || !channel.listPeople) throw new ApiError(503, 'Подключите Slack в разделе «Подключения», чтобы загрузить каталог.');
+    return channel as typeof channel & Required<Pick<typeof channel, 'listChats' | 'listThreads' | 'listPeople'>>;
+  }
+  function catalogQuery(value: unknown, extra: string[] = []) {
+    const query = object(value); fields(query, ['cursor', ...extra]);
+    const cursor = query.cursor === undefined ? undefined : string(query.cursor, 'страница каталога', 2048);
+    return { query, cursor };
+  }
+  function namedEndpoint(endpoint: Endpoint): Endpoint {
+    return { ...endpoint, title: store.getMeta(`endpoint-alias:${endpoint.id}`) || endpoint.title };
+  }
+  app.get('/api/catalog/slack/chats', async request => {
+    const { cursor } = catalogQuery(request.query);
+    const channel = slackCatalog();
+    const page = await channel.listChats(cursor);
+    if (engine.channels.slack !== channel) throw new ApiError(409, 'Подключение Slack изменилось. Обновите каталог.');
+    return page;
+  });
+  app.get('/api/catalog/slack/threads', async request => {
+    const { query, cursor } = catalogQuery(request.query, ['chatId']);
+    const channel = slackCatalog();
+    const page = await channel.listThreads(string(query.chatId, 'канал Slack', 200), cursor);
+    if (engine.channels.slack !== channel) throw new ApiError(409, 'Подключение Slack изменилось. Обновите каталог.');
+    return { ...page, items: page.items.map(namedEndpoint) };
+  });
+  app.get('/api/catalog/slack/people', async request => {
+    const { query, cursor } = catalogQuery(request.query, ['endpointId']);
+    const channel = slackCatalog();
+    const endpoint = store.getEndpoint(string(query.endpointId, 'обсуждение Slack', 200));
+    if (!endpoint || endpoint.platform !== 'slack' || endpoint.accountId !== channel.state.accountId) throw new ApiError(404, 'Обсуждение не относится к подключённому Slack. Обновите каталог.');
+    const page = await channel.listPeople(endpoint.chatId, cursor);
+    if (engine.channels.slack !== channel) throw new ApiError(409, 'Подключение Slack изменилось. Обновите каталог.');
+    const current = store.getEndpoint(endpoint.id)!;
+    store.upsertEndpoint({ ...current, people: page.items });
+    return page;
+  });
+  app.get('/api/catalog/telegram', async () => engine.channels.telegram?.discoveryInfo?.() ?? { command: '/rele_register' });
   app.patch<{ Params: { id: string } }>('/api/endpoints/:id', async request => {
     const input = object(request.body); fields(input, ['title']);
     if (!store.getEndpoint(request.params.id)) throw new ApiError(404, 'Чат не найден.');
@@ -92,6 +144,10 @@ export function createApp(services: AppServices) {
     const endpointId = string(input.endpointId, 'чат', 200);
     const endpoint = store.getEndpoint(endpointId);
     if (!endpoint || endpoint.platform !== source) throw new ApiError(400, 'Выберите известный чат нужного мессенджера.');
+    const accountId = engine.channels[source]?.state.accountId;
+    if (accountId && endpoint.accountId !== accountId) throw new ApiError(400, 'Этот чат относится к другому боту. Обновите каталог.');
+    if (endpoint.available === false) throw new ApiError(400, 'У бота больше нет доступа к этому чату. Добавьте бота и обновите каталог.');
+    if (source === 'telegram' && endpoint.isForum && !endpoint.threadId && !endpoint.generalTopic) throw new ApiError(400, 'Выберите тему внутри группы Telegram.');
     const senders = input.allowedSenderIds;
     if (!Array.isArray(senders) || senders.length > 100 || senders.some(id => typeof id !== 'string' || !endpoint.people.some(person => person.id === id))) throw new ApiError(400, 'Выберите отправителей из участников чата.');
     return { platform: source, endpointId, allowedSenderIds: [...new Set(senders as string[])] };
@@ -102,8 +158,10 @@ export function createApp(services: AppServices) {
     const name = string(input.name, 'название', 200);
     const threadId = string(input.threadId, 'тред', 200);
     const cwd = string(input.cwd, 'каталог');
-    const thread = (await services.codex().listThreads()).find(candidate => candidate.id === threadId);
-    if (!thread || thread.cwd !== cwd) throw new ApiError(400, 'Тред или рабочий каталог изменился. Обновите список Codex.');
+    const codex = services.codex();
+    const thread = (await codex.listThreads()).find(candidate => candidate.id === threadId);
+    if (services.codex() !== codex) throw new ApiError(409, 'Подключение Codex изменилось. Обновите список разговоров.');
+    if (!thread || thread.archived || thread.cwd !== cwd) throw new ApiError(400, 'Тред или рабочий каталог изменился. Обновите список Codex; архивный разговор сначала восстановите в Codex.');
     if (input.bindings !== undefined && (!Array.isArray(input.bindings) || input.bindings.length > 2)) throw new ApiError(400, 'У связки может быть один Telegram и один Slack.');
     const bindings = (input.bindings as unknown[] | undefined)?.map(value => binding(value));
     const conversation = store.createConversation({ name, threadId, cwd, bindings });

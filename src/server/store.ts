@@ -81,6 +81,9 @@ const MIGRATIONS = [String.raw`
   DROP TABLE deliveries_v1;
   CREATE INDEX deliveries_queue ON deliveries(status, next_attempt_at);
   CREATE INDEX deliveries_request ON deliveries(request_id);
+`, String.raw`
+  ALTER TABLE endpoints ADD COLUMN catalog TEXT NOT NULL DEFAULT '{}'
+    CHECK(json_valid(catalog) AND json_type(catalog) = 'object');
 `];
 
 function required(value: string, label: string): void {
@@ -98,7 +101,7 @@ function optional(value: SQLOutputValue): string | undefined { return value === 
 function toEndpoint(r: Row): Endpoint {
   return { id: r.id as string, platform: r.platform as Platform, accountId: r.account_id as string, chatId: r.chat_id as string,
     threadId: r.thread_id as string, title: r.title as string, subtitle: r.subtitle as string, url: optional(r.url),
-    people: json(r.people), updatedAt: r.updated_at as string };
+    people: json(r.people), updatedAt: r.updated_at as string, ...json<Record<string, unknown>>(r.catalog) };
 }
 function toBinding(r: Row): Binding {
   return { id: r.id as string, conversationId: r.conversation_id as string, platform: r.platform as Platform,
@@ -181,9 +184,16 @@ export class Store {
       throw new Error('Endpoint identity cannot be changed');
     }
     const people = [...new Map([...(existing?.people ?? []), ...endpoint.people].map((person) => [person.id, person])).values()];
-    this.db.prepare(`INSERT INTO endpoints (id,platform,account_id,chat_id,thread_id,title,subtitle,url,people,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,subtitle=excluded.subtitle,url=excluded.url,people=excluded.people,updated_at=excluded.updated_at`)
-      .run(endpoint.id, endpoint.platform, endpoint.accountId, endpoint.chatId, endpoint.threadId, endpoint.title, endpoint.subtitle, endpoint.url ?? null, JSON.stringify(people), endpoint.updatedAt);
+    const catalog: Record<string, unknown> = {};
+    for (const key of ['chatTitle', 'topicTitle', 'isForum', 'generalTopic', 'available'] as const) {
+      const value = endpoint[key] ?? existing?.[key];
+      if (value === undefined) continue;
+      if (typeof value !== (key === 'chatTitle' || key === 'topicTitle' ? 'string' : 'boolean')) throw new Error('Invalid endpoint catalog metadata');
+      catalog[key] = value;
+    }
+    this.db.prepare(`INSERT INTO endpoints (id,platform,account_id,chat_id,thread_id,title,subtitle,url,people,updated_at,catalog)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,subtitle=excluded.subtitle,url=excluded.url,people=excluded.people,updated_at=excluded.updated_at,catalog=excluded.catalog`)
+      .run(endpoint.id, endpoint.platform, endpoint.accountId, endpoint.chatId, endpoint.threadId, endpoint.title, endpoint.subtitle, endpoint.url ?? null, JSON.stringify(people), endpoint.updatedAt, JSON.stringify(catalog));
   }
 
   upsertEndpoint(endpoint: Endpoint): Endpoint {

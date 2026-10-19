@@ -1,6 +1,14 @@
 export type Platform = 'telegram' | 'slack';
 export interface Person { id: string; name: string }
 
+export interface CatalogPage<T> { items: T[]; nextCursor?: string }
+export interface CatalogChat {
+  id: string;
+  name: string;
+  subtitle: string;
+  kind: 'channel' | 'group' | 'direct';
+}
+
 export interface Endpoint {
   id: string;
   platform: Platform;
@@ -12,6 +20,11 @@ export interface Endpoint {
   url?: string;
   people: Person[];
   updatedAt: string;
+  chatTitle?: string;
+  topicTitle?: string;
+  isForum?: boolean;
+  generalTopic?: boolean;
+  available?: boolean;
 }
 
 export interface Binding {
@@ -129,6 +142,7 @@ export interface CodexThread {
   preview: string;
   updatedAt: number;
   status?: string;
+  archived?: boolean;
 }
 
 export interface ConnectionState {
@@ -136,6 +150,7 @@ export interface ConnectionState {
   connected: boolean;
   name?: string;
   error?: string;
+  accountId?: string;
 }
 
 export interface PublicConfig {

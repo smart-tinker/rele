@@ -268,14 +268,16 @@ supports_websockets=false
         else: raise RuntimeError('proxy test server did not create a socket')
         repo=pathlib.Path(__file__).resolve().parent.parent
         adapter=await asyncio.create_subprocess_exec(shutil.which('node'),str(repo/'node_modules/tsx/dist/cli.mjs'),
-            str(repo/'scripts/probe-codex.ts'),'--executable',CLI,env=env,cwd=str(repo),
+            str(repo/'scripts/probe-codex.ts'),'--executable',CLI,'--thread',thread,env=env,cwd=str(repo),
             stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
         adapter_out,adapter_err=await asyncio.wait_for(adapter.communicate(),35)
         assert adapter.returncode==0,adapter_err.decode(errors='replace')
         adapter_report=json.loads(adapter_out)
         assert adapter_report['runtimeProcessId']==process.pid,adapter_report
         assert adapter_report['status']['queueSupported'] is True,adapter_report
+        assert adapter_report['checks']['requestedThreadListed'] is True,adapter_report
         report['checks']['project_adapter_uses_same_runtime_pid_over_proxy']=True
+        report['checks']['catalog_lists_app_server_thread_without_resuming']=True
         report['provider_requests']=len(records)
         report['result']='passed'
     except BaseException as exc:

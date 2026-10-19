@@ -1,5 +1,5 @@
 import WebSocket from 'ws';
-import type { Approval, AudioAttachment, ConnectionState, Delivery, Endpoint, InboundMessage, Person } from '../../shared/types.js';
+import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionState, Delivery, Endpoint, InboundMessage, Person } from '../../shared/types.js';
 import { ChannelError, downloadBounded, endpointId, readableTitle, type Channel, type ChannelCallbacks } from './common.js';
 
 type Json = Record<string, any>;
@@ -26,7 +26,9 @@ export class SlackChannel implements Channel {
   private processing: Promise<void> = Promise.resolve();
   private endpoints = new Map<string, Endpoint>();
   private people = new Map<string, Person>();
+  private profiles = new Map<string, Json>();
   private channelNames = new Map<string, string>();
+  private conversations = new Map<string, Json>();
   private refreshing = new Set<string>();
   private abort = new AbortController();
 
@@ -34,7 +36,6 @@ export class SlackChannel implements Channel {
     this.fetcher = options.fetch ?? fetch;
     for (const endpoint of options.knownEndpoints ?? []) if (endpoint.platform === 'slack') {
       this.endpoints.set(endpoint.id, endpoint);
-      for (const person of endpoint.people) this.people.set(person.id, person);
     }
   }
 
@@ -45,10 +46,21 @@ export class SlackChannel implements Channel {
     try {
       const identity = await this.api('auth.test', {});
       if (!identity.team_id || !identity.user_id) throw new ChannelError('Slack не сообщил учётную запись бота.');
+      if (this.stopped) return;
       this.teamId = identity.team_id;
       this.botUserId = identity.user_id;
-      this.accountId = `${this.teamId}:${this.botUserId}`;
+      const accountId = `${this.teamId}:${this.botUserId}`;
+      if (this.accountId !== accountId) {
+        this.endpoints = new Map([...this.endpoints].filter(([, endpoint]) => endpoint.accountId === accountId));
+        this.people.clear();
+        this.profiles.clear();
+        this.channelNames.clear();
+        for (const endpoint of this.endpoints.values()) for (const person of endpoint.people) this.people.set(person.id, person);
+      }
+      this.accountId = accountId;
+      this.conversations.clear();
       this.teamName = readableTitle(identity.team, 'Slack');
+      this.setState({ accountId, name: this.teamName });
       const connection = await this.api('apps.connections.open', {}, this.appToken);
       const url = new URL(connection.url);
       if (url.protocol !== 'wss:' || !url.hostname.endsWith('.slack.com') || url.username || url.password) throw new ChannelError('Slack вернул неподдерживаемый адрес Socket Mode.');
@@ -102,6 +114,189 @@ export class SlackChannel implements Channel {
     socket?.terminate();
     await this.processing;
     this.setState({ connected: false });
+  }
+
+  async listChats(cursor?: string): Promise<CatalogPage<CatalogChat>> {
+    const accountId = this.requireAccount();
+    const signal = this.abort.signal;
+    if (!cursor) this.conversations.clear();
+    const page = await this.conversationPage(cursor);
+    const items: CatalogChat[] = [];
+    for (const conversation of page.items) {
+      this.requireAccount(accountId, signal);
+      const name = await this.conversationName(conversation);
+      items.push({
+        id: conversation.id, name,
+        kind: conversation.is_im ? 'direct' : conversation.is_mpim ? 'group' : 'channel',
+        subtitle: `${this.teamName} · ${conversation.is_im ? 'Личные сообщения' : conversation.is_mpim ? 'Групповой чат' : conversation.is_private ? 'Закрытый канал' : 'Канал'}`,
+      });
+    }
+    this.requireAccount(accountId, signal);
+    return { items, nextCursor: page.nextCursor };
+  }
+
+  async listThreads(chatId: string, cursor?: string): Promise<CatalogPage<Endpoint>> {
+    const accountId = this.requireAccount();
+    const signal = this.abort.signal;
+    const conversation = await this.requireConversation(chatId);
+    this.requireAccount(accountId, signal);
+    const chatTitle = await this.conversationName(conversation);
+    this.requireAccount(accountId, signal);
+    const data = await this.api('conversations.history', { channel: chatId, limit: 100, ...(cursor ? { cursor } : {}) });
+    this.requireAccount(accountId, signal);
+    if (!Array.isArray(data.messages)) throw new ChannelError('Slack вернул неразборчивую историю разговора.');
+    this.setAvailability(chatId, true, accountId, signal);
+    const items: Endpoint[] = [];
+    for (const message of data.messages) {
+      if (!message || message.type !== 'message' || typeof message.ts !== 'string' || !/^\d+\.\d+$/u.test(message.ts)) continue;
+      if (message.thread_ts && message.thread_ts !== message.ts) continue;
+      if (message.subtype && !['file_share', 'bot_message', 'me_message'].includes(message.subtype)) continue;
+      const date = new Date(Number(message.ts) * 1000);
+      if (!Number.isFinite(date.getTime())) continue;
+      const text = readableTitle(message.text, readableTitle(message.files?.[0]?.title || message.files?.[0]?.name, 'Сообщение без текста'), 160);
+      const id = endpointId('slack', accountId, chatId, message.ts);
+      const previous = this.endpoints.get(id);
+      const replies = Number.isSafeInteger(message.reply_count) && message.reply_count > 0 ? message.reply_count : 0;
+      const endpoint: Endpoint = {
+        id, platform: 'slack', accountId, chatId, threadId: message.ts,
+        title: readableTitle(text, 'Обсуждение Slack'), chatTitle, available: true,
+        subtitle: `${this.teamName} · ${chatTitle} · ${date.toISOString().slice(0, 16).replace('T', ' ')} UTC · Ответов: ${replies} · ${text}`,
+        url: `slack://channel?team=${encodeURIComponent(this.teamId)}&id=${encodeURIComponent(chatId)}&message=${encodeURIComponent(message.ts)}`,
+        people: previous?.people ?? [], updatedAt: new Date().toISOString(),
+      };
+      this.requireAccount(accountId, signal);
+      this.endpoints.set(id, endpoint);
+      this.callbacks.endpoint(endpoint);
+      items.push(endpoint);
+    }
+    return { items, nextCursor: this.nextCursor(data) };
+  }
+
+  async listPeople(chatId: string, cursor?: string): Promise<CatalogPage<Person>> {
+    const accountId = this.requireAccount();
+    const signal = this.abort.signal;
+    const conversation = await this.requireConversation(chatId);
+    this.requireAccount(accountId, signal);
+    const page = await this.peoplePage(conversation, cursor);
+    this.requireAccount(accountId, signal);
+    return page;
+  }
+
+  private requireAccount(expected = this.accountId, signal = this.abort.signal): string {
+    if (this.stopped || !expected || expected !== this.accountId || signal !== this.abort.signal || signal.aborted) throw new ChannelError('Подключение Slack изменилось. Подключите Slack и обновите каталог.');
+    return expected;
+  }
+
+  private nextCursor(data: Json): string | undefined {
+    const cursor = data.response_metadata?.next_cursor;
+    return typeof cursor === 'string' && cursor.trim() ? cursor : undefined;
+  }
+
+  private setAvailability(chatId: string, available: boolean, accountId: string, signal: AbortSignal): void {
+    this.requireAccount(accountId, signal);
+    if (!available) this.conversations.delete(chatId);
+    for (const endpoint of this.endpoints.values()) {
+      if (endpoint.accountId !== accountId || endpoint.chatId !== chatId || endpoint.available === available) continue;
+      this.requireAccount(accountId, signal);
+      const updated = { ...endpoint, available, updatedAt: new Date().toISOString() };
+      this.endpoints.set(updated.id, updated);
+      this.callbacks.endpoint(updated);
+    }
+  }
+
+  private async conversationPage(cursor?: string): Promise<CatalogPage<Json>> {
+    const accountId = this.requireAccount();
+    const signal = this.abort.signal;
+    const data = await this.api('users.conversations', {
+      types: 'public_channel,private_channel,im,mpim', exclude_archived: true, limit: 100, ...(cursor ? { cursor } : {}),
+    });
+    this.requireAccount(accountId, signal);
+    if (!Array.isArray(data.channels)) throw new ChannelError('Slack вернул неразборчивый каталог разговоров.');
+    // This method establishes bot membership; conversations.info alone does not.
+    const items = data.channels.filter((channel: Json) => channel && typeof channel.id === 'string' && channel.is_archived !== true && channel.is_member !== false);
+    for (const conversation of items) {
+      this.conversations.set(conversation.id, conversation);
+      this.setAvailability(conversation.id, true, accountId, signal);
+    }
+    return { items, nextCursor: this.nextCursor(data) };
+  }
+
+  private async requireConversation(chatId: string): Promise<Json> {
+    const accountId = this.requireAccount();
+    const signal = this.abort.signal;
+    if (!/^[CDG][A-Z0-9]+$/u.test(chatId)) throw new ChannelError('Некорректный разговор Slack.');
+    if (this.conversations.has(chatId)) return this.conversations.get(chatId)!;
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const page = await this.conversationPage(cursor);
+      this.requireAccount(accountId, signal);
+      if (this.conversations.has(chatId)) return this.conversations.get(chatId)!;
+      cursor = page.nextCursor;
+      if (cursor && cursors.has(cursor)) throw new ChannelError('Slack повторил страницу каталога. Обновите каталог.');
+      if (cursor) cursors.add(cursor);
+    } while (cursor);
+    this.setAvailability(chatId, false, accountId, signal);
+    throw new ChannelError('Разговор недоступен боту Slack. Добавьте Rele в разговор и обновите каталог.');
+  }
+
+  private async person(userId: string): Promise<Person | undefined> {
+    const accountId = this.requireAccount();
+    const signal = this.abort.signal;
+    if (userId === this.botUserId || userId === 'USLACKBOT') return;
+    let user = this.profiles.get(userId);
+    if (!user) {
+      user = (await this.api('users.info', { user: userId })).user;
+      this.requireAccount(accountId, signal);
+      if (!user || user.id !== userId) throw new ChannelError('Slack не подтвердил сведения об участнике.');
+      this.profiles.set(userId, user);
+    }
+    if (user.deleted || user.is_bot || user.is_app_user) return;
+    const person = { id: userId, name: readableTitle(user.profile?.display_name || user.profile?.real_name || user.real_name || user.name, 'Участник Slack') };
+    this.people.set(userId, person);
+    return person;
+  }
+
+  private async peoplePage(conversation: Json, cursor?: string): Promise<CatalogPage<Person>> {
+    const accountId = this.requireAccount();
+    const signal = this.abort.signal;
+    if (conversation.is_im) {
+      if (typeof conversation.user !== 'string' || !conversation.user) {
+        const data = await this.api('conversations.info', { channel: conversation.id });
+        this.requireAccount(accountId, signal);
+        const detail = data.channel;
+        if (!detail || detail.id !== conversation.id || detail.is_im !== true || typeof detail.user !== 'string' || !detail.user) throw new ChannelError('Slack не сообщил участника личного разговора.');
+        conversation.user = detail.user;
+      }
+      const person = await this.person(conversation.user);
+      this.requireAccount(accountId, signal);
+      return { items: person ? [person] : [] };
+    }
+    const data = await this.api('conversations.members', { channel: conversation.id, limit: 20, ...(cursor ? { cursor } : {}) });
+    this.requireAccount(accountId, signal);
+    if (!Array.isArray(data.members) || data.members.some((id: unknown) => typeof id !== 'string')) throw new ChannelError('Slack вернул неразборчивый список участников.');
+    const items: Person[] = [];
+    for (const id of new Set<string>(data.members)) {
+      this.requireAccount(accountId, signal);
+      const person = await this.person(id);
+      if (person) items.push(person);
+    }
+    this.requireAccount(accountId, signal);
+    return { items, nextCursor: this.nextCursor(data) };
+  }
+
+  private async conversationName(conversation: Json): Promise<string> {
+    const accountId = this.requireAccount();
+    const signal = this.abort.signal;
+    let name: string;
+    if (conversation.is_im) name = (await this.peoplePage(conversation)).items[0]?.name ?? 'Личные сообщения';
+    else if (conversation.is_mpim) {
+      const people = await this.peoplePage(conversation);
+      name = readableTitle(people.items.map(person => person.name).join(', '), 'Групповой чат');
+    } else name = `#${readableTitle(conversation.name, 'Канал Slack')}`;
+    this.requireAccount(accountId, signal);
+    this.channelNames.set(conversation.id, name);
+    return name;
   }
 
   async deliver(delivery: Delivery, approval?: Approval): Promise<string> {
@@ -170,6 +365,7 @@ export class SlackChannel implements Channel {
     const person = this.people.get(event.user) ?? { id: event.user, name: 'Участник Slack' };
     const text = String(event.text ?? '').replaceAll(`<@${this.botUserId}>`, '').trim().slice(0, 50_000);
     const endpoint: Endpoint = {
+      ...previous,
       id, platform: 'slack', accountId: this.accountId, chatId: event.channel, threadId,
       title: previous?.title ?? readableTitle(text, 'Обсуждение Slack'),
       subtitle: previous?.subtitle ?? `${this.teamName} · ${this.channelNames.get(event.channel) ?? 'Канал Slack'}`,
@@ -187,6 +383,7 @@ export class SlackChannel implements Channel {
 
   private async refreshNames(event: Json, endpoint: Endpoint): Promise<void> {
     if (this.refreshing.has(endpoint.id) || this.stopped) return;
+    const signal = this.abort.signal;
     this.refreshing.add(endpoint.id);
     try {
       const results = await Promise.allSettled([
@@ -194,6 +391,7 @@ export class SlackChannel implements Channel {
         this.channelNames.has(event.channel) ? Promise.resolve(null) : this.api('conversations.info', { channel: event.channel }),
         endpoint.title === 'Обсуждение Slack' ? this.api('conversations.replies', { channel: event.channel, ts: endpoint.threadId, limit: 1 }) : Promise.resolve(null),
       ]);
+      if (this.stopped || endpoint.accountId !== this.accountId || signal !== this.abort.signal || signal.aborted) return;
       const user = results[0].status === 'fulfilled' ? results[0].value?.user : null;
       if (user) this.people.set(event.user, { id: event.user, name: readableTitle(user.profile?.display_name || user.profile?.real_name || user.real_name || user.name, 'Участник Slack') });
       const channel = results[1].status === 'fulfilled' ? results[1].value?.channel : null;
@@ -207,15 +405,22 @@ export class SlackChannel implements Channel {
   }
 
   private async api(method: string, body: Json, token = this.botToken, sending = false): Promise<Json> {
+    const accountId = this.accountId;
+    const signal = this.abort.signal;
     let response: Response;
-    try { response = await this.fetcher(`https://slack.com/api/${method}`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json; charset=utf-8' }, body: JSON.stringify(body), signal: AbortSignal.any([this.abort.signal, AbortSignal.timeout(20_000)]) }); }
+    try { response = await this.fetcher(`https://slack.com/api/${method}`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json; charset=utf-8' }, body: JSON.stringify(body), signal: AbortSignal.any([signal, AbortSignal.timeout(20_000)]) }); }
     catch { throw new ChannelError('Соединение со Slack прервано.', !sending, sending); }
-    if (response.status === 429) throw new ChannelError('Slack ограничил частоту запросов.', true, false, Math.max(1000, Math.min(3600_000, Number(response.headers.get('retry-after') || 30) * 1000)));
+    const retrySeconds = Number(response.headers.get('retry-after'));
+    const retryAfterMs = Number.isFinite(retrySeconds) && retrySeconds > 0 ? Math.max(1000, Math.min(3600_000, retrySeconds * 1000)) : 30_000;
+    if (response.status === 429) throw new ChannelError('Slack ограничил частоту запросов. Повторите загрузку позже.', true, false, retryAfterMs, 429);
     let data: Json;
     try { data = await response.json() as Json; } catch { throw new ChannelError('Slack вернул неразборчивое подтверждение.', !sending, sending); }
     if (!response.ok || data.ok !== true) {
-      if (data.error === 'ratelimited') throw new ChannelError('Slack ограничил частоту запросов.', true);
-      const known: Record<string, string> = { invalid_auth: 'Неверный токен Slack.', token_revoked: 'Токен Slack отозван.', missing_scope: 'Приложению Slack не хватает разрешений.', not_in_channel: 'Добавьте бота Slack в канал.', channel_not_found: 'Канал Slack недоступен.', account_inactive: 'Учётная запись Slack отключена.', is_archived: 'Канал Slack архивирован.' };
+      if (data.error === 'ratelimited') throw new ChannelError('Slack ограничил частоту запросов. Повторите загрузку позже.', true, false, retryAfterMs, 429);
+      if (['conversations.history', 'conversations.members'].includes(method) && typeof body.channel === 'string' && ['not_in_channel', 'channel_not_found', 'is_archived', 'no_permission'].includes(data.error)) {
+        this.setAvailability(body.channel, false, accountId, signal);
+      }
+      const known: Record<string, string> = { invalid_auth: 'Неверный токен Slack.', token_revoked: 'Токен Slack отозван.', missing_scope: 'Приложению Slack не хватает разрешений. Обновите разрешения и переустановите приложение в workspace.', not_in_channel: 'Добавьте бота Slack в канал.', channel_not_found: 'Канал Slack недоступен.', no_permission: 'Боту Slack недоступен этот разговор.', not_allowed_token_type: 'Неподдерживаемый тип токена Slack.', user_not_found: 'Участник Slack недоступен.', account_inactive: 'Учётная запись Slack отключена.', is_archived: 'Канал Slack архивирован.' };
       throw new ChannelError(known[data.error] ?? 'Slack отклонил запрос.', !sending && response.status >= 500, sending && response.status >= 500);
     }
     return data;

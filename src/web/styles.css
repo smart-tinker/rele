@@ -810,6 +810,60 @@ tbody tr:hover {
 .endpoint-name-editor .text-button {
   font-size: 13px;
 }
+.catalog-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.catalog-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.catalog-controls .button {
+  font-size: 13px;
+  min-height: 38px;
+}
+.catalog-instruction {
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.catalog-instruction strong {
+  color: var(--text);
+}
+.catalog-instruction p {
+  margin: 7px 0 0;
+}
+.catalog-instruction code {
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.catalog-people-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 16px;
+}
+.catalog-preview {
+  padding: 13px 15px;
+  border-left: 2px solid var(--accent);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  max-height: 130px;
+  overflow-y: auto;
+}
+.catalog-preview strong {
+  display: block;
+  color: var(--text);
+}
 .people-fieldset,
 .question-fieldset {
   margin: 20px 0 0;
