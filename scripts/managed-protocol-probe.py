@@ -161,13 +161,28 @@ stream_max_retries=0
             entry['client'] = None
         process = entry['process']
         if process.returncode is None:
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), 8)
-            except TimeoutError:
-                process.kill()
-                await process.wait()
-        await entry['drain']
+            if os.name == 'nt':
+                # These independent runtimes can also own plugin/git children.
+                # Keep their root alive until Windows has terminated the whole tree.
+                killer = await asyncio.create_subprocess_exec('taskkill.exe', '/PID', str(process.pid), '/T', '/F',
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                try:
+                    code = await asyncio.wait_for(killer.wait(), 20)
+                    if code != 0:
+                        raise RuntimeError(f'Isolated source tree shutdown failed: taskkill exit {code}')
+                    await asyncio.wait_for(process.wait(), 8)
+                finally:
+                    if killer.returncode is None:
+                        killer.kill()
+                        await killer.wait()
+            else:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), 8)
+                except TimeoutError:
+                    process.kill()
+                    await process.wait()
+        await asyncio.wait_for(asyncio.shield(entry['drain']), 8)
 
     async def source_turn(entry, thread, text):
         result = await entry['client'].call('turn/start', {'threadId': thread, 'input': [{'type': 'text', 'text': text}]})

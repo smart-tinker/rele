@@ -1,6 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 
 const MAX_FRAME_BYTES = 32 * 1024 * 1024;
+// Windows enumerates and terminates a whole process tree. Its helper must not be
+// interrupted by the shorter Unix SIGTERM escalation timer.
+const WINDOWS_SHUTDOWN_TIMEOUT_MS = 15_000;
 
 export class CodexStdioError extends Error {
   constructor(message: string, readonly code: string) { super(message); this.name = 'CodexStdioError'; }
@@ -13,6 +16,12 @@ interface StdioCallbacks {
   closed: () => void;
 }
 
+interface StdioOptions {
+  maxFrameBytes?: number;
+  platform?: NodeJS.Platform;
+  spawnProcess?: typeof spawn;
+}
+
 /** One owned foreground child. Its stdout is NDJSON, never a WebSocket stream. */
 export class CodexStdioTransport {
   readonly ready: Promise<void>;
@@ -21,17 +30,18 @@ export class CodexStdioTransport {
   private readonly chunks: Buffer[] = [];
   private frameBytes = 0;
   private spawned = false;
+  private rootExited = false;
   private ended = false;
   private stopping = false;
   private failed = false;
   private shutdown?: Promise<void>;
 
-  constructor(command: string, args: string[], env: NodeJS.ProcessEnv, private readonly callbacks: StdioCallbacks, private readonly options: { maxFrameBytes?: number } = {}) {
-    this.child = spawn(command, args, {
+  constructor(command: string, args: string[], env: NodeJS.ProcessEnv, private readonly callbacks: StdioCallbacks, private readonly options: StdioOptions = {}) {
+    this.child = (options.spawnProcess ?? spawn)(command, args, {
       stdio: ['pipe', 'pipe', 'pipe'], env, windowsHide: true,
       // A private Unix process group lets us also stop the official npm wrapper's child.
       // The process remains attached to Rele through its pipes and is never unref'ed.
-      detached: process.platform !== 'win32',
+      detached: (options.platform ?? process.platform) !== 'win32',
     });
     this.ready = new Promise((resolve, reject) => {
       this.child.once('spawn', () => { this.spawned = true; resolve(); });
@@ -42,6 +52,7 @@ export class CodexStdioTransport {
       resolve();
       this.callbacks.closed();
     }));
+    this.child.once('exit', () => { this.rootExited = true; });
     this.child.on('error', () => this.fail('Не удалось запустить выбранный Codex CLI.', 'cli-unavailable'));
     this.child.stdin.on('error', () => this.fail('Соединение с управляемым Codex прервано; неподтверждённые запросы требуют сверки.', 'connection-closed'));
     this.child.stdout.on('data', (chunk: Buffer) => this.read(chunk));
@@ -104,33 +115,21 @@ export class CodexStdioTransport {
   private async stop(): Promise<void> {
     if (this.ended) return;
     const pid = this.child.pid;
-    let treeKill: ReturnType<typeof spawn> | undefined;
-    let treeStopped: Promise<void> = Promise.resolve();
+    if (pid && (this.options.platform ?? process.platform) === 'win32') return this.stopWindows(pid);
     const killGroup = (signal: NodeJS.Signals) => {
       if (this.ended || !pid) return;
       try { process.kill(-pid, signal); }
       catch { this.child.kill(signal); }
     };
-    if (pid && process.platform === 'win32') {
-      // Kill only the process tree created by this transport, including npm's native child.
-      treeKill = spawn('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
-      treeStopped = new Promise(resolve => {
-        treeKill!.once('error', () => { this.child.kill(); resolve(); });
-        treeKill!.once('close', code => { if (code !== 0 && !this.ended) this.child.kill(); resolve(); });
-      });
-    } else if (pid) killGroup('SIGTERM');
+    if (pid) killGroup('SIGTERM');
     this.child.stdin.end();
     let forceTimer: NodeJS.Timeout | undefined;
     let deadline: NodeJS.Timeout | undefined;
     try {
-      forceTimer = setTimeout(() => {
-        treeKill?.kill();
-        if (process.platform === 'win32') this.child.kill();
-        else killGroup('SIGKILL');
-      }, 2_000);
+      forceTimer = setTimeout(() => killGroup('SIGKILL'), 2_000);
       forceTimer.unref();
       await Promise.race([
-        Promise.all([this.exited, treeStopped]),
+        this.exited,
         new Promise<never>((_resolve, reject) => {
           deadline = setTimeout(() => reject(new CodexStdioError('Не удалось подтвердить остановку управляемого Codex. Новый процесс не будет запущен до перезапуска Rele.', 'shutdown-timeout')), 4_000);
           deadline.unref();
@@ -139,7 +138,48 @@ export class CodexStdioTransport {
     } finally {
       clearTimeout(forceTimer);
       clearTimeout(deadline);
-      treeKill?.kill();
+    }
+  }
+
+  private async stopWindows(pid: number): Promise<void> {
+    // Keep stdin open until /T finishes: EOF can make Codex or the npm wrapper
+    // exit before taskkill enumerates its descendants, losing the root PID.
+    let treeKill: ReturnType<typeof spawn> | undefined;
+    let helperEnded = true;
+    let deadline: NodeJS.Timeout | undefined;
+    let treeStopped: Promise<void> = Promise.resolve();
+    // An exited root can leave inherited pipes open. Its PID may be reused, so
+    // never issue a new kill by that PID; wait for close or fail the deadline.
+    if (!this.rootExited && this.child.exitCode == null && this.child.signalCode == null) {
+      treeKill = (this.options.spawnProcess ?? spawn)('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+      helperEnded = false;
+      treeStopped = new Promise<void>((resolve, reject) => {
+        treeKill!.once('error', () => {
+          helperEnded = true;
+          reject(new CodexStdioError('Windows не смог запустить остановку дерева управляемого Codex. Новый процесс не будет запущен до перезапуска Rele.', 'shutdown-failed'));
+        });
+        treeKill!.once('close', code => {
+          helperEnded = true;
+          if (code !== 0) reject(new CodexStdioError('Windows не подтвердил остановку дерева управляемого Codex. Новый процесс не будет запущен до перезапуска Rele.', 'shutdown-failed'));
+          else resolve();
+        });
+      }).then(() => { this.child.stdin.end(); });
+    }
+    try {
+      await Promise.race([
+        // A successful taskkill is insufficient while inherited pipes are open;
+        // likewise, direct-child close alone cannot establish tree-kill success.
+        Promise.all([treeStopped, this.exited]),
+        new Promise<never>((_resolve, reject) => {
+          deadline = setTimeout(() => reject(new CodexStdioError('Не удалось подтвердить остановку дерева управляемого Codex за 15 секунд. Новый процесс не будет запущен до перезапуска Rele.', 'shutdown-timeout')), WINDOWS_SHUTDOWN_TIMEOUT_MS);
+          deadline.unref();
+        }),
+      ]);
+    } finally {
+      clearTimeout(deadline);
+      // Only the overall failure deadline may stop our helper. Never replace an
+      // incomplete tree operation with a direct-parent kill and report success.
+      if (!helperEnded) treeKill?.kill();
     }
   }
 }
