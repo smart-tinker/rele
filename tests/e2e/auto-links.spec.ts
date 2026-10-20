@@ -50,12 +50,12 @@ test('automatic conversation creation is explicit, named, editable, and leaves e
   await page.getByRole('button', { name: 'Добавить правило', exact: true }).click();
   const dialog = page.getByRole('dialog');
   await expect(dialog.getByLabel('Разрешить автоматическое создание новых разговоров в этом чате')).not.toBeChecked();
-  await expect(dialog.getByLabel('В группах создавать разговор только при упоминании Rele')).toBeChecked();
+  await expect(dialog.getByLabel('В группах создавать разговор только при упоминании подключённого агента')).toBeChecked();
   await dialog.getByLabel('Чат для новых разговоров').selectOption('sl-alpha-chat');
   await dialog.getByLabel('Рабочая папка новых разговоров').fill('/work/alpha');
   await expect(dialog.getByText('Все участники выбранной группы или канала, включая агентов, получают право запускать Codex. Отдельный список отправителей не требуется.')).toBeVisible();
   await expect(dialog.getByRole('group', { name: 'Кто может отправлять запросы' })).toHaveCount(0);
-  await dialog.getByLabel('В группах создавать разговор только при упоминании Rele').uncheck();
+  await dialog.getByLabel('В группах создавать разговор только при упоминании подключённого агента').uncheck();
   await dialog.getByLabel('Разрешить автоматическое создание новых разговоров в этом чате').check();
   await dialog.getByRole('button', { name: 'Сохранить правило', exact: true }).click();
   await expect(dialog).not.toBeVisible();
@@ -121,7 +121,7 @@ test('editing an automatically created group binding preserves visible all-parti
   await page.getByRole('button', { name: 'Открыть связку Пример: проект Альфа', exact: true }).click();
   const form = page.getByRole('form', { name: 'Подключение Slack 1', exact: true });
   await expect(form.getByLabel('Разрешить всем участникам группы, включая агентов')).toBeChecked();
-  await expect(form.getByLabel('В группах запускать только при упоминании Rele')).toBeChecked();
+  await expect(form.getByLabel('В группах запускать только при упоминании подключённого агента')).toBeChecked();
   await expect(form.getByText('Все участники этого канала или группы, включая других агентов, могут отправлять запросы.')).toBeVisible();
   await form.getByRole('button', { name: 'Сохранить Slack', exact: true }).click();
   await expect.poll(() => api.mutations.length).toBe(1);
@@ -143,7 +143,7 @@ test('changing an all-participant source explicitly resets both access policies 
   await form.getByLabel('Чат Slack', { exact: true }).selectOption('CREPLACEMENT');
   await form.getByLabel('Разговор Slack', { exact: true }).selectOption('replacement-group');
   await expect(form.getByLabel('Разрешить всем участникам группы, включая агентов')).not.toBeChecked();
-  await expect(form.getByLabel('В группах запускать только при упоминании Rele')).not.toBeChecked();
+  await expect(form.getByLabel('В группах запускать только при упоминании подключённого агента')).not.toBeChecked();
   await form.getByLabel('Анна (пример)').check();
   await form.getByRole('button', { name: 'Сохранить Slack', exact: true }).click();
   await expect.poll(() => api.mutations.length).toBe(1);

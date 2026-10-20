@@ -132,7 +132,7 @@ test('chat aliases can be saved with Enter and reset without submitting the bind
   await dialog.getByLabel('Анна (пример)').check();
   await dialog
     .getByRole('button', {
-      name: 'Переименовать разговор Telegram',
+      name: 'Изменить название разговора Telegram только в Rele',
       exact: true,
     })
     .click();
@@ -150,7 +150,7 @@ test('chat aliases can be saved with Enter and reset without submitting the bind
   ]);
   await dialog
     .getByRole('button', {
-      name: 'Переименовать разговор Telegram',
+      name: 'Изменить название разговора Telegram только в Rele',
       exact: true,
     })
     .click();

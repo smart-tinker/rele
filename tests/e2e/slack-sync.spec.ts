@@ -171,8 +171,8 @@ test('keeps other bots selectable for explicit mention-based launches while all 
   await page.getByRole('button', { name: 'Открыть связку Пример: проект Альфа' }).click();
   const slack = page.getByRole('dialog').locator('form').filter({ has: page.getByRole('heading', { name: 'Slack', exact: true }) });
   await expect(slack).toContainText('Все сообщения обсуждения, включая ботов, передаются как контекст.');
-  await expect(slack).toContainText('Отмеченный бот запускает запрос только по новому упоминанию Rele.');
-  const bot = slack.getByRole('checkbox', { name: 'Другой агент · бот, запуск по @Rele' });
+  await expect(slack).toContainText('Отмеченный бот запускает запрос только по новому упоминанию подключённого агента.');
+  const bot = slack.getByRole('checkbox', { name: 'Другой агент · бот, запуск по упоминанию подключённого агента' });
   await expect(bot).toBeEnabled();
   await expect(bot).not.toBeChecked();
   await bot.check();
