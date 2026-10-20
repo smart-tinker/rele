@@ -544,6 +544,32 @@ describe('durable Slack transcript sync', () => {
     expect(() => store.recordSlackMessage(transcript(next, '1770000000.000003', { accountId: 'foreign-account' }))).toThrow(/origin/);
   });
 
+  it('resets stream coverage on Slack detach and reattach while preserving its ledger and ACL-only updates', () => {
+    const store = open();
+    const conv = conversation(store);
+    const entry = store.recordSlackMessage(transcript())!;
+    const checkpoint = { cursor: 'page-2', coveredThrough: '1770000001.000000', scanUntil: '1770000002.000000',
+      scanOldest: '1770000001.000000', state: 'blocked' as const, error: 'Previous failure', retryAt: '2999-01-01T00:00:00.000Z' };
+    store.updateSlackSyncStream(entry.streamId, checkpoint);
+    store.setBinding(conv.id, 'slack', endpoint().id, []);
+    expect(store.getSlackSyncStream(entry.streamId)).toMatchObject(checkpoint);
+    store.removeBinding(conv.id, 'slack');
+    const reset = { cursor: undefined, coveredThrough: undefined, scanUntil: undefined, scanOldest: undefined,
+      state: 'backfill', error: undefined, retryAt: undefined };
+    expect(store.getSlackSyncStream(entry.streamId)).toMatchObject({ ...reset, active: false, codexThreadId: conv.threadId });
+    // Returning to an existing target must reset it even if its inactive checkpoint was retained by an older process.
+    store.updateSlackSyncStream(entry.streamId, checkpoint);
+    store.setBinding(conv.id, 'slack', endpoint().id, ['user-1']);
+    expect(store.getSlackSyncStream(entry.streamId)).toMatchObject({ ...reset, active: true, codexThreadId: conv.threadId });
+    expect(store.listSlackSyncEntries(entry.streamId)).toEqual([entry]);
+    store.updateSlackSyncStream(entry.streamId, checkpoint);
+    const occupied = endpoint({ id: 'occupied-endpoint', chatId: 'occupied-chat' });
+    conversation(store, occupied, 'other-codex');
+    expect(() => store.setBinding(conv.id, 'slack', occupied.id, ['user-1'])).toThrow(/UNIQUE/);
+    expect(store.getSlackSyncStream(entry.streamId)).toMatchObject(checkpoint);
+    expect(store.getConversation(conv.id)?.bindings[0].endpointId).toBe(endpoint().id);
+  });
+
   it('orders source timestamps exactly, retries passive uncertain writes and recovers applying after restart', () => {
     const path = join(directory(), 'sync.sqlite');
     const store = open(path);

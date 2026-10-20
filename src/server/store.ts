@@ -298,7 +298,9 @@ export class Store {
   }
 
   private writeBinding(conversationId: string, platform: Platform, endpointId: string, allowedSenderIds: string[]): Binding {
-    if (!this.getConversation(conversationId)) throw new Error('Conversation not found');
+    const conversation = this.getConversation(conversationId);
+    if (!conversation) throw new Error('Conversation not found');
+    const previous = conversation.bindings.find(binding => binding.platform === platform);
     const endpoint = this.getEndpoint(endpointId);
     if (!endpoint) throw new Error('Endpoint not found');
     if (endpoint.platform !== platform) throw new Error('Endpoint platform does not match the binding');
@@ -307,6 +309,10 @@ export class Store {
     this.db.prepare(`INSERT INTO bindings (id,conversation_id,platform,endpoint_id,allowed_sender_ids) VALUES (?,?,?,?,?)
       ON CONFLICT(conversation_id,platform) DO UPDATE SET endpoint_id=excluded.endpoint_id,allowed_sender_ids=excluded.allowed_sender_ids`)
       .run(randomUUID(), conversationId, platform, endpointId, JSON.stringify([...new Set(allowedSenderIds)]));
+    if (platform === 'slack' && previous?.endpointId !== endpointId) {
+      if (previous) this.resetSlackSyncStream(conversationId, previous.endpointId);
+      this.resetSlackSyncStream(conversationId, endpointId);
+    }
     this.db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(new Date().toISOString(), conversationId);
     return toBinding(this.db.prepare('SELECT * FROM bindings WHERE conversation_id=? AND platform=?').get(conversationId, platform)!);
   }
@@ -315,10 +321,18 @@ export class Store {
   }
   removeBinding(conversationId: string, platform: Platform): void {
     this.transaction(() => {
-      if (!this.getConversation(conversationId)) throw new Error('Conversation not found');
+      const conversation = this.getConversation(conversationId);
+      if (!conversation) throw new Error('Conversation not found');
+      const binding = conversation.bindings.find(binding => binding.platform === platform);
       this.db.prepare('DELETE FROM bindings WHERE conversation_id=? AND platform=?').run(conversationId, platform);
+      if (platform === 'slack' && binding) this.resetSlackSyncStream(conversationId, binding.endpointId);
       this.db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(new Date().toISOString(), conversationId);
     });
+  }
+
+  private resetSlackSyncStream(conversationId: string, endpointId: string): void {
+    this.db.prepare(`UPDATE slack_sync_streams SET cursor=NULL,covered_through=NULL,scan_until=NULL,scan_oldest=NULL,
+      state='backfill',error=NULL,retry_at=NULL WHERE conversation_id=? AND endpoint_id=?`).run(conversationId, endpointId);
   }
 
   private ensureSlackSyncStreams(): void {

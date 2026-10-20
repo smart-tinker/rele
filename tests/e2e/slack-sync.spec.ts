@@ -183,3 +183,25 @@ test('keeps other bots selectable for explicit mention-based launches while all 
     body: { endpointId: 'sl-alpha', allowedSenderIds: ['person-anna', 'BOTOTHER'] },
   }]);
 });
+
+test('shows captured detached context without claiming its unfinished history scan is still running', async ({ page }) => {
+  const api = await installApi(page);
+  const reads: string[] = [];
+  await page.route(journalRoute, async route => {
+    expect(route.request().method()).toBe('GET');
+    reads.push(route.request().url());
+    await route.fulfill({ json: {
+      streamId: 'stream-active',
+      streams: [stream({ active: false, state: 'backfill', error: 'История не была загружена полностью до отвязки.', counts: { pending: 1, applying: 0, applied: 1, uncertain: 0 } })],
+      entries: [entry(0, 'pending'), entry(1)],
+    } satisfies SlackSyncJournal });
+  });
+  const journal = await openJournal(page);
+  await expect(journal).toContainText('Полученные сообщения отвязанного источника ожидают передачи в Codex.');
+  await expect(journal.getByText('Загружается история треда.', { exact: true })).toHaveCount(0);
+  await expect(journal).toContainText('Источник отвязан');
+  await expect(journal).toContainText('Получено: 2 · В контексте Codex: 1 · Ожидают: 1');
+  await expect(journal).toContainText('История не была загружена полностью до отвязки.');
+  expect(reads.length).toBeGreaterThan(0);
+  expect(api.mutations).toEqual([]);
+});

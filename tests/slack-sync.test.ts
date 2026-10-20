@@ -183,6 +183,99 @@ describe('durable Slack passive sync', () => {
     expect(f.readThreadPage).not.toHaveBeenCalled();
   });
 
+  it('rescans old edits after a same-target unbind and rebind between pump ticks', async () => {
+    const f = fixture(); const original = f.store.recordSlackMessage(f.message())!;
+    await f.sync.backfill(); expect(await f.sync.drain(f.conversation.id)).toBe(true);
+    f.store.removeBinding(f.conversation.id, 'slack');
+    const edited = f.message(original.messageId, 'Edited while unbound', { kind: 'edit', payload: { text: 'Edited while unbound', edited: { ts: '201.000000' } } });
+    expect(f.store.ingest({ eventId: 'message_changed:unbound', endpoint: f.endpoint, sender: edited.sender,
+      messageId: edited.messageId, text: edited.text, slack: edited, contextOnly: true, directMention: true }).request).toBeNull();
+    f.store.setBinding(f.conversation.id, 'slack', f.endpoint.id, ['U1']);
+    expect(f.store.listSlackSyncStreams()).toHaveLength(1);
+    expect(f.store.getSlackSyncStream(original.streamId)?.coveredThrough).toBeUndefined();
+    expect(await f.sync.drain(f.conversation.id, original.messageId)).toBe(false);
+    f.readThreadPage.mockResolvedValueOnce({ messages: [edited] });
+    advance(); await f.sync.backfill();
+    expect(f.readThreadPage.mock.calls.at(-1)?.[1]?.oldest).toBeUndefined();
+    expect(f.store.listSlackSyncEntries(original.streamId)).toHaveLength(2);
+    expect(await f.sync.drain(f.conversation.id, original.messageId)).toBe(true);
+    expect(f.codex.injectContext).toHaveBeenCalledTimes(2);
+    expect(f.codex.injectContext.mock.calls[1][2]).toContain('Edited while unbound');
+    expect(f.store.listRequests()).toEqual([]);
+  });
+
+  it.each(['page', 'error'])('discards a stale in-flight %s after same-target rebinding', async result => {
+    const f = fixture(); await f.sync.backfill();
+    const [stream] = f.store.listSlackSyncStreams();
+    let resolve!: (page: { messages: SlackTranscriptMessage[] }) => void;
+    let reject!: (error: Error) => void;
+    f.readThreadPage.mockImplementationOnce(() => new Promise((done, fail) => { resolve = done; reject = fail; }));
+    advance(); const inFlight = f.sync.backfill();
+    expect(f.readThreadPage.mock.calls.at(-1)?.[1]?.oldest).toBe('200.000000');
+    f.store.removeBinding(f.conversation.id, 'slack');
+    f.store.setBinding(f.conversation.id, 'slack', f.endpoint.id, ['U1']);
+    if (result === 'page') resolve({ messages: [f.message('150.000000', 'Stale page')] });
+    else reject(new ChannelError('Stale rate limit', true, false, 7000, 429));
+    await inFlight;
+    expect(f.store.getSlackSyncStream(stream.id)).toMatchObject({ coveredThrough: undefined, scanUntil: undefined,
+      cursor: undefined, state: 'backfill', error: undefined, retryAt: undefined });
+    expect(f.store.listSlackSyncEntries(stream.id)).toEqual([]);
+    expect(await f.sync.drain(f.conversation.id)).toBe(false);
+    f.readThreadPage.mockResolvedValueOnce({ messages: [f.message('110.000000', 'Fresh full history')] });
+    advance(); await f.sync.backfill();
+    expect(f.readThreadPage.mock.calls.at(-1)?.[1]?.oldest).toBeUndefined();
+    expect(await f.sync.drain(f.conversation.id)).toBe(true);
+    expect(f.codex.injectContext).toHaveBeenCalledExactlyOnceWith('original-codex', expect.any(String), expect.stringContaining('Fresh full history'));
+  });
+
+  it.each(['proxy', 'websocket'] as const)('allows %s after Slack is detached and fully applied, but retains pending original-destination context', async transport => {
+    const f = fixture(); f.store.recordSlackMessage(f.message());
+    await f.sync.backfill(); await f.sync.drain(f.conversation.id);
+    f.store.removeBinding(f.conversation.id, 'slack');
+    f.status.transport = transport;
+    const status = vi.spyOn(f.codex, 'status');
+    expect(await f.sync.drain(f.conversation.id)).toBe(true);
+    expect(status).not.toHaveBeenCalled();
+    expect(f.codex.injectContext).toHaveBeenCalledTimes(1);
+    f.store.setBinding(f.conversation.id, 'slack', f.endpoint.id, ['U1']);
+    const pending = f.store.recordSlackMessage(f.message('120.000000', 'Captured before detach'))!;
+    f.store.updateSlackSyncEntry(pending.id, { state: 'uncertain', retryAt: new Date(Date.now() + 5000).toISOString() });
+    f.store.removeBinding(f.conversation.id, 'slack');
+    expect(await f.sync.drain(f.conversation.id, '110.000000')).toBe(true);
+    expect(await f.sync.drain(f.conversation.id)).toBe(false);
+    expect(f.store.getSlackSyncEntry(pending.id)?.state).toBe('uncertain');
+    expect(f.store.getSlackSyncStream(pending.streamId)?.error).toContain('managed');
+    expect(f.codex.injectContext).toHaveBeenCalledTimes(1);
+    f.status.transport = 'managed'; advance(5001);
+    expect(await f.sync.drain(f.conversation.id)).toBe(true);
+    expect(f.codex.injectContext.mock.calls[1]).toEqual(['original-codex', pending.id, expect.stringContaining('Captured before detach')]);
+    expect(f.store.getSlackSyncEntry(pending.id)?.state).toBe('applied');
+    expect(f.readThreadPage).toHaveBeenCalledTimes(1);
+    f.status.transport = transport;
+    expect(await f.sync.drain(f.conversation.id)).toBe(true);
+  });
+
+  it.each(['append', 'release'])('rechecks the context barrier after rebinding during writer %s', async phase => {
+    const f = fixture(); const entry = f.store.recordSlackMessage(f.message())!;
+    await f.sync.backfill();
+    let resolve!: () => void;
+    f.codex[phase === 'append' ? 'injectContext' : 'releaseThread'].mockImplementationOnce(() => new Promise<void>(done => { resolve = done; }));
+    const draining = f.sync.drain(f.conversation.id, entry.messageId);
+    await Promise.resolve();
+    if (phase === 'release') expect(f.codex.releaseThread).toHaveBeenCalledTimes(1);
+    f.store.removeBinding(f.conversation.id, 'slack');
+    f.store.setBinding(f.conversation.id, 'slack', f.endpoint.id, ['U1']);
+    resolve();
+    expect(await draining).toBe(false);
+    expect(f.store.getSlackSyncEntry(entry.id)?.state).toBe('applied');
+    expect(f.store.getSlackSyncStream(entry.streamId)).toMatchObject({ state: 'backfill', coveredThrough: undefined });
+    expect(f.codex.releaseThread).toHaveBeenCalledExactlyOnceWith('original-codex');
+    advance(); await f.sync.backfill();
+    expect(f.readThreadPage.mock.calls.at(-1)?.[1]?.oldest).toBeUndefined();
+    expect(await f.sync.drain(f.conversation.id, entry.messageId)).toBe(true);
+    expect(f.codex.injectContext).toHaveBeenCalledTimes(1);
+  });
+
   it('rejects wrong-thread pages and changed accounts without claiming coverage', async () => {
     const f = fixture();
     f.readThreadPage.mockResolvedValueOnce({ messages: [f.message('110.000000', 'Wrong thread', { threadId: 'other-thread' })] });

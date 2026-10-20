@@ -61,7 +61,9 @@ export function SlackSyncJournal({ api, conversationId }: { api: ReleApi; conver
   const received = stream ? Object.values(stream.counts).reduce((total, count) => total + count, 0) : 0;
   const applied = stream ? stream.counts.applied : 0;
   const pending = stream ? stream.counts.pending + stream.counts.applying + stream.counts.uncertain : 0;
-  const phase = stream?.state === 'backfill' ? 'Загружается история треда.'
+  const phase = stream && !stream.active && stream.state === 'backfill'
+    ? pending ? 'Полученные сообщения отвязанного источника ожидают передачи в Codex.' : 'Полученные сообщения отвязанного источника переданы в контекст Codex.'
+    : stream?.state === 'backfill' ? 'Загружается история треда.'
     : stream?.state === 'blocked' ? 'Синхронизация заблокирована.'
     : pending ? 'Контекст ожидает передачи в Codex.'
     : 'Полученные сообщения переданы в контекст Codex.';

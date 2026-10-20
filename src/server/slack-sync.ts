@@ -39,7 +39,9 @@ export class SlackSync {
   async backfill(): Promise<void> {
     if (this.reading || Date.now() < this.nextReadAt) return;
     const all = this.store.listSlackSyncStreams();
-    for (const stream of all) if (!stream.active || stream.paused) { this.fullScanned.delete(stream.id); this.fullScanGeneration.delete(stream.id); }
+    for (const stream of all) if (!stream.active || stream.paused || (!stream.coveredThrough && !stream.scanUntil)) {
+      this.fullScanned.delete(stream.id); this.fullScanGeneration.delete(stream.id);
+    }
     const streams = all.filter(stream => stream.active && !stream.paused && (!stream.retryAt || Date.parse(stream.retryAt) <= Date.now()));
     if (!streams.length) return;
     let stream = streams[this.nextStream++ % streams.length];
@@ -64,8 +66,8 @@ export class SlackSync {
       }
       const page = await channel.readThreadPage(stream, { cursor: stream.cursor, oldest: stream.scanOldest, latest: stream.scanUntil });
       if (generation !== this.generation) return;
-      const current = this.store.getSlackSyncStream(stream.id);
-      if (!current?.active || current.paused) return;
+      const current = this.currentWindow(stream);
+      if (!current) return;
       if (this.getChannel() !== channel || !channel.state.connected || channel.state.accountId !== stream.accountId) {
         this.block(current, 'Подключение Slack изменилось во время загрузки контекста. Требуется повторная загрузка.', 5000);
         return;
@@ -89,7 +91,7 @@ export class SlackSync {
           scanUntil: undefined, scanOldest: undefined, state: this.fullScanned.has(stream.id) ? 'ready' : 'backfill', error: undefined, retryAt: undefined });
       }
     } catch (error) {
-      if (generation !== this.generation) return;
+      if (generation !== this.generation || !this.currentWindow(stream)) return;
       const retry = error instanceof ChannelError ? error.retryAfterMs : 5000;
       this.block(stream, errorMessage(error), retry);
       if (stream.cursor && error instanceof ChannelError && !error.retryable && !error.uncertain) {
@@ -102,7 +104,8 @@ export class SlackSync {
 
   async drain(conversationId: string, cutoff?: string): Promise<boolean> {
     if (this.draining.has(conversationId) || this.store.activeRequests().some(request => request.conversationId === conversationId && request.status !== 'queued')) return false;
-    const streams = this.store.listSlackSyncStreams().filter(stream => stream.conversationId === conversationId);
+    const streams = this.store.listSlackSyncStreams().filter(stream => stream.conversationId === conversationId &&
+      (stream.active || this.store.hasPendingSlackSyncEntries(stream.id, cutoff)));
     if (!streams.length) return true;
     if (streams.some(stream => stream.paused)) return false;
     const codex = this.getCodex();
@@ -114,9 +117,7 @@ export class SlackSync {
       for (const stream of streams) this.block(stream, message, 5000);
       return false;
     }
-    if (streams.some(stream => (stream.retryAt && Date.parse(stream.retryAt) > Date.now()) ||
-      (stream.active && (!this.fullScanned.has(stream.id) || !stream.coveredThrough || stream.scanUntil ||
-        (cutoff !== undefined && timestampKey(stream.coveredThrough) < timestampKey(cutoff)))))) return false;
+    if (streams.some(stream => !this.ready(stream, cutoff))) return false;
     this.draining.add(conversationId);
     const generation = this.generation;
     const owned = new Set<string>();
@@ -125,7 +126,8 @@ export class SlackSync {
     try {
       for (const stream of streams) {
         for (const candidate of this.store.listSlackSyncEntries(stream.id, { pending: true, beforeMessageId: cutoff, limit: remaining })) {
-          if (generation !== this.generation || this.getCodex() !== codex || this.store.getSlackSyncStream(stream.id)?.paused ||
+          const current = this.store.getSlackSyncStream(stream.id);
+          if (generation !== this.generation || this.getCodex() !== codex || !current || !this.ready(current, cutoff) ||
             this.store.activeRequests().some(request => request.conversationId === conversationId && request.status !== 'queued')) { failed = true; break; }
           const entry = this.store.claimSlackSyncEntry(candidate.id);
           if (!entry) { failed = true; break; }
@@ -133,7 +135,8 @@ export class SlackSync {
           try {
             await codex.injectContext(stream.codexThreadId, entry.id, quotedEntry(entry));
             this.store.updateSlackSyncEntry(entry.id, { state: 'applied', error: undefined, retryAt: undefined });
-            this.store.updateSlackSyncStream(stream.id, { state: 'ready', error: undefined, retryAt: undefined });
+            const current = this.store.getSlackSyncStream(stream.id);
+            if (current && this.ready(current, cutoff)) this.store.updateSlackSyncStream(stream.id, { state: 'ready', error: undefined, retryAt: undefined });
           } catch (error) {
             this.store.updateSlackSyncEntry(entry.id, { state: error instanceof CodexThreadBusyError ? 'pending' : 'uncertain',
               error: errorMessage(error), retryAt: new Date(Date.now() + 5000).toISOString() });
@@ -151,7 +154,22 @@ export class SlackSync {
       }
       this.draining.delete(conversationId);
     }
-    return !failed && generation === this.generation && !streams.some(stream => this.store.hasPendingSlackSyncEntries(stream.id, cutoff));
+    const currentStreams = this.store.listSlackSyncStreams().filter(stream => stream.conversationId === conversationId &&
+      (stream.active || this.store.hasPendingSlackSyncEntries(stream.id, cutoff)));
+    return !failed && generation === this.generation && !currentStreams.some(stream =>
+      !this.ready(stream, cutoff) || this.store.hasPendingSlackSyncEntries(stream.id, cutoff));
+  }
+
+  private currentWindow(stream: SlackSyncStream): SlackSyncStream | undefined {
+    const current = this.store.getSlackSyncStream(stream.id);
+    return current?.active && !current.paused && current.scanUntil === stream.scanUntil &&
+      current.scanOldest === stream.scanOldest && current.cursor === stream.cursor ? current : undefined;
+  }
+
+  private ready(stream: SlackSyncStream, cutoff?: string): boolean {
+    return !stream.paused && (!stream.retryAt || Date.parse(stream.retryAt) <= Date.now()) &&
+      (!stream.active || (this.fullScanned.has(stream.id) && !!stream.coveredThrough && !stream.scanUntil &&
+        (cutoff === undefined || timestampKey(stream.coveredThrough) >= timestampKey(cutoff))));
   }
 
   private block(stream: SlackSyncStream, error: string, retryMs: number): void {
