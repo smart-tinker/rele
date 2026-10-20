@@ -76,6 +76,23 @@ def result(response):
 def frame(event):
     return ('data: ' + json.dumps(event) + '\n\n').encode()
 
+def raw_receipts(rollout, item):
+    receipts=[]
+    for line in rollout.read_text(encoding='utf-8').splitlines():
+        try: saved=json.loads(line)
+        except json.JSONDecodeError: continue
+        payload=saved.get('payload',{})
+        if saved.get('type')=='response_item' and payload.get('id')==item['id']:
+            assert all(payload.get(key)==item[key] for key in ('type','role','content')),payload
+            receipts.append(payload)
+    return receipts
+
+async def persisted_receipt(rollout, item):
+    for attempt in range(100):
+        if receipts:=raw_receipts(rollout,item): return receipts
+        await asyncio.sleep(.02)
+    raise AssertionError('Injected Slack item has no exact fixture rollout receipt')
+
 async def main():
     records, next_actions, errors = [], [], []
     async def provider(req):
@@ -85,22 +102,31 @@ async def main():
         index = len(records)+1
         action = next_actions.pop(0) if next_actions else ('final', None)
         records.append({'index':index,'body':data,'action':action[0]})
-        if action[0]=='hold': await action[1].wait()
         response_id=f'resp-{index}'
         response=web.StreamResponse(headers={'Content-Type':'text/event-stream'})
         await response.prepare(req)
         await response.write(frame({'type':'response.created','response':{'id':response_id}}))
+        if action[0]=='hold': await action[1].wait()
         if action[0]=='approval':
             item={'type':'function_call','name':'exec_command','call_id':f'call-{index}',
                   'arguments':json.dumps({'cmd':'echo rele-probe-no-execution','sandbox_permissions':'require_escalated',
                       'justification':'Rele isolated protocol probe; decline this command.'})}
+        elif action[0]=='question':
+            item={'type':'function_call','name':'request_user_input','call_id':f'call-{index}',
+                  'arguments':json.dumps({'questions':[{'id':'continue','header':'Continue',
+                    'question':'Continue the isolated fixture?',
+                    'options':[{'label':'Yes','description':'Continue the fixture.'},
+                               {'label':'No','description':'Stop the fixture.'}]}]})}
         else:
             item={'type':'message','role':'assistant','id':f'msg-{index}','phase':'final_answer',
                   'content':[{'type':'output_text','text':f'fake-answer-{index}'}]}
-        await response.write(frame({'type':'response.output_item.done','output_index':0,'item':item}))
-        await response.write(frame({'type':'response.completed','response':{'id':response_id,
-          'usage':{'input_tokens':10,'output_tokens':3,'total_tokens':13}}}))
-        await response.write_eof()
+        try:
+            await response.write(frame({'type':'response.output_item.done','output_index':0,'item':item}))
+            await response.write(frame({'type':'response.completed','response':{'id':response_id,
+              'usage':{'input_tokens':10,'output_tokens':3,'total_tokens':13}}}))
+            await response.write_eof()
+        except ConnectionError:
+            pass  # Native interrupt closes the held synthetic model stream.
         return response
     app=web.Application()
     app.router.add_route('*','/{tail:.*}',provider)
@@ -152,6 +178,7 @@ supports_websockets=false
         response=result(await client.call('initialize',{'clientInfo':{'name':name,'version':'0.0.0'},
                               'capabilities':{'experimentalApi':True}}))
         await ws.send(json.dumps({'method':'initialized'}))
+        assert result(await client.call('server/diagnostics'))['process']['id']==process.pid
         return client,response
     report={'cli':args.expected_version,'checks':{},'desktopVerified':False}
     try:
@@ -160,6 +187,7 @@ supports_websockets=false
         assert f'/{args.expected_version} ' in init_a['userAgent'], init_a['userAgent']
         report['initialize']=init_a
         report['checks']['two_clients_same_home']=init_a['codexHome']==init_b['codexHome']
+        report['checks']['all_clients_share_native_runtime_pid']=True
         thread=result(await a.call('thread/start',{'cwd':str(workspace)}))['thread']['id']
         report['threadId']=thread
         hold=asyncio.Event(); next_actions.append(('hold',hold))
@@ -212,19 +240,9 @@ supports_websockets=false
         context_turn_ids=[turn['id'] for turn in history['data']]
         context_started_count=sum(event.get('method')=='turn/started' for event in b.events)
         assert result(await b.call('thread/inject_items',{'threadId':thread,'items':[context_item]}))=={}
-        persisted_context=False
-        for attempt in range(100):
-            for rollout in (home/'sessions').rglob('*.jsonl'):
-                for line in rollout.read_text(encoding='utf-8').splitlines():
-                    try: saved=json.loads(line)
-                    except json.JSONDecodeError: continue
-                    payload=saved.get('payload',{})
-                    if saved.get('type')=='response_item' and payload.get('id')==context_id:
-                        assert payload.get('role')=='user' and payload.get('content')==context_item['content'],payload
-                        persisted_context=True
-            if persisted_context: break
-            await asyncio.sleep(.02)
-        assert persisted_context,'Injected Slack canary was not persisted in the fixture rollout'
+        rollout=pathlib.Path(result(await b.call('thread/read',{'threadId':thread}))['thread']['path']).resolve()
+        assert rollout.is_relative_to(home.resolve()),rollout
+        await persisted_receipt(rollout,context_item)
         context_history=result(await b.call('thread/turns/list',{'threadId':thread,'limit':10,'itemsView':'full'}))
         assert [turn['id'] for turn in context_history['data']]==context_turn_ids,context_history
         assert len(records)==context_model_count,'Passive injection started a model request'
@@ -250,6 +268,37 @@ supports_websockets=false
         identities=[it.get('clientId') for it in mixed_turn['items'] if it.get('type')=='userMessage']
         assert steer_id in identities and 'desktop-steer' in identities,identities
         report['checks']['native_steering_requires_mixed_turn_quarantine']=True
+        # An active raw-inject ACK can be lost by native interrupt. Only an exact
+        # persisted receipt permits delivery; an idle retry creates no model/turn.
+        receipt_hold=asyncio.Event(); next_actions.append(('hold',receipt_hold))
+        before=len(records)
+        receipt_turn=result(await a.call('turn/start',{'threadId':thread,
+            'input':[{'type':'text','text':'hold the native injection receipt race'}]}))['turn']['id']
+        await asyncio.wait_for(wait_len(records,before+1),20)
+        raw_item={'type':'message','id':'rele_slack_'+str(uuid.uuid4()),'role':'user',
+            'content':[{'type':'input_text','text':'<quoted_slack_transcript author="UOTHER">'
+                +'Synthetic source '+str(uuid.uuid4())+'</quoted_slack_transcript>'}]}
+        assert result(await b.call('thread/inject_items',{'threadId':thread,'items':[raw_item]}))=={}
+        assert not raw_receipts(rollout,raw_item),'Active injection unexpectedly persisted before interrupt'
+        result(await b.call('turn/interrupt',{'threadId':thread,'turnId':receipt_turn}))
+        for client in (a,b):
+            interrupted=await client.wait(lambda x:x.get('method')=='turn/completed'
+                and x['params']['turn']['id']==receipt_turn)
+            assert interrupted['params']['turn']['status']=='interrupted',interrupted
+        receipt_hold.set()
+        assert not raw_receipts(rollout,raw_item),'Interrupted pending input unexpectedly persisted'
+        assert result(await b.call('thread/read',{'threadId':thread}))['thread']['status']['type']=='idle'
+        receipt_history=result(await b.call('thread/turns/list',{'threadId':thread,'limit':100,'itemsView':'full'}))
+        receipt_started=sum(event.get('method')=='turn/started' for event in b.events)
+        assert result(await b.call('thread/inject_items',{'threadId':thread,'items':[raw_item]}))=={}
+        assert len(await persisted_receipt(rollout,raw_item))==1
+        after_retry=result(await b.call('thread/turns/list',{'threadId':thread,'limit':100,'itemsView':'full'}))
+        assert [turn['id'] for turn in after_retry['data']]==[turn['id'] for turn in receipt_history['data']]
+        assert len(records)==before+1,'Raw injection/retry created a model request'
+        assert sum(event.get('method')=='turn/started' for event in b.events)==receipt_started
+        report['checks']['second_client_interrupts_original_turn']=True
+        report['checks']['active_inject_ack_lost_on_interrupt_requires_receipt']=True
+        report['checks']['idle_retry_persists_exact_receipt_without_model_or_turn']=True
         # Model emits a command approval; decline it, so no command is run.
         next_actions.append(('approval',None))
         approval_turn=result(await a.call('turn/start',{'threadId':thread,
@@ -259,10 +308,40 @@ supports_websockets=false
         approval_b=await b.wait(lambda x:x.get('method')=='item/commandExecution/requestApproval'
                                   and x['params'].get('turnId')==approval_turn)
         report['checks']['approval_broadcasts_to_subscribers']=True
-        await a.ws.send(json.dumps({'id':approval_a['id'],'result':{'decision':'decline'}}))
-        await b.wait(lambda x:x.get('method')=='serverRequest/resolved')
-        await a.wait(lambda x:x.get('method')=='turn/completed' and x['params']['turn']['id']==approval_turn)
+        assert approval_a['id']==approval_b['id'] and approval_a['params']==approval_b['params']
+        await b.close()
+        b,_=await connect('rele_probe_b_replayed')
+        result(await b.call('thread/resume',{'threadId':thread,'excludeTurns':True}))
+        replay=await b.wait(lambda x:x.get('method')=='item/commandExecution/requestApproval'
+            and x['params'].get('turnId')==approval_turn)
+        assert replay['id']==approval_a['id'] and replay['params']==approval_a['params'],replay
+        await b.ws.send(json.dumps({'id':replay['id'],'result':{'decision':'decline'}}))
+        for client in (a,b):
+            await client.wait(lambda x:x.get('method')=='serverRequest/resolved'
+                and x['params'].get('threadId')==thread and x['params'].get('requestId')==replay['id'])
+        completed=await a.wait(lambda x:x.get('method')=='turn/completed' and x['params']['turn']['id']==approval_turn)
+        assert completed['params']['turn']['status']=='completed',completed
+        report['checks']['late_second_client_receives_pending_approval_replay']=True
+        report['checks']['second_client_decline_resolves_owner_and_peer']=True
         report['checks']['approval_resolution_seen_by_peer']=True
+        next_actions.append(('question',None))
+        question_turn=result(await a.call('turn/start',{'threadId':thread,
+            'collaborationMode':{'mode':'plan','settings':{'model':'mock-model',
+                'reasoning_effort':None,'developer_instructions':None}},
+            'input':[{'type':'text','text':'ask the synthetic native question'}]}))['turn']['id']
+        question_a=await a.wait(lambda x:x.get('method')=='item/tool/requestUserInput'
+            and x['params'].get('turnId')==question_turn)
+        question_b=await b.wait(lambda x:x.get('method')=='item/tool/requestUserInput'
+            and x['params'].get('turnId')==question_turn)
+        assert question_a['id']==question_b['id'] and question_a['params']==question_b['params']
+        await b.ws.send(json.dumps({'id':question_b['id'],'result':{'answers':{'continue':{'answers':['Yes']}}}}))
+        for client in (a,b):
+            await client.wait(lambda x:x.get('method')=='serverRequest/resolved'
+                and x['params'].get('threadId')==thread and x['params'].get('requestId')==question_b['id'])
+        completed=await a.wait(lambda x:x.get('method')=='turn/completed' and x['params']['turn']['id']==question_turn)
+        assert completed['params']['turn']['status']=='completed',completed
+        assert 'Yes' in json.dumps(records[-1]['body']),'Remote answer omitted from model continuation'
+        report['checks']['second_client_answers_question_and_both_observe_resolution']=True
         # Treat an acknowledged server enqueue as lost by its submitting application.
         hold2=asyncio.Event(); next_actions.append(('hold',hold2))
         before=len(records)
@@ -320,7 +399,7 @@ supports_websockets=false
         report['result']='failed'; report['exception']=repr(exc); report['stderr_tail']=errors[-25:]
         raise
     finally:
-        for pending_hold in (locals().get('hold'),locals().get('hold2'),locals().get('steer_hold')):
+        for pending_hold in (locals().get('hold'),locals().get('hold2'),locals().get('steer_hold'),locals().get('receipt_hold')):
             if pending_hold: pending_hold.set()
         for client in clients:
             with contextlib.suppress(Exception): await client.close()

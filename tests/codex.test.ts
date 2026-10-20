@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
@@ -102,7 +102,7 @@ async function managedFixture(options: {
   return { client, executable, directory, discover, records, calls };
 }
 
-async function fixture(handlers: Record<string, Handler> = {}) {
+async function fixture(handlers: Record<string, Handler> = {}, codexHome?: string) {
   const calls: Rpc[] = [], responses: Rpc[] = [], sockets: WebSocket[] = [];
   const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
   await once(server, 'listening');
@@ -133,7 +133,7 @@ async function fixture(handlers: Record<string, Handler> = {}) {
     });
   });
   const endpoint = `ws://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  const client = new CodexClient({ transport: 'websocket', executable: 'codex', endpoint });
+  const client = new CodexClient({ transport: 'websocket', executable: 'codex', endpoint, codexHome });
   cleanup.push(() => client.close());
   return { client, calls, responses, sockets, handlers, endpoint };
 }
@@ -439,11 +439,11 @@ describe('Codex shared-runtime adapter', () => {
 });
 
 describe('Codex passive context', () => {
-  it('rejects shared runtimes before any context mutation or writer acquisition', async () => {
+  it('rejects an unmatched shared profile before any context mutation or writer acquisition', async () => {
     const f = await fixture();
     await f.client.connect();
     const before = f.calls.length;
-    await expect(f.client.injectContext(threadId, 'slack-entry', 'Passive Slack transcript')).rejects.toThrow('управляемом');
+    await expect(f.client.injectContext(threadId, 'slack-entry', 'Passive Slack transcript')).rejects.toThrow('тем же профилем');
     expect(f.calls).toHaveLength(before);
   });
 
@@ -517,6 +517,109 @@ describe('Codex passive context', () => {
     await f.client.connect();
     expect((await f.calls()).filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
     expect((await f.calls()).filter(call => call.method === 'thread/resume')).toHaveLength(1);
+  });
+});
+
+
+async function sharedContextFixture(options: { persist?: boolean; dropAck?: boolean } = {}) {
+  const home = await mkdtemp(path.join(tmpdir(), 'Rele shared receipts '));
+  cleanup.push(() => rm(home, { recursive: true, force: true }));
+  const sessions = path.join(home, 'sessions');
+  await mkdir(sessions);
+  const rolloutPath = path.join(sessions, 'synthetic.jsonl');
+  const meta = JSON.stringify({ type: 'session_meta', payload: { id: threadId } }) + '\n';
+  await writeFile(rolloutPath, meta);
+  const runtime = { userAgent: 'rele/0.163.0 (Fixture)', codexHome: home,
+    platformFamily: process.platform === 'win32' ? 'windows' : 'unix',
+    platformOs: process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'macos' : process.platform };
+  const thread: typeof rawThread & { path?: string | null } = { ...rawThread, status: { ...rawThread.status }, path: rolloutPath };
+  const pending: unknown[] = [];
+  const f = await fixture({
+    initialize: () => runtime,
+    'thread/read': () => ({ thread }),
+    'thread/inject_items': async (message, socket) => {
+      const item = (message.params.items as unknown[])[0];
+      pending.push(item);
+      if (options.persist !== false) await appendFile(rolloutPath, JSON.stringify({ type: 'response_item', payload: item }) + '\n');
+      if (options.dropAck) { options.dropAck = false; socket.terminate(); return noResponse; }
+      return {};
+    },
+  }, home);
+  return { ...f, home, rolloutPath, runtime, thread, pending, meta };
+}
+
+describe('Codex shared passive context receipts', () => {
+  it('accepts only an exact durable raw item after ACK without creating a turn', async () => {
+    const f = await sharedContextFixture();
+    await f.client.connect();
+    await f.client.injectContext(threadId, 'entry', 'Context');
+    expect(f.calls.filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
+    expect(f.calls.find(call => call.method === 'thread/inject_items')?.params).toEqual({
+      threadId, items: [{ type: 'message', id: 'rele_slack_entry', role: 'user', content: [{ type: 'input_text', text: 'Context' }] }],
+    });
+    expect(f.calls.some(call => ['thread/start', 'thread/fork', 'turn/start', 'thread/queue/add'].includes(call.method ?? ''))).toBe(false);
+    expect(await readFile(f.rolloutPath, 'utf8')).toContain('rele_slack_entry');
+  });
+
+  it('reconciles a persisted injection after a lost ACK without appending it again', async () => {
+    const f = await sharedContextFixture({ dropAck: true });
+    await f.client.connect();
+    await expect(f.client.injectContext(threadId, 'entry', 'Context')).rejects.toBeInstanceOf(CodexTransportError);
+    expect(f.client.runtimeInfo()).toBeUndefined();
+    await f.client.connect();
+    const before = f.calls.length;
+    await f.client.injectContext(threadId, 'entry', 'Context');
+    expect(f.calls.filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
+    expect(f.calls.slice(before).map(call => call.method)).toEqual(['thread/read']);
+  });
+
+  it('keeps ACK-only context pending and confirms a later native flush on retry', async () => {
+    const f = await sharedContextFixture({ persist: false });
+    await f.client.connect();
+    await expect(f.client.injectContext(threadId, 'entry', 'Context')).rejects.toThrow('сохранённая запись пока не подтверждена');
+    expect(f.calls.filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
+    await appendFile(f.rolloutPath, JSON.stringify({ type: 'response_item', payload: f.pending[0] }) + '\n');
+    await f.client.injectContext(threadId, 'entry', 'Context');
+    expect(f.calls.filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
+  });
+
+  it.each(['profile', 'platform', 'remote-home', 'missing-path', 'outside-path', 'wrong-thread'] as const)('rejects %s before acquiring a writer or mutating context', async failure => {
+    const f = await sharedContextFixture();
+    if (failure === 'profile') { f.runtime.codexHome = path.join(f.home, 'other-profile'); await mkdir(f.runtime.codexHome); }
+    if (failure === 'platform') f.runtime.platformOs = 'remote-os' as typeof f.runtime.platformOs;
+    if (failure === 'remote-home') f.runtime.codexHome = '//remote/profile';
+    if (failure === 'missing-path') delete f.thread.path;
+    if (failure === 'outside-path') { f.thread.path = path.join(f.home, 'outside.jsonl'); await writeFile(f.thread.path, f.meta); }
+    if (failure === 'wrong-thread') f.thread.id = randomUUID();
+    await f.client.connect();
+    await expect(f.client.injectContext(threadId, 'entry', 'Context')).rejects.toThrow();
+    expect(f.calls.some(call => ['thread/resume', 'thread/inject_items', 'turn/start', 'thread/queue/add'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it.each(['queue', 'active'] as const)('preserves the shared %s readiness guard', async condition => {
+    const f = await sharedContextFixture();
+    if (condition === 'queue') f.handlers['thread/queue/list'] = () => ({ data: [{ id: 'other', clientUserMessageId: 'other' }], nextCursor: null });
+    else f.thread.status.type = 'active';
+    await f.client.connect();
+    await expect(f.client.injectContext(threadId, 'entry', 'Context')).rejects.toMatchObject({ name: 'CodexThreadBusyError', reason: condition === 'queue' ? 'queued_input' : 'non_idle' });
+    expect(f.calls.some(call => call.method === 'thread/inject_items')).toBe(false);
+  });
+
+  it('re-reads the exact native rollout path after ACK when the thread was archived', async () => {
+    const f = await sharedContextFixture({ persist: false });
+    const archive = path.join(f.home, 'archived_sessions');
+    await mkdir(archive);
+    const moved = path.join(archive, 'synthetic.jsonl');
+    await writeFile(moved, f.meta);
+    f.handlers['thread/inject_items'] = async message => {
+      await appendFile(moved, JSON.stringify({ type: 'response_item', payload: (message.params.items as unknown[])[0] }) + '\n');
+      f.thread.path = moved;
+      return {};
+    };
+    await f.client.connect();
+    await f.client.injectContext(threadId, 'entry', 'Context');
+    expect(f.calls.filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
+    expect(await readFile(f.rolloutPath, 'utf8')).toBe(f.meta);
   });
 });
 

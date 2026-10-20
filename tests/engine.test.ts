@@ -420,6 +420,111 @@ describe('Engine approvals', () => {
     expect(f.codex.respond).toHaveBeenCalledTimes(1);
   });
 
+  it.each(['slack', 'telegram'] as const)('cancels only the originating sender task from %s, with a durable control receipt', async platform => {
+    const f = fixture();
+    const request = await acceptRequest(f, platform);
+    await requestApproval(f, request, true);
+    const wrong = f.message(platform, 'wrong-cancel', { text: 'rele:cancel', sender: { id: 'other', name: 'Other' } });
+    await f.engine.receive(wrong);
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+    const control = f.message(platform, 'cancel-control', { text: platform === 'telegram' ? '/rele_cancel' : 'rele:cancel' });
+    f.codex.interrupt.mockImplementationOnce(async () => { expect(f.store.recordInbound(control).duplicate).toBe(true); });
+    await f.engine.receive(control);
+    await f.engine.receive(control);
+    await f.engine.settled();
+    expect(f.codex.interrupt).toHaveBeenCalledExactlyOnceWith(THREAD, 'turn-1');
+    expect(f.codex.respond).not.toHaveBeenCalled();
+    expect(f.store.listRequests()).toHaveLength(1);
+    expect(f.store.listDeliveries().find(row => row.key === 'control:cancel-control')?.origin).toEqual(request.origin);
+  });
+
+  it.each([true, false])('refuses to interrupt mixed turns, including a persisted mixed flag=%s', async persisted => {
+    const f = fixture(); const request = await acceptRequest(f, 'telegram'); await running(f, request);
+    if (persisted) f.store.setMeta(`mixed:${request.id}`, '1');
+    else f.codex.locations.set(request.id, { state: 'running', turnId: 'turn-1', mixed: true });
+    await expect(f.engine.cancel(request.id)).rejects.toThrow('смешанного хода');
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+    expect(f.codex.deleteQueued).not.toHaveBeenCalled();
+  });
+
+  it('cancels a local queued request from its origin without starting Codex', async () => {
+    const f = fixture(); f.codex.connected = false;
+    const request = await acceptRequest(f, 'telegram');
+    await f.engine.receive(f.message('telegram', 'cancel-queued', { text: '/rele_cancel' })); await f.engine.settled();
+    expect(f.store.getRequest(request.id)?.status).toBe('cancelled');
+    expect(f.codex.enqueue).not.toHaveBeenCalled();
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+    expect(f.store.listDeliveries()[0].body).toBe('Запрос отменён в Rele.');
+  });
+
+  it.each(['slack', 'telegram'] as const)('answers several questions from %s and keeps invalid replies out of the Codex task queue', async platform => {
+    const f = fixture(); const request = await acceptRequest(f, platform); await running(f, request);
+    f.codex.request({ id: 'many-questions', method: 'item/tool/requestUserInput', params: {
+      threadId: THREAD, turnId: 'turn-1', itemId: 'questions', questions: [
+        { id: 'branch', header: 'Branch', question: 'Which branch?' }, { id: 'mode', header: 'Mode', question: 'Which mode?' },
+      ],
+    } });
+    await f.engine.settled();
+    const approval = f.store.listApprovals()[0];
+    const prompt = f.store.listDeliveries().find(row => row.approvalId === approval.id)!;
+    expect(prompt.body).toContain('1. Branch');
+    const invalid = f.message(platform, 'invalid-many-answer', { text: 'main', replyToMessageId: prompt.remoteMessageId });
+    await f.engine.receive(invalid); await f.engine.settled();
+    expect(f.store.getApproval(approval.id)?.status).toBe('pending');
+    expect(f.codex.respond).not.toHaveBeenCalled();
+    const reply = f.message(platform, 'valid-many-answer', { text: '1. main\n2. read-only', replyToMessageId: prompt.remoteMessageId });
+    await f.engine.receive(reply); await f.engine.receive(reply); await f.engine.settled();
+    expect(f.codex.respond).toHaveBeenCalledExactlyOnceWith('many-questions', { answers: { branch: { answers: ['main'] }, mode: { answers: ['read-only'] } } });
+    expect(f.store.listRequests()).toHaveLength(1);
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['slack', 'telegram'] as const)('delivers every long question part before accepting an answer from %s', async platform => {
+    const f = fixture(); const request = await acceptRequest(f, platform); await running(f, request);
+    const channel = platform === 'slack' ? f.slack : f.telegram;
+    let failed = false;
+    channel.deliver.mockImplementation(async delivery => {
+      if (delivery.ordinal === 1 && !failed) { failed = true; throw new ChannelError('Retry this part', true, false, 60_000); }
+      return `${platform}-part-${delivery.ordinal}`;
+    });
+    const questions = [1, 2, 3].map(index => ({ id: `q${index}`, header: `Question ${index}`,
+      question: `${'Длинный вопрос '.repeat(450)}FULL_QUESTION_${index}_CANARY`,
+      options: [{ label: `Choice ${index}`, description: `LAST_OPTION_${index}_CANARY` }] }));
+    f.codex.request({ id: 'long-questions', method: 'item/tool/requestUserInput', params: {
+      threadId: THREAD, turnId: 'turn-1', itemId: 'long-questions', questions,
+    } });
+    await f.engine.settled();
+    const approval = f.store.listApprovals()[0];
+    let parts = f.store.listDeliveries(2000).filter(delivery => delivery.approvalId === approval.id).sort((a, b) => a.ordinal - b.ordinal);
+    expect(parts.length).toBeGreaterThan(1);
+    expect(parts[0]).toMatchObject({ key: `approval:${approval.id}`, status: 'sent' });
+    expect(parts[1].status).toBe('pending');
+    const early = f.message(platform, 'early-long-answer', { text: '1. first\n2. second\n3. third', replyToMessageId: parts[0].remoteMessageId });
+    await f.engine.receive(early); await f.engine.settled();
+    expect(f.codex.respond).not.toHaveBeenCalled();
+    expect(f.store.listRequests()).toHaveLength(1);
+    expect(f.store.recordInbound(early).duplicate).toBe(true);
+    f.store.updateDelivery(parts[1].id, { nextAttemptAt: undefined });
+    await f.engine.pump(); await f.engine.settled();
+    parts = f.store.listDeliveries(2000).filter(delivery => delivery.approvalId === approval.id).sort((a, b) => a.ordinal - b.ordinal);
+    expect(parts.every(delivery => delivery.status === 'sent' && [...delivery.body].length <= 3000)).toBe(true);
+    expect(parts.map(delivery => delivery.ordinal)).toEqual(parts.map((_delivery, index) => index));
+    expect(new Set(parts.map(delivery => delivery.key)).size).toBe(parts.length);
+    expect(channel.deliver.mock.calls.map(([delivery]) => delivery.ordinal)).toEqual([0, 1, ...parts.slice(1).map(delivery => delivery.ordinal)]);
+    const delivered = parts.map(delivery => delivery.body).join('');
+    for (const question of questions) expect(delivered).toContain(question.question);
+    expect(delivered).toContain('LAST_OPTION_3_CANARY');
+    expect(approval.details.length).toBeGreaterThan(16_000);
+    expect(approval.details).toContain('LAST_OPTION_3_CANARY');
+    await f.engine.receive(early); // The old early receipt cannot turn into a later answer or a task.
+    expect(f.codex.respond).not.toHaveBeenCalled();
+    await f.engine.receive(f.message(platform, 'complete-long-answer', { text: early.text, replyToMessageId: parts.at(-1)!.remoteMessageId }));
+    await f.engine.settled();
+    expect(f.codex.respond).toHaveBeenCalledExactlyOnceWith('long-questions', { answers: { q1: { answers: ['first'] }, q2: { answers: ['second'] }, q3: { answers: ['third'] } } });
+    expect(f.store.listRequests()).toHaveLength(1);
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+  });
+
   it('persists a question-reply receipt before writing to Codex and never turns its replay into a new task', async () => {
     const f = fixture();
     const request = await acceptRequest(f, 'telegram');
@@ -659,18 +764,19 @@ describe('Engine Slack transcript and authorized task boundary', () => {
     expect(f.store.listSlackSyncEntries(stream.id).find(entry => entry.messageId === passive.messageId)?.state).toBe('pending');
   });
 
-  it.each(['websocket', 'proxy'] as const)('buffers source context and blocks task execution on shared %s runtimes', async transport => {
+  it.each(['websocket', 'proxy'] as const)('buffers source context until shared %s runtime confirms persistence', async transport => {
     const f = fixture(); f.codex.transport = transport;
+    f.codex.injectContext.mockRejectedValueOnce(new Error('Receipt not confirmed'));
     await f.engine.receive(slackInbound(f, 'shared-runtime', '170002.000001', 'Task needs complete source context'));
     await f.engine.settled();
-    expect(f.codex.injectContext).not.toHaveBeenCalled();
+    expect(f.codex.injectContext).toHaveBeenCalledTimes(1);
     expect(f.codex.enqueue).not.toHaveBeenCalled();
     expect(f.codex.subscribe).not.toHaveBeenCalled();
     expect(f.slack.deliver).not.toHaveBeenCalled();
     expect(f.store.listRequests()[0]).toMatchObject({ status: 'queued' });
     const [stream] = f.store.listSlackSyncStreams();
-    expect(stream.error).toContain('managed');
-    expect(f.store.listSlackSyncEntries(stream.id)[0].state).toBe('pending');
+    expect(stream.error).toContain('Receipt not confirmed');
+    expect(f.store.listSlackSyncEntries(stream.id)[0].state).toBe('uncertain');
   });
 
   it('replays an uncertain passive append with the same marker before attempting the task only once', async () => {

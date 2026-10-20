@@ -91,6 +91,14 @@ afterEach(async () => {
 });
 
 describe('Telegram connection and incoming events', () => {
+  it('routes bare and addressed cancel commands only to their own bot', async () => {
+    const h = harness(); await h.channel.start();
+    h.push(['/rele_cancel', '/rele_cancel@RELE_TEST_BOT', '/rele_cancel@other_bot'].map((text, index) => ({ update_id: index + 1, message: telegramMessage({ text }) })));
+    await vi.waitFor(() => expect(h.offset).toBe(4));
+    expect(vi.mocked(h.callbacks.message).mock.calls.map(([message]) => message.text)).toEqual(['/rele_cancel', '/rele_cancel']);
+    expect(h.calls.some(call => call.method === 'sendMessage')).toBe(false);
+  });
+
   it('recovers an offline startup with capped backoff without sending any messages', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const h = harness();

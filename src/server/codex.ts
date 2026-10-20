@@ -1,14 +1,18 @@
 import { EventEmitter } from 'node:events';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { realpath } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import path from 'node:path';
 import { Duplex } from 'node:stream';
 import type { Socket } from 'node:net';
 import WebSocket from 'ws';
 import type { CodexConnectionState, CodexConnectionTarget, CodexDiscoveryResult, CodexThread } from '../shared/types.js';
 import { SUPPORTED_CODEX_VERSION, SUPPORTED_CODEX_VERSIONS } from '../shared/codex-runtime.js';
-import { isLocalEndpoint, isLocalSocketPath } from './config.js';
+import { isLocalCodexHome, isLocalEndpoint, isLocalSocketPath } from './config.js';
 import { discoverCodex } from './codex-discovery.js';
-import { codexEnvironment, resolveCodexLaunch } from './codex-launch.js';
+import { codexEnvironment, environmentValue, resolveCodexLaunch } from './codex-launch.js';
+import { CodexContextReceipts } from './codex-context-receipts.js';
 import { CodexStdioError, CodexStdioTransport } from './codex-stdio.js';
 
 export { SUPPORTED_CODEX_VERSION } from '../shared/codex-runtime.js';
@@ -38,7 +42,7 @@ interface HistoryTurn { id: string; status: string; items: HistoryItem[] }
 interface Page<T> { data: T[]; nextCursor: string | null }
 interface RawThread {
   id: string; name?: string | null; cwd: string; preview: string; updatedAt: number;
-  status?: { type: string }; ephemeral?: boolean;
+  status?: { type: string }; ephemeral?: boolean; path?: string | null;
   source?: string | Record<string, unknown>; parentThreadId?: string | null;
 }
 function isBindableThread(thread: RawThread): boolean {
@@ -104,6 +108,7 @@ export class CodexClient extends EventEmitter {
   private stopped = true;
   private retry = 0;
   private runtime?: CodexRuntime;
+  private contextReceipts = new CodexContextReceipts();
   private version?: string;
   private state: CodexConnectionState;
   private discovery?: { at: number; result: CodexDiscoveryResult };
@@ -246,30 +251,67 @@ export class CodexClient extends EventEmitter {
 
   /** Passive user context only; caller serializes this with requests and releases our writer. */
   async injectContext(threadId: string, entryId: string, text: string): Promise<void> {
-    if (this.config.transport !== 'managed' || !this.stdio) throw new Error('Фоновый контекст доступен только в управляемом Codex Rele.');
+    const shared = this.config.transport !== 'managed';
+    if (!shared && !this.stdio) throw new Error('Управляемый Codex Rele не подключён.');
     if (!entryId.trim() || !text.trim()) throw new Error('Фоновому контексту нужны постоянный идентификатор и непустой текст.');
     this.requireQueue();
     if (!this.isVerifiedVersion()) throw new Error(`Для фонового контекста нужен проверенный Codex ${SUPPORTED_CODEX_VERSION}.`);
+    const runtime = this.runtime;
+    const home = shared ? await this.localContextHome(runtime) : undefined;
+    const current = () => {
+      if (!runtime || this.runtime !== runtime || !this.state.connected) throw new CodexTransportError('Соединение Codex изменилось во время сохранения контекста.');
+    };
+    const read = async () => {
+      current();
+      const response = await this.call<{ thread: RawThread }>('thread/read', { threadId });
+      current();
+      if (response?.thread?.id !== threadId) {
+        const error = new CodexTransportError('Codex вернул другой разговор при проверке фонового контекста. Исходная связка сохранена.', 'thread-identity-mismatch');
+        await this.disconnect(error.message, error.code);
+        this.scheduleReconnect();
+        throw error;
+      }
+      return response.thread;
+    };
+    const receipt = async () => {
+      const thread = await read(); // Re-read: archive/compression can change the persisted rollout path.
+      if (!home || typeof thread.path !== 'string') throw new Error('Не удалось подтвердить сохранение контекста Codex.');
+      const found = await this.contextReceipts.has({ codexHome: home, rolloutPath: thread.path, threadId, itemId: `rele_slack_${entryId}`, text });
+      current();
+      return found;
+    };
+    // Resolve an earlier lost ACK without acquiring a writer or appending the raw item twice.
+    if (shared && await receipt()) return;
     // Resume may drain a persisted queue. Check before acquiring the original writer too.
     const pending = await this.call<Page<QueueEntry>>('thread/queue/list', { threadId, limit: 1 });
     if (!Array.isArray(pending?.data)) throw new CodexTransportError('Codex вернул некорректную очередь фонового контекста.', 'invalid-protocol');
     if (pending.data.length || pending.nextCursor) throw new CodexThreadBusyError(threadId, 'queued_input');
     await this.subscribe(threadId);
-    const response = await this.call<{ thread: RawThread }>('thread/read', { threadId });
-    if (response?.thread?.id !== threadId) {
-      const error = new CodexTransportError('Codex вернул другой разговор при проверке фонового контекста. Исходная связка сохранена.', 'thread-identity-mismatch');
-      await this.disconnect(error.message, error.code);
-      this.scheduleReconnect();
-      throw error;
-    }
-    if (response.thread.status?.type !== 'idle') throw new CodexThreadBusyError(threadId, 'non_idle');
+    const thread = await read();
+    if (thread.status?.type !== 'idle') throw new CodexThreadBusyError(threadId, 'non_idle');
     const queue = await this.call<Page<QueueEntry>>('thread/queue/list', { threadId, limit: 1 });
     if (!Array.isArray(queue?.data)) throw new CodexTransportError('Codex вернул некорректную очередь фонового контекста.', 'invalid-protocol');
     if (queue.data.length || queue.nextCursor) throw new CodexThreadBusyError(threadId, 'queued_input');
+    if (shared && await receipt()) return;
+    current();
     // Raw item IDs are attribution, not server idempotency keys. Never retry the RPC here.
     await this.call('thread/inject_items', {
       threadId, items: [{ type: 'message', id: `rele_slack_${entryId}`, role: 'user', content: [{ type: 'input_text', text }] }],
     });
+    if (shared && !await receipt()) throw new Error('Codex принял контекст, но сохранённая запись пока не подтверждена. Контекст остаётся в ожидании.');
+  }
+
+  private async localContextHome(runtime: CodexRuntime | undefined): Promise<string> {
+    const error = 'Для пассивного контекста общего Codex нужен локальный runtime с тем же профилем Rele.';
+    const os = process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'macos' : process.platform;
+    const expected = this.config.codexHome || (process.platform === 'win32' ? environmentValue(process.env, 'CODEX_HOME') : process.env.CODEX_HOME) || path.join(homedir(), '.codex');
+    try {
+      if (!runtime || runtime.platformOs !== os || runtime.platformFamily !== (process.platform === 'win32' ? 'windows' : 'unix')
+        || !isLocalCodexHome(runtime.codexHome) || !isLocalCodexHome(expected)) throw new Error();
+      const [home, selected] = await Promise.all([realpath(runtime.codexHome), realpath(expected)]);
+      if (home !== selected || !isLocalCodexHome(home)) throw new Error();
+      return home;
+    } catch { throw new Error(error); }
   }
 
   async enqueue(threadId: string, text: string, clientUserMessageId: string): Promise<{ queuedSubmissionId: string }> {
@@ -599,6 +641,9 @@ export class CodexClient extends EventEmitter {
       });
     }
     this.subscribed.clear();
+    this.runtime = undefined;
+    this.version = undefined;
+    this.contextReceipts.clear();
     this.serverRequests.clear();
     for (const waiter of this.closedWaiters.values()) waiter.reject(new CodexTransportError(message, errorCode));
     this.closedWaiters.clear();
