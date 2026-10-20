@@ -55,10 +55,16 @@ export class CodexRpcError extends Error {
   constructor(readonly code: number, message: string) { super(message); this.name = 'CodexRpcError'; }
 }
 
-/** A persisted thread is owned by another runtime; retry the same ID after handoff. */
+const busyMessages = {
+  foreign_writer: 'Разговор удерживает другой Codex. Desktop может сохранять право записи даже без выполняющейся задачи. Ожидается освобождение этого же разговора.',
+  queued_input: 'В очереди Codex уже есть сообщения. Ожидается освобождение очереди этого разговора.',
+  non_idle: 'Codex ещё не подтвердил, что разговор свободен. Операция ожидает готовности этого же разговора.',
+};
+
+/** The original thread is not ready for this operation; preserve its identity while waiting. */
 export class CodexThreadBusyError extends Error {
-  constructor(readonly threadId: string) {
-    super('Разговор занят другим Codex, например Desktop. Запрос подождёт освобождения этого же разговора.');
+  constructor(readonly threadId: string, readonly reason: keyof typeof busyMessages = 'foreign_writer') {
+    super(busyMessages[reason]);
     this.name = 'CodexThreadBusyError';
   }
 }
@@ -247,7 +253,7 @@ export class CodexClient extends EventEmitter {
     // Resume may drain a persisted queue. Check before acquiring the original writer too.
     const pending = await this.call<Page<QueueEntry>>('thread/queue/list', { threadId, limit: 1 });
     if (!Array.isArray(pending?.data)) throw new CodexTransportError('Codex вернул некорректную очередь фонового контекста.', 'invalid-protocol');
-    if (pending.data.length || pending.nextCursor) throw new CodexThreadBusyError(threadId);
+    if (pending.data.length || pending.nextCursor) throw new CodexThreadBusyError(threadId, 'queued_input');
     await this.subscribe(threadId);
     const response = await this.call<{ thread: RawThread }>('thread/read', { threadId });
     if (response?.thread?.id !== threadId) {
@@ -256,10 +262,10 @@ export class CodexClient extends EventEmitter {
       this.scheduleReconnect();
       throw error;
     }
-    if (response.thread.status?.type !== 'idle') throw new CodexThreadBusyError(threadId);
+    if (response.thread.status?.type !== 'idle') throw new CodexThreadBusyError(threadId, 'non_idle');
     const queue = await this.call<Page<QueueEntry>>('thread/queue/list', { threadId, limit: 1 });
     if (!Array.isArray(queue?.data)) throw new CodexTransportError('Codex вернул некорректную очередь фонового контекста.', 'invalid-protocol');
-    if (queue.data.length || queue.nextCursor) throw new CodexThreadBusyError(threadId);
+    if (queue.data.length || queue.nextCursor) throw new CodexThreadBusyError(threadId, 'queued_input');
     // Raw item IDs are attribution, not server idempotency keys. Never retry the RPC here.
     await this.call('thread/inject_items', {
       threadId, items: [{ type: 'message', id: `rele_slack_${entryId}`, role: 'user', content: [{ type: 'input_text', text }] }],

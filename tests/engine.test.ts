@@ -563,6 +563,38 @@ function slackInbound(f: ReturnType<typeof fixture>, eventId: string, messageId:
 }
 
 describe('Engine Slack transcript and authorized task boundary', () => {
+  it('replaces a stale writer error while a fresh Slack history scan is still paginating', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture();
+    const busy = new CodexThreadBusyError(THREAD);
+    f.codex.injectContext.mockRejectedValueOnce(busy);
+    const request = await acceptRequest(f);
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'queued', error: busy.message });
+    f.slack.readThreadPage.mockResolvedValueOnce({ messages: [], nextCursor: 'next-history-page' });
+    vi.setSystemTime(Date.now() + 5001);
+    await f.engine.pump(); await f.engine.settled();
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'queued', error: expect.stringContaining('синхронизация полного контекста Slack') });
+    expect(f.codex.enqueue).not.toHaveBeenCalled();
+    vi.setSystemTime(Date.now() + 1501);
+    await f.engine.pump(); await f.engine.settled();
+    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, request.text, request.id);
+    expect(f.store.getRequest(request.id)?.error).toBeUndefined();
+  });
+
+  it('does not attach a late sync error to a request cancelled during context injection', async () => {
+    const f = fixture();
+    const append = deferred<void>();
+    f.codex.injectContext.mockImplementationOnce(() => append.promise);
+    await f.engine.receive(slackInbound(f, 'cancel-sync', '170002.000001', 'Cancel while context waits'));
+    await vi.waitFor(() => expect(f.codex.injectContext).toHaveBeenCalledOnce());
+    const request = f.store.listRequests()[0];
+    await f.engine.cancel(request.id);
+    append.reject(new CodexThreadBusyError(THREAD));
+    await f.engine.settled();
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'cancelled', error: undefined });
+    expect(f.codex.enqueue).not.toHaveBeenCalled();
+  });
+
   it('projects every history page and the triggering source before enqueueing the authorized task', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     const f = fixture();

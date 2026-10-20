@@ -2,12 +2,13 @@ import type { Origin, ReleRequest } from '../shared/types.js';
 
 const refreshMs = 45_000;
 const retryMs = 15_000;
+// Slack treats every non-empty status as processing; waiting states must stay clear.
 const statuses = {
-  queued: [1, 'Запрос в очереди…'],
-  waiting_approval: [2, 'Ожидает подтверждения…'],
-  transcribing: [3, 'Распознаёт аудио…'],
-  starting: [4, 'Запускает запрос…'],
-  running: [5, 'Выполняет запрос…'],
+  queued: [0, ''],
+  waiting_approval: [0, ''],
+  transcribing: [1, 'Распознаёт аудио…'],
+  starting: [0, ''],
+  running: [2, 'Выполняет запрос…'],
   uncertain: [0, ''],
 } as const;
 

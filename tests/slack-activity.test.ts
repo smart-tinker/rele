@@ -37,23 +37,28 @@ const settle = () => vi.advanceTimersByTimeAsync(0);
 const sentStatuses = (send: ReturnType<typeof make>['send']) => send.mock.calls.map(([, status]) => status);
 
 describe('Slack request activity', () => {
-  it('keeps a shared thread busy until its last request finishes and prefers running over queued', async () => {
+  it('prefers actual work over waiting requests in a shared thread and clears when only waiting remains', async () => {
     const running = request();
-    const queued = { ...request('queued'), id: 'queued' };
-    const { activity, send, set } = make([queued, running]);
+    const transcribing = { ...request('transcribing'), id: 'transcribing' };
+    const waiting = (['queued', 'starting', 'waiting_approval', 'uncertain'] as const).map(status => ({ ...request(status), id: status }));
+    const { activity, send, set } = make([...waiting, transcribing, running]);
     activity.refresh();
     await settle();
     activity.refresh();
     expect(sentStatuses(send)).toEqual(['Выполняет запрос…']);
-    set([queued]);
+    set([...waiting, transcribing]);
     activity.refresh();
     await settle();
-    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', 'Запрос в очереди…']);
+    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', 'Распознаёт аудио…']);
+    set(waiting);
+    activity.refresh();
+    await settle();
+    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', 'Распознаёт аудио…', '']);
     set([]);
     activity.refresh();
     await settle();
     activity.refresh();
-    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', 'Запрос в очереди…', '']);
+    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', 'Распознаёт аудио…', '']);
   });
 
   it.each(['completed', 'failed', 'cancelled', 'interrupted', 'uncertain'] as const)('clears native status on %s without repeated clear calls', async status => {
@@ -69,8 +74,8 @@ describe('Slack request activity', () => {
   });
 
   it.each([
-    ['queued', 'Запрос в очереди…'], ['starting', 'Запускает запрос…'],
-    ['transcribing', 'Распознаёт аудио…'], ['waiting_approval', 'Ожидает подтверждения…'],
+    ['queued', ''], ['starting', ''], ['waiting_approval', ''], ['uncertain', ''],
+    ['transcribing', 'Распознаёт аудио…'],
   ] as const)('represents persisted %s requests', async (status, label) => {
     const { activity, send } = make([request(status)]);
     activity.refresh();
@@ -78,12 +83,56 @@ describe('Slack request activity', () => {
     expect(sentStatuses(send)).toEqual([label]);
   });
 
+  it('keeps a foreign-busy request clear through retries and heartbeats until execution starts', async () => {
+    const queued = { ...request('queued'), error: 'Codex thread is busy in another client.' };
+    const { activity, send, set } = make([request()]);
+    activity.start();
+    await settle();
+    set([queued]);
+    activity.refresh();
+    await settle();
+    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', '']);
+    for (let i = 0; i < 10; i++) activity.refresh();
+    await vi.advanceTimersByTimeAsync(180_000);
+    activity.refresh(true);
+    await settle();
+    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', '']);
+    set([request('starting')]);
+    activity.refresh();
+    await settle();
+    set([queued]);
+    activity.refresh();
+    await settle();
+    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', '']);
+    set([request()]);
+    activity.refresh();
+    await settle();
+    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', '', 'Выполняет запрос…']);
+  });
+
+  it('clears processing while approval is pending and resumes after approval', async () => {
+    const { activity, send, set } = make([request()]);
+    activity.start();
+    await settle();
+    set([request('waiting_approval')]);
+    activity.refresh();
+    await settle();
+    await vi.advanceTimersByTimeAsync(90_000);
+    activity.refresh(true);
+    await settle();
+    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', '']);
+    set([request()]);
+    activity.refresh();
+    await settle();
+    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', '', 'Выполняет запрос…']);
+  });
+
   it('uses only persisted Slack origins and keeps account, chat and thread targets separate', async () => {
     const { activity, send, set } = make([request('running', { platform: 'telegram' })]);
     activity.refresh();
     await settle();
     expect(send).not.toHaveBeenCalled();
-    set([request(), request('queued', { accountId: 'T2:UBOT' }), request('starting', { chatId: 'C2' }), request('waiting_approval', { threadId: '200.1' })]);
+    set([request(), request('running', { accountId: 'T2:UBOT' }), request('transcribing', { chatId: 'C2' }), request('running', { threadId: '200.1' })]);
     activity.refresh();
     await settle();
     expect(send.mock.calls.map(([origin]) => [origin.accountId, origin.chatId, origin.threadId])).toEqual([
@@ -93,7 +142,7 @@ describe('Slack request activity', () => {
 
   it('serializes slow writes and coalesces intermediate states before clearing a quick completion', async () => {
     const pending = deferred();
-    const { activity, send, set } = make([request('queued')]);
+    const { activity, send, set } = make([request('transcribing')]);
     send.mockImplementationOnce(() => pending.promise);
     activity.refresh();
     set([request('starting')]);
@@ -102,10 +151,10 @@ describe('Slack request activity', () => {
     activity.refresh();
     set([]);
     activity.refresh();
-    expect(sentStatuses(send)).toEqual(['Запрос в очереди…']);
+    expect(sentStatuses(send)).toEqual(['Распознаёт аудио…']);
     pending.resolve();
     await settle();
-    expect(sentStatuses(send)).toEqual(['Запрос в очереди…', '']);
+    expect(sentStatuses(send)).toEqual(['Распознаёт аудио…', '']);
   });
 
   it('reasserts activity after delivery invalidation even if a status write was already in flight', async () => {

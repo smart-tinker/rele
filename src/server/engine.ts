@@ -259,8 +259,11 @@ export class Engine extends EventEmitter {
       const client = this.codex;
       const cutoff = waiting?.origin.platform === 'slack' ? waiting.origin.messageId : undefined;
       if (!await this.slackSync.drain(conversationId, cutoff)) {
-        const error = this.store.listSlackSyncStreams().find(stream => stream.conversationId === conversationId && stream.error)?.error;
-        if (waiting && error) this.store.updateRequest(waiting.id, { error });
+        const error = this.store.listSlackSyncStreams().find(stream => stream.conversationId === conversationId &&
+          (stream.active || this.store.hasPendingSlackSyncEntries(stream.id, cutoff)) && stream.error)?.error
+          ?? 'Ожидается синхронизация полного контекста Slack. Запрос остаётся в очереди Rele.';
+        const current = waiting && this.store.getRequest(waiting.id);
+        if (current?.status === 'queued' && current.error !== error) this.store.updateRequest(current.id, { error });
         return;
       }
       if (!waiting || client !== this.codex || this.stopped || this.suspended) return;

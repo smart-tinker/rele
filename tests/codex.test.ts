@@ -25,7 +25,7 @@ async function managedFixture(options: {
   resume?: 'busy' | 'wrong';
   release?: 'early' | 'delayed' | 'notLoaded' | 'silent';
   dropAck?: boolean;
-  contextRead?: 'busy' | 'wrong';
+  contextRead?: 'busy' | 'notLoaded' | 'wrong';
   contextQueue?: 'pending' | 'afterResume';
   dropInjectAck?: boolean;
   malformed?: boolean;
@@ -80,7 +80,7 @@ async function managedFixture(options: {
           break;
         case 'thread/read':
           if (message.params.threadId === 'fixture-release-now') send({ method: 'thread/closed', params: { threadId: released } });
-          reply({ thread: { ...thread, id: options.contextRead === 'wrong' ? 'unexpected-context-thread' : thread.id, status: { type: options.contextRead === 'busy' ? 'active' : 'idle' } } });
+          reply({ thread: { ...thread, id: options.contextRead === 'wrong' ? 'unexpected-context-thread' : thread.id, status: { type: options.contextRead === 'busy' ? 'active' : options.contextRead === 'notLoaded' ? 'notLoaded' : 'idle' } } });
           break;
         case 'thread/inject_items':
           if (options.dropInjectAck) process.exit(0);
@@ -476,23 +476,29 @@ describe('Codex passive context', () => {
   it.each(['pending', 'afterResume'] as const)('does not inject when the native queue is %s', async contextQueue => {
     const f = await managedFixture({ contextQueue });
     await f.client.connect();
-    await expect(f.client.injectContext(threadId, 'entry', 'Context')).rejects.toBeInstanceOf(CodexThreadBusyError);
+    await expect(f.client.injectContext(threadId, 'entry', 'Context')).rejects.toMatchObject({
+      name: 'CodexThreadBusyError', threadId, reason: 'queued_input', message: expect.stringContaining('очереди Codex'),
+    });
     const calls = await f.calls();
     expect(calls.some(call => ['thread/inject_items', 'thread/queue/add', 'turn/start'].includes(call.method ?? ''))).toBe(false);
     if (contextQueue === 'pending') expect(calls.some(call => call.method === 'thread/resume')).toBe(false);
   });
 
-  it('does not inject into an active turn', async () => {
-    const f = await managedFixture({ contextRead: 'busy' });
+  it.each(['busy', 'notLoaded'] as const)('does not inject when the thread readiness is %s', async contextRead => {
+    const f = await managedFixture({ contextRead });
     await f.client.connect();
-    await expect(f.client.injectContext(threadId, 'entry', 'Context')).rejects.toBeInstanceOf(CodexThreadBusyError);
+    await expect(f.client.injectContext(threadId, 'entry', 'Context')).rejects.toMatchObject({
+      name: 'CodexThreadBusyError', threadId, reason: 'non_idle', message: expect.stringContaining('ещё не подтвердил'),
+    });
     expect((await f.calls()).some(call => call.method === 'thread/inject_items')).toBe(false);
   });
 
   it('preserves the original writer ownership fence', async () => {
     const f = await managedFixture({ resume: 'busy' });
     await f.client.connect();
-    await expect(f.client.injectContext(threadId, 'entry', 'Context')).rejects.toBeInstanceOf(CodexThreadBusyError);
+    await expect(f.client.injectContext(threadId, 'entry', 'Context')).rejects.toMatchObject({
+      name: 'CodexThreadBusyError', threadId, reason: 'foreign_writer', message: expect.stringContaining('без выполняющейся задачи'),
+    });
     expect((await f.calls()).some(call => call.method === 'thread/inject_items')).toBe(false);
   });
 
@@ -561,7 +567,7 @@ describe('Codex managed runtime', () => {
     await f.client.connect();
     const requestId = randomUUID();
     await expect(f.client.enqueue(threadId, 'Wait for Desktop', requestId)).rejects.toBeInstanceOf(CodexThreadBusyError);
-    await expect(f.client.subscribe(threadId)).rejects.toMatchObject({ threadId });
+    await expect(f.client.subscribe(threadId)).rejects.toMatchObject({ threadId, reason: 'foreign_writer' });
     expect(f.client.status().connected).toBe(true);
     const calls = await f.calls();
     expect(calls.filter(call => call.method === 'thread/resume').map(call => call.params)).toEqual([
