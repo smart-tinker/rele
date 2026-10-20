@@ -236,6 +236,8 @@ export class TelegramChannel implements Channel {
     }
     const text = typeof message.text === 'string' ? message.text : typeof message.caption === 'string' ? message.caption : '';
     const command = /^\/(rele_register|rele_chats|start)(?:@([A-Za-z0-9_]+))?(?:\s+([\s\S]*))?$/iu.exec(typeof message.text === 'string' ? message.text.trimEnd() : '');
+    const cancelCommand = /^\/rele_cancel(?:@([A-Za-z0-9_]+))?$/iu.exec(text.trim());
+    if (cancelCommand?.[1] && cancelCommand[1].toLowerCase() !== this.botUsername?.toLowerCase()) return;
     const register = command?.[1].toLowerCase() === 'rele_register';
     const picker = command?.[1].toLowerCase() === 'rele_chats' || (command?.[1].toLowerCase() === 'start' && command[3]?.trim() === 'rele_chats');
     if ((register || picker) && command?.[2] && command[2].toLowerCase() !== this.botUsername?.toLowerCase()) return;
@@ -275,7 +277,7 @@ export class TelegramChannel implements Channel {
         size: typeof audioSource.file_size === 'number' && Number.isSafeInteger(audioSource.file_size) && audioSource.file_size >= 0 ? audioSource.file_size : undefined };
     }
     if (!text.trim() && !audio) return;
-    const inbound: InboundMessage = { eventId: String(update.update_id), endpoint, sender, messageId, text, audio,
+    const inbound: InboundMessage = { eventId: String(update.update_id), endpoint, sender, messageId, text: cancelCommand ? '/rele_cancel' : text, audio,
       replyToMessageId: numericId(object(message.reply_to_message)?.message_id) };
     await abortable(this.callbacks.message(inbound), signal);
   }

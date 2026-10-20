@@ -599,6 +599,11 @@ export class Store {
       ORDER BY d.rowid DESC LIMIT 1`).get(remoteMessageId, origin.platform, origin.accountId, origin.chatId, origin.threadId);
     return row ? toApproval(row) : undefined;
   }
+  approvalDeliveryProgress(approvalId: string): { sent: boolean; complete: boolean } {
+    const row = this.db.prepare("SELECT COUNT(*) AS total, SUM(status='sent') AS sent FROM deliveries WHERE kind='approval' AND approval_id=?").get(approvalId)!;
+    return { sent: Number(row.sent) > 0, complete: Number(row.total) > 0 && Number(row.sent) === Number(row.total) };
+  }
+
   cancelApprovalDeliveries(approvalId: string): void {
     this.db.prepare("UPDATE deliveries SET status='cancelled',updated_at=? WHERE approval_id=? AND kind='approval' AND status IN ('pending','failed')")
       .run(new Date().toISOString(), approvalId);

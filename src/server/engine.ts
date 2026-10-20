@@ -91,23 +91,47 @@ export class Engine extends EventEmitter {
 
   async receive(message: InboundMessage): Promise<void> {
     if (this.stopped) throw new ChannelError('Rele завершает работу; событие будет доставлено повторно.', true);
+    if (!message.contextOnly && !message.audio && /^(?:rele:cancel|\/rele_cancel)$/iu.test(message.text.trim())) {
+      if (this.store.recordInbound(message).duplicate) return;
+      const requests = this.store.activeRequests().filter(request => this.sameOrigin(request, message));
+      const request = requests.find(request => request.status !== 'queued') ?? requests[0];
+      if (request) {
+        let body: string;
+        try {
+          await this.cancel(request.id);
+          body = this.store.getRequest(request.id)?.status === 'cancelled'
+            ? 'Запрос отменён в Rele.' : 'Отмена передана Codex. Rele проверит завершение выполнения.';
+        } catch (error) { body = this.options.redact(error); }
+        this.store.addDeliveries(request.id, [{ key: `control:${message.eventId}`, ordinal: 0, kind: 'error', body }]);
+      }
+      this.changed();
+      this.track(this.pump());
+      return;
+    }
     // Telegram has an explicit reply target. Even a stale approval reply remains
     // an approval receipt, never a new agent task. Slack uses its active question.
     const approval = message.contextOnly ? undefined : message.endpoint.platform === 'telegram'
       ? message.replyToMessageId ? this.store.findReplyApproval(message.endpoint, message.replyToMessageId) : undefined
       : this.store.listApprovals(1000).find(candidate => {
-        if (candidate.status !== 'pending' || candidate.questions?.length !== 1 || candidate.questions[0].isSecret) return false;
+        if (candidate.status !== 'pending' || !candidate.questions?.length || candidate.questions.some(question => question.isSecret)) return false;
         const request = this.store.getRequest(candidate.requestId);
-        return !!request && this.sameOrigin(request, message) && this.store.listDeliveries(2000).some(delivery => delivery.approvalId === candidate.id && delivery.status === 'sent');
+        return !!request && this.sameOrigin(request, message) && this.store.approvalDeliveryProgress(candidate.id).sent;
       });
     if (approval && (message.endpoint.platform === 'telegram' || (message.text.trim() && !message.audio))) {
       // Record first: after any crash this event cannot become a fresh Codex turn.
       // A crash before resolution leaves the question available in the panel.
       if (this.store.recordInbound(message).duplicate) return;
       const request = this.store.getRequest(approval.requestId);
-      if (approval.status === 'pending' && request && !terminal(request.status) && this.sameOrigin(request, message)
-          && approval.questions?.length === 1 && !approval.questions[0].isSecret && message.text.trim() && !message.audio) {
-        await this.resolveApproval(approval.id, 'accept', { [approval.questions[0].id]: [message.text] });
+      const allPartsSent = this.store.approvalDeliveryProgress(approval.id).complete;
+      if (approval.status === 'pending' && allPartsSent && request && !terminal(request.status) && this.sameOrigin(request, message)
+          && approval.questions?.length && !approval.questions.some(question => question.isSecret) && message.text.trim() && !message.audio) {
+        const questions = approval.questions;
+        const lines = questions.length === 1 ? [message.text] : message.text.trim().split(/\r?\n/u).filter(line => line.trim());
+        if (questions.length > 1 && (lines.length !== questions.length || lines.some((line, index) => !line.startsWith(`${index + 1}. `) || !line.slice(line.indexOf(' ') + 1).trim()))) {
+          this.store.addDeliveries(request.id, [{ key: `question-format:${message.eventId}`, ordinal: 0, kind: 'error', body: 'Ответьте одной строкой на каждый вопрос, по порядку: 1. ответ, затем с новой строки 2. ответ.' }]);
+        } else {
+          await this.resolveApproval(approval.id, 'accept', Object.fromEntries(questions.map((question, index) => [question.id, [questions.length === 1 ? lines[index] : lines[index].slice(lines[index].indexOf(' ') + 1)]])));
+        }
       }
     } else {
       this.store.ingest(message);
@@ -170,6 +194,7 @@ export class Engine extends EventEmitter {
     }
     const conversation = this.store.getConversation(request.conversationId)!;
     const found = await this.codex.findRequest(conversation.threadId, request.id);
+    if (found.mixed || this.isMixed(request.id)) throw new Error('В ход добавлено сообщение другого клиента Codex. Автоматическая отмена смешанного хода недоступна.');
     if (found.state === 'queued' && found.queuedSubmissionId) {
       const removed = await this.codex.deleteQueued(conversation.threadId, found.queuedSubmissionId);
       if (!removed.deleted) throw new Error('Запрос уже начал выполняться. Сверьте состояние и повторите отмену.');
@@ -259,8 +284,11 @@ export class Engine extends EventEmitter {
       const client = this.codex;
       const cutoff = waiting?.origin.platform === 'slack' ? waiting.origin.messageId : undefined;
       if (!await this.slackSync.drain(conversationId, cutoff)) {
-        const error = this.store.listSlackSyncStreams().find(stream => stream.conversationId === conversationId && stream.error)?.error;
-        if (waiting && error) this.store.updateRequest(waiting.id, { error });
+        const error = this.store.listSlackSyncStreams().find(stream => stream.conversationId === conversationId &&
+          (stream.active || this.store.hasPendingSlackSyncEntries(stream.id, cutoff)) && stream.error)?.error
+          ?? 'Ожидается синхронизация полного контекста Slack. Запрос остаётся в очереди Rele.';
+        const current = waiting && this.store.getRequest(waiting.id);
+        if (current?.status === 'queued' && current.error !== error) this.store.updateRequest(current.id, { error });
         return;
       }
       if (!waiting || client !== this.codex || this.stopped || this.suspended) return;
@@ -441,14 +469,21 @@ export class Engine extends EventEmitter {
     }
     const questions: ApprovalQuestion[] | undefined = question && Array.isArray(p.questions) ? p.questions.map((entry: Record<string, any>) => ({ id: String(entry.id), header: String(entry.header ?? ''), question: String(entry.question ?? ''), isSecret: !!entry.isSecret, ...(Array.isArray(entry.options) ? { options: entry.options.map((option: Record<string, any>) => ({ label: String(option.label), description: String(option.description ?? '') })) } : {}) })) : undefined;
     const title = question ? 'Codex ждёт уточнения' : command ? 'Codex запрашивает выполнение команды' : 'Codex запрашивает изменение файлов';
-    const details = [p.reason, p.command, p.cwd ? `Каталог: ${p.cwd}` : '', p.grantRoot ? `Доступ на запись: ${p.grantRoot}` : '', p.additionalPermissions ? JSON.stringify(p.additionalPermissions) : '', files ? this.fileChanges.get(String(p.itemId)) : '', questions?.map(value => `${value.header}: ${value.question}${value.options?.length ? '\n' + value.options.map(option => `${option.label} — ${option.description}`).join('\n') : ''}`).join('\n\n')].filter(Boolean).join('\n\n').slice(0, 16_000);
+    const metadata = [p.reason, p.command, p.cwd ? `Каталог: ${p.cwd}` : '', p.grantRoot ? `Доступ на запись: ${p.grantRoot}` : '', p.additionalPermissions ? JSON.stringify(p.additionalPermissions) : '', files ? this.fileChanges.get(String(p.itemId)) : ''].filter(Boolean).join('\n\n').slice(0, 16_000);
+    const questionDetails = questions?.map((value, index) => `${questions.length > 1 ? `${index + 1}. ` : ''}${value.header}: ${value.question}${value.options?.length ? '\n' + value.options.map(option => `${option.label} — ${option.description}`).join('\n') : ''}`).join('\n\n');
+    const details = [metadata, questionDetails].filter(Boolean).join('\n\n');
     const approval = this.store.addApproval({ requestId: request.id, turnId: p.turnId, itemId: `${p.itemId}:${p.approvalId ?? event.id}:${this.epoch}`, rpcId: event.id, method: event.method, title, details, questions });
     const choices: unknown[] | undefined = Array.isArray(p.availableDecisions) ? p.availableDecisions : undefined;
     this.approvals.set(approval.id, { accept: !choices || choices.includes('accept'), decline: choices?.includes('cancel') && !choices.includes('decline') ? 'cancel' : 'decline' });
     this.store.updateRequest(request.id, { status: 'waiting_approval' });
-    const guidance = questions?.length === 1 && !questions[0].isSecret ? '\n\nОтветьте на это сообщение. Все вопросы также доступны в локальной панели Rele.' : questions?.length ? '\n\nОтветьте на вопросы в локальной панели Rele.' : '';
-    // Short transport preview; full details are available only in the authenticated panel.
-    this.store.addDeliveries(request.id, [{ key: `approval:${approval.id}`, ordinal: 0, kind: 'approval', body: `${title}\n\n${details.slice(0, 2400)}${details.length > 2400 ? '\n… Полный запрос доступен в панели Rele.' : ''}${guidance}`, approvalId: approval.id }]);
+    const guidance = questions?.length && !questions.some(question => question.isSecret)
+      ? questions.length === 1 ? '\n\nОтветьте на это сообщение.' : '\n\nОтветьте на это сообщение: по строке на каждый вопрос, по порядку — 1. ответ, затем с новой строки 2. ответ.'
+      : questions?.length ? '\n\nСекретные ответы вводятся только в локальной панели Rele.' : '';
+    // Nonsecret questions must be visible in full before the origin can answer them.
+    const bodies = questions?.length && !questions.some(value => value.isSecret)
+      ? splitReply(`${title}\n\n${details}${guidance}`, 3000)
+      : [`${title}\n\n${details.slice(0, 2400)}${details.length > 2400 ? '\n… Полный запрос доступен в панели Rele.' : ''}${guidance}`];
+    this.store.addDeliveries(request.id, bodies.map((body, ordinal) => ({ key: ordinal ? `approval:${approval.id}:${ordinal}` : `approval:${approval.id}`, ordinal, kind: 'approval' as const, body, approvalId: approval.id })));
     this.changed();
     this.track(this.deliver());
   }

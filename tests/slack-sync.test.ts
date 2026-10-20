@@ -155,14 +155,15 @@ describe('durable Slack passive sync', () => {
     expect(f.codex.releaseThread).toHaveBeenCalledTimes(2);
   });
 
-  it('blocks shared-server writes visibly, keeps buffered context and resumes in managed mode', async () => {
+  it('keeps shared-server context pending until its durable receipt is confirmed', async () => {
     const f = fixture(); const entry = f.store.recordSlackMessage(f.message())!;
     await f.sync.backfill(); f.status.transport = 'proxy';
+    f.codex.injectContext.mockRejectedValueOnce(new Error('Receipt not confirmed'));
     expect(await f.sync.drain(f.conversation.id)).toBe(false);
-    expect(f.store.getSlackSyncStream(entry.streamId)?.error).toContain('managed');
-    expect(f.store.getSlackSyncEntry(entry.id)?.state).toBe('pending');
-    expect(f.codex.injectContext).not.toHaveBeenCalled();
-    f.status.transport = 'managed'; advance(5001);
+    expect(f.store.getSlackSyncStream(entry.streamId)?.error).toContain('Receipt not confirmed');
+    expect(f.store.getSlackSyncEntry(entry.id)?.state).toBe('uncertain');
+    expect(f.codex.injectContext).toHaveBeenCalledTimes(1);
+    advance(5001);
     expect(await f.sync.drain(f.conversation.id)).toBe(true);
   });
 
@@ -244,9 +245,9 @@ describe('durable Slack passive sync', () => {
     expect(await f.sync.drain(f.conversation.id, '110.000000')).toBe(true);
     expect(await f.sync.drain(f.conversation.id)).toBe(false);
     expect(f.store.getSlackSyncEntry(pending.id)?.state).toBe('uncertain');
-    expect(f.store.getSlackSyncStream(pending.streamId)?.error).toContain('managed');
+    expect(f.store.getSlackSyncStream(pending.streamId)?.error).toBeUndefined();
     expect(f.codex.injectContext).toHaveBeenCalledTimes(1);
-    f.status.transport = 'managed'; advance(5001);
+    advance(5001);
     expect(await f.sync.drain(f.conversation.id)).toBe(true);
     expect(f.codex.injectContext.mock.calls[1]).toEqual(['original-codex', pending.id, expect.stringContaining('Captured before detach')]);
     expect(f.store.getSlackSyncEntry(pending.id)?.state).toBe('applied');

@@ -165,7 +165,9 @@ jobs:
 
           Both installers include Node.js 24.19.0 and production dependencies. Codex discovery checks Desktop backend locations, versioned Windows CLI directories, running process metadata, and local CLI installations. Opening the installed application uses an expiring single-use login link. Existing chat bindings and saved tokens survive upgrades. Portable ZIP/TAR packages remain available.
 
-          New in rc.6: Native Slack activity indicators and rich Markdown blocks including tables. All available messages in a bound Slack thread, including peer bots and Rele output, are durably journaled and passively projected before authorized tasks. Selected peer bots need a fresh direct mention to start work. Full history requires Server Rele (managed); passive entries are model-visible but not Desktop bubbles. SQLite migrates v3 to v4; rollback requires a pre-upgrade backup. See docs/RC6.md.
+          New in rc.7: Shared local Codex servers support passive Slack context with exact persisted JSONL receipts. Lost acknowledgements are checked before re-injection. Cancel an original request from Slack with rele:cancel or Telegram with /rele_cancel; answer multiple ordinary questions with numbered lines. Working status excludes waiting states. Concurrent Desktop requires both clients on the same app-server; upgrading Rele does not reconfigure Desktop. See docs/RC7.md.
+
+          Previously in rc.6: Native Slack activity indicators and rich Markdown blocks including tables. All available messages in a bound Slack thread, including peer bots and Rele output, are durably journaled and passively projected before authorized tasks. Selected peer bots need a fresh direct mention to start work. Full history requires Server Rele (managed); passive entries are model-visible but not Desktop bubbles. SQLite migrates v3 to v4; rollback requires a pre-upgrade backup. See docs/RC6.md.
 
           Previously in rc.5: Slack member/profile reads use form encoding while message delivery remains JSON. Telegram registration shows the short /rele_register command and retains an addressed fallback for group privacy routing. The Codex catalog lists ordinary cli/vscode/exec/appServer conversations, excludes technical subagents by metadata, and uses the state index for fast initial loading. Explicit Refresh performs a full scan for older unindexed conversations. See docs/RC5.md.
 
@@ -175,7 +177,7 @@ jobs:
 
           Exact verified protocol versions: Codex 0.163.0 and 0.163.0-alpha.10.2. Native Windows and Ubuntu CI runs the real Codex protocol and the real Rele engine with isolated profiles, two independent Codex processes, a local fake model and synthetic Slack/Telegram delivery. It checks busy ownership, context handoff, origin routing, child restart and child shutdown.
 
-          This is an unsigned prerelease. Shared persisted history does not establish instant Desktop GUI synchronization or release behavior of a particular Desktop build. Real Windows Desktop and authorized messenger acceptance remain open before stable publishing. Rele does not fork or replace a bound thread when resume fails. See docs/RC6.md, docs/RC5.md, docs/RC4.md and docs/ACCEPTANCE.md.
+          This is an unsigned prerelease. Shared persisted history does not establish instant Desktop GUI synchronization or release behavior of a particular Desktop build. Real Windows Desktop and authorized messenger acceptance remain open before stable publishing. Rele does not fork or replace a bound thread when resume fails. See docs/RC7.md, docs/RC6.md, docs/RC5.md, docs/RC4.md and docs/ACCEPTANCE.md.
           NOTES
           sed -i "s/VERSION/$RELE_CANDIDATE_VERSION/g" release-notes.md
           gh release create "$tag" release-assets/* --target "$GITHUB_SHA" --prerelease --title "Rele $RELE_CANDIDATE_VERSION" --notes-file release-notes.md
