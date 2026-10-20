@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionState, Delivery, Endpoint, InboundMessage, Origin, Person, Platform, SlackTranscriptMessage } from '../../shared/types.js';
 
+export type SlackSessionStatus = 'processing' | 'active' | 'suspended';
+
 export interface ApprovalAction {
   approvalId: string;
   decision: 'accept' | 'decline';
@@ -29,7 +31,7 @@ export interface Channel {
   listThreads?(chatId: string, cursor?: string): Promise<CatalogPage<Endpoint>>;
   listPeople?(chatId: string, cursor?: string): Promise<CatalogPage<Person>>;
   discoveryInfo?(): { botUrl?: string; command: string };
-  setThreadStatus?(origin: Origin, status: string): Promise<void>;
+  setThreadStatus?(origin: Origin, status: SlackSessionStatus): Promise<void>;
   readThreadPage?(target: Pick<Origin, 'endpointId' | 'accountId' | 'chatId' | 'threadId'>, options?: { cursor?: string; oldest?: string; latest?: string }): Promise<{ messages: SlackTranscriptMessage[]; nextCursor?: string }>;
 }
 

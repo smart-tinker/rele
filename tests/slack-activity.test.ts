@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Origin, ReleRequest, RequestStatus } from '../src/shared/types.js';
 import { SlackActivity } from '../src/server/slack-activity.js';
+import type { SlackSessionStatus } from '../src/server/channels/common.js';
 
 const activities: SlackActivity[] = [];
 beforeEach(() => vi.useFakeTimers());
@@ -19,7 +20,7 @@ function request(status: RequestStatus = 'running', extra: Partial<Origin> = {})
 
 function make(initial: ReleRequest[] = []) {
   let rows = initial;
-  const send = vi.fn<(origin: Origin, status: string) => Promise<void>>().mockResolvedValue(undefined);
+  const send = vi.fn<(origin: Origin, status: SlackSessionStatus) => Promise<void>>().mockResolvedValue(undefined);
   const diagnostic = vi.fn();
   const activity = new SlackActivity(() => rows, send, diagnostic);
   activities.push(activity);
@@ -37,31 +38,36 @@ const settle = () => vi.advanceTimersByTimeAsync(0);
 const sentStatuses = (send: ReturnType<typeof make>['send']) => send.mock.calls.map(([, status]) => status);
 
 describe('Slack request activity', () => {
-  it('prefers actual work over waiting requests in a shared thread and clears when only waiting remains', async () => {
+  it('prioritizes suspended approvals over processing and coalesces work in a shared thread', async () => {
     const running = request();
     const transcribing = { ...request('transcribing'), id: 'transcribing' };
-    const waiting = (['queued', 'starting', 'waiting_approval', 'uncertain'] as const).map(status => ({ ...request(status), id: status }));
-    const { activity, send, set } = make([...waiting, transcribing, running]);
+    const waiting = (['queued', 'starting', 'uncertain'] as const).map(status => ({ ...request(status), id: status }));
+    const approval = { ...request('waiting_approval'), id: 'approval' };
+    const { activity, send, set } = make([approval, ...waiting, transcribing, running]);
     activity.refresh();
     await settle();
     activity.refresh();
-    expect(sentStatuses(send)).toEqual(['Выполняет запрос…']);
+    expect(sentStatuses(send)).toEqual(['suspended']);
+    set([...waiting, transcribing, running]);
+    activity.refresh();
+    await settle();
+    expect(sentStatuses(send)).toEqual(['suspended', 'processing']);
     set([...waiting, transcribing]);
     activity.refresh();
     await settle();
-    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', 'Распознаёт аудио…']);
+    expect(sentStatuses(send)).toEqual(['suspended', 'processing']);
     set(waiting);
     activity.refresh();
     await settle();
-    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', 'Распознаёт аудио…', '']);
+    expect(sentStatuses(send)).toEqual(['suspended', 'processing', 'active']);
     set([]);
     activity.refresh();
     await settle();
     activity.refresh();
-    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', 'Распознаёт аудио…', '']);
+    expect(sentStatuses(send)).toEqual(['suspended', 'processing', 'active']);
   });
 
-  it.each(['completed', 'failed', 'cancelled', 'interrupted', 'uncertain'] as const)('clears native status on %s without repeated clear calls', async status => {
+  it.each(['completed', 'failed', 'cancelled', 'interrupted'] as const)('clears native status on %s without repeated clear calls', async status => {
     const { activity, send, set } = make([request()]);
     activity.refresh();
     await settle();
@@ -70,12 +76,12 @@ describe('Slack request activity', () => {
     await settle();
     activity.refresh();
     await settle();
-    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', '']);
+    expect(sentStatuses(send)).toEqual(['processing', 'active']);
   });
 
   it.each([
-    ['queued', ''], ['starting', ''], ['waiting_approval', ''], ['uncertain', ''],
-    ['transcribing', 'Распознаёт аудио…'],
+    ['queued', 'active'], ['starting', 'active'], ['waiting_approval', 'suspended'], ['uncertain', 'active'],
+    ['transcribing', 'processing'],
   ] as const)('represents persisted %s requests', async (status, label) => {
     const { activity, send } = make([request(status)]);
     activity.refresh();
@@ -91,40 +97,55 @@ describe('Slack request activity', () => {
     set([queued]);
     activity.refresh();
     await settle();
-    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', '']);
+    expect(sentStatuses(send)).toEqual(['processing', 'active']);
     for (let i = 0; i < 10; i++) activity.refresh();
     await vi.advanceTimersByTimeAsync(180_000);
     activity.refresh(true);
     await settle();
-    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', '']);
+    expect(sentStatuses(send)).toEqual(['processing', 'active']);
     set([request('starting')]);
     activity.refresh();
     await settle();
     set([queued]);
     activity.refresh();
     await settle();
-    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', '']);
+    expect(sentStatuses(send)).toEqual(['processing', 'active']);
     set([request()]);
     activity.refresh();
     await settle();
-    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', '', 'Выполняет запрос…']);
+    expect(sentStatuses(send)).toEqual(['processing', 'active', 'processing']);
   });
 
-  it('clears processing while approval is pending and resumes after approval', async () => {
+  it('renews suspended approval status and resumes processing after approval', async () => {
     const { activity, send, set } = make([request()]);
     activity.start();
     await settle();
     set([request('waiting_approval')]);
     activity.refresh();
     await settle();
-    await vi.advanceTimersByTimeAsync(90_000);
+    expect(sentStatuses(send)).toEqual(['processing', 'suspended']);
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(sentStatuses(send)).toEqual(['processing', 'suspended', 'suspended']);
     activity.refresh(true);
     await settle();
-    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', '']);
+    expect(sentStatuses(send)).toEqual(['processing', 'suspended', 'suspended', 'suspended']);
     set([request()]);
     activity.refresh();
     await settle();
-    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', '', 'Выполняет запрос…']);
+    expect(sentStatuses(send)).toEqual(['processing', 'suspended', 'suspended', 'suspended', 'processing']);
+  });
+
+  it('clears a suspended approval after completion and culls its heartbeat target', async () => {
+    const { activity, send, set } = make([request('waiting_approval')]);
+    activity.start();
+    await settle();
+    set([request('completed')]);
+    activity.refresh();
+    await settle();
+    await vi.advanceTimersByTimeAsync(90_000);
+    activity.refresh(true);
+    await settle();
+    expect(sentStatuses(send)).toEqual(['suspended', 'active']);
   });
 
   it('uses only persisted Slack origins and keeps account, chat and thread targets separate', async () => {
@@ -151,10 +172,10 @@ describe('Slack request activity', () => {
     activity.refresh();
     set([]);
     activity.refresh();
-    expect(sentStatuses(send)).toEqual(['Распознаёт аудио…']);
+    expect(sentStatuses(send)).toEqual(['processing']);
     pending.resolve();
     await settle();
-    expect(sentStatuses(send)).toEqual(['Распознаёт аудио…', '']);
+    expect(sentStatuses(send)).toEqual(['processing', 'active']);
   });
 
   it('reasserts activity after delivery invalidation even if a status write was already in flight', async () => {
@@ -165,7 +186,7 @@ describe('Slack request activity', () => {
     activity.refresh(true);
     pending.resolve();
     await settle();
-    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', 'Выполняет запрос…']);
+    expect(sentStatuses(send)).toEqual(['processing', 'processing']);
   });
 
   it('renews busy statuses before Slack expires them and stops the heartbeat at shutdown', async () => {
@@ -177,7 +198,7 @@ describe('Slack request activity', () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(send).toHaveBeenCalledTimes(2);
     await activity.stop();
-    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', 'Выполняет запрос…', '']);
+    expect(sentStatuses(send)).toEqual(['processing', 'processing', 'active']);
     await vi.advanceTimersByTimeAsync(180_000);
     activity.refresh();
     expect(send).toHaveBeenCalledTimes(3);
@@ -210,12 +231,12 @@ describe('Slack request activity', () => {
     pending.reject(new Error('Synthetic late failure'));
     await settle();
     expect(diagnostic).toHaveBeenCalledOnce();
-    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', '']);
+    expect(sentStatuses(send)).toEqual(['processing', 'active']);
   });
 
-  it('waits for an in-flight write and then clears during stop', async () => {
+  it.each(['running', 'waiting_approval'] as const)('waits for an in-flight %s write and then clears during stop', async status => {
     const pending = deferred();
-    const { activity, send } = make([request()]);
+    const { activity, send } = make([request(status)]);
     send.mockImplementationOnce(() => pending.promise);
     activity.start();
     let stopped = false;
@@ -225,7 +246,7 @@ describe('Slack request activity', () => {
     expect(send).toHaveBeenCalledTimes(1);
     pending.resolve();
     await stopping;
-    expect(sentStatuses(send)).toEqual(['Выполняет запрос…', '']);
+    expect(sentStatuses(send)).toEqual([status === 'running' ? 'processing' : 'suspended', 'active']);
     expect(stopped).toBe(true);
   });
 

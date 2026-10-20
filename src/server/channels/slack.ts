@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import WebSocket from 'ws';
 import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionState, Delivery, Endpoint, InboundMessage, Origin, Person, SlackTranscriptMessage } from '../../shared/types.js';
-import { ChannelError, downloadBounded, endpointId, readableTitle, type Channel, type ChannelCallbacks } from './common.js';
+import { ChannelError, downloadBounded, endpointId, readableTitle, type Channel, type ChannelCallbacks, type SlackSessionStatus } from './common.js';
 import { escapeSlackText, formatSlackReply } from './slack-format.js';
 
 type Json = Record<string, any>;
@@ -227,12 +227,16 @@ export class SlackChannel implements Channel {
     return page;
   }
 
-  async setThreadStatus(origin: Origin, status: string): Promise<void> {
+  async setThreadStatus(origin: Origin, status: SlackSessionStatus): Promise<void> {
     const accountId = this.requireAccount(origin.accountId);
     const signal = this.abort.signal;
     if (origin.platform !== 'slack' || !/^[CDG][A-Z0-9]+$/u.test(origin.chatId) || !SLACK_TS.test(origin.threadId)) throw new ChannelError('Некорректное обсуждение Slack.');
-    await this.api('assistant.threads.setStatus', { channel_id: origin.chatId, thread_ts: origin.threadId, status });
+    const result = await this.api('agents.sessions.setStatus', { channel_id: origin.chatId, thread_ts: origin.threadId, status });
     this.requireAccount(accountId, signal);
+    const warning = 'Для штатной кнопки Stop добавьте agent_session_stopped в Event Subscriptions приложения Slack.';
+    const missingStop = result.response_metadata?.warnings?.includes('missing_agent_session_stopped_event_subscription') || result.warning === 'missing_agent_session_stopped_event_subscription';
+    if (missingStop && this.state.error !== warning) this.setState({ error: warning });
+    else if (!missingStop && this.state.error === warning) this.setState({ error: undefined });
   }
 
   async readThreadPage(target: Pick<Origin, 'endpointId' | 'accountId' | 'chatId' | 'threadId'>, options: { cursor?: string; oldest?: string; latest?: string } = {}): Promise<{ messages: SlackTranscriptMessage[]; nextCursor?: string }> {
@@ -412,6 +416,22 @@ export class SlackChannel implements Channel {
       const payload = envelope.payload as Json;
       if (payload?.team_id && payload.team_id !== this.teamId) return;
       const event = payload?.event;
+      if (event?.type === 'agent_session_stopped') {
+        if (payload.team_id === this.teamId && typeof payload.event_id === 'string' && payload.event_id
+            && typeof event.channel === 'string' && /^[CDG][A-Z0-9]+$/u.test(event.channel)
+            && typeof event.thread_ts === 'string' && SLACK_TS.test(event.thread_ts)
+            && typeof event.event_ts === 'string' && SLACK_TS.test(event.event_ts)
+            && typeof event.user === 'string' && SLACK_USER.test(event.user)) {
+          const endpoint = this.endpoints.get(endpointId('slack', this.accountId, event.channel, event.thread_ts));
+          if (endpoint) await this.callbacks.message({
+            control: 'stop', eventId: `agent-session-stopped:${payload.event_id}`, endpoint,
+            sender: endpoint.people.find(person => person.id === event.user) ?? { id: event.user, name: 'Участник Slack' },
+            messageId: event.event_ts, text: '',
+          });
+        }
+        this.ack(socket, envelope.envelope_id);
+        return;
+      }
       const source = event && ['message', 'app_mention'].includes(event.type) ? this.messageSource(event, event.channel) : undefined;
       if (source) {
         const message = this.normalize(source.message, source.kind);
