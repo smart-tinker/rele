@@ -1,13 +1,25 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { DatabaseSync, backup as backupDatabase, type SQLOutputValue } from 'node:sqlite';
-import type { Approval, Binding, Conversation, Delivery, Endpoint, InboundMessage, Origin, Platform, ReleRequest } from '../shared/types.js';
+import type { Approval, Binding, Conversation, Delivery, Endpoint, InboundMessage, Origin, Platform, ReleRequest, SlackTranscriptMessage } from '../shared/types.js';
 
 type Row = Record<string, SQLOutputValue>;
 type BindingInput = { platform: Platform; endpointId: string; allowedSenderIds: string[] };
 type DeliveryPart = Pick<Delivery, 'key' | 'ordinal' | 'kind' | 'body' | 'approvalId'>;
 type ApprovalInput = Omit<Approval, 'id' | 'status' | 'createdAt' | 'updatedAt'> & Partial<Pick<Approval, 'id' | 'status'>>;
+export interface SlackSyncStream {
+  id: string; endpointId: string; conversationId: string; codexThreadId: string;
+  accountId: string; chatId: string; threadId: string; active: boolean; paused: boolean;
+  cursor?: string; coveredThrough?: string; scanUntil?: string; scanOldest?: string;
+  state: 'backfill' | 'ready' | 'blocked'; error?: string; retryAt?: string;
+}
+export interface SlackSyncEntry {
+  id: string; streamId: string; message: SlackTranscriptMessage; messageId: string; revision: string;
+  requestId?: string;
+  state: 'pending' | 'applying' | 'applied' | 'uncertain';
+  error?: string; retryAt?: string; createdAt: string; updatedAt: string;
+}
 const APPLICATION_ID = 0x52454c45;
 const BLOCKING_REQUESTS = "'starting','running','transcribing','waiting_approval','uncertain'";
 const MIGRATIONS = [String.raw`
@@ -84,6 +96,25 @@ const MIGRATIONS = [String.raw`
 `, String.raw`
   ALTER TABLE endpoints ADD COLUMN catalog TEXT NOT NULL DEFAULT '{}'
     CHECK(json_valid(catalog) AND json_type(catalog) = 'object');
+`, String.raw`
+  CREATE TABLE slack_sync_streams (
+    id TEXT PRIMARY KEY NOT NULL, endpoint_id TEXT NOT NULL REFERENCES endpoints(id),
+    conversation_id TEXT NOT NULL REFERENCES conversations(id), codex_thread_id TEXT NOT NULL,
+    account_id TEXT NOT NULL, chat_id TEXT NOT NULL, thread_id TEXT NOT NULL,
+    cursor TEXT, covered_through TEXT, scan_until TEXT, scan_oldest TEXT,
+    state TEXT NOT NULL DEFAULT 'backfill' CHECK(state IN ('backfill','ready','blocked')),
+    error TEXT, retry_at TEXT, UNIQUE(endpoint_id, conversation_id)
+  ) STRICT;
+  CREATE TABLE slack_sync_entries (
+    id TEXT PRIMARY KEY NOT NULL, stream_id TEXT NOT NULL REFERENCES slack_sync_streams(id),
+    message_id TEXT NOT NULL, message_order TEXT NOT NULL, revision TEXT NOT NULL,
+    message TEXT NOT NULL CHECK(json_valid(message) AND json_type(message) = 'object'),
+    request_id TEXT REFERENCES requests(id),
+    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','applying','applied','uncertain')),
+    error TEXT, retry_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(stream_id, message_id, revision)
+  ) STRICT;
+  CREATE INDEX slack_sync_pending ON slack_sync_entries(stream_id, state, message_order);
 `];
 
 function required(value: string, label: string): void {
@@ -118,6 +149,27 @@ function toDelivery(r: Row): Delivery {
     ordinal: r.ordinal as number, kind: r.kind as Delivery['kind'], body: r.body as string, approvalId: optional(r.approval_id),
     status: r.status as Delivery['status'], attempts: r.attempts as number, remoteMessageId: optional(r.remote_message_id),
     error: optional(r.error), nextAttemptAt: optional(r.next_attempt_at), createdAt: r.created_at as string, updatedAt: r.updated_at as string };
+}
+function stableJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item: unknown) => item && typeof item === 'object' && !Array.isArray(item)
+    ? Object.fromEntries(Object.keys(item).sort().map(key => [key, (item as Record<string, unknown>)[key]])) : item);
+}
+function slackMessageOrder(value: string): string {
+  const match = /^(\d+)\.(\d+)$/u.exec(value);
+  return match ? `${match[1].padStart(20, '0')}.${match[2].padEnd(12, '0')}` : value;
+}
+function toSlackSyncStream(r: Row): SlackSyncStream {
+  return { id: r.id as string, endpointId: r.endpoint_id as string, conversationId: r.conversation_id as string,
+    codexThreadId: r.codex_thread_id as string, accountId: r.account_id as string, chatId: r.chat_id as string,
+    threadId: r.thread_id as string, active: !!r.active, paused: !!r.paused, cursor: optional(r.cursor),
+    coveredThrough: optional(r.covered_through), scanUntil: optional(r.scan_until), scanOldest: optional(r.scan_oldest), state: r.state as SlackSyncStream['state'],
+    error: optional(r.error), retryAt: optional(r.retry_at) };
+}
+function toSlackSyncEntry(r: Row): SlackSyncEntry {
+  return { id: r.id as string, streamId: r.stream_id as string, message: json(r.message), messageId: r.message_id as string,
+    revision: r.revision as string, requestId: optional(r.request_id),
+    state: r.state as SlackSyncEntry['state'], error: optional(r.error), retryAt: optional(r.retry_at),
+    createdAt: r.created_at as string, updatedAt: r.updated_at as string };
 }
 function toApproval(r: Row): Approval {
   return { id: r.id as string, requestId: r.request_id as string, turnId: r.turn_id as string, itemId: r.item_id as string,
@@ -183,7 +235,8 @@ export class Store {
     if (existing && (existing.platform !== endpoint.platform || existing.accountId !== endpoint.accountId || existing.chatId !== endpoint.chatId || existing.threadId !== endpoint.threadId)) {
       throw new Error('Endpoint identity cannot be changed');
     }
-    const people = [...new Map([...(existing?.people ?? []), ...endpoint.people].map((person) => [person.id, person])).values()];
+    const knownBots = new Set(existing?.people.filter(person => person.isBot).map(person => person.id));
+    const people = [...new Map([...(existing?.people ?? []), ...endpoint.people].map(person => [person.id, knownBots.has(person.id) ? { ...person, isBot: true } : person])).values()];
     const catalog: Record<string, unknown> = {};
     for (const key of ['chatTitle', 'topicTitle', 'isForum', 'generalTopic', 'available'] as const) {
       const value = endpoint[key] ?? existing?.[key];
@@ -268,15 +321,158 @@ export class Store {
     });
   }
 
+  private ensureSlackSyncStreams(): void {
+    const rows = this.db.prepare(`SELECT b.endpoint_id, b.conversation_id, c.thread_id AS codex_thread_id,
+      e.account_id, e.chat_id, e.thread_id FROM bindings b JOIN endpoints e ON e.id=b.endpoint_id
+      JOIN conversations c ON c.id=b.conversation_id WHERE b.platform='slack'`).all();
+    for (const row of rows) {
+      const id = randomUUID();
+      const inserted = this.db.prepare(`INSERT OR IGNORE INTO slack_sync_streams
+        (id,endpoint_id,conversation_id,codex_thread_id,account_id,chat_id,thread_id) VALUES (?,?,?,?,?,?,?)`)
+        .run(id, row.endpoint_id, row.conversation_id, row.codex_thread_id, row.account_id, row.chat_id, row.thread_id);
+      if (!inserted.changes) continue;
+      // Existing receipts remain useful when upgrading, even before Slack backfill succeeds.
+      for (const receipt of this.db.prepare('SELECT payload,request_id FROM inbound_events WHERE endpoint_id=? ORDER BY rowid').all(row.endpoint_id)) {
+        const inbound = json<InboundMessage>(receipt.payload);
+        const message = inbound.slack ?? { endpointId: inbound.endpoint.id, accountId: inbound.endpoint.accountId,
+          chatId: inbound.endpoint.chatId, threadId: inbound.endpoint.threadId, messageId: inbound.messageId,
+          sender: inbound.sender, text: inbound.text, payload: { text: inbound.text, ...(inbound.audio ? { audio: inbound.audio } : {}) }, kind: 'message' as const };
+        const requestId = optional(receipt.request_id);
+        this.writeSlackSyncEntry(id, message, requestId && this.getRequest(requestId)?.conversationId === row.conversation_id ? requestId : undefined);
+      }
+    }
+  }
+
+  listSlackSyncStreams(): SlackSyncStream[] {
+    return this.transaction(() => {
+      this.ensureSlackSyncStreams();
+      return this.db.prepare(`SELECT s.*,c.paused,EXISTS(SELECT 1 FROM bindings b WHERE
+        b.platform='slack' AND b.endpoint_id=s.endpoint_id AND b.conversation_id=s.conversation_id) AS active
+        FROM slack_sync_streams s JOIN conversations c ON c.id=s.conversation_id ORDER BY s.rowid`).all().map(toSlackSyncStream);
+    });
+  }
+  getSlackSyncStream(id: string): SlackSyncStream | undefined {
+    const row = this.db.prepare(`SELECT s.*,c.paused,EXISTS(SELECT 1 FROM bindings b WHERE
+      b.platform='slack' AND b.endpoint_id=s.endpoint_id AND b.conversation_id=s.conversation_id) AS active
+      FROM slack_sync_streams s JOIN conversations c ON c.id=s.conversation_id WHERE s.id=?`).get(id);
+    return row ? toSlackSyncStream(row) : undefined;
+  }
+  updateSlackSyncStream(id: string, patch: Partial<Pick<SlackSyncStream, 'cursor' | 'coveredThrough' | 'scanUntil' | 'scanOldest' | 'state' | 'error' | 'retryAt'>>): SlackSyncStream {
+    allowedPatch(patch, ['cursor', 'coveredThrough', 'scanUntil', 'scanOldest', 'state', 'error', 'retryAt']);
+    return this.transaction(() => {
+      const current = this.getSlackSyncStream(id);
+      if (!current) throw new Error('Slack sync stream not found');
+      const next = { ...current, ...patch };
+      const retryAt = next.retryAt === undefined ? null : new Date(next.retryAt).toISOString();
+      this.db.prepare('UPDATE slack_sync_streams SET cursor=?,covered_through=?,scan_until=?,scan_oldest=?,state=?,error=?,retry_at=? WHERE id=?')
+        .run(next.cursor ?? null, next.coveredThrough ?? null, next.scanUntil ?? null, next.scanOldest ?? null, next.state, next.error ?? null, retryAt, id);
+      return this.getSlackSyncStream(id)!;
+    });
+  }
+
+  private writeSlackSyncEntry(streamId: string, message: SlackTranscriptMessage, requestId?: string): SlackSyncEntry {
+    for (const [label, value] of Object.entries({ messageId: message.messageId, senderId: message.sender.id })) required(value, label);
+    if (!['message', 'edit', 'deleted'].includes(message.kind) || typeof message.text !== 'string' || !message.payload || typeof message.payload !== 'object' || Array.isArray(message.payload)) throw new Error('Invalid Slack transcript message');
+    const stream = this.getSlackSyncStream(streamId);
+    if (!stream || stream.endpointId !== message.endpointId || stream.accountId !== message.accountId || stream.chatId !== message.chatId || stream.threadId !== message.threadId) throw new Error('Slack transcript origin does not match the sync stream');
+    if (requestId && this.getRequest(requestId)?.conversationId !== stream.conversationId) throw new Error('Slack transcript request belongs to another conversation');
+    const revision = createHash('sha256').update(stableJson({ kind: message.kind === 'deleted' ? 'deleted' : 'message',
+      senderId: message.sender.id, text: message.text, edited: (message.payload.edited as { ts?: unknown } | undefined)?.ts,
+      files: message.payload.files, attachments: message.payload.attachments, blocks: message.payload.blocks })).digest('hex');
+    const id = randomUUID(); const now = new Date().toISOString();
+    this.db.prepare(`INSERT INTO slack_sync_entries (id,stream_id,message_id,message_order,revision,message,request_id,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(stream_id,message_id,revision) DO UPDATE SET request_id=COALESCE(slack_sync_entries.request_id,excluded.request_id)`)
+      .run(id, streamId, message.messageId, slackMessageOrder(message.messageId), revision, JSON.stringify(message), requestId ?? null, now, now);
+    return toSlackSyncEntry(this.db.prepare('SELECT * FROM slack_sync_entries WHERE stream_id=? AND message_id=? AND revision=?').get(streamId, message.messageId, revision)!);
+  }
+  private recordSlackMessageInside(message: SlackTranscriptMessage, requestId?: string): SlackSyncEntry | undefined {
+    this.ensureSlackSyncStreams();
+    let row = this.db.prepare(`SELECT s.id,s.conversation_id FROM slack_sync_streams s JOIN bindings b
+      ON b.endpoint_id=s.endpoint_id AND b.conversation_id=s.conversation_id WHERE b.platform='slack' AND s.endpoint_id=?`).get(message.endpointId);
+    if (!row && message.kind === 'deleted') {
+      const prior = this.db.prepare(`SELECT s.id,s.conversation_id,e.message FROM slack_sync_entries e
+        JOIN slack_sync_streams s ON s.id=e.stream_id JOIN bindings b ON b.endpoint_id=s.endpoint_id AND b.conversation_id=s.conversation_id
+        WHERE b.platform='slack' AND s.account_id=? AND s.chat_id=? AND e.message_id=? ORDER BY e.rowid DESC LIMIT 1`)
+        .get(message.accountId, message.chatId, message.messageId);
+      if (prior) {
+        const previous = json<SlackTranscriptMessage>(prior.message);
+        message = { ...message, endpointId: previous.endpointId, threadId: previous.threadId, sender: previous.sender };
+        row = prior;
+      }
+    }
+    if (!row) return undefined;
+    const matchingRequest = requestId && this.getRequest(requestId)?.conversationId === row.conversation_id ? requestId : undefined;
+    return this.writeSlackSyncEntry(row.id as string, message, matchingRequest);
+  }
+  recordSlackMessage(message: SlackTranscriptMessage): SlackSyncEntry | undefined {
+    return this.transaction(() => this.recordSlackMessageInside(message));
+  }
+  getSlackSyncEntry(id: string): SlackSyncEntry | undefined {
+    const row = this.db.prepare('SELECT * FROM slack_sync_entries WHERE id=?').get(id);
+    return row ? toSlackSyncEntry(row) : undefined;
+  }
+  listSlackSyncEntries(streamId: string, options: { pending?: boolean; beforeMessageId?: string; limit?: number; offset?: number } = {}): SlackSyncEntry[] {
+    const before = options.beforeMessageId === undefined ? null : slackMessageOrder(options.beforeMessageId);
+    return this.db.prepare(`SELECT * FROM slack_sync_entries WHERE stream_id=?
+      AND (?=0 OR (state IN ('pending','uncertain') AND (retry_at IS NULL OR retry_at<=?)))
+      AND (? IS NULL OR message_order<=?) ORDER BY message_order,rowid LIMIT ? OFFSET ?`)
+      .all(streamId, Number(!!options.pending), new Date().toISOString(), before, before, limitValue(options.limit ?? 100), limitValue(options.offset ?? 0)).map(toSlackSyncEntry);
+  }
+  latestSlackMessageId(streamId: string): string | undefined {
+    return this.db.prepare('SELECT message_id FROM slack_sync_entries WHERE stream_id=? ORDER BY message_order DESC,rowid DESC LIMIT 1').get(streamId)?.message_id as string | undefined;
+  }
+  hasPendingSlackSyncEntries(streamId: string, beforeMessageId?: string): boolean {
+    const before = beforeMessageId === undefined ? null : slackMessageOrder(beforeMessageId);
+    return !!this.db.prepare(`SELECT 1 FROM slack_sync_entries WHERE stream_id=?
+      AND state<>'applied' AND (? IS NULL OR message_order<=?) LIMIT 1`).get(streamId, before, before);
+  }
+  getSlackSyncCounts(streamId: string): Record<SlackSyncEntry['state'], number> {
+    const counts: Record<SlackSyncEntry['state'], number> = { pending: 0, applying: 0, applied: 0, uncertain: 0 };
+    for (const row of this.db.prepare('SELECT state,COUNT(*) AS count FROM slack_sync_entries WHERE stream_id=? GROUP BY state').all(streamId)) counts[row.state as SlackSyncEntry['state']] = Number(row.count);
+    return counts;
+  }
+  updateSlackSyncEntry(id: string, patch: Partial<Pick<SlackSyncEntry, 'state' | 'requestId' | 'error' | 'retryAt'>>): SlackSyncEntry {
+    allowedPatch(patch, ['state', 'requestId', 'error', 'retryAt']);
+    return this.transaction(() => {
+      const current = this.getSlackSyncEntry(id);
+      if (!current) throw new Error('Slack sync entry not found');
+      const next = { ...current, ...patch };
+      const stream = this.getSlackSyncStream(current.streamId)!;
+      if (next.requestId && this.getRequest(next.requestId)?.conversationId !== stream.conversationId) throw new Error('Slack transcript request belongs to another conversation');
+      const retryAt = next.retryAt === undefined ? null : new Date(next.retryAt).toISOString();
+      this.db.prepare('UPDATE slack_sync_entries SET state=?,request_id=?,error=?,retry_at=?,updated_at=? WHERE id=?')
+        .run(next.state, next.requestId ?? null, next.error ?? null, retryAt, new Date().toISOString(), id);
+      return this.getSlackSyncEntry(id)!;
+    });
+  }
+  claimSlackSyncEntry(id: string): SlackSyncEntry | undefined {
+    return this.transaction(() => {
+      const now = new Date().toISOString();
+      const result = this.db.prepare(`UPDATE slack_sync_entries SET state='applying',updated_at=? WHERE id=?
+        AND state IN ('pending','uncertain') AND (retry_at IS NULL OR retry_at<=?)
+        AND EXISTS(SELECT 1 FROM slack_sync_streams s JOIN conversations c ON c.id=s.conversation_id
+          WHERE s.id=slack_sync_entries.stream_id AND c.paused=0)`).run(now, id, now);
+      return result.changes ? this.getSlackSyncEntry(id) : undefined;
+    });
+  }
+
   private recordEvent(message: InboundMessage): { duplicate: boolean; requestId?: string } {
     required(message.eventId, 'Event ID'); required(message.sender.id, 'Sender ID'); required(message.messageId, 'Message ID');
     const endpoint = message.endpoint;
-    const event = this.db.prepare('SELECT request_id FROM inbound_events WHERE platform=? AND account_id=? AND event_id=?')
+    if (message.slack && (endpoint.platform !== 'slack' || message.slack.endpointId !== endpoint.id || message.slack.accountId !== endpoint.accountId
+      || message.slack.chatId !== endpoint.chatId || message.slack.threadId !== endpoint.threadId || message.slack.messageId !== message.messageId || message.slack.sender.id !== message.sender.id)) throw new Error('Slack transcript origin does not match the inbound event');
+    const event = this.db.prepare('SELECT request_id,payload FROM inbound_events WHERE platform=? AND account_id=? AND event_id=?')
       .get(endpoint.platform, endpoint.accountId, message.eventId);
-    if (event) return { duplicate: true, requestId: optional(event.request_id) };
+    if (event) {
+      const requestId = optional(event.request_id);
+      const original = json<InboundMessage>(event.payload).slack;
+      if (original) this.recordSlackMessageInside(original, requestId);
+      return { duplicate: true, requestId };
+    }
     this.writeEndpoint(endpoint);
     this.db.prepare('INSERT INTO inbound_events (platform,account_id,event_id,endpoint_id,payload,created_at) VALUES (?,?,?,?,?,?)')
       .run(endpoint.platform, endpoint.accountId, message.eventId, endpoint.id, JSON.stringify(message), new Date().toISOString());
+    if (message.slack) this.recordSlackMessageInside(message.slack);
     return { duplicate: false };
   }
   recordInbound(message: InboundMessage): { duplicate: boolean } {
@@ -291,12 +487,13 @@ export class Store {
       const row = this.db.prepare(`SELECT bindings.* FROM bindings JOIN conversations ON conversations.id=bindings.conversation_id
         WHERE bindings.endpoint_id=? AND conversations.paused=0`).get(endpoint.id);
       const binding = row ? toBinding(row) : undefined;
-      if (!binding || !binding.allowedSenderIds.length || !binding.allowedSenderIds.includes(message.sender.id)) return { request: null, duplicate: false };
+      if (message.contextOnly || (message.slack && message.slack.kind !== 'message') || ((message.sender.isBot || message.slack?.sender.isBot || this.getEndpoint(endpoint.id)?.people.some(person => person.id === message.sender.id && person.isBot)) && !message.directMention) || !binding || !binding.allowedSenderIds.length || !binding.allowedSenderIds.includes(message.sender.id)) return { request: null, duplicate: false };
       const origin: Origin = { platform: endpoint.platform, accountId: endpoint.accountId, endpointId: endpoint.id,
         chatId: endpoint.chatId, threadId: endpoint.threadId, senderId: message.sender.id, senderName: message.sender.name, messageId: message.messageId };
       const id = randomUUID();
       this.db.prepare(`INSERT INTO requests (id,conversation_id,event_id,origin,text,audio,status,created_at,updated_at) VALUES (?,?,?,?,?,?,'queued',?,?)`)
         .run(id, binding.conversationId, message.eventId, JSON.stringify(origin), message.text, message.audio ? JSON.stringify(message.audio) : null, now, now);
+      if (message.slack) this.recordSlackMessageInside(message.slack, id);
       this.db.prepare('UPDATE inbound_events SET request_id=? WHERE platform=? AND account_id=? AND event_id=?').run(id, endpoint.platform, endpoint.accountId, message.eventId);
       return { request: this.getRequest(id)!, duplicate: false };
     });
@@ -457,6 +654,7 @@ export class Store {
   recoverInterrupted(): { requests: number; deliveries: number } {
     return this.transaction(() => {
       const now = new Date().toISOString();
+      this.db.prepare("UPDATE slack_sync_entries SET state='pending',error=COALESCE(error,'Passive append acknowledgement was interrupted; replay may duplicate context'),updated_at=? WHERE state='applying'").run(now);
       const execution = this.db.prepare("UPDATE requests SET status='uncertain',error=COALESCE(error,'Execution interrupted; reconcile with Codex before retrying'),updated_at=? WHERE status IN ('starting','running')").run(now);
       const transcription = this.db.prepare("UPDATE requests SET status='queued',updated_at=? WHERE status='transcribing'").run(now);
       const deliveries = this.db.prepare("UPDATE deliveries SET status='uncertain',error=COALESCE(error,'Delivery interrupted; verify receipt before retrying'),updated_at=? WHERE status='sending'").run(now);

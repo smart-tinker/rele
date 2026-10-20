@@ -6,6 +6,7 @@ import { ConfigStore, defaultDataDirectory, type AppConfig } from './config.js';
 import { Store } from './store.js';
 import { CodexClient } from './codex.js';
 import { Engine } from './engine.js';
+import { SlackActivity } from './slack-activity.js';
 import { createApp } from './app.js';
 import { TelegramChannel } from './channels/telegram.js';
 import { SlackChannel } from './channels/slack.js';
@@ -71,6 +72,13 @@ async function main(): Promise<void> {
   }
   let codex = new CodexClient(config.config.codex);
   const engine = new Engine(store, codex, { config: () => config.config, temporaryRoot, redact: value => config.redact(value) });
+  const activity = new SlackActivity(() => store.activeRequests(), async (origin, status) => {
+    const channel = engine.channels.slack;
+    if (!channel?.state.connected || !channel.setThreadStatus) throw new Error('Slack отключён; индикатор будет обновлён после подключения.');
+    await channel.setThreadStatus(origin, status);
+  }, error => { process.stderr.write(`Rele Slack: ${config.redact(error)}\n`); });
+  engine.on('change', () => activity.refresh());
+  engine.on('delivered', delivery => { if (delivery.origin.platform === 'slack') activity.refresh(true); });
   let shuttingDown = false;
   let app: ReturnType<typeof createApp>;
 
@@ -78,7 +86,7 @@ async function main(): Promise<void> {
     const callbacks: ChannelCallbacks = {
       message: message => engine.receive(message),
       endpoint: endpoint => { store.upsertEndpoint(endpoint); },
-      action: action => engine.action(action), status: () => {},
+      action: action => engine.action(action), status: () => { engine.channelStatus(); activity.refresh(true); },
     };
     const next = config.config;
     engine.channels = {
@@ -96,7 +104,10 @@ async function main(): Promise<void> {
       // Voice-only changes do not reconnect transports or expire approvals.
       const channelsChanged = JSON.stringify([next.telegram, next.slack]) !== JSON.stringify([config.config.telegram, config.config.slack]);
       await config.save(next);
-      if (channelsChanged) await Promise.allSettled(Object.values(engine.channels).map(channel => channel.stop()));
+      if (channelsChanged) {
+        await activity.stop();
+        await Promise.allSettled(Object.values(engine.channels).map(channel => channel.stop()));
+      }
       if (codexChanged) {
         const old = codex;
         await old.close();
@@ -104,7 +115,7 @@ async function main(): Promise<void> {
         engine.replaceCodex(codex);
         void codex.connect().catch(() => {});
       }
-      if (channelsChanged) attachChannels();
+      if (channelsChanged) { attachChannels(); activity.start(); }
     } finally { engine.suspend(false); }
   }
   app = createApp({ store, config, engine, codex: () => codex, configure, version, webDirectory: path.join(root, 'dist', 'web'), shutdown });
@@ -114,14 +125,16 @@ async function main(): Promise<void> {
     const address = await app.listen({ host: '127.0.0.1', port });
     await writeFile(temporaryInstance, JSON.stringify({ pid: process.pid, address, version }), { mode: 0o600 });
     await rename(temporaryInstance, instanceFile);
-    engine.start(); attachChannels();
+    engine.start(); attachChannels(); activity.start();
     void codex.connect().catch(() => {});
     process.stdout.write(`Rele: ${address}/\nОткрыть панель: rele open. Ключ панели: rele token или npm start -- token.\n`);
-  } catch (error) { await app.close(); await engine.stop(); await codex.close(); store.close(); await rm(temporaryInstance, { force: true }); lock.close(); throw error; }
+  } catch (error) { await app.close(); await activity.stop(); await engine.stop(); await codex.close(); store.close(); await rm(temporaryInstance, { force: true }); lock.close(); throw error; }
   async function shutdown(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
+    engine.suspend(true);
     await app.close();
+    await activity.stop();
     await Promise.allSettled(Object.values(engine.channels).map(channel => channel.stop()));
     await engine.stop(); await codex.close(); store.close();
     // Keep the data-directory lock until our marker is removed, so another

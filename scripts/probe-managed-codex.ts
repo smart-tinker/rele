@@ -8,7 +8,7 @@ import { Engine } from '../src/server/engine.js';
 import { Store } from '../src/server/store.js';
 import { defaultConfig } from '../src/server/config.js';
 import type { Channel } from '../src/server/channels/common.js';
-import type { Endpoint, Platform } from '../src/shared/types.js';
+import type { Endpoint, Platform, SlackTranscriptMessage } from '../src/shared/types.js';
 
 const { values } = parseArgs({ options: {
   executable: { type: 'string' }, home: { type: 'string' }, directory: { type: 'string' },
@@ -21,13 +21,19 @@ const config = { ...structuredClone(defaultConfig), codex: {
 const store = new Store(join(values.directory, 'rele.sqlite'));
 const endpoints = Object.fromEntries((['slack', 'telegram'] as const).map(platform => [platform, {
   id: `fixture-${platform}`, platform, accountId: 'synthetic-account', chatId: `synthetic-${platform}`,
-  threadId: 'synthetic-topic', title: `Fixture ${platform}`, subtitle: 'Synthetic origin',
+  threadId: platform === 'slack' ? '1700000000.000000' : 'synthetic-topic', title: `Fixture ${platform}`, subtitle: 'Synthetic origin',
   people: [{ id: 'fixture-user', name: 'Fixture user' }], updatedAt: new Date().toISOString(),
 } satisfies Endpoint])) as Record<Platform, Endpoint>;
 for (const endpoint of Object.values(endpoints)) store.upsertEndpoint(endpoint);
 store.createConversation({ name: 'Managed fixture', threadId: values.thread, cwd: values.directory,
   bindings: Object.values(endpoints).map(endpoint => ({ platform: endpoint.platform, endpointId: endpoint.id, allowedSenderIds: ['fixture-user'] })),
 });
+const slackHistory: SlackTranscriptMessage[] = [{
+  endpointId: endpoints.slack.id, accountId: endpoints.slack.accountId, chatId: endpoints.slack.chatId,
+  threadId: endpoints.slack.threadId, messageId: '1700000000.000001',
+  sender: { id: 'fixture-peer-bot', name: 'Peer agent', isBot: true },
+  text: 'passive-peer-agent-context', payload: { text: 'passive-peer-agent-context' }, kind: 'message',
+}];
 let codex!: CodexClient;
 let engine!: Engine;
 const diagnostics: string[] = [];
@@ -37,7 +43,8 @@ async function start(): Promise<void> {
   codex = new CodexClient(config.codex);
   engine = new Engine(store, codex, { config: () => config, temporaryRoot: values.directory!, redact: value => String(value) });
   for (const platform of ['slack', 'telegram'] as const) engine.channels[platform] = {
-    state: { configured: true, connected: true, name: platform },
+    state: { configured: true, connected: true, name: platform, accountId: endpoints[platform].accountId },
+    readThreadPage: async () => ({ messages: platform === 'slack' ? [...slackHistory] : [] }),
     start: async () => {}, stop: async () => {}, download: async () => { throw new Error('Audio not used in this fixture'); },
     deliver: async delivery => `${platform}:${delivery.id}`,
   } satisfies Channel;
@@ -59,8 +66,15 @@ try {
     if (command.action === 'ingest') {
       const platform = command.platform!;
       if (!endpoints[platform]) throw new Error('Unknown fixture origin');
+      const messageId = platform === 'slack' ? `1700000001.${String(slackHistory.length).padStart(6, '0')}` : command.eventId!;
+      const slack: SlackTranscriptMessage | undefined = platform === 'slack' ? {
+        endpointId: endpoints.slack.id, accountId: endpoints.slack.accountId, chatId: endpoints.slack.chatId,
+        threadId: endpoints.slack.threadId, messageId, sender: endpoints.slack.people[0], text: command.text!,
+        payload: { text: command.text!, ts: messageId }, kind: 'message',
+      } : undefined;
+      if (slack) slackHistory.push(slack);
       await engine.receive({ eventId: command.eventId!, endpoint: endpoints[platform], sender: endpoints[platform].people[0],
-        messageId: command.eventId!, text: command.text!,
+        messageId, text: command.text!, ...(slack ? { slack } : {}),
       });
       await engine.settled();
     } else if (command.action === 'wait') {

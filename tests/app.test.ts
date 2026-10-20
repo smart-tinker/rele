@@ -161,7 +161,7 @@ describe('local panel request boundary', () => {
     expect(response.headers['cache-control']).toBe('no-store');
   });
 
-  it.each(['/api/state', '/api/threads', '/api/catalog/slack/chats', '/api/catalog/slack/threads?chatId=CEXAMPLE', '/api/catalog/slack/people?endpointId=example', '/api/catalog/telegram', '/api/unknown', '/api'])(
+  it.each(['/api/state', '/api/threads', '/api/catalog/slack/chats', '/api/catalog/slack/threads?chatId=CEXAMPLE', '/api/catalog/slack/people?endpointId=example', '/api/catalog/telegram', '/api/conversations/example/slack-sync', '/api/unknown', '/api'])(
     'requires bearer authentication for %s',
     async (url) => {
       const { app } = makeApp();
@@ -733,4 +733,95 @@ describe('conversation discovery API', () => {
     expect(response.statusCode).toBe(400);
     expect(f.store.listConversations()).toEqual([]);
   });
+});
+
+
+describe('authenticated Slack sync journal API', () => {
+  function journal() {
+    const f = makeApp();
+    const endpoint: Endpoint = { ...f.endpoint, id: 'slack-journal', platform: 'slack', accountId: 'T1:URELE', chatId: 'C1', threadId: '100.000000', title: 'Original thread' };
+    f.store.upsertEndpoint(endpoint);
+    const conversation = f.store.createConversation({ name: 'Journal conversation', threadId: 'journal-codex', cwd: '/journal', bindings: [{ platform: 'slack', endpointId: endpoint.id, allowedSenderIds: [] }] });
+    const fullText = 'journal-only-private-context-' + 'x'.repeat(60_000);
+    const entries = Array.from({ length: 105 }, (_, index) => f.store.recordSlackMessage({ endpointId: endpoint.id,
+      accountId: endpoint.accountId, chatId: endpoint.chatId, threadId: endpoint.threadId,
+      messageId: `110.${String(index).padStart(6, '0')}`, sender: { id: 'UAGENT', name: 'Other agent', isBot: true },
+      text: index ? `Message ${index}` : fullText, payload: { text: index ? `Message ${index}` : fullText, files: [{ id: 'F1', title: 'Full attachment metadata' }] }, kind: 'message' })!);
+    f.store.updateSlackSyncEntry(entries[0].id, { state: 'uncertain', error: 'Lost passive append ACK' });
+    f.store.updateSlackSyncEntry(entries[1].id, { state: 'applied' });
+    f.store.updateSlackSyncStream(entries[0].streamId, { state: 'blocked', coveredThrough: '200.000000', error: 'Slack rate limited' });
+    f.store.setMeta(`endpoint-alias:${endpoint.id}`, 'Local journal title');
+    return { ...f, endpoint, conversation, entries, fullText, url: `/api/conversations/${conversation.id}/slack-sync` };
+  }
+
+  it('requires local panel authentication and refuses unknown or foreign conversation streams', async () => {
+    const f = journal();
+    expect((await f.app.inject({ url: f.url, headers: { host: headers.host } })).statusCode).toBe(401);
+    expect((await f.app.inject({ url: '/api/conversations/missing/slack-sync', headers })).statusCode).toBe(404);
+    const otherEndpoint = { ...f.endpoint, id: 'slack-other-journal', chatId: 'C2' };
+    f.store.upsertEndpoint(otherEndpoint);
+    const other = f.store.createConversation({ name: 'Other conversation', threadId: 'other-journal-codex', cwd: '/other', bindings: [{ platform: 'slack', endpointId: otherEndpoint.id, allowedSenderIds: [] }] });
+    const foreign = f.store.listSlackSyncStreams().find(stream => stream.conversationId === other.id)!;
+    const rejected = await f.app.inject({ url: `${f.url}?streamId=${foreign.id}`, headers });
+    expect(rejected.statusCode).toBe(404);
+    expect(rejected.body).not.toContain(f.fullText);
+    expect((await f.app.inject({ url: `${f.url}?streamId=missing`, headers })).statusCode).toBe(404);
+  });
+
+  it('returns exact counts, complete payloads and a bounded page with the requested stream', async () => {
+    const f = journal();
+    const response = await f.app.inject({ url: `${f.url}?streamId=${f.entries[0].streamId}&offset=0&limit=2`, headers });
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['cache-control']).toBe('no-store');
+    const body = response.json();
+    expect(body.streamId).toBe(f.entries[0].streamId);
+    expect(body.nextOffset).toBe(2);
+    expect(body.entries).toHaveLength(2);
+    expect(body.streams).toEqual([{ id: f.entries[0].streamId, endpointId: f.endpoint.id, title: 'Local journal title',
+      active: true, paused: false, state: 'blocked', coveredThrough: '200.000000', error: 'Slack rate limited',
+      counts: { pending: 103, applying: 0, applied: 1, uncertain: 1 } }]);
+    expect(body.entries[0]).toEqual({ id: f.entries[0].id, message: f.entries[0].message, state: 'uncertain', error: 'Lost passive append ACK', createdAt: f.entries[0].createdAt });
+    expect(body.entries[0].message.text).toBe(f.fullText);
+    expect(body.entries[0].message.payload.files[0].title).toBe('Full attachment metadata');
+    const last = (await f.app.inject({ url: `${f.url}?offset=104&limit=2`, headers })).json();
+    expect(last.entries.map((entry: { id: string }) => entry.id)).toEqual([f.entries[104].id]);
+    expect(last.nextOffset).toBeUndefined();
+    expect((await f.app.inject({ url: `${f.url}?offset=999&limit=100`, headers })).json().entries).toEqual([]);
+    const state = await f.app.inject({ url: '/api/state', headers });
+    expect(state.body).not.toContain('journal-only-private-context-');
+    expect(state.json()).not.toHaveProperty('slackSync');
+  });
+
+  it('includes detached streams and selects the first stream by default without exposing another conversation', async () => {
+    const f = journal();
+    const replacement = { ...f.endpoint, id: 'slack-replacement', chatId: 'C3', title: 'Replacement title' };
+    f.store.upsertEndpoint(replacement);
+    f.store.setBinding(f.conversation.id, 'slack', replacement.id, []);
+    f.store.updateConversation(f.conversation.id, { paused: true });
+    const result = (await f.app.inject({ url: `${f.url}?limit=1`, headers })).json();
+    expect(result.streamId).toBe(f.entries[0].streamId);
+    expect(result.streams).toHaveLength(2);
+    expect(result.streams[0]).toMatchObject({ active: false, paused: true, title: 'Local journal title' });
+    expect(result.streams[1]).toMatchObject({ active: true, paused: true, title: 'Replacement title' });
+    expect(result.entries).toHaveLength(1);
+    const selected = (await f.app.inject({ url: `${f.url}?streamId=${result.streams[1].id}`, headers })).json();
+    expect(selected.streamId).toBe(result.streams[1].id);
+    expect(selected.entries).toEqual([]);
+  });
+
+  it('returns an empty journal for a conversation with no Slack stream', async () => {
+    const f = makeApp();
+    const conversation = f.store.createConversation({ name: 'No Slack', threadId: 'no-slack-codex', cwd: '/project' });
+    const result = await f.app.inject({ url: `/api/conversations/${conversation.id}/slack-sync`, headers });
+    expect(result.statusCode).toBe(200);
+    expect(result.json()).toEqual({ streams: [], entries: [] });
+  });
+
+  it.each(['unknown=true', 'streamId=', 'streamId=first&streamId=second', 'offset=-1', 'offset=1.5', 'offset=9007199254740992', 'offset=1&offset=2', 'limit=0', 'limit=101', 'limit=1.5', 'limit=1e2', 'limit=2&limit=3'])(
+    'rejects invalid journal query %s', async query => {
+      const f = makeApp();
+      const conversation = f.store.createConversation({ name: 'Arguments', threadId: 'arguments-codex', cwd: '/project' });
+      expect((await f.app.inject({ url: `/api/conversations/${conversation.id}/slack-sync?${query}`, headers })).statusCode).toBe(400);
+    },
+  );
 });

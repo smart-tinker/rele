@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
-import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionState, Delivery, Endpoint, InboundMessage, Person, Platform } from '../../shared/types.js';
+import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionState, Delivery, Endpoint, InboundMessage, Origin, Person, Platform, SlackTranscriptMessage } from '../../shared/types.js';
 
 export interface ApprovalAction {
   approvalId: string;
@@ -29,6 +29,8 @@ export interface Channel {
   listThreads?(chatId: string, cursor?: string): Promise<CatalogPage<Endpoint>>;
   listPeople?(chatId: string, cursor?: string): Promise<CatalogPage<Person>>;
   discoveryInfo?(): { botUrl?: string; command: string };
+  setThreadStatus?(origin: Origin, status: string): Promise<void>;
+  readThreadPage?(target: Pick<Origin, 'endpointId' | 'accountId' | 'chatId' | 'threadId'>, options?: { cursor?: string; oldest?: string; latest?: string }): Promise<{ messages: SlackTranscriptMessage[]; nextCursor?: string }>;
 }
 
 export class ChannelError extends Error {

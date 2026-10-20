@@ -240,6 +240,8 @@ stream_max_retries=0
         assert completed['deliveries'][0]['status'] == 'sent'
         assert 'source-context-A' in json.dumps(records[1]) and 'managed-answer-1' in json.dumps(records[1])
         assert completed['runtimeProcessId'] == ready['runtimeProcessId']
+        assert 'passive-peer-agent-context' in json.dumps(records[1])
+        report['checks']['all_author_slack_context_precedes_authorized_task'] = True
         report['checks']['released_source_resumes_same_request_with_prior_exchange'] = True
         report['checks']['slack_result_delivered_only_to_its_origin'] = True
         source2 = await start_source('source_a_reopened')

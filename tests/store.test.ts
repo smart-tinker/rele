@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
 import { Store } from '../src/server/store.js';
-import type { Approval, Delivery, Endpoint, InboundMessage, ReleRequest } from '../src/shared/types.js';
+import type { Approval, Delivery, Endpoint, InboundMessage, ReleRequest, SlackTranscriptMessage } from '../src/shared/types.js';
 
 const directories: string[] = [];
 const stores: Store[] = [];
@@ -374,7 +374,7 @@ describe('Store durability and recovery', () => {
     const check = new DatabaseSync(path);
     try {
       expect(check.prepare('PRAGMA journal_mode').get()?.journal_mode).toBe('wal');
-      expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(3);
+      expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(4);
       expect(check.prepare('PRAGMA quick_check').get()?.quick_check).toBe('ok');
       expect(check.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     } finally { check.close(); }
@@ -388,7 +388,7 @@ describe('Store durability and recovery', () => {
     original.setMeta('endpoint-alias:slack-1', 'Мой разговор');
     original.close();
     const old = new DatabaseSync(path);
-    old.exec('ALTER TABLE endpoints DROP COLUMN catalog; PRAGMA user_version = 2;');
+    old.exec('DROP TABLE slack_sync_entries; DROP TABLE slack_sync_streams; ALTER TABLE endpoints DROP COLUMN catalog; PRAGMA user_version = 2;');
     old.close();
     const upgraded = open(path);
     expect(upgraded.getConversation(conv.id)).toEqual(conv);
@@ -425,5 +425,183 @@ describe('Store durability and recovery', () => {
     futureDb.exec('PRAGMA application_id = 1380273221; PRAGMA user_version = 999;');
     futureDb.close();
     expect(() => new Store(future)).toThrow(/newer/);
+  });
+});
+
+
+function transcript(ep = endpoint(), messageId = '1770000000.000001', overrides: Partial<SlackTranscriptMessage> = {}): SlackTranscriptMessage {
+  return { endpointId: ep.id, accountId: ep.accountId, chatId: ep.chatId, threadId: ep.threadId, messageId,
+    sender: ep.people[0], text: 'Full Slack message', payload: { text: 'Full Slack message', ts: messageId }, kind: 'message', ...overrides };
+}
+function transcriptInbound(value: SlackTranscriptMessage, overrides: Partial<InboundMessage> = {}): InboundMessage {
+  return message(endpoint(), `message:${value.chatId}:${value.messageId}`, { messageId: value.messageId, sender: value.sender,
+    text: value.text, slack: value, ...overrides });
+}
+
+describe('durable Slack transcript sync', () => {
+  it('upgrades v3 without changing requests and seeds receipts without advancing coverage', () => {
+    const path = join(directory(), 'v3.sqlite');
+    const oldStore = open(path);
+    const conv = conversation(oldStore);
+    const original = request(oldStore);
+    oldStore.close();
+    const old = new DatabaseSync(path);
+    old.exec('DROP TABLE slack_sync_entries; DROP TABLE slack_sync_streams; PRAGMA user_version = 3;');
+    old.close();
+    const upgraded = open(path);
+    const [stream] = upgraded.listSlackSyncStreams();
+    expect(stream).toMatchObject({ endpointId: endpoint().id, conversationId: conv.id, codexThreadId: conv.threadId, active: true, paused: false, state: 'backfill' });
+    expect(stream.coveredThrough).toBeUndefined();
+    const [entry] = upgraded.listSlackSyncEntries(stream.id);
+    expect(entry).toMatchObject({ requestId: original.id, state: 'pending', message: { text: original.text } });
+    expect(upgraded.getRequest(original.id)).toEqual(original);
+    expect(upgraded.listRequests()).toHaveLength(1);
+  });
+
+  it('commits full context and task receipt together, replays once and rolls everything back on error', () => {
+    const store = open();
+    conversation(store);
+    const slack = transcript(endpoint(), undefined, { text: 'a'.repeat(60_000), payload: { text: 'a'.repeat(60_000), files: [{ id: 'F1', title: 'Attachment' }] } });
+    const inbound = transcriptInbound(slack);
+    const first = store.ingest(inbound);
+    expect(store.ingest({ ...inbound, slack: { ...slack, text: 'Changed replay' } })).toMatchObject({ duplicate: true, request: first.request });
+    const [stream] = store.listSlackSyncStreams();
+    const [entry] = store.listSlackSyncEntries(stream.id);
+    expect(entry.requestId).toBe(first.request!.id);
+    expect(entry.message).toEqual(slack);
+    expect(store.listSlackSyncEntries(stream.id)).toHaveLength(1);
+    expect(stream.coveredThrough).toBeUndefined();
+    const next = transcript(endpoint(), '1770000000.000002');
+    expect(() => store.ingest(transcriptInbound(next, { text: undefined as unknown as string }))).toThrow();
+    expect(store.listSlackSyncEntries(stream.id)).toHaveLength(1);
+    expect(store.ingest(transcriptInbound(next)).duplicate).toBe(false);
+  });
+
+  it('backfills passively, dedupes live/history metadata and retains edit/delete revisions', () => {
+    const store = open();
+    conversation(store);
+    const slack = transcript();
+    const original = store.recordSlackMessage(slack)!;
+    expect(store.recordSlackMessage({ ...slack, payload: { ...slack.payload, event_ts: 'later', type: 'app_mention', team: 'T1' } })!.id).toBe(original.id);
+    const edited = store.recordSlackMessage({ ...slack, kind: 'edit', text: 'Updated', payload: { text: 'Updated', edited: { ts: '1770000001.000000' } } })!;
+    expect(store.recordSlackMessage({ ...edited.message, kind: 'message' })!.id).toBe(edited.id);
+    const deleted = store.recordSlackMessage({ ...slack, kind: 'deleted', text: '', payload: {} })!;
+    expect(deleted.id).not.toBe(edited.id);
+    expect(store.listSlackSyncEntries(original.streamId)).toHaveLength(3);
+    expect(store.listRequests()).toEqual([]);
+    const stream = store.updateSlackSyncStream(original.streamId, { cursor: 'page-2', scanUntil: '1770000002.000000' });
+    expect(stream.coveredThrough).toBeUndefined();
+    expect(store.getSlackSyncStream(stream.id)?.cursor).toBe('page-2');
+  });
+
+  it('requires selected bots and direct mentions, while context-only and edits never trigger', () => {
+    const store = open();
+    const conv = conversation(store);
+    const bot = { id: 'UBOT2', name: 'Other agent', isBot: true };
+    store.setBinding(conv.id, 'slack', endpoint().id, ['user-1', bot.id]);
+    const botMessage = transcript(endpoint(), '1770000000.000001', { sender: bot });
+    expect(store.ingest(transcriptInbound(botMessage)).request).toBeNull();
+    expect(store.ingest(transcriptInbound({ ...botMessage, messageId: '1770000000.000002' }, { directMention: true, contextOnly: true })).request).toBeNull();
+    expect(store.ingest(transcriptInbound({ ...botMessage, messageId: '1770000000.000003' }, { directMention: true })).request).not.toBeNull();
+    expect(store.ingest(transcriptInbound({ ...botMessage, messageId: '1770000000.000004', sender: { ...bot, id: 'UNOTSELECTED' } }, { directMention: true })).request).toBeNull();
+    expect(store.ingest(transcriptInbound({ ...botMessage, messageId: '1770000000.000005', kind: 'edit' }, { directMention: true })).request).toBeNull();
+    const [stream] = store.listSlackSyncStreams();
+    expect(store.listSlackSyncEntries(stream.id)).toHaveLength(5);
+    expect(store.listRequests()).toHaveLength(1);
+  });
+
+  it('records approval replies without tasks and preserves a cancelled trigger in the transcript', () => {
+    const store = open();
+    conversation(store);
+    const reply = transcriptInbound(transcript());
+    expect(store.recordInbound(reply)).toEqual({ duplicate: false });
+    expect(store.ingest(reply)).toEqual({ duplicate: true, request: null });
+    const trigger = transcriptInbound(transcript(endpoint(), '1770000000.000002'));
+    const req = store.ingest(trigger).request!;
+    store.finishRequest(req.id, { status: 'cancelled' }, []);
+    const [stream] = store.listSlackSyncStreams();
+    expect(store.listSlackSyncEntries(stream.id)).toHaveLength(2);
+    expect(store.listSlackSyncEntries(stream.id)[1]).toMatchObject({ requestId: req.id, state: 'pending' });
+  });
+
+  it('pins captured entries to the old Codex destination across rebind and buffers while paused', () => {
+    const store = open();
+    const conv = conversation(store);
+    const captured = store.recordSlackMessage(transcript())!;
+    store.updateConversation(conv.id, { paused: true });
+    expect(store.claimSlackSyncEntry(captured.id)).toBeUndefined();
+    const next = endpoint({ id: 'new-endpoint', chatId: 'new-chat' });
+    store.upsertEndpoint(next);
+    store.setBinding(conv.id, 'slack', next.id, ['user-1']);
+    const streams = store.listSlackSyncStreams();
+    expect(streams).toHaveLength(2);
+    expect(store.getSlackSyncStream(captured.streamId)).toMatchObject({ active: false, paused: true, codexThreadId: conv.threadId, endpointId: endpoint().id });
+    expect(store.recordSlackMessage(transcript(endpoint(), '1770000000.000002'))).toBeUndefined();
+    store.updateConversation(conv.id, { paused: false });
+    expect(store.claimSlackSyncEntry(captured.id)?.state).toBe('applying');
+    expect(store.getSlackSyncStream(captured.streamId)?.codexThreadId).toBe(conv.threadId);
+    expect(() => store.updateSlackSyncStream(captured.streamId, { codexThreadId: 'other-thread' } as never)).toThrow(/immutable/);
+    expect(() => store.recordSlackMessage(transcript(next, '1770000000.000003', { accountId: 'foreign-account' }))).toThrow(/origin/);
+  });
+
+  it('orders source timestamps exactly, retries passive uncertain writes and recovers applying after restart', () => {
+    const path = join(directory(), 'sync.sqlite');
+    const store = open(path);
+    conversation(store);
+    const later = store.recordSlackMessage(transcript(endpoint(), '1770000000.000002'))!;
+    const earlier = store.recordSlackMessage(transcript(endpoint(), '1770000000.000001'))!;
+    expect(store.listSlackSyncEntries(later.streamId, { pending: true, beforeMessageId: earlier.messageId }).map(entry => entry.id)).toEqual([earlier.id]);
+    expect(store.claimSlackSyncEntry(earlier.id)?.state).toBe('applying');
+    expect(store.claimSlackSyncEntry(earlier.id)).toBeUndefined();
+    store.updateSlackSyncEntry(later.id, { state: 'uncertain', retryAt: '2999-01-01T00:00:00Z' });
+    expect(store.listSlackSyncEntries(later.streamId, { pending: true })).toEqual([]);
+    store.close();
+    const restarted = open(path);
+    expect(restarted.recoverInterrupted()).toEqual({ requests: 0, deliveries: 0 });
+    expect(restarted.getSlackSyncEntry(earlier.id)).toMatchObject({ state: 'pending' });
+    expect(restarted.claimSlackSyncEntry(earlier.id)?.state).toBe('applying');
+    expect(restarted.claimSlackSyncEntry(later.id)).toBeUndefined();
+    restarted.updateSlackSyncEntry(later.id, { retryAt: undefined });
+    expect(restarted.claimSlackSyncEntry(later.id)?.state).toBe('applying');
+  });
+});
+
+
+describe('Slack transcript identity guards', () => {
+  it('keeps a known bot classified as a bot when later events omit its profile', () => {
+    const store = open();
+    const ep = endpoint({ people: [{ id: 'UBOT', name: 'Agent', isBot: true }] });
+    const conv = conversation(store, ep);
+    store.setBinding(conv.id, 'slack', ep.id, ['UBOT']);
+    store.upsertEndpoint({ ...ep, people: [{ id: 'UBOT', name: 'Unknown role' }] });
+    expect(store.getEndpoint(ep.id)?.people[0].isBot).toBe(true);
+    const value = transcript(ep, '1770000000.000001', { sender: { id: 'UBOT', name: 'Unknown role' } });
+    expect(store.ingest(transcriptInbound(value, { endpoint: { ...ep, people: [value.sender] } })).request).toBeNull();
+    expect(store.getEndpoint(ep.id)?.people[0].isBot).toBe(true);
+  });
+
+  it('routes a parentless deletion only by a previously logged message in the same account and channel', () => {
+    const store = open();
+    conversation(store);
+    const original = store.recordSlackMessage(transcript())!;
+    const missingParent = transcript(endpoint(), original.messageId, { endpointId: 'unknown-root', threadId: original.messageId,
+      kind: 'deleted', sender: { id: 'slack:unknown', name: 'Unknown' }, text: '', payload: { deleted_ts: original.messageId } });
+    const deletion = store.recordSlackMessage(missingParent)!;
+    expect(deletion).toMatchObject({ streamId: original.streamId, message: { endpointId: endpoint().id, threadId: endpoint().threadId, sender: original.message.sender, kind: 'deleted' } });
+    expect(store.recordSlackMessage({ ...missingParent, messageId: '1770000000.999999' })).toBeUndefined();
+    expect(store.recordSlackMessage({ ...missingParent, accountId: 'other-account' })).toBeUndefined();
+    expect(store.listSlackSyncEntries(original.streamId)).toHaveLength(2);
+  });
+
+  it('reports counts beyond the journal page size and pending rows whose retry has not elapsed', () => {
+    const store = open();
+    conversation(store);
+    const entries = Array.from({ length: 105 }, (_, index) => store.recordSlackMessage(transcript(endpoint(), `1770000000.${String(index).padStart(6, '0')}`))!);
+    store.updateSlackSyncEntry(entries[0].id, { state: 'uncertain', retryAt: '2999-01-01T00:00:00Z' });
+    store.updateSlackSyncEntry(entries[1].id, { state: 'applied' });
+    expect(store.getSlackSyncCounts(entries[0].streamId)).toEqual({ pending: 103, uncertain: 1, applied: 1, applying: 0 });
+    expect(store.listSlackSyncEntries(entries[0].streamId)).toHaveLength(100);
+    expect(store.hasPendingSlackSyncEntries(entries[0].streamId, entries[0].messageId)).toBe(true);
+    expect(store.latestSlackMessageId(entries[0].streamId)).toBe(entries.at(-1)!.messageId);
   });
 });

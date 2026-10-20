@@ -203,6 +203,33 @@ supports_websockets=false
         assert any(item['id']==thread for item in catalog['data']),catalog
         assert all(item['source'] in normal_sources and not item.get('parentThreadId') for item in catalog['data']),catalog
         report['checks']['indexed_normal_source_catalog']=True
+        # Passive Slack transcript must persist without starting a model or a UI turn.
+        context_id='rele_slack_'+str(uuid.uuid4())
+        context_canary='Rele passive Slack context canary '+str(uuid.uuid4())
+        context_item={'type':'message','id':context_id,'role':'user',
+                      'content':[{'type':'input_text','text':context_canary}]}
+        context_model_count=len(records)
+        context_turn_ids=[turn['id'] for turn in history['data']]
+        context_started_count=sum(event.get('method')=='turn/started' for event in b.events)
+        assert result(await b.call('thread/inject_items',{'threadId':thread,'items':[context_item]}))=={}
+        persisted_context=False
+        for attempt in range(100):
+            for rollout in (home/'sessions').rglob('*.jsonl'):
+                for line in rollout.read_text(encoding='utf-8').splitlines():
+                    try: saved=json.loads(line)
+                    except json.JSONDecodeError: continue
+                    payload=saved.get('payload',{})
+                    if saved.get('type')=='response_item' and payload.get('id')==context_id:
+                        assert payload.get('role')=='user' and payload.get('content')==context_item['content'],payload
+                        persisted_context=True
+            if persisted_context: break
+            await asyncio.sleep(.02)
+        assert persisted_context,'Injected Slack canary was not persisted in the fixture rollout'
+        context_history=result(await b.call('thread/turns/list',{'threadId':thread,'limit':10,'itemsView':'full'}))
+        assert [turn['id'] for turn in context_history['data']]==context_turn_ids,context_history
+        assert len(records)==context_model_count,'Passive injection started a model request'
+        assert sum(event.get('method')=='turn/started' for event in b.events)==context_started_count
+        report['checks']['passive_context_persists_without_model_or_turn']=True
         # Native clients can steer an already running Rele turn. The gateway must
         # quarantine such a turn instead of forwarding its mixed final answer.
         steer_hold=asyncio.Event(); next_actions.append(('hold',steer_hold))
@@ -210,6 +237,8 @@ supports_websockets=false
         result(await b.call('thread/queue/add',{'threadId':thread,'clientUserMessageId':steer_id,
             'input':[{'type':'text','text':'queued request before desktop steering'}]}))
         await asyncio.wait_for(wait_len(records,before+1),20)
+        assert context_canary in json.dumps(records[before]['body']),'Next authorized request omitted passive Slack context'
+        report['checks']['next_authorized_model_request_contains_passive_context']=True
         own_steer=await b.wait(lambda x:x.get('method')=='item/started' and x['params']['item'].get('clientId')==steer_id)
         steered=result(await a.call('turn/start',{'threadId':thread,'clientUserMessageId':'desktop-steer',
             'input':[{'type':'text','text':'native input steers the active external turn'}]}))
