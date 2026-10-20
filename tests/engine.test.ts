@@ -25,10 +25,14 @@ function deferred<T>() {
 
 class FakeCodex extends EventEmitter implements CodexGateway {
   connected = true;
+  verifiedVersion = true;
+  isVerifiedVersion = () => this.verifiedVersion;
   queueSupported = true;
   locations = new Map<string, RequestLocation>();
   transport: CodexConnectionState['transport'] = 'managed';
   status = vi.fn(() => ({ configured: true, connected: this.connected, queueSupported: this.queueSupported, desktopVerified: false, transport: this.transport }));
+  createThread = vi.fn<(_cwd: string) => Promise<string>>().mockResolvedValue('auto-created-thread');
+  setThreadName = vi.fn(async (_threadId: string, _name: string): Promise<void> => {});
   injectContext = vi.fn(async (_threadId: string, _entryId: string, _text: string) => {});
   subscribe = vi.fn(async (_threadId: string) => {});
   releaseThread = vi.fn(async (_threadId: string) => {});
@@ -91,13 +95,14 @@ function fixture(options: { path?: string; start?: boolean; transcribe?: EngineO
   const slack = fakeChannel('slack');
   const telegram = fakeChannel('telegram');
   const diagnostics: string[] = [];
-  const engine = new Engine(store, codex, { config: () => structuredClone(defaultConfig), temporaryRoot: dirname(path),
+  const config = structuredClone(defaultConfig);
+  const engine = new Engine(store, codex, { config: () => config, temporaryRoot: dirname(path),
     redact: error => error instanceof Error ? error.message : String(error), transcribe: options.transcribe });
   engine.channels = { slack, telegram };
   engine.on('diagnostic', (error: string) => diagnostics.push(error));
   fixtures.push({ engine, store });
   if (options.start !== false) engine.start();
-  return { engine, store, codex, slack, telegram, eps, path, diagnostics,
+  return { engine, store, codex, slack, telegram, eps, path, diagnostics, config,
     conversation: store.listConversations()[0],
     message(platform: Platform, eventId = '1', overrides: Partial<InboundMessage> = {}): InboundMessage {
       const endpoint = eps[platform];
@@ -166,6 +171,7 @@ describe('Engine correlation and queue', () => {
   });
 
   it('waits for thread release before dispatching the next origin', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
     const f = fixture();
     f.codex.transport = 'managed';
     const closed = deferred<void>();
@@ -181,6 +187,7 @@ describe('Engine correlation and queue', () => {
     expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
     closed.resolve();
     await f.engine.settled();
+    vi.setSystemTime(Date.now() + 2000);
     await f.engine.pump();
     expect(f.codex.enqueue).toHaveBeenCalledTimes(2);
     expect(f.codex.enqueue.mock.calls[1][0]).toBe(THREAD);
@@ -894,5 +901,197 @@ describe('Engine Slack transcript and authorized task boundary', () => {
     expect(f.codex.injectContext.mock.calls.at(-1)?.[2]).toContain(secondMessage.text);
     expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, secondMessage.text, second.id);
     expect(f.codex.injectContext.mock.invocationCallOrder.at(-1)!).toBeLessThan(f.codex.enqueue.mock.invocationCallOrder[0]);
+  });
+});
+
+
+describe('automatic native thread creation', () => {
+  function autoFixture() {
+    const f = fixture();
+    const endpoint = { ...f.eps.telegram, id: 'unbound-topic', threadId: '99' };
+    f.store.upsertEndpoint(endpoint);
+    f.config.telegram.enabled = true;
+    f.config.autoLinkRules = [{ id: 'rule', enabled: true, platform: 'telegram', accountId: endpoint.accountId,
+      chatId: endpoint.chatId, cwd: '/projects/new', allowedSenderIds: ['123'], requireMention: false }];
+    return { ...f, endpoint, incoming: (eventId = 'auto-1', overrides: Partial<InboundMessage> = {}) =>
+      f.message('telegram', eventId, { endpoint, ...overrides }) };
+  }
+
+  it('durably groups concurrent first messages, creates once, and keeps origin delivery', async () => {
+    const f = autoFixture(); const gate = deferred<string>();
+    f.codex.createThread.mockReturnValue(gate.promise);
+    await f.engine.receive(f.incoming());
+    await f.engine.receive(f.incoming('auto-2'));
+    expect(f.store.listAutoLinkIntents()).toHaveLength(1);
+    expect(f.store.listAutoLinkIntents()[0].status).toBe('creating');
+    gate.resolve('new-native'); await f.engine.settled(); await f.engine.pump();
+    expect(f.codex.createThread).toHaveBeenCalledExactlyOnceWith('/projects/new');
+    const conversation = f.store.listConversations().find(row => row.threadId === 'new-native')!;
+    const requests = f.store.listRequests().filter(row => row.conversationId === conversation.id);
+    expect(requests).toHaveLength(2);
+    expect(requests.every(row => row.origin.endpointId === f.endpoint.id && row.origin.threadId === '99')).toBe(true);
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+    expect(f.store.listAutoLinkIntents()[0]).toMatchObject({ status: 'completed', threadId: 'new-native' });
+    await f.engine.receive(f.incoming()); await f.engine.settled();
+    expect(f.codex.createThread).toHaveBeenCalledOnce();
+    expect(f.store.listRequests()).toHaveLength(2);
+  });
+
+  it('waits for a supported connected runtime before making a durable creation attempt', async () => {
+    const f = autoFixture(); f.codex.verifiedVersion = false;
+    await f.engine.receive(f.incoming()); await f.engine.settled();
+    expect(f.codex.createThread).not.toHaveBeenCalled();
+    expect(f.store.listAutoLinkIntents()[0].status).toBe('pending');
+    f.codex.verifiedVersion = true; await f.engine.pump();
+    expect(f.codex.createThread).toHaveBeenCalledOnce();
+  });
+
+  it('does not create on denied, context-only, control, unmentioned or administrative messages', async () => {
+    const f = autoFixture(); f.config.autoLinkRules![0].requireMention = true;
+    for (const [index, patch] of [ { sender: { id: 'denied', name: 'Denied' }, directMention: true },
+      { contextOnly: true, directMention: true }, { text: '/start', directMention: true },
+      { text: '/rele_chats', directMention: true }, { text: '/rele_cancel' }, { directMention: false } ].entries()) {
+      await f.engine.receive(f.incoming(`denied-${index}`, patch));
+    }
+    await f.engine.settled();
+    expect(f.codex.createThread).not.toHaveBeenCalled();
+    expect(f.store.listAutoLinkIntents()).toEqual([]);
+    await f.engine.receive(f.incoming('accepted', { directMention: true })); await f.engine.settled();
+    expect(f.codex.createThread).toHaveBeenCalledOnce();
+  });
+
+  it('accepts an allowlisted human DM without a mention and denies bot DMs', async () => {
+    const f = autoFixture();
+    f.endpoint.chatId = '123'; f.endpoint.threadId = ''; f.store.upsertEndpoint({ ...f.endpoint, id: 'dm-human' });
+    f.config.autoLinkRules![0] = { ...f.config.autoLinkRules![0], chatId: '123', requireMention: true };
+    const endpoint = { ...f.endpoint, id: 'dm-human' };
+    await f.engine.receive(f.incoming('bot-dm', { endpoint, sender: { id: '123', name: 'Bot', isBot: true }, directMention: true }));
+    await f.engine.settled(); expect(f.codex.createThread).not.toHaveBeenCalled();
+    // A bot identity cannot become a human merely by omitting its flag later.
+    const fresh = autoFixture(); fresh.config.autoLinkRules![0] = { ...fresh.config.autoLinkRules![0], chatId: '123', requireMention: true };
+    await fresh.engine.receive(fresh.incoming('human-dm', { endpoint: { ...fresh.endpoint, id: 'dm-fresh', chatId: '123', threadId: '' } }));
+    await fresh.engine.settled(); expect(fresh.codex.createThread).toHaveBeenCalledOnce();
+  });
+
+  it('never repeats thread/start after an unknown ACK, including after restart', async () => {
+    const f = autoFixture(); f.codex.createThread.mockRejectedValue(new CodexTransportError('Lost create ACK'));
+    await f.engine.receive(f.incoming()); await f.engine.settled();
+    expect(f.store.listAutoLinkIntents()[0].status).toBe('uncertain');
+    f.codex.connected = false; await f.engine.pump();
+    expect(f.store.listAutoLinkIntents()[0].error).toBe('Lost create ACK');
+    expect(f.codex.createThread).toHaveBeenCalledOnce();
+    await f.engine.stop(); f.store.close(); fixtures.splice(fixtures.findIndex(row => row.engine === f.engine), 1);
+    const restarted = fixture({ path: f.path }); restarted.config.autoLinkRules = f.config.autoLinkRules;
+    restarted.config.telegram.enabled = true;
+    await restarted.engine.pump(); expect(restarted.codex.createThread).not.toHaveBeenCalled();
+    expect(restarted.store.listAutoLinkIntents()[0].status).toBe('uncertain');
+  });
+
+  it('persists a known ID without creating a binding after its rule is disabled', async () => {
+    const f = autoFixture(); const gate = deferred<string>(); f.codex.createThread.mockReturnValue(gate.promise);
+    await f.engine.receive(f.incoming()); f.config.autoLinkRules![0].enabled = false;
+    gate.resolve('known-native'); await f.engine.settled();
+    expect(f.store.listAutoLinkIntents()[0]).toMatchObject({ status: 'created', threadId: 'known-native' });
+    expect(f.store.bindingForEndpoint(f.endpoint.id)).toBeUndefined();
+    expect(f.codex.releaseThread).toHaveBeenCalledWith('known-native');
+    f.config.autoLinkRules![0].enabled = true; await f.engine.pump();
+    expect(f.store.bindingForEndpoint(f.endpoint.id)).toBeDefined();
+    expect(f.codex.createThread).toHaveBeenCalledOnce();
+  });
+
+  it('retains a lazy new thread until idempotent native metadata has materialized it', async () => {
+    const f = autoFixture(); f.codex.setThreadName.mockRejectedValueOnce(new CodexTransportError('Lost metadata ACK'));
+    await f.engine.receive(f.incoming()); await f.engine.settled();
+    expect(f.store.listAutoLinkIntents()[0]).toMatchObject({ status: 'created', threadId: 'auto-created-thread' });
+    expect(f.store.bindingForEndpoint(f.endpoint.id)).toBeUndefined();
+    expect(f.codex.releaseThread).not.toHaveBeenCalledWith('auto-created-thread');
+    await f.engine.pump();
+    expect(f.codex.createThread).toHaveBeenCalledOnce();
+    expect(f.codex.setThreadName).toHaveBeenCalledTimes(2);
+    expect(f.codex.setThreadName).toHaveBeenLastCalledWith('auto-created-thread', f.endpoint.title);
+    expect(f.codex.releaseThread).toHaveBeenCalledWith('auto-created-thread');
+    expect(f.store.bindingForEndpoint(f.endpoint.id)).toBeDefined();
+  });
+
+  it('releases an unused lazy thread when a manual binding resolves a failed metadata checkpoint', async () => {
+    const f = autoFixture(); f.codex.setThreadName.mockRejectedValueOnce(new CodexTransportError('Lost metadata ACK'));
+    await f.engine.receive(f.incoming()); await f.engine.settled();
+    expect(f.codex.releaseThread).not.toHaveBeenCalledWith('auto-created-thread');
+    f.store.addBinding(f.conversation.id, 'telegram', f.endpoint.id, ['123']);
+    await f.engine.pump();
+    expect(f.store.bindingForEndpoint(f.endpoint.id)?.conversationId).toBe(f.conversation.id);
+    expect(f.codex.releaseThread).toHaveBeenCalledWith('auto-created-thread');
+    expect(f.codex.createThread).toHaveBeenCalledOnce();
+    expect(f.codex.setThreadName).toHaveBeenCalledOnce();
+  });
+
+  it('prefers a manual binding that appeared while native creation was in flight', async () => {
+    const f = autoFixture(); const gate = deferred<string>(); f.codex.createThread.mockReturnValue(gate.promise);
+    await f.engine.receive(f.incoming());
+    f.store.addBinding(f.conversation.id, 'telegram', f.endpoint.id, ['123']);
+    gate.resolve('orphaned-created-native'); await f.engine.settled(); await f.engine.pump();
+    expect(f.store.bindingForEndpoint(f.endpoint.id)?.conversationId).toBe(f.conversation.id);
+    expect(f.store.listRequests()[0].conversationId).toBe(f.conversation.id);
+    expect(f.store.listAutoLinkIntents()[0].error).toMatch(/Ручная/);
+    expect(f.codex.releaseThread).toHaveBeenCalledWith('orphaned-created-native');
+    expect(f.codex.createThread).toHaveBeenCalledOnce();
+  });
+});
+
+describe('multiple origins and terminal reconciliation', () => {
+  it('keeps an automatic group open to future humans and agents without creating more native threads', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture(); const endpoint = { ...f.eps.slack, id: 'auto-group-origin', chatId: 'CINFRA', threadId: '170000.456' };
+    f.config.slack.enabled = true;
+    f.config.autoLinkRules = [{ id: 'all-group', enabled: true, platform: 'slack', accountId: endpoint.accountId,
+      chatId: endpoint.chatId, cwd: '/project/group', allowedSenderIds: [], allowAllSenders: true, requireMention: false }];
+    await f.engine.receive(slackInbound(f, 'first-agent', '170001.000001', 'agent task', { endpoint, sender: { id: 'UAGENT', name: 'Agent', isBot: true } }));
+    await f.engine.settled();
+    await f.engine.receive(slackInbound(f, 'future-human', '170001.000002', 'new member task', { endpoint, sender: { id: 'UFUTURE', name: 'New member' } }));
+    await f.engine.settled();
+    const binding = f.store.bindingForEndpoint(endpoint.id)!;
+    expect(binding).toMatchObject({ allowAllSenders: true, requireMention: false, allowedSenderIds: [] });
+    expect(f.store.listRequests().filter(row => row.conversationId === binding.conversationId)).toHaveLength(2);
+    expect(f.codex.createThread).toHaveBeenCalledOnce();
+    f.store.updateBinding(binding.conversationId, binding.id, endpoint.id, [], { requireMention: true });
+    await f.engine.receive(slackInbound(f, 'unmentioned-later', '170001.000003', 'no call', { endpoint, sender: { id: 'UOTHER', name: 'Other' } }));
+    await f.engine.receive(slackInbound(f, 'mentioned-later', '170001.000004', 'explicit call', { endpoint, directMention: true, sender: { id: 'UOTHER', name: 'Other' } }));
+    await f.engine.settled();
+    expect(f.store.listRequests().filter(row => row.conversationId === binding.conversationId)).toHaveLength(3);
+  });
+
+  it('serializes four origins on one native thread and delivers each answer only to its origin', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture();
+    const extra = Object.values(f.eps).map(endpoint => ({ ...endpoint, id: `${endpoint.id}-2`, threadId: `${endpoint.threadId}2` }));
+    for (const endpoint of extra) { f.store.upsertEndpoint(endpoint); f.store.addBinding(f.conversation.id, endpoint.platform, endpoint.id, [endpoint.people[0].id]); }
+    for (const endpoint of [...Object.values(f.eps), ...extra]) {
+      await f.engine.receive(f.message(endpoint.platform, endpoint.id, { endpoint }));
+      await f.engine.settled();
+    }
+    for (let index = 0; index < 4; index++) {
+      for (let scan = 0; scan < 3; scan++) { vi.setSystemTime(Date.now() + 2000); await f.engine.pump(); await f.engine.settled(); }
+      const active = f.store.activeRequests().find(row => row.status !== 'queued')!;
+      expect(active).toBeDefined(); expect(f.codex.enqueue).toHaveBeenCalledTimes(index + 1);
+      await running(f, active, `turn-${index}`);
+      f.codex.complete(active.id, `answer-${active.origin.endpointId}`, `turn-${index}`);
+      await f.engine.settled(); await f.engine.pump();
+    }
+    const sent = [...f.slack.deliver.mock.calls, ...f.telegram.deliver.mock.calls].map(([delivery]) => delivery).filter(row => row.kind === 'answer');
+    expect(sent).toHaveLength(4);
+    for (const delivery of sent) expect(delivery.body).toBe(`answer-${delivery.origin.endpointId}`);
+  });
+
+  it('rechecks a completion notification received during an earlier history read', async () => {
+    const f = fixture(); const request = await acceptRequest(f, 'telegram'); await running(f, request);
+    const gate = deferred<RequestLocation>(); f.codex.findRequest.mockReturnValueOnce(gate.promise);
+    const pendingRead = f.engine.reconcile(request.id);
+    await vi.waitFor(() => expect(f.codex.findRequest).toHaveBeenCalled());
+    f.codex.complete(request.id, 'OK'); await Promise.resolve(); await Promise.resolve();
+    gate.reject(new Error('Interrupted snapshot has no completion timestamp'));
+    await pendingRead; await f.engine.settled(); await f.engine.pump();
+    expect(f.store.getRequest(request.id)?.status).toBe('completed');
+    expect(f.telegram.deliver.mock.calls.map(([delivery]) => delivery.body)).toContain('OK');
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
   });
 });

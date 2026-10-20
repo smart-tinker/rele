@@ -113,6 +113,8 @@ model_provider="mock_provider"
 approval_policy="never"
 sandbox_mode="read-only"
 cli_auth_credentials_store="file"
+[features]
+plugins=false
 [model_providers.mock_provider]
 name="Rele isolated managed fixture"
 base_url="http://127.0.0.1:{provider_port}/v1"
@@ -268,13 +270,26 @@ stream_max_retries=0
         assert (home / 'config.toml').read_text(encoding='utf-8') == config
         assert not (root / 'unused-profile').exists()
         report['checks']['user_config_unchanged_and_no_private_profile_created'] = True
+        # Exercise Rele's actual createThread/injectContext path in a separate empty profile.
+        before_fresh = len(records)
+        fresh = (await command('fresh-context'))['freshContext']
+        assert fresh['queueEstablished'] and fresh['namedBeforeRelease'] and fresh['releasedBeforeContext'] and fresh['receiptBeforeFirstModel'], fresh
+        assert fresh['passiveTurnsStarted'] == 0 and fresh['turnsStarted'] == 1, fresh
+        assert fresh['childExited'], fresh
+        assert len(records) == before_fresh + 1, 'Fresh passive injection created an extra model call'
+        assert fresh['text'] in json.dumps(records[before_fresh]), 'First managed request omitted passive context'
+        assert fresh['answer'] == f'managed-answer-{before_fresh + 1}', fresh
+        report['checks']['empty_profile_create_thread_establishes_queue_gate'] = True
+        report['checks']['native_name_persists_new_thread_before_release_and_first_passive_context'] = True
+        report['checks']['new_managed_thread_passive_context_persists_before_first_model_or_turn'] = True
+        report['checks']['first_managed_model_request_contains_new_thread_passive_context'] = True
         stopped = await command('close')
         assert stopped['childExited'], stopped
         await asyncio.wait_for(bridge.wait(), 15)
         assert bridge.returncode == 0, errors
         report['checks']['shutdown_waits_for_owned_child_exit'] = True
         report['syntheticProviderRequests'] = len(records)
-        assert len(records) == 4, records
+        assert len(records) == 5, records
         report['result'] = 'passed'
     except BaseException as exc:
         report['result'] = 'failed'

@@ -34,6 +34,8 @@ const platformLabel = (platform: Platform) =>
 interface BindingDraft {
   endpointId: string;
   allowedSenderIds: string[];
+  allowAllSenders?: boolean;
+  requireMention?: boolean;
 }
 const emptyBinding = (): BindingDraft => ({
   endpointId: '',
@@ -71,18 +73,8 @@ export function Conversations({
   });
   const current = state.conversations.find((item) => item.id === editing);
 
-  const connectionCell = (conversation: Conversation, platform: Platform) => {
-    const binding = conversation.bindings.find(
-      (item) => item.platform === platform,
-    );
+  const bindingCell = (binding: Binding, platform: Platform) => {
     const endpoint = binding && endpoints.get(binding.endpointId);
-    if (!binding)
-      return (
-        <div className="cell-copy cell-muted">
-          <span>—</span>
-          <small>Не подключён</small>
-        </div>
-      );
     if (!endpoint)
       return (
         <div className="cell-copy cell-muted">
@@ -106,6 +98,12 @@ export function Conversations({
         </div>
       </div>
     );
+  };
+
+  const connectionCell = (conversation: Conversation, platform: Platform) => {
+    const bindings = conversation.bindings.filter(item => item.platform === platform);
+    return bindings.length ? <div className="binding-cells">{bindings.map(binding => <div key={binding.id}>{bindingCell(binding, platform)}</div>)}</div>
+      : <div className="cell-copy cell-muted"><span>—</span><small>Не подключён</small></div>;
   };
 
   const conversationStatus = (conversation: Conversation) => {
@@ -309,7 +307,7 @@ function BindingFields({
   disabled,
   api,
   refresh,
-  conversationId,
+  bindingId,
 }: {
   platform: Platform;
   value: BindingDraft;
@@ -318,7 +316,7 @@ function BindingFields({
   disabled: boolean;
   api: ReleApi;
   refresh: () => Promise<void>;
-  conversationId?: string;
+  bindingId?: string;
 }) {
   const [loadedEndpoint, setLoadedEndpoint] = useState<Endpoint>();
   const endpoint =
@@ -340,10 +338,10 @@ function BindingFields({
         value={value.endpointId}
         onChange={(next) => {
           setLoadedEndpoint(next);
-          onChange({ endpointId: next?.id ?? '', allowedSenderIds: [] });
+          onChange({ endpointId: next?.id ?? '', allowedSenderIds: [], allowAllSenders: false, requireMention: false });
         }}
         disabled={disabled}
-        conversationId={conversationId}
+        bindingId={bindingId}
       />
       {value.endpointId && !endpoint && (
         <Notice tone="warning">
@@ -369,7 +367,7 @@ function BindingFields({
             refresh={refresh}
             disabled={disabled}
           />
-          <AllowedSenders
+          {value.allowAllSenders ? <Notice tone="info">Все участники этого канала или группы, включая других агентов, могут отправлять запросы.</Notice> : <AllowedSenders
             key={`people:${accountId ?? platform}:${endpoint.id}`}
             endpoint={endpoint}
             accountId={accountId}
@@ -380,7 +378,9 @@ function BindingFields({
               onChange({ ...value, allowedSenderIds })
             }
             disabled={disabled}
-          />
+          />}
+          <label className="check-row"><input type="checkbox" checked={!!value.allowAllSenders} disabled={disabled || (endpoint.platform === 'slack' ? !/^[CG][A-Z0-9]+$/u.test(endpoint.chatId) : !/^-\d+$/u.test(endpoint.chatId))} onChange={event => onChange({ ...value, allowAllSenders: event.target.checked, ...(event.target.checked ? { allowedSenderIds: [] } : {}) })} /><span>Разрешить всем участникам группы, включая агентов</span></label>
+          <label className="check-row"><input type="checkbox" checked={!!value.requireMention} disabled={disabled} onChange={event => onChange({ ...value, requireMention: event.target.checked })} /><span>В группах запускать только при упоминании Rele</span></label>
         </>
       )}
     </>
@@ -497,9 +497,9 @@ function NewConversation({
 }) {
   const [name, setName] = useState('');
   const [threadId, setThreadId] = useState('');
-  const [bindings, setBindings] = useState<Record<Platform, BindingDraft>>({
-    telegram: emptyBinding(),
-    slack: emptyBinding(),
+  const [bindings, setBindings] = useState<Record<Platform, BindingDraft[]>>({
+    telegram: [emptyBinding()],
+    slack: [emptyBinding()],
   });
   const action = useAction();
   const [threadQuery, setThreadQuery] = useState('');
@@ -535,10 +535,13 @@ function NewConversation({
       action.setError('Выберите разговор Codex.');
       return;
     }
-    const chosen = platforms
-      .filter((platform) => bindings[platform].endpointId)
-      .map((platform) => ({ platform, ...bindings[platform] }));
-    if (chosen.some((binding) => !binding.allowedSenderIds.length)) {
+    const chosen = platforms.flatMap(platform => bindings[platform]
+      .filter(value => value.endpointId).map(value => ({ platform, ...value })));
+    if (new Set(chosen.map(value => value.endpointId)).size !== chosen.length) {
+      action.setError('Каждый разговор можно подключить только один раз.');
+      return;
+    }
+    if (chosen.some((binding) => !binding.allowAllSenders && !binding.allowedSenderIds.length)) {
       action.setError(
         'Для каждого подключённого разговора разрешите хотя бы одного отправителя.',
       );
@@ -693,21 +696,17 @@ function NewConversation({
       </div>
       {platforms.map((platform) => (
         <section className="form-section" key={platform}>
-          <h3>
-            <PlatformIcon platform={platform} />
-            {platformLabel(platform)}
-          </h3>
-          <BindingFields
-            platform={platform}
-            value={bindings[platform]}
-            onChange={(value) =>
-              setBindings((current) => ({ ...current, [platform]: value }))
-            }
-            state={state}
-            disabled={action.busy}
-            api={api}
-            refresh={refresh}
-          />
+          <h3><PlatformIcon platform={platform} />{platformLabel(platform)}</h3>
+          {bindings[platform].map((value, index) => (
+            <div className="form-stack binding-draft" key={index}>
+              {index > 0 && <h4>{platformLabel(platform)} · {index + 1}</h4>}
+              <BindingFields platform={platform} value={value}
+                onChange={next => setBindings(current => ({ ...current, [platform]: current[platform].map((item, position) => position === index ? next : item) }))}
+                state={state} disabled={action.busy} api={api} refresh={refresh} />
+              {index > 0 && <Button disabled={action.busy} onClick={() => setBindings(current => ({ ...current, [platform]: current[platform].filter((_, position) => position !== index) }))}>Убрать подключение</Button>}
+            </div>
+          ))}
+          <Button disabled={action.busy} onClick={() => setBindings(current => ({ ...current, [platform]: [...current[platform], emptyBinding()] }))}>Добавить ещё {platformLabel(platform)}</Button>
         </section>
       ))}
       <ActionMessages error={action.error} success={action.success} />
@@ -737,6 +736,8 @@ function EditConversation({
   refresh: () => Promise<void>;
 }) {
   const [name, setName] = useState(conversation.name);
+  const [drafts, setDrafts] = useState<Array<{ id: string; platform: Platform }>>([]);
+  const [bindingMessage, setBindingMessage] = useState('');
   const action = useAction();
   const update = async (body: unknown, message: string) => {
     const result = await action.run(
@@ -806,19 +807,22 @@ function EditConversation({
         Выполняющуюся задачу можно прервать отдельно в очереди.
       </p>
       <ActionMessages error={action.error} success={action.success} />
-      {platforms.map((platform) => (
-        <EditBinding
-          key={`${conversation.id}-${platform}`}
-          platform={platform}
-          conversation={conversation}
-          binding={conversation.bindings.find(
-            (item) => item.platform === platform,
-          )}
-          state={state}
-          api={api}
-          refresh={refresh}
-        />
-      ))}
+      {bindingMessage && <p className="action-success" role="status">{bindingMessage}</p>}
+      {platforms.map(platform => {
+        const existing = conversation.bindings.filter(binding => binding.platform === platform);
+        const pending = drafts.filter(draft => draft.platform === platform);
+        return <div className="form-stack" key={platform}>
+          {existing.map((binding, index) => <EditBinding key={binding.id} platform={platform}
+            ordinal={index + 1} conversation={conversation} binding={binding} state={state} api={api} refresh={refresh} onSaved={setBindingMessage} />)}
+          {!existing.length && !pending.length && <EditBinding key={`empty-${platform}`} platform={platform}
+            conversation={conversation} state={state} api={api} refresh={refresh} onSaved={setBindingMessage} />}
+          {pending.map((draft, index) => <EditBinding key={draft.id} platform={platform} ordinal={existing.length + index + 1}
+            conversation={conversation} state={state} api={api} refresh={refresh}
+            onSaved={message => { setBindingMessage(message); setDrafts(current => current.filter(item => item.id !== draft.id)); }}
+            onDiscard={() => setDrafts(current => current.filter(item => item.id !== draft.id))} />)}
+          <Button onClick={() => { setBindingMessage(''); setDrafts(current => [...current, { id: crypto.randomUUID(), platform }]); }}>Добавить ещё {platformLabel(platform)}</Button>
+        </div>;
+      })}
       <SlackSyncJournal api={api} conversationId={conversation.id} />
     </div>
   );
@@ -831,8 +835,14 @@ function EditBinding({
   state,
   api,
   refresh,
+  ordinal = 1,
+  onSaved,
+  onDiscard,
 }: {
   platform: Platform;
+  ordinal?: number;
+  onSaved: (message: string) => void;
+  onDiscard?: () => void;
   conversation: Conversation;
   binding?: Binding;
   state: DashboardState;
@@ -844,14 +854,17 @@ function EditBinding({
       ? {
           endpointId: binding.endpointId,
           allowedSenderIds: binding.allowedSenderIds,
+          ...(binding.allowAllSenders !== undefined ? { allowAllSenders: binding.allowAllSenders } : {}),
+          ...(binding.requireMention !== undefined ? { requireMention: binding.requireMention } : {}),
         }
       : emptyBinding(),
   );
   const action = useAction();
-  const path = `/api/conversations/${encodeURIComponent(conversation.id)}/bindings/${platform}`;
+  const collection = `/api/conversations/${encodeURIComponent(conversation.id)}/bindings`;
+  const path = binding ? `${collection}/${encodeURIComponent(binding.id)}` : collection;
   const save = async (event: FormEvent) => {
     event.preventDefault();
-    if (value.endpointId && !value.allowedSenderIds.length) {
+    if (value.endpointId && !value.allowAllSenders && !value.allowedSenderIds.length) {
       action.setError('Разрешите хотя бы одного отправителя.');
       return;
     }
@@ -859,14 +872,14 @@ function EditBinding({
       () =>
         api.request(
           path,
-          value.endpointId ? 'PUT' : 'DELETE',
-          value.endpointId ? value : undefined,
+          value.endpointId ? binding ? 'PUT' : 'POST' : 'DELETE',
+          value.endpointId ? binding ? value : { platform, ...value } : undefined,
         ),
       value.endpointId
         ? `${platformLabel(platform)} подключён. Доступ сохранён.`
         : `${platformLabel(platform)} отвязан.`,
     );
-    if (result.ok) await refresh();
+    if (result.ok) { await refresh(); onSaved(value.endpointId ? `${platformLabel(platform)} подключён. Доступ сохранён.` : `${platformLabel(platform)} отвязан.`); }
   };
   const remove = async () => {
     const result = await action.run(
@@ -876,20 +889,21 @@ function EditBinding({
     if (result.ok) {
       setValue(emptyBinding());
       await refresh();
+      onSaved(`${platformLabel(platform)} отвязан.`);
     }
   };
   return (
-    <form className="form-section form-stack" onSubmit={save}>
+    <form className="form-section form-stack" aria-label={`Подключение ${platformLabel(platform)} ${ordinal}`} onSubmit={save}>
       <h3>
         <PlatformIcon platform={platform} />
-        {platformLabel(platform)}
+        {platformLabel(platform)}{ordinal > 1 && ` · ${ordinal}`}
       </h3>
       <BindingFields
         platform={platform}
         value={value}
         onChange={setValue}
         state={state}
-        conversationId={conversation.id}
+        bindingId={binding?.id}
         disabled={action.busy}
         api={api}
         refresh={refresh}
@@ -903,6 +917,7 @@ function EditBinding({
         >
           Сохранить {platformLabel(platform)}
         </Button>
+        {onDiscard && <Button onClick={onDiscard} disabled={action.busy}>Убрать подключение</Button>}
         {binding && (
           <Button
             variant="danger"

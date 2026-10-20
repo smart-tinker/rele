@@ -350,6 +350,149 @@ describe('Codex shared-runtime adapter', () => {
     expect(f.calls.some(call => call.method === 'thread/queue/add')).toBe(false);
   });
 
+  it.each(['0.163.0', '0.163.0-alpha.10.2'])('creates an empty-profile thread on supported %s before probing its queue', async version => {
+    const createdId = randomUUID(), cwd = '/new project';
+    const f = await fixture({
+      initialize: () => ({ userAgent: `rele/${version} (Linux)`, codexHome: '/isolated', platformFamily: 'unix', platformOs: 'linux' }),
+      'thread/list': () => ({ data: [], nextCursor: null }),
+      'thread/start': () => ({ thread: { ...rawThread, id: createdId, cwd } }),
+    });
+    await f.client.connect();
+    expect(f.client.status().queueSupported).toBe(false);
+    expect(await f.client.createThread(cwd)).toBe(createdId);
+    expect(f.client.status()).toMatchObject({ queueSupported: true, error: undefined });
+    expect(f.calls.find(call => call.method === 'thread/start')?.params).toEqual({ cwd });
+    expect(f.calls.filter(call => call.method === 'thread/queue/list').map(call => call.params)).toEqual([{ threadId: createdId, limit: 1 }]);
+    await f.client.subscribe(createdId);
+    expect(f.calls.some(call => ['thread/resume', 'turn/start', 'thread/queue/add'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it.each(['0.164.0', '0.163.0-alpha.10.3'])('refuses creation on unsupported %s without a native write', async version => {
+    const f = await fixture({ initialize: () => ({ userAgent: `rele/${version} (Linux)`, codexHome: '/isolated', platformFamily: 'unix', platformOs: 'linux' }) });
+    await f.client.connect();
+    await expect(f.client.createThread('/project')).rejects.toThrow('0.163.0');
+    expect(f.calls.some(call => call.method === 'thread/start')).toBe(false);
+  });
+
+  it('refuses disconnected creation and an empty cwd before any native write', async () => {
+    const f = await fixture();
+    await expect(f.client.createThread('/project')).rejects.toThrow('проверенный Codex');
+    await f.client.connect();
+    await expect(f.client.createThread('  ')).rejects.toThrow('каталог');
+    expect(f.calls.some(call => call.method === 'thread/start')).toBe(false);
+  });
+
+  it.each(['rpc', 'disconnect'])('returns the acknowledged new ID if its queue probe encounters %s', async failure => {
+    const createdId = randomUUID();
+    const f = await fixture({
+      'thread/list': () => ({ data: [], nextCursor: null }),
+      'thread/start': () => ({ thread: { ...rawThread, id: createdId } }),
+      'thread/queue/list': (message, socket) => {
+        if (failure === 'disconnect') socket.close();
+        else socket.send(JSON.stringify({ id: message.id, error: { code: -32600, message: 'user message queue is unavailable' } }));
+        return noResponse;
+      },
+    });
+    await f.client.connect();
+    expect(await f.client.createThread('/project')).toBe(createdId);
+    expect(f.client.status()).toMatchObject({ queueSupported: false, error: expect.any(String) });
+    expect(f.calls.filter(call => call.method === 'thread/start')).toHaveLength(1);
+    expect(f.calls.some(call => ['thread/resume', 'turn/start', 'thread/queue/add'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it('keeps an unconfirmed create ACK uncertain without retrying or probing another thread', async () => {
+    const f = await fixture({
+      'thread/list': () => ({ data: [], nextCursor: null }),
+      'thread/start': () => ({ thread: { ...rawThread, id: '' } }),
+    });
+    await f.client.connect();
+    await expect(f.client.createThread('/project')).rejects.toMatchObject({ uncertain: true, code: 'thread-start-unconfirmed' });
+    expect(f.calls.filter(call => call.method === 'thread/start')).toHaveLength(1);
+    expect(f.calls.some(call => call.method === 'thread/queue/list')).toBe(false);
+  });
+
+  it.each(['0.163.0', '0.163.0-alpha.10.2'])('names a thread on supported %s with bounded Unicode title and recovers the empty-profile queue gate', async version => {
+    const f = await fixture({
+      initialize: () => ({ userAgent: `rele/${version} (Linux)`, codexHome: '/isolated', platformFamily: 'unix', platformOs: 'linux' }),
+      'thread/list': () => ({ data: [], nextCursor: null }),
+      'thread/name/set': () => ({}),
+    });
+    await f.client.connect();
+    expect(f.client.status().queueSupported).toBe(false);
+    await f.client.setThreadName(threadId, `  ${'🧵'.repeat(205)}\n`);
+    expect(f.calls.find(call => call.method === 'thread/name/set')?.params).toEqual({ threadId, name: '🧵'.repeat(200) });
+    expect(f.client.status()).toMatchObject({ queueSupported: true, error: undefined });
+    expect(f.calls.filter(call => ['thread/name/set', 'thread/queue/list'].includes(call.method ?? '')).map(call => call.method)).toEqual(['thread/name/set', 'thread/queue/list']);
+    expect(f.calls.some(call => ['thread/start', 'thread/resume', 'turn/start', 'thread/queue/add', 'thread/inject_items'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it.each(['0.164.0', '0.163.0-alpha.10.3'])('does not rename on unsupported %s', async version => {
+    const f = await fixture({ initialize: () => ({ userAgent: `rele/${version} (Linux)`, codexHome: '/isolated', platformFamily: 'unix', platformOs: 'linux' }) });
+    await f.client.connect();
+    await expect(f.client.setThreadName(threadId, 'New title')).rejects.toThrow('0.163.0');
+    expect(f.calls.some(call => call.method === 'thread/name/set')).toBe(false);
+  });
+
+  it('requires a connected runtime, target and nonempty title before renaming', async () => {
+    const f = await fixture();
+    await expect(f.client.setThreadName(threadId, 'New title')).rejects.toThrow('проверенный Codex');
+    await f.client.connect();
+    await expect(f.client.setThreadName(threadId, ' \n\t ')).rejects.toThrow('непустое название');
+    await expect(f.client.setThreadName('', 'New title')).rejects.toThrow('идентификатор');
+    expect(f.calls.some(call => call.method === 'thread/name/set')).toBe(false);
+  });
+
+  it('preserves a name ACK if the subsequent read-only queue probe fails', async () => {
+    const f = await fixture({
+      'thread/list': () => ({ data: [], nextCursor: null }),
+      'thread/name/set': () => ({}),
+      'thread/queue/list': (message, socket) => {
+        socket.send(JSON.stringify({ id: message.id, error: { code: -32600, message: 'queue unavailable' } }));
+        return noResponse;
+      },
+    });
+    await f.client.connect();
+    await expect(f.client.setThreadName(threadId, ' Named thread ')).resolves.toBeUndefined();
+    expect(f.client.status()).toMatchObject({ queueSupported: false, error: 'queue unavailable' });
+    expect(f.calls.filter(call => call.method === 'thread/name/set')).toHaveLength(1);
+  });
+
+  it.each(['rpc', 'disconnect'])('propagates an unconfirmed name result after %s without retrying metadata or queue input', async failure => {
+    const f = await fixture({
+      'thread/list': () => ({ data: [], nextCursor: null }),
+      'thread/name/set': (message, socket) => {
+        if (failure === 'disconnect') socket.close();
+        else socket.send(JSON.stringify({ id: message.id, error: { code: -32600, message: 'name rejected' } }));
+        return noResponse;
+      },
+    });
+    await f.client.connect();
+    await expect(f.client.setThreadName(threadId, 'New title')).rejects.toMatchObject(failure === 'rpc' ? { code: -32600 } : { uncertain: true });
+    expect(f.calls.filter(call => call.method === 'thread/name/set')).toHaveLength(1);
+    expect(f.calls.some(call => ['thread/queue/list', 'thread/queue/add', 'turn/start'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it.each([undefined, null, '1792486920'])('keeps interrupted history with completedAt=%s uncertain and can later recover the answer', async completedAt => {
+    const clientId = randomUUID();
+    const f = await fixture({ 'thread/turns/list': () => ({ data: [{ id: 'turn-1', status: 'interrupted', completedAt,
+      items: [{ type: 'userMessage', clientId }] }], nextCursor: null }) });
+    await f.client.connect();
+    await expect(f.client.findRequest(threadId, clientId)).rejects.toMatchObject({ uncertain: true, code: 'turn-interruption-unconfirmed', message: expect.stringContaining('не подтвердил прерывание') });
+    f.handlers['thread/turns/list'] = () => ({ data: [{ id: 'turn-1', status: 'completed', completedAt: 1792486920,
+      items: [{ type: 'userMessage', clientId }, { type: 'agentMessage', phase: 'final_answer', text: 'OK' }] }], nextCursor: null });
+    expect(await f.client.findRequest(threadId, clientId)).toEqual({ state: 'completed', turnId: 'turn-1', text: 'OK' });
+    expect(f.calls.some(call => ['turn/interrupt', 'thread/queue/add', 'thread/queue/delete'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it('recovers a timestamped native abort without receiving its original notification', async () => {
+    const clientId = randomUUID();
+    const f = await fixture({ 'thread/turns/list': () => ({ data: [{ id: 'stopped-turn', status: 'interrupted', completedAt: 1792486920,
+      items: [{ type: 'userMessage', clientId }] }], nextCursor: null }) });
+    await f.client.connect();
+    expect(await f.client.findRequest(threadId, clientId)).toMatchObject({ state: 'interrupted', turnId: 'stopped-turn' });
+    expect(f.calls.some(call => ['turn/interrupt', 'thread/queue/add'].includes(call.method ?? ''))).toBe(false);
+  });
+
   it('recovers an accepted request from queue or paginated completed history without resending', async () => {
     const clientId = randomUUID();
     const f = await fixture({

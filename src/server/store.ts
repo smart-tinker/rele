@@ -2,10 +2,11 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { DatabaseSync, backup as backupDatabase, type SQLOutputValue } from 'node:sqlite';
-import type { Approval, Binding, Conversation, Delivery, Endpoint, InboundMessage, Origin, Platform, ReleRequest, SlackTranscriptMessage } from '../shared/types.js';
+import type { Approval, AutoLinkIntent, AutoLinkRule, Binding, Conversation, Delivery, Endpoint, InboundMessage, Origin, Platform, ReleRequest, SlackTranscriptMessage } from '../shared/types.js';
 
 type Row = Record<string, SQLOutputValue>;
-type BindingInput = { platform: Platform; endpointId: string; allowedSenderIds: string[] };
+type BindingPolicy = Pick<Binding, 'allowAllSenders' | 'requireMention'>;
+type BindingInput = { platform: Platform; endpointId: string; allowedSenderIds: string[] } & BindingPolicy;
 type DeliveryPart = Pick<Delivery, 'key' | 'ordinal' | 'kind' | 'body' | 'approvalId'>;
 type ApprovalInput = Omit<Approval, 'id' | 'status' | 'createdAt' | 'updatedAt'> & Partial<Pick<Approval, 'id' | 'status'>>;
 export interface SlackSyncStream {
@@ -115,6 +116,30 @@ const MIGRATIONS = [String.raw`
     UNIQUE(stream_id, message_id, revision)
   ) STRICT;
   CREATE INDEX slack_sync_pending ON slack_sync_entries(stream_id, state, message_order);
+`, String.raw`
+  CREATE TABLE bindings_v5 (
+    id TEXT PRIMARY KEY NOT NULL, conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    platform TEXT NOT NULL CHECK(platform IN ('slack','telegram')), endpoint_id TEXT NOT NULL UNIQUE,
+    allowed_sender_ids TEXT NOT NULL CHECK(json_valid(allowed_sender_ids) AND json_type(allowed_sender_ids) = 'array'),
+    allow_all_senders INTEGER NOT NULL DEFAULT 0 CHECK(allow_all_senders IN (0,1)),
+    require_mention INTEGER NOT NULL DEFAULT 0 CHECK(require_mention IN (0,1)),
+    FOREIGN KEY(endpoint_id, platform) REFERENCES endpoints(id, platform)
+  ) STRICT;
+  INSERT INTO bindings_v5(rowid,id,conversation_id,platform,endpoint_id,allowed_sender_ids)
+    SELECT rowid,id,conversation_id,platform,endpoint_id,allowed_sender_ids FROM bindings ORDER BY rowid;
+  DROP TABLE bindings;
+  ALTER TABLE bindings_v5 RENAME TO bindings;
+  CREATE INDEX bindings_conversation ON bindings(conversation_id,platform);
+  CREATE TABLE auto_link_intents (
+    id TEXT PRIMARY KEY NOT NULL, endpoint_id TEXT NOT NULL REFERENCES endpoints(id),
+    rule TEXT NOT NULL CHECK(json_valid(rule) AND json_type(rule) = 'object'), target_fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','creating','created','uncertain','failed','completed')),
+    thread_id TEXT, conversation_id TEXT REFERENCES conversations(id), error TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  ) STRICT;
+  CREATE UNIQUE INDEX auto_link_active_endpoint ON auto_link_intents(endpoint_id) WHERE status<>'completed';
+  ALTER TABLE inbound_events ADD COLUMN auto_link_intent_id TEXT REFERENCES auto_link_intents(id);
+  CREATE INDEX inbound_auto_link ON inbound_events(auto_link_intent_id);
 `];
 
 function required(value: string, label: string): void {
@@ -136,7 +161,14 @@ function toEndpoint(r: Row): Endpoint {
 }
 function toBinding(r: Row): Binding {
   return { id: r.id as string, conversationId: r.conversation_id as string, platform: r.platform as Platform,
-    endpointId: r.endpoint_id as string, allowedSenderIds: json(r.allowed_sender_ids) };
+    endpointId: r.endpoint_id as string, allowedSenderIds: json(r.allowed_sender_ids),
+    allowAllSenders: !!r.allow_all_senders, requireMention: !!r.require_mention };
+}
+function toAutoLinkIntent(r: Row): AutoLinkIntent {
+  return { id: r.id as string, endpointId: r.endpoint_id as string, rule: json(r.rule),
+    targetFingerprint: r.target_fingerprint as string, status: r.status as AutoLinkIntent['status'],
+    threadId: optional(r.thread_id), conversationId: optional(r.conversation_id), error: optional(r.error),
+    createdAt: r.created_at as string, updatedAt: r.updated_at as string };
 }
 function toRequest(r: Row): ReleRequest {
   return { id: r.id as string, conversationId: r.conversation_id as string, eventId: r.event_id as string,
@@ -259,19 +291,15 @@ export class Store {
   }
 
   createConversation(input: { name: string; threadId: string; cwd: string; bindings?: BindingInput[] }): Conversation {
+    return this.transaction(() => this.writeConversation(input));
+  }
+  private writeConversation(input: { name: string; threadId: string; cwd: string; bindings?: BindingInput[] }): Conversation {
     required(input.name, 'Conversation name'); required(input.threadId, 'Codex thread'); required(input.cwd, 'Working directory');
-    return this.transaction(() => {
-      const id = randomUUID(); const now = new Date().toISOString();
-      this.db.prepare('INSERT INTO conversations (id,name,thread_id,cwd,created_at,updated_at) VALUES (?,?,?,?,?,?)')
-        .run(id, input.name.trim(), input.threadId, input.cwd, now, now);
-      const platforms = new Set<Platform>();
-      for (const binding of input.bindings ?? []) {
-        if (platforms.has(binding.platform)) throw new Error('A conversation can have only one binding per platform');
-        platforms.add(binding.platform);
-        this.writeBinding(id, binding.platform, binding.endpointId, binding.allowedSenderIds);
-      }
-      return this.getConversation(id)!;
-    });
+    const id = randomUUID(); const now = new Date().toISOString();
+    this.db.prepare('INSERT INTO conversations (id,name,thread_id,cwd,created_at,updated_at) VALUES (?,?,?,?,?,?)')
+      .run(id, input.name.trim(), input.threadId, input.cwd, now, now);
+    for (const binding of input.bindings ?? []) this.writeBinding(id, binding.platform, binding.endpointId, binding.allowedSenderIds, undefined, binding);
+    return this.getConversation(id)!;
   }
   updateConversation(id: string, patch: Partial<Pick<Conversation, 'name' | 'paused'>>): Conversation {
     allowedPatch(patch, ['name', 'paused']);
@@ -290,42 +318,74 @@ export class Store {
     const row = this.db.prepare('SELECT * FROM conversations WHERE id=?').get(id);
     if (!row) return undefined;
     return { id: row.id as string, name: row.name as string, threadId: row.thread_id as string, cwd: row.cwd as string,
-      paused: Boolean(row.paused), bindings: this.db.prepare('SELECT * FROM bindings WHERE conversation_id=? ORDER BY platform').all(id).map(toBinding),
+      paused: Boolean(row.paused), bindings: this.db.prepare('SELECT * FROM bindings WHERE conversation_id=? ORDER BY platform,rowid').all(id).map(toBinding),
       createdAt: row.created_at as string, updatedAt: row.updated_at as string };
   }
   listConversations(): Conversation[] {
     return this.db.prepare('SELECT id FROM conversations ORDER BY rowid').all().map((row) => this.getConversation(row.id as string)!);
   }
 
-  private writeBinding(conversationId: string, platform: Platform, endpointId: string, allowedSenderIds: string[]): Binding {
-    const conversation = this.getConversation(conversationId);
-    if (!conversation) throw new Error('Conversation not found');
-    const previous = conversation.bindings.find(binding => binding.platform === platform);
+  getBinding(conversationId: string, bindingId: string): Binding | undefined {
+    const row = this.db.prepare('SELECT * FROM bindings WHERE conversation_id=? AND id=?').get(conversationId, bindingId);
+    return row ? toBinding(row) : undefined;
+  }
+  bindingForEndpoint(endpointId: string): Binding | undefined {
+    const row = this.db.prepare('SELECT * FROM bindings WHERE endpoint_id=?').get(endpointId);
+    return row ? toBinding(row) : undefined;
+  }
+  private writeBinding(conversationId: string, platform: Platform, endpointId: string, allowedSenderIds: string[], bindingId?: string, policy?: BindingPolicy): Binding {
+    if (!this.getConversation(conversationId)) throw new Error('Conversation not found');
+    const previous = bindingId ? this.getBinding(conversationId, bindingId) : undefined;
+    if (bindingId && !previous) throw new Error('Binding not found');
+    if (previous && previous.platform !== platform) throw new Error('Binding platform is immutable');
     const endpoint = this.getEndpoint(endpointId);
     if (!endpoint) throw new Error('Endpoint not found');
     if (endpoint.platform !== platform) throw new Error('Endpoint platform does not match the binding');
     if (!Array.isArray(allowedSenderIds)) throw new Error('Allowed senders must be an array');
     for (const senderId of allowedSenderIds) required(senderId, 'Allowed sender ID');
-    this.db.prepare(`INSERT INTO bindings (id,conversation_id,platform,endpoint_id,allowed_sender_ids) VALUES (?,?,?,?,?)
-      ON CONFLICT(conversation_id,platform) DO UPDATE SET endpoint_id=excluded.endpoint_id,allowed_sender_ids=excluded.allowed_sender_ids`)
-      .run(randomUUID(), conversationId, platform, endpointId, JSON.stringify([...new Set(allowedSenderIds)]));
+    for (const value of [policy?.allowAllSenders, policy?.requireMention]) if (value !== undefined && typeof value !== 'boolean') throw new Error('Binding policy must be boolean');
+    const inheritedPolicy = previous?.endpointId === endpointId ? previous : undefined;
+    const allowAllSenders = policy?.allowAllSenders ?? inheritedPolicy?.allowAllSenders ?? false;
+    const requireMention = policy?.requireMention ?? inheritedPolicy?.requireMention ?? false;
+    if (allowAllSenders && this.isDirectMessage(endpoint)) throw new Error('Direct messages require explicitly allowed human senders');
+    const id = previous?.id ?? randomUUID();
+    if (previous) this.db.prepare('UPDATE bindings SET endpoint_id=?,allowed_sender_ids=?,allow_all_senders=?,require_mention=? WHERE id=? AND conversation_id=?')
+      .run(endpointId, JSON.stringify([...new Set(allowedSenderIds)]), Number(allowAllSenders), Number(requireMention), id, conversationId);
+    else this.db.prepare('INSERT INTO bindings (id,conversation_id,platform,endpoint_id,allowed_sender_ids,allow_all_senders,require_mention) VALUES (?,?,?,?,?,?,?)')
+      .run(id, conversationId, platform, endpointId, JSON.stringify([...new Set(allowedSenderIds)]), Number(allowAllSenders), Number(requireMention));
     if (platform === 'slack' && previous?.endpointId !== endpointId) {
       if (previous) this.resetSlackSyncStream(conversationId, previous.endpointId);
       this.resetSlackSyncStream(conversationId, endpointId);
     }
     this.db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(new Date().toISOString(), conversationId);
-    return toBinding(this.db.prepare('SELECT * FROM bindings WHERE conversation_id=? AND platform=?').get(conversationId, platform)!);
+    return this.getBinding(conversationId, id)!;
   }
-  setBinding(conversationId: string, platform: Platform, endpointId: string, allowedSenderIds: string[]): Binding {
-    return this.transaction(() => this.writeBinding(conversationId, platform, endpointId, allowedSenderIds));
+  addBinding(conversationId: string, platform: Platform, endpointId: string, allowedSenderIds: string[], policy?: BindingPolicy): Binding {
+    return this.transaction(() => this.writeBinding(conversationId, platform, endpointId, allowedSenderIds, undefined, policy));
   }
-  removeBinding(conversationId: string, platform: Platform): void {
-    this.transaction(() => {
+  updateBinding(conversationId: string, bindingId: string, endpointId: string, allowedSenderIds: string[], policy?: BindingPolicy): Binding {
+    return this.transaction(() => {
+      const binding = this.getBinding(conversationId, bindingId);
+      if (!binding) throw new Error('Binding not found');
+      return this.writeBinding(conversationId, binding.platform, endpointId, allowedSenderIds, bindingId, policy);
+    });
+  }
+  setBinding(conversationId: string, platform: Platform, endpointId: string, allowedSenderIds: string[], policy?: BindingPolicy): Binding {
+    return this.transaction(() => {
       const conversation = this.getConversation(conversationId);
       if (!conversation) throw new Error('Conversation not found');
-      const binding = conversation.bindings.find(binding => binding.platform === platform);
-      this.db.prepare('DELETE FROM bindings WHERE conversation_id=? AND platform=?').run(conversationId, platform);
-      if (platform === 'slack' && binding) this.resetSlackSyncStream(conversationId, binding.endpointId);
+      const matches = conversation.bindings.filter(binding => binding.platform === platform);
+      if (matches.length > 1) throw new Error('Multiple bindings require a binding ID');
+      return this.writeBinding(conversationId, platform, endpointId, allowedSenderIds, matches[0]?.id, policy);
+    });
+  }
+  removeBinding(conversationId: string, bindingId: string): void {
+    this.transaction(() => {
+      if (!this.getConversation(conversationId)) throw new Error('Conversation not found');
+      const binding = this.getBinding(conversationId, bindingId);
+      if (!binding) throw new Error('Binding not found');
+      this.db.prepare('DELETE FROM bindings WHERE conversation_id=? AND id=?').run(conversationId, bindingId);
+      if (binding.platform === 'slack') this.resetSlackSyncStream(conversationId, binding.endpointId);
       this.db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(new Date().toISOString(), conversationId);
     });
   }
@@ -433,6 +493,13 @@ export class Store {
       AND (? IS NULL OR message_order<=?) ORDER BY message_order,rowid LIMIT ? OFFSET ?`)
       .all(streamId, Number(!!options.pending), new Date().toISOString(), before, before, limitValue(options.limit ?? 100), limitValue(options.offset ?? 0)).map(toSlackSyncEntry);
   }
+  listPendingSlackSyncEntries(conversationId: string, beforeMessageId?: string, limit = 10): SlackSyncEntry[] {
+    const before = beforeMessageId === undefined ? null : slackMessageOrder(beforeMessageId);
+    return this.db.prepare(`SELECT e.* FROM slack_sync_entries e JOIN slack_sync_streams s ON s.id=e.stream_id
+      WHERE s.conversation_id=? AND e.state IN ('pending','uncertain') AND (e.retry_at IS NULL OR e.retry_at<=?)
+      AND (? IS NULL OR e.message_order<=?) ORDER BY e.message_order,e.rowid LIMIT ?`)
+      .all(conversationId, new Date().toISOString(), before, before, limitValue(limit)).map(toSlackSyncEntry);
+  }
   latestSlackMessageId(streamId: string): string | undefined {
     return this.db.prepare('SELECT message_id FROM slack_sync_entries WHERE stream_id=? ORDER BY message_order DESC,rowid DESC LIMIT 1').get(streamId)?.message_id as string | undefined;
   }
@@ -493,24 +560,148 @@ export class Store {
   recordInbound(message: InboundMessage): { duplicate: boolean } {
     return this.transaction(() => ({ duplicate: this.recordEvent(message).duplicate }));
   }
-  ingest(message: InboundMessage): { request: ReleRequest | null; duplicate: boolean } {
+  private isBotMessage(message: InboundMessage): boolean {
+    return !!(message.sender.isBot || message.slack?.sender.isBot || this.getEndpoint(message.endpoint.id)?.people.some(person => person.id === message.sender.id && person.isBot));
+  }
+  private isDirectMessage(endpoint: Endpoint): boolean {
+    return endpoint.platform === 'slack' ? endpoint.chatId.startsWith('D') : /^\d+$/u.test(endpoint.chatId);
+  }
+  private acceptsRequest(message: InboundMessage, allowedSenderIds: string[], policy: BindingPolicy = {}): boolean {
+    const endpoint = message.endpoint;
+    const group = !this.isDirectMessage(endpoint);
+    const all = group && policy.allowAllSenders === true;
+    if (message.contextOnly || message.control || message.slack && message.slack.kind !== 'message') return false;
+    if (!group && (this.isBotMessage(message) || endpoint.platform === 'telegram' && message.sender.id !== endpoint.chatId)) return false;
+    if (all) {
+      const stable = endpoint.platform === 'slack' ? /^[UW][A-Z0-9]+$/u.test(message.sender.id) : /^\d+$/u.test(message.sender.id);
+      const self = message.sender.id === (endpoint.platform === 'slack' ? endpoint.accountId.split(':').at(-1) : endpoint.accountId);
+      return stable && !self && message.sender.id !== 'USLACKBOT' && (!policy.requireMention || message.directMention === true);
+    }
+    return !(this.isBotMessage(message) && !message.directMention) &&
+      (!group || !policy.requireMention || message.directMention === true) && allowedSenderIds.includes(message.sender.id);
+  }
+  private writeRequest(message: InboundMessage, binding: Binding): ReleRequest {
+    const endpoint = message.endpoint;
+    const now = new Date().toISOString();
+    const origin: Origin = { platform: endpoint.platform, accountId: endpoint.accountId, endpointId: endpoint.id,
+      chatId: endpoint.chatId, threadId: endpoint.threadId, senderId: message.sender.id, senderName: message.sender.name, messageId: message.messageId };
+    const id = randomUUID();
+    this.db.prepare(`INSERT INTO requests (id,conversation_id,event_id,origin,text,audio,status,created_at,updated_at) VALUES (?,?,?,?,?,?,'queued',?,?)`)
+      .run(id, binding.conversationId, message.eventId, JSON.stringify(origin), message.text, message.audio ? JSON.stringify(message.audio) : null, now, now);
+    if (message.slack) this.recordSlackMessageInside(message.slack, id);
+    this.db.prepare('UPDATE inbound_events SET request_id=? WHERE platform=? AND account_id=? AND event_id=?').run(id, endpoint.platform, endpoint.accountId, message.eventId);
+    return this.getRequest(id)!;
+  }
+  ingest(message: InboundMessage, auto?: { rule: AutoLinkRule; targetFingerprint: string }): { request: ReleRequest | null; duplicate: boolean; autoLinkIntent?: AutoLinkIntent } {
     return this.transaction(() => {
-      const endpoint = message.endpoint;
       const event = this.recordEvent(message);
       if (event.duplicate) return { request: event.requestId ? this.getRequest(event.requestId)! : null, duplicate: true };
+      const binding = this.bindingForEndpoint(message.endpoint.id);
+      if (binding) return { request: !this.getConversation(binding.conversationId)!.paused && this.acceptsRequest(message, binding.allowedSenderIds, binding)
+        ? this.writeRequest(message, binding) : null, duplicate: false };
+      const intent = auto && this.acceptsAutoLink(message, auto.rule) ? this.recordAutoLink(message, auto) : undefined;
+      return { request: null, duplicate: false, ...(intent ? { autoLinkIntent: intent } : {}) };
+    });
+  }
+  private acceptsAutoLink(message: InboundMessage, rule: AutoLinkRule): boolean {
+    const endpoint = message.endpoint;
+    if (!rule || typeof rule !== 'object') return false;
+    const directMessage = this.isDirectMessage(endpoint);
+    return !(directMessage && (rule.allowAllSenders || this.isBotMessage(message) || endpoint.platform === 'telegram' && message.sender.id !== endpoint.chatId)) && rule.enabled === true && !!rule.id?.trim() && !!rule.cwd?.trim() && typeof rule.requireMention === 'boolean' &&
+      rule.platform === endpoint.platform && rule.accountId === endpoint.accountId && rule.chatId === endpoint.chatId &&
+      Array.isArray(rule.allowedSenderIds) && this.acceptsRequest(message, rule.allowedSenderIds, rule) &&
+      (!rule.requireMention || directMessage || message.directMention === true) &&
+      (!!message.audio || typeof message.text === 'string' && !!message.text.trim()) &&
+      !/^(?:rele:cancel|\/rele_cancel(?:@[\w]+)?)(?:\s|$)/iu.test(message.text) &&
+      !(endpoint.platform === 'telegram' && /^\/(?:start|rele_register|rele_chats)(?:@[\w]+)?(?:\s|$)/iu.test(message.text));
+  }
+  private recordAutoLink(message: InboundMessage, auto: { rule: AutoLinkRule; targetFingerprint: string }): AutoLinkIntent | undefined {
+    required(auto.targetFingerprint, 'Codex target fingerprint');
+    let row = this.db.prepare("SELECT * FROM auto_link_intents WHERE endpoint_id=? AND status<>'completed'").get(message.endpoint.id);
+    if (row && (row.target_fingerprint !== auto.targetFingerprint || stableJson(json(row.rule)) !== stableJson(auto.rule))) return undefined;
+    if (!row) {
+      const id = randomUUID(); const now = new Date().toISOString();
+      this.db.prepare('INSERT INTO auto_link_intents(id,endpoint_id,rule,target_fingerprint,created_at,updated_at) VALUES (?,?,?,?,?,?)')
+        .run(id, message.endpoint.id, JSON.stringify(auto.rule), auto.targetFingerprint, now, now);
+      row = this.db.prepare('SELECT * FROM auto_link_intents WHERE id=?').get(id)!;
+    }
+    this.db.prepare('UPDATE inbound_events SET auto_link_intent_id=? WHERE platform=? AND account_id=? AND event_id=?')
+      .run(row.id, message.endpoint.platform, message.endpoint.accountId, message.eventId);
+    return toAutoLinkIntent(row);
+  }
+  getAutoLinkIntent(id: string): AutoLinkIntent | undefined {
+    const row = this.db.prepare('SELECT * FROM auto_link_intents WHERE id=?').get(id);
+    return row ? toAutoLinkIntent(row) : undefined;
+  }
+  listAutoLinkIntents(): AutoLinkIntent[] {
+    return this.db.prepare('SELECT * FROM auto_link_intents ORDER BY rowid').all().map(toAutoLinkIntent);
+  }
+  claimAutoLinkIntent(id: string): AutoLinkIntent | undefined {
+    return this.transaction(() => {
+      const intent = this.getAutoLinkIntent(id);
+      const endpoint = intent && this.getEndpoint(intent.endpointId);
+      const rule = intent?.rule;
+      if (!endpoint || !rule || typeof rule.id !== 'string' || !rule.id.trim() || typeof intent.targetFingerprint !== 'string' || !intent.targetFingerprint.trim()
+        || typeof rule.requireMention !== 'boolean' || rule.enabled !== true || typeof rule.cwd !== 'string' || !rule.cwd.trim() || !Array.isArray(rule.allowedSenderIds)
+        || rule.platform !== endpoint.platform || rule.accountId !== endpoint.accountId || rule.chatId !== endpoint.chatId) return undefined;
+      const changed = this.db.prepare(`UPDATE auto_link_intents SET status='creating',error=NULL,updated_at=?
+        WHERE id=? AND status='pending' AND thread_id IS NULL AND NOT EXISTS(SELECT 1 FROM bindings b WHERE b.endpoint_id=auto_link_intents.endpoint_id)`)
+        .run(new Date().toISOString(), id);
+      return changed.changes ? this.getAutoLinkIntent(id) : undefined;
+    });
+  }
+  updateAutoLinkIntent(id: string, patch: Partial<Pick<AutoLinkIntent, 'status' | 'threadId' | 'error'>>): AutoLinkIntent {
+    allowedPatch(patch, ['status', 'threadId', 'error']);
+    return this.transaction(() => {
+      const current = this.getAutoLinkIntent(id);
+      if (!current) throw new Error('Auto-link intent not found');
+      if ('threadId' in patch) {
+        required(patch.threadId!, 'Native Codex thread');
+        if (current.threadId && current.threadId !== patch.threadId) throw new Error('Native Codex thread is immutable');
+      }
+      const next = { ...current, ...patch };
+      if (next.status === 'created' && !next.threadId) throw new Error('Persist the native Codex thread before finalizing');
+      this.db.prepare('UPDATE auto_link_intents SET status=?,thread_id=?,error=?,updated_at=? WHERE id=?')
+        .run(next.status, next.threadId ?? null, next.error ?? null, new Date().toISOString(), id);
+      return this.getAutoLinkIntent(id)!;
+    });
+  }
+  finalizeAutoLinkIntent(id: string, name?: string): Conversation | undefined {
+    return this.transaction(() => {
+      const intent = this.getAutoLinkIntent(id);
+      if (!intent) throw new Error('Auto-link intent not found');
+      if (intent.status === 'completed') return intent.conversationId ? this.getConversation(intent.conversationId) : undefined;
+      let binding = this.bindingForEndpoint(intent.endpointId);
+      if (!binding) {
+        if (!intent.threadId || intent.status !== 'created') return undefined;
+        const existing = this.db.prepare('SELECT id FROM conversations WHERE thread_id=?').get(intent.threadId);
+        const conversation = existing ? this.getConversation(existing.id as string)! : this.writeConversation({
+          name: name ?? this.getEndpoint(intent.endpointId)!.title, threadId: intent.threadId, cwd: intent.rule.cwd });
+        if (conversation.cwd !== intent.rule.cwd) throw new Error('Native Codex thread belongs to another working directory');
+        binding = this.writeBinding(conversation.id, intent.rule.platform, intent.endpointId, intent.rule.allowedSenderIds, undefined, intent.rule);
+      }
+      const conversation = this.getConversation(binding.conversationId)!;
+      if (conversation.paused) {
+        this.db.prepare('UPDATE auto_link_intents SET error=?,updated_at=? WHERE id=?').run('Связка приостановлена; принятые события ожидают возобновления.', new Date().toISOString(), id);
+        return undefined;
+      }
+      this.ensureSlackSyncStreams();
+      const events = this.db.prepare('SELECT payload FROM inbound_events WHERE auto_link_intent_id=? AND request_id IS NULL ORDER BY rowid').all(id);
+      let blocked = false;
+      for (const event of events) {
+        const message = json<InboundMessage>(event.payload);
+        if (!this.acceptsRequest(message, binding.allowedSenderIds, binding)) { blocked = true; continue; }
+        this.writeRequest(message, binding);
+      }
       const now = new Date().toISOString();
-      const row = this.db.prepare(`SELECT bindings.* FROM bindings JOIN conversations ON conversations.id=bindings.conversation_id
-        WHERE bindings.endpoint_id=? AND conversations.paused=0`).get(endpoint.id);
-      const binding = row ? toBinding(row) : undefined;
-      if (message.contextOnly || (message.slack && message.slack.kind !== 'message') || ((message.sender.isBot || message.slack?.sender.isBot || this.getEndpoint(endpoint.id)?.people.some(person => person.id === message.sender.id && person.isBot)) && !message.directMention) || !binding || !binding.allowedSenderIds.length || !binding.allowedSenderIds.includes(message.sender.id)) return { request: null, duplicate: false };
-      const origin: Origin = { platform: endpoint.platform, accountId: endpoint.accountId, endpointId: endpoint.id,
-        chatId: endpoint.chatId, threadId: endpoint.threadId, senderId: message.sender.id, senderName: message.sender.name, messageId: message.messageId };
-      const id = randomUUID();
-      this.db.prepare(`INSERT INTO requests (id,conversation_id,event_id,origin,text,audio,status,created_at,updated_at) VALUES (?,?,?,?,?,?,'queued',?,?)`)
-        .run(id, binding.conversationId, message.eventId, JSON.stringify(origin), message.text, message.audio ? JSON.stringify(message.audio) : null, now, now);
-      if (message.slack) this.recordSlackMessageInside(message.slack, id);
-      this.db.prepare('UPDATE inbound_events SET request_id=? WHERE platform=? AND account_id=? AND event_id=?').run(id, endpoint.platform, endpoint.accountId, message.eventId);
-      return { request: this.getRequest(id)!, duplicate: false };
+      if (blocked) {
+        this.db.prepare('UPDATE auto_link_intents SET error=?,updated_at=? WHERE id=?').run('Текущий доступ связки не разрешает все принятые события автосоздания.', now, id);
+        return undefined;
+      }
+      const error = intent.threadId && intent.threadId !== conversation.threadId ? 'Ручная связка использована; ранее созданный Codex thread остаётся непривязанным.' : null;
+      this.db.prepare("UPDATE auto_link_intents SET status='completed',conversation_id=?,thread_id=COALESCE(thread_id,?),error=?,updated_at=? WHERE id=?")
+        .run(conversation.id, conversation.threadId, error, now, id);
+      return this.getConversation(conversation.id)!;
     });
   }
 
@@ -675,6 +866,7 @@ export class Store {
   recoverInterrupted(): { requests: number; deliveries: number } {
     return this.transaction(() => {
       const now = new Date().toISOString();
+      this.db.prepare("UPDATE auto_link_intents SET status='uncertain',error=COALESCE(error,'Native creation acknowledgement was interrupted; reconcile before retrying'),updated_at=? WHERE status='creating'").run(now);
       this.db.prepare("UPDATE slack_sync_entries SET state='pending',error=COALESCE(error,'Passive append acknowledgement was interrupted; replay may duplicate context'),updated_at=? WHERE state='applying'").run(now);
       const execution = this.db.prepare("UPDATE requests SET status='uncertain',error=COALESCE(error,'Execution interrupted; reconcile with Codex before retrying'),updated_at=? WHERE status IN ('starting','running')").run(now);
       const transcription = this.db.prepare("UPDATE requests SET status='queued',updated_at=? WHERE status='transcribing'").run(now);

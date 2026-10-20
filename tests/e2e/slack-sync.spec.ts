@@ -166,6 +166,7 @@ test('keeps other bots selectable for explicit mention-based launches while all 
   const api = await installApi(page, fixtureState(), {
     people: { 'sl-alpha': [{ items: [{ id: 'BOTOTHER', name: 'Другой агент', isBot: true }] }] },
   });
+  const bindingId = api.state.conversations[0].bindings.find(binding => binding.endpointId === 'sl-alpha')!.id;
   await openPanel(page);
   await page.getByRole('button', { name: 'Открыть связку Пример: проект Альфа' }).click();
   const slack = page.getByRole('dialog').locator('form').filter({ has: page.getByRole('heading', { name: 'Slack', exact: true }) });
@@ -179,7 +180,7 @@ test('keeps other bots selectable for explicit mention-based launches while all 
   await slack.getByRole('button', { name: 'Сохранить Slack', exact: true }).click();
   await expect(slack).toContainText('Slack подключён. Доступ сохранён.');
   expect(api.mutations).toEqual([{
-    method: 'PUT', path: '/api/conversations/conversation-0/bindings/slack',
+    method: 'PUT', path: `/api/conversations/conversation-0/bindings/${bindingId}`,
     body: { endpointId: 'sl-alpha', allowedSenderIds: ['person-anna', 'BOTOTHER'] },
   }]);
 });

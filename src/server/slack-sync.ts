@@ -120,30 +120,28 @@ export class SlackSync {
     const generation = this.generation;
     const owned = new Set<string>();
     let failed = false;
-    let remaining = 10;
+    const byId = new Map(streams.map(stream => [stream.id, stream]));
     try {
-      for (const stream of streams) {
-        for (const candidate of this.store.listSlackSyncEntries(stream.id, { pending: true, beforeMessageId: cutoff, limit: remaining })) {
+      for (const candidate of this.store.listPendingSlackSyncEntries(conversationId, cutoff)) {
+        const stream = byId.get(candidate.streamId);
+        if (!stream) { failed = true; break; }
+        const current = this.store.getSlackSyncStream(stream.id);
+        if (generation !== this.generation || this.getCodex() !== codex || !current || !this.ready(current, cutoff) ||
+          this.store.activeRequests().some(request => request.conversationId === conversationId && request.status !== 'queued')) { failed = true; break; }
+        const entry = this.store.claimSlackSyncEntry(candidate.id);
+        if (!entry) { failed = true; break; }
+        owned.add(stream.codexThreadId);
+        try {
+          await codex.injectContext(stream.codexThreadId, entry.id, quotedEntry(entry));
+          this.store.updateSlackSyncEntry(entry.id, { state: 'applied', error: undefined, retryAt: undefined });
           const current = this.store.getSlackSyncStream(stream.id);
-          if (generation !== this.generation || this.getCodex() !== codex || !current || !this.ready(current, cutoff) ||
-            this.store.activeRequests().some(request => request.conversationId === conversationId && request.status !== 'queued')) { failed = true; break; }
-          const entry = this.store.claimSlackSyncEntry(candidate.id);
-          if (!entry) { failed = true; break; }
-          owned.add(stream.codexThreadId);
-          try {
-            await codex.injectContext(stream.codexThreadId, entry.id, quotedEntry(entry));
-            this.store.updateSlackSyncEntry(entry.id, { state: 'applied', error: undefined, retryAt: undefined });
-            const current = this.store.getSlackSyncStream(stream.id);
-            if (current && this.ready(current, cutoff)) this.store.updateSlackSyncStream(stream.id, { state: 'ready', error: undefined, retryAt: undefined });
-          } catch (error) {
-            this.store.updateSlackSyncEntry(entry.id, { state: error instanceof CodexThreadBusyError ? 'pending' : 'uncertain',
-              error: errorMessage(error), retryAt: new Date(Date.now() + 5000).toISOString() });
-            this.block(stream, errorMessage(error), 5000);
-            failed = true; break;
-          }
-          remaining--;
+          if (current && this.ready(current, cutoff)) this.store.updateSlackSyncStream(stream.id, { state: 'ready', error: undefined, retryAt: undefined });
+        } catch (error) {
+          this.store.updateSlackSyncEntry(entry.id, { state: error instanceof CodexThreadBusyError ? 'pending' : 'uncertain',
+            error: errorMessage(error), retryAt: new Date(Date.now() + 5000).toISOString() });
+          this.block(stream, errorMessage(error), 5000);
+          failed = true; break;
         }
-        if (failed || !remaining) break;
       }
     } finally {
       for (const threadId of owned) {

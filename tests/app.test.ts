@@ -46,6 +46,7 @@ function makeApp() {
     resolveApproval: vi.fn().mockResolvedValue(undefined),
   };
   const codex = {
+    runtimeInfo: vi.fn().mockReturnValue({ platformOs: 'linux', platformFamily: 'unix', codexHome: '/home/example/.codex', userAgent: 'test' }),
     listThreads: vi.fn().mockResolvedValue([
       {
         id: 'thread-example',
@@ -161,7 +162,7 @@ describe('local panel request boundary', () => {
     expect(response.headers['cache-control']).toBe('no-store');
   });
 
-  it.each(['/api/state', '/api/threads', '/api/catalog/slack/chats', '/api/catalog/slack/threads?chatId=CEXAMPLE', '/api/catalog/slack/people?endpointId=example', '/api/catalog/telegram', '/api/conversations/example/slack-sync', '/api/unknown', '/api'])(
+  it.each(['/api/state', '/api/auto-links', '/api/threads', '/api/catalog/slack/chats', '/api/catalog/slack/threads?chatId=CEXAMPLE', '/api/catalog/slack/people?endpointId=example', '/api/catalog/telegram', '/api/conversations/example/slack-sync', '/api/unknown', '/api'])(
     'requires bearer authentication for %s',
     async (url) => {
       const { app } = makeApp();
@@ -824,4 +825,141 @@ describe('authenticated Slack sync journal API', () => {
       expect((await f.app.inject({ url: `/api/conversations/${conversation.id}/slack-sync?${query}`, headers })).statusCode).toBe(400);
     },
   );
+});
+
+describe('independent conversation origins', () => {
+  it('creates four origins, edits and deletes by scoped ID, rejects duplicate endpoints and ambiguous legacy routes', async () => {
+    const f = makeApp();
+    const endpoints = Array.from({ length: 5 }, (_, index): Endpoint => ({ ...f.endpoint, id: `origin-${index}`, platform: index < 2 ? 'telegram' : 'slack', accountId: `account-${index < 2 ? 'telegram' : 'slack'}`, chatId: `chat-${index}`, people: [{ id: 'anna', name: 'Анна' }, { id: 'mikhail', name: 'Михаил' }] }));
+    endpoints.forEach(endpoint => f.store.upsertEndpoint(endpoint));
+    const created = await f.app.inject({ method: 'POST', url: '/api/conversations', headers, payload: { name: 'Four origins', threadId: 'thread-example', cwd: '/work/example', bindings: endpoints.slice(0, 4).map(endpoint => ({ platform: endpoint.platform, endpointId: endpoint.id, allowedSenderIds: ['anna'] })) } });
+    expect(created.statusCode).toBe(200);
+    const conversation = created.json().conversation;
+    expect(conversation.bindings).toHaveLength(4);
+    const other = f.store.createConversation({ name: 'Other', threadId: 'thread-other', cwd: '/work/other' });
+    const selected = conversation.bindings.find((binding: { endpointId: string }) => binding.endpointId === endpoints[2].id);
+    const path = `/api/conversations/${conversation.id}/bindings/${selected.id}`;
+    expect((await f.app.inject({ method: 'PUT', url: path, headers, payload: { endpointId: endpoints[4].id, allowedSenderIds: ['mikhail'] } })).statusCode).toBe(200);
+    expect(f.store.getBinding(conversation.id, selected.id)).toMatchObject({ platform: 'slack', endpointId: endpoints[4].id, allowedSenderIds: ['mikhail'] });
+    expect(f.store.getConversation(conversation.id)?.bindings.find(binding => binding.id !== selected.id)?.allowedSenderIds).toEqual(['anna']);
+    for (const method of ['PUT', 'DELETE'] as const) expect((await f.app.inject({ method, url: `/api/conversations/${other.id}/bindings/${selected.id}`, headers, ...(method === 'PUT' ? { payload: { endpointId: endpoints[4].id, allowedSenderIds: [] } } : {}) })).statusCode).toBe(404);
+    expect((await f.app.inject({ method: 'POST', url: `/api/conversations/${conversation.id}/bindings`, headers, payload: { platform: 'slack', endpointId: endpoints[4].id, allowedSenderIds: ['anna'] } })).statusCode).toBe(409);
+    for (const method of ['PUT', 'DELETE'] as const) expect((await f.app.inject({ method, url: `/api/conversations/${conversation.id}/bindings/slack`, headers, ...(method === 'PUT' ? { payload: { endpointId: endpoints[4].id, allowedSenderIds: ['anna'] } } : {}) })).statusCode).toBe(409);
+    expect((await f.app.inject({ method: 'DELETE', url: path, headers })).statusCode).toBe(200);
+    expect(f.store.getConversation(conversation.id)?.bindings).toHaveLength(3);
+    expect((await f.app.inject({ method: 'POST', url: `/api/conversations/${conversation.id}/bindings`, headers, payload: { platform: 'slack', endpointId: endpoints[2].id, allowedSenderIds: ['mikhail'] } })).statusCode).toBe(200);
+    expect(f.store.getConversation(conversation.id)?.bindings).toHaveLength(4);
+  });
+});
+
+describe('explicit automatic conversation rules', () => {
+  const rule = { id: 'rule-example', enabled: false, platform: 'telegram' as const, accountId: 'bot-example', chatId: 'chat-example', cwd: '/work/example', allowedSenderIds: ['sender-anna'] };
+  function connected(f: ReturnType<typeof makeApp>) {
+    f.engine.channels.telegram = { state: { configured: true, connected: true, accountId: f.endpoint.accountId }, start: vi.fn(), stop: vi.fn(), deliver: vi.fn(), download: vi.fn() } as unknown as Channel;
+  }
+  it('defaults existing configs to no rules, preserves explicit opt-in and mention policy, exposes only authenticated local state', async () => {
+    const f = makeApp(); connected(f);
+    expect(mergeConfig(defaultConfig, {}).autoLinkRules).toEqual([]);
+    expect((await f.app.inject({ url: '/api/state', headers })).json().config.autoLinkRules).toEqual([]);
+    const response = await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [rule] } });
+    expect(response.statusCode).toBe(200);
+    expect(f.config.config.autoLinkRules).toEqual([{ ...rule, requireMention: true }]);
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [{ ...rule, enabled: true, requireMention: false }] } })).statusCode).toBe(200);
+    expect(f.config.config.autoLinkRules[0]).toMatchObject({ enabled: true, requireMention: false });
+    expect((await f.app.inject({ url: '/api/auto-links', headers })).json()).toEqual({ intents: [] });
+    f.engine.channels.telegram = undefined;
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [{ ...rule, requireMention: false }] } })).statusCode).toBe(200);
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [] } })).statusCode).toBe(200);
+  });
+  it.each([
+    null, [{ ...rule, arbitrary: true }], [{ ...rule, enabled: 'true' }], [{ ...rule, requireMention: 'false' }], [{ ...rule, cwd: 'relative' }], [{ ...rule, cwd: '\\\\server\\share' }], [{ ...rule, allowedSenderIds: [] }], [rule, rule], [{ ...rule, accountId: 'other-bot' }], [{ ...rule, chatId: 'unknown' }], [{ ...rule, allowedSenderIds: ['unknown'] }], [{ ...rule, cwd: 'C:\\work\\example' }],
+  ])('rejects malformed or unobserved rules without persisting: %j', async autoLinkRules => {
+    const f = makeApp(); connected(f);
+    const response = await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules } });
+    expect(response.statusCode).toBe(400);
+    expect(f.configure).not.toHaveBeenCalled();
+    expect(f.config.config.autoLinkRules).toEqual([]);
+  });
+  it('validates paths against the actual Codex OS and requires identity for shared transports', async () => {
+    const f = makeApp(); connected(f);
+    f.codex.runtimeInfo.mockReturnValue({ platformOs: 'windows', platformFamily: 'windows', codexHome: 'C:\\Users\\Example\\.codex', userAgent: 'test' });
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [{ ...rule, cwd: 'C:\\work\\example' }] } })).statusCode).toBe(200);
+    f.config.config.autoLinkRules = [];
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [rule] } })).statusCode).toBe(400);
+    f.config.config.codex = { transport: 'websocket', executable: 'codex', endpoint: 'ws://127.0.0.1:9010' };
+    f.codex.runtimeInfo.mockReturnValue(undefined as never);
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [rule] } })).statusCode).toBe(400);
+  });
+  it('loads people for a whole Slack channel before any thread exists, validates access, and fences account changes', async () => {
+    const f = makeApp();
+    const channel = { state: { configured: true, connected: true, accountId: 'TEAM:BOT' }, start: vi.fn(), stop: vi.fn(), deliver: vi.fn(), download: vi.fn(), listChats: vi.fn(), listThreads: vi.fn(), listPeople: vi.fn().mockResolvedValue({ items: [{ id: 'peer', name: 'Peer agent', isBot: true }] }) };
+    f.engine.channels.slack = channel;
+    const selected = { ...rule, platform: 'slack', accountId: 'TEAM:BOT', chatId: 'CEXAMPLE', allowedSenderIds: ['peer'] };
+    expect((await f.app.inject({ url: '/api/catalog/slack/people?chatId=CEXAMPLE', headers })).json()).toMatchObject({ items: [{ id: 'peer' }] });
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [selected] } })).statusCode).toBe(200);
+    expect(f.store.listConversations()).toEqual([]);
+    f.config.config.autoLinkRules = [];
+    channel.listPeople.mockImplementationOnce(async () => { f.engine.channels.slack = { ...channel, state: { ...channel.state, accountId: 'OTHER:BOT' } }; return { items: [{ id: 'peer', name: 'Peer' }] }; });
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [selected] } })).statusCode).toBe(409);
+    expect(f.config.config.autoLinkRules).toEqual([]);
+  });
+});
+
+describe('automatic group access and private chat boundaries', () => {
+  it('permits explicit all-participant group rules without sender IDs and preserves the generated binding policy on edits', async () => {
+    const f = makeApp();
+    const endpoint = { ...f.endpoint, id: 'group-all', chatId: '-100123', people: [] };
+    f.store.upsertEndpoint(endpoint);
+    f.engine.channels.telegram = { state: { configured: true, connected: true, accountId: endpoint.accountId } } as Channel;
+    const rule = { id: 'all-group', platform: 'telegram', accountId: endpoint.accountId, chatId: endpoint.chatId, cwd: '/work/example', enabled: true, allowAllSenders: true, allowedSenderIds: [], requireMention: false };
+    const response = await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [rule] } });
+    expect(response.statusCode).toBe(200);
+    expect(f.config.config.autoLinkRules).toEqual([rule]);
+    const conversation = f.store.createConversation({ name: 'Group policy', threadId: 'thread-example', cwd: '/work/example' });
+    const created = await f.app.inject({ method: 'POST', url: `/api/conversations/${conversation.id}/bindings`, headers, payload: { platform: 'telegram', endpointId: endpoint.id, allowedSenderIds: [], allowAllSenders: true, requireMention: true } });
+    expect(created.statusCode).toBe(200);
+    const binding = created.json().conversation.bindings[0];
+    expect(binding).toMatchObject({ allowAllSenders: true, requireMention: true });
+    const path = `/api/conversations/${conversation.id}/bindings/${binding.id}`;
+    expect((await f.app.inject({ method: 'PUT', url: path, headers, payload: { endpointId: endpoint.id, allowedSenderIds: [] } })).statusCode).toBe(200);
+    expect(f.store.getBinding(conversation.id, binding.id)).toMatchObject({ allowAllSenders: true, requireMention: true });
+    expect((await f.app.inject({ method: 'PUT', url: path, headers, payload: { endpointId: endpoint.id, allowedSenderIds: [], allowAllSenders: false, requireMention: false } })).statusCode).toBe(200);
+    expect(f.store.getBinding(conversation.id, binding.id)).toMatchObject({ allowAllSenders: false, requireMention: false });
+  });
+  it('rejects all-participant access and bots in DMs, while accepting the selected human', async () => {
+    const f = makeApp();
+    const endpoint = { ...f.endpoint, id: 'private', chatId: '123456', people: [{ id: '123456', name: 'Human' }, { id: '888', name: 'Bot', isBot: true }] };
+    f.store.upsertEndpoint(endpoint);
+    f.engine.channels.telegram = { state: { configured: true, connected: true, accountId: endpoint.accountId } } as Channel;
+    const rule = { id: 'private-rule', platform: 'telegram', accountId: endpoint.accountId, chatId: endpoint.chatId, cwd: '/work/example', enabled: true, allowedSenderIds: ['123456'], requireMention: true };
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [{ ...rule, allowAllSenders: true, allowedSenderIds: [] }] } })).statusCode).toBe(400);
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [{ ...rule, allowedSenderIds: ['888'] }] } })).statusCode).toBe(400);
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [rule] } })).statusCode).toBe(200);
+    const channel = { state: { configured: true, connected: true, accountId: 'TEAM:BOT' }, listPeople: vi.fn().mockResolvedValue({ items: [{ id: 'agent', name: 'Peer agent', isBot: true }, { id: 'human', name: 'Human' }] }) };
+    f.engine.channels.slack = channel as unknown as Channel;
+    const slack = { ...rule, id: 'slack-private', platform: 'slack', accountId: 'TEAM:BOT', chatId: 'DEXAMPLE', allowedSenderIds: ['agent'] };
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [slack] } })).statusCode).toBe(400);
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [{ ...slack, allowedSenderIds: ['human'] }] } })).statusCode).toBe(200);
+  });
+});
+
+
+describe('automatic rules remain scoped to the selected Codex target', () => {
+  it('requires disabling rules before changing the target and checks the new runtime before re-enabling', async () => {
+    const f = makeApp();
+    f.engine.channels.telegram = { state: { configured: true, connected: true, accountId: f.endpoint.accountId } } as Channel;
+    const rule = { id: 'profile-rule', platform: 'telegram', accountId: f.endpoint.accountId, chatId: f.endpoint.chatId, cwd: '/work/example', enabled: true, allowedSenderIds: ['sender-anna'], requireMention: true };
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [rule] } })).statusCode).toBe(200);
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { codex: { token: 'replacement-synthetic-token' } } })).statusCode).toBe(200);
+    const codex = { transport: 'websocket', endpoint: 'ws://127.0.0.1:9077' };
+    const rejected = await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { codex } });
+    expect(rejected.statusCode).toBe(400);
+    expect(rejected.json().error).toContain('Отключите правила');
+    expect(f.config.config.codex.transport).toBe('managed');
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { codex, autoLinkRules: [{ ...rule, enabled: false }] } })).statusCode).toBe(200);
+    f.codex.runtimeInfo.mockReturnValue({ platformOs: 'windows', platformFamily: 'windows', codexHome: 'C:\\Users\\Example\\.codex', userAgent: 'test' });
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [rule] } })).statusCode).toBe(400);
+    expect(f.config.config.autoLinkRules[0].enabled).toBe(false);
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [{ ...rule, cwd: 'C:\\work\\example' }] } })).statusCode).toBe(200);
+  });
 });

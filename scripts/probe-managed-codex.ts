@@ -1,9 +1,12 @@
 /** Fixture driver: real Rele engine/SQLite/managed transport, synthetic channels only. */
 import { parseArgs } from 'node:util';
 import { createInterface } from 'node:readline';
+import { randomUUID } from 'node:crypto';
+import { copyFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { CodexClient } from '../src/server/codex.js';
+import { CodexClient, CodexTransportError } from '../src/server/codex.js';
+import { CodexContextReceipts } from '../src/server/codex-context-receipts.js';
 import { Engine } from '../src/server/engine.js';
 import { Store } from '../src/server/store.js';
 import { defaultConfig } from '../src/server/config.js';
@@ -57,12 +60,57 @@ async function snapshot() {
     requests: store.listRequests(), deliveries: store.listDeliveries(), diagnostics,
   };
 }
+async function freshContextProof() {
+  const home = join(values.home!, '..', 'f');
+  await mkdir(home);
+  await copyFile(join(values.home!, 'config.toml'), join(home, 'config.toml'));
+  const fresh = new CodexClient({ ...config.codex, codexHome: home });
+  let pid: number | undefined;
+  let proof;
+  try {
+    await fresh.connect();
+    pid = (await fresh.diagnostics()).process.id;
+    if (fresh.status().queueSupported) throw new Error('Fresh fixture profile was not empty');
+    const thread = await fresh.createThread(values.directory!);
+    if (!fresh.status().queueSupported) throw new Error('New thread did not establish the queue gate');
+    await fresh.setThreadName(thread, 'Fresh managed fixture');
+    await fresh.releaseThread(thread);
+    const startedTurns = new Set<string>();
+    fresh.on('notification', event => {
+      if (event.method === 'turn/started' && event.params.threadId === thread && typeof event.params.turn?.id === 'string') startedTurns.add(event.params.turn.id);
+    });
+    const entryId = randomUUID(), text = `First-turn managed Slack canary ${randomUUID()}`;
+    await fresh.injectContext(thread, entryId, text);
+    const metadata = await fresh.readThread(thread) as { thread: { path: string } };
+    const receipt = await new CodexContextReceipts().has({ codexHome: home, rolloutPath: metadata.thread.path,
+      threadId: thread, itemId: `rele_slack_${entryId}`, text });
+    const passiveTurnsStarted = startedTurns.size;
+    if (!receipt || passiveTurnsStarted !== 0) throw new Error('Fresh passive context created a turn or has no persisted receipt');
+    const clientId = randomUUID();
+    await fresh.enqueue(thread, 'First authorized managed request after passive context', clientId);
+    const until = Date.now() + 25_000;
+    let found;
+    while (Date.now() < until) {
+      try { found = await fresh.findRequest(thread, clientId); }
+      catch (error) { if (!(error instanceof CodexTransportError) || error.code !== 'turn-interruption-unconfirmed') throw error; }
+      if (found?.state === 'completed') break;
+      if (found?.state === 'failed' || found?.state === 'interrupted') throw new Error('First managed request did not complete');
+      await delay(50);
+    }
+    if (found?.state !== 'completed' || startedTurns.size !== 1) throw new Error(`Fresh managed request did not complete exactly one turn: ${JSON.stringify({ state: found?.state, turnsStarted: startedTurns.size })}`);
+    proof = { queueEstablished: true, namedBeforeRelease: true, releasedBeforeContext: true, receiptBeforeFirstModel: true, passiveTurnsStarted, turnsStarted: startedTurns.size, text, answer: found.text };
+  } finally { await fresh.close(); }
+  if (pid && processAlive(pid)) throw new Error('Fresh managed child survived its awaited close');
+  return { ...proof, childExited: true };
+}
+
 const lines = createInterface({ input: process.stdin });
 try {
   await start();
   process.stdout.write(JSON.stringify({ ready: true, catalog: await codex.listThreads(), ...(await snapshot()) }) + '\n');
   for await (const line of lines) {
     const command = JSON.parse(line) as { action: string; platform?: Platform; text?: string; eventId?: string };
+    let freshContext;
     if (command.action === 'ingest') {
       const platform = command.platform!;
       if (!endpoints[platform]) throw new Error('Unknown fixture origin');
@@ -84,6 +132,8 @@ try {
       }
       if (store.activeRequests().length) throw new Error(`Fixture requests did not finish: ${JSON.stringify(store.listRequests())}`);
       await engine.settled(); await engine.pump();
+    } else if (command.action === 'fresh-context') {
+      freshContext = await freshContextProof();
     } else if (command.action === 'restart') {
       oldPid = (await codex.diagnostics()).process.id;
       await engine.stop(); await codex.close();
@@ -95,7 +145,7 @@ try {
       process.stdout.write(JSON.stringify({ stopped: true, childExited: !processAlive(pid) }) + '\n');
       break;
     } else if (command.action !== 'snapshot') throw new Error('Unknown fixture action');
-    process.stdout.write(JSON.stringify({ action: command.action, ...(oldPid ? { previousProcessId: oldPid } : {}), ...(await snapshot()) }) + '\n');
+    process.stdout.write(JSON.stringify({ action: command.action, ...(freshContext ? { freshContext } : {}), ...(oldPid ? { previousProcessId: oldPid } : {}), ...(await snapshot()) }) + '\n');
   }
 } finally {
   lines.close();

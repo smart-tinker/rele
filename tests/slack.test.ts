@@ -273,7 +273,7 @@ describe('Slack Socket Mode durability and identity', () => {
     expect(vi.mocked(message).mock.calls[1][0]).toMatchObject({ contextOnly: false, directMention: true, sender: { id: 'UANNA', isBot: true } });
   });
 
-  it('requires a fresh body mention for peer agents and never wakes itself', async () => {
+  it('reports fresh peer mentions for the binding policy and never wakes itself', async () => {
     const { socket, message } = await makeChannel();
     socket.receive(envelope('peer-passive', 'message', { user: 'UPEER', bot_id: 'BPEER', text: 'Готово', ts: '1000.1002' }));
     socket.receive(envelope('peer-block', 'message', { user: 'UPEER', bot_id: 'BPEER', text: '', blocks: [{ type: 'rich_text', elements: [{ type: 'rich_text_quote', elements: [{ type: 'user', user_id: 'UBOT' }] }] }], ts: '1000.1003' }));
@@ -281,7 +281,7 @@ describe('Slack Socket Mode durability and identity', () => {
     socket.receive(envelope('self-direct', 'message', { user: 'UBOT', text: '<@UBOT> Мой ответ', ts: '1000.1005' }));
     await vi.waitFor(() => expect(message).toHaveBeenCalledTimes(4));
     const received = vi.mocked(message).mock.calls.map(([value]) => value);
-    expect(received.map(value => value.contextOnly)).toEqual([true, true, false, true]);
+    expect(received.map(value => value.contextOnly)).toEqual([false, true, false, true]);
     expect(received.map(value => value.directMention)).toEqual([false, false, true, true]);
     expect(received[0].endpoint.people).toContainEqual({ id: 'UPEER', name: 'Бот Slack', isBot: true });
     expect(received[3].endpoint.people.some(person => person.id === 'UBOT')).toBe(false);
@@ -305,11 +305,11 @@ describe('Slack Socket Mode durability and identity', () => {
     expect(JSON.stringify(received[0].slack?.payload)).not.toMatch(/synthetic-exclude|bot_profile|reply_count|event_ts/);
   });
 
-  it.each(['> <@UBOT> цитата', '`<@UBOT>`', '``<@UBOT>``', '``a ` <@UBOT> b``', '```md\n<@UBOT>\n```', '~~~\n<@UBOT>\n~~~'])('does not wake a peer for a quoted/code-only mention: %s', async text => {
+  it.each(['> <@UBOT> цитата', '`<@UBOT>`', '``<@UBOT>``', '``a ` <@UBOT> b``', '```md\n<@UBOT>\n```', '~~~\n<@UBOT>\n~~~'])('does not treat a quoted/code-only token as a fresh peer mention: %s', async text => {
     const { socket, message } = await makeChannel();
     socket.receive(envelope('quoted-peer', 'message', { user: 'UPEER', bot_id: 'BPEER', text }));
     await vi.waitFor(() => expect(message).toHaveBeenCalledOnce());
-    expect(vi.mocked(message).mock.calls[0][0]).toMatchObject({ directMention: false, contextOnly: true });
+    expect(vi.mocked(message).mock.calls[0][0]).toMatchObject({ directMention: false, contextOnly: false });
   });
 
   it('recognizes app traffic and remembered bot roles even without a bot_message subtype', async () => {
@@ -319,7 +319,7 @@ describe('Slack Socket Mode durability and identity', () => {
     socket.receive(envelope('app-peer', 'message', { user: 'UAPP', app_id: 'AOTHER', text: 'Сводка', ts: '1000.1002' }));
     socket.receive(envelope('remember-app-role', 'message', { user: 'UAPP', text: 'Сводка в другом треде', ts: '1000.1003', thread_ts: '1000.0999' }));
     await vi.waitFor(() => expect(message).toHaveBeenCalledTimes(3));
-    for (const [received] of vi.mocked(message).mock.calls) expect(received).toMatchObject({ sender: { isBot: true }, directMention: false, contextOnly: true });
+    for (const [received] of vi.mocked(message).mock.calls) expect(received).toMatchObject({ sender: { isBot: true }, directMention: false, contextOnly: false });
   });
 
   it('persists unknown message subtypes as context without making them task candidates', async () => {
@@ -366,7 +366,7 @@ describe('Slack Socket Mode durability and identity', () => {
     const { socket, message } = await makeChannel();
     socket.receive(envelope('peer-native', 'message', { user: 'UPEER', bot_id: 'BPEER', text: '', ...payload }));
     await vi.waitFor(() => expect(message).toHaveBeenCalledOnce());
-    expect(vi.mocked(message).mock.calls[0][0]).toMatchObject({ directMention: mention, contextOnly: !mention });
+    expect(vi.mocked(message).mock.calls[0][0]).toMatchObject({ directMention: mention, contextOnly: false });
   });
 });
 

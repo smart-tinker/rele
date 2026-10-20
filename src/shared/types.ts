@@ -33,6 +33,33 @@ export interface Binding {
   platform: Platform;
   endpointId: string;
   allowedSenderIds: string[];
+  allowAllSenders?: boolean;
+  requireMention?: boolean;
+}
+
+export interface AutoLinkRule {
+  id: string;
+  enabled: boolean;
+  platform: Platform;
+  accountId: string;
+  chatId: string;
+  cwd: string;
+  allowedSenderIds: string[];
+  requireMention: boolean;
+  allowAllSenders?: boolean;
+}
+
+export interface AutoLinkIntent {
+  id: string;
+  endpointId: string;
+  rule: AutoLinkRule;
+  targetFingerprint: string;
+  status: 'pending' | 'creating' | 'created' | 'uncertain' | 'failed' | 'completed';
+  threadId?: string;
+  conversationId?: string;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface Conversation {
@@ -214,6 +241,7 @@ export interface CodexConnectionState extends ConnectionState {
 }
 
 export interface PublicConfig {
+  autoLinkRules?: AutoLinkRule[];
   codex: CodexConnectionTarget & { tokenConfigured: boolean };
   telegram: { enabled: boolean; tokenConfigured: boolean };
   slack: { enabled: boolean; botTokenConfigured: boolean; appTokenConfigured: boolean };
@@ -221,6 +249,7 @@ export interface PublicConfig {
 }
 
 export interface DashboardState {
+  autoLinks?: AutoLinkIntent[];
   version: string;
   codex: CodexConnectionState;
   connections: Record<Platform, ConnectionState>;
