@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import type { CatalogChat, CatalogPage, Person } from '../../src/shared/types';
 import { fixtureEndpoint, fixtureState, installApi, openPanel } from './fixtures';
 
 test('several independent origins share one Codex conversation and edit only their own ACL', async ({ page }) => {
@@ -149,4 +150,63 @@ test('changing an all-participant source explicitly resets both access policies 
   await expect.poll(() => api.mutations.length).toBe(1);
   expect(api.mutations[0]).toMatchObject({ method: 'PUT', body: { endpointId: 'replacement-group', allowedSenderIds: ['person-anna'], allowAllSenders: false, requireMention: false } });
   expect(binding).toMatchObject({ endpointId: 'replacement-group', allowedSenderIds: ['person-anna'], allowAllSenders: false, requireMention: false });
+});
+
+
+test('fresh partial Slack catalog makes an unavailable cached DM selectable with a human-only rule', async ({ page }) => {
+  const state = fixtureState(true);
+  state.endpoints = [{
+    ...fixtureEndpoint('observed-private', 'slack', 'Старая подпись DM', 'Личные сообщения'),
+    chatId: 'DANNA', threadId: '1770000000.100000', chatTitle: 'Устаревшее название', available: false,
+  }];
+  const warning = 'Каталог Slack частичный: не выданы разрешения mpim:read. Чтобы добавить остальные типы чатов, обновите разрешения приложения в workspace.';
+  const channel: CatalogChat = { id: 'CPUBLIC', name: '#публичный', subtitle: 'Канал', kind: 'channel' };
+  const direct: CatalogChat = { id: 'DANNA', name: 'Анна из Slack', subtitle: 'Личные сообщения', kind: 'direct' };
+  const catalog: { chats: CatalogPage<CatalogChat>[]; people: Record<string, CatalogPage<Person>[]> } = {
+    chats: [{ items: [channel], nextCursor: 'dm-page', warning }, { items: [direct] }],
+    people: { DANNA: [{ items: [{ id: 'UANNA', name: 'Анна из Slack' }, { id: 'UPEERBOT', name: 'Другой агент', isBot: true }] }] },
+  };
+  const api = await installApi(page, state, catalog);
+  const consoleErrors: string[] = [];
+  page.on('pageerror', error => consoleErrors.push(error.message));
+  page.on('console', message => { if (['error', 'warning'].includes(message.type())) consoleErrors.push(message.text()); });
+  await openPanel(page);
+  await page.getByRole('button', { name: 'Подключения', exact: true }).click();
+  await page.getByRole('button', { name: 'Добавить правило', exact: true }).click();
+  const dialog = page.getByRole('dialog');
+  const chat = dialog.getByLabel('Чат для новых разговоров');
+  const notice = dialog.getByText(warning, { exact: true });
+  await expect(notice).toBeVisible();
+  await expect(notice).toHaveClass(/notice-warning/);
+  await expect(dialog.getByRole('alert')).toHaveCount(0);
+  await expect(chat.locator('option[value="DANNA"]')).toHaveCount(0);
+  await dialog.getByRole('button', { name: 'Загрузить ещё чаты для автосоздания', exact: true }).click();
+  await expect(chat.locator('option[value="DANNA"]')).toHaveText('Анна из Slack');
+  await expect(notice).toBeVisible();
+  await expect(chat).not.toContainText('Устаревшее название');
+  await chat.selectOption('DANNA');
+  await dialog.getByLabel('Рабочая папка новых разговоров').fill('/work/private');
+  await expect(dialog.getByLabel('Другой агент')).toHaveCount(0);
+  await dialog.getByLabel('Анна из Slack', { exact: true }).check();
+  await dialog.getByLabel('Разрешить автоматическое создание новых разговоров в этом чате').check();
+  await page.screenshot({ path: test.info().outputPath('dm-catalog-desktop.png') });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(notice).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: test.info().outputPath('dm-catalog-mobile.png') });
+  await page.setViewportSize({ width: 1536, height: 1024 });
+  // A fresh complete response clears the earlier warning without losing the selected DM.
+  catalog.chats = [{ items: [channel, direct] }];
+  await dialog.getByRole('button', { name: 'Обновить чаты для автосоздания', exact: true }).click();
+  await expect(notice).toHaveCount(0);
+  await expect(chat).toHaveValue('DANNA');
+  await expect(dialog.getByLabel('Анна из Slack', { exact: true })).toBeChecked();
+  await dialog.getByRole('button', { name: 'Сохранить правило', exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  expect(api.mutations).toEqual([{ method: 'PUT', path: '/api/config', body: { autoLinkRules: [{
+    id: expect.any(String), enabled: true, platform: 'slack', accountId: 'slack-test-account', chatId: 'DANNA',
+    cwd: '/work/private', allowedSenderIds: ['UANNA'], requireMention: true, allowAllSenders: false,
+  }] } }]);
+  expect(state.config.autoLinkRules).toHaveLength(1);
+  expect(consoleErrors).toEqual([]);
 });

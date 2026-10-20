@@ -42,6 +42,7 @@ export function useCatalog<T extends { id: string }>(
     path?: string;
     items: T[];
     nextCursor?: string;
+    warning?: string;
     loading: boolean;
     error: string;
   }>({ items: [], loading: false, error: '' });
@@ -57,6 +58,7 @@ export function useCatalog<T extends { id: string }>(
         path,
         items: current.path === path ? current.items : [],
         nextCursor: current.path === path ? current.nextCursor : undefined,
+        warning: current.path === path ? current.warning : undefined,
         loading: true,
         error: '',
       }));
@@ -78,6 +80,7 @@ export function useCatalog<T extends { id: string }>(
               ? mergeItems(current.items, page.items)
               : page.items,
           nextCursor: page.nextCursor,
+          warning: page.warning ?? (cursor && current.path === path ? current.warning : undefined),
           loading: false,
           error: '',
         }));
@@ -101,7 +104,7 @@ export function useCatalog<T extends { id: string }>(
   const current =
     result.path === path
       ? result
-      : { items: [] as T[], loading: !!path, error: '', nextCursor: undefined };
+      : { items: [] as T[], loading: !!path, error: '', nextCursor: undefined, warning: undefined };
   return {
     ...current,
     reload: () => void load(),
@@ -117,6 +120,7 @@ export function CatalogControls({
   catalog: {
     loading: boolean;
     error: string;
+    warning?: string;
     nextCursor?: string;
     reload: () => void;
     loadMore: () => void;
@@ -152,6 +156,7 @@ export function CatalogControls({
           Загружаем {label}…
         </p>
       )}
+      {catalog.warning && <Notice tone="warning">{catalog.warning}</Notice>}
       {catalog.error && <Notice>{catalog.error}</Notice>}
     </>
   );

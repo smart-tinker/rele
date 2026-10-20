@@ -1,7 +1,7 @@
 export type Platform = 'telegram' | 'slack';
 export interface Person { id: string; name: string; isBot?: boolean }
 
-export interface CatalogPage<T> { items: T[]; nextCursor?: string }
+export interface CatalogPage<T> { items: T[]; nextCursor?: string; warning?: string }
 export interface CatalogChat {
   id: string;
   name: string;
