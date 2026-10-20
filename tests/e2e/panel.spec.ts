@@ -606,6 +606,8 @@ test('Slack catalog pages discover a direct chat, threads and explicit people wi
             platform: 'slack',
             endpointId: target.id,
             allowedSenderIds: ['person-mikhail'],
+            allowAllSenders: false,
+            requireMention: false,
           },
         ],
       },
