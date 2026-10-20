@@ -305,7 +305,7 @@ export class Engine extends EventEmitter {
     if (this.provisioning.has(intent.id)) return;
     this.provisioning.add(intent.id);
     const client = this.codex;
-    let persistedThreadId: string | undefined;
+    let releasableThreadId: string | undefined;
     const allowed = () => {
       const config = this.options.config();
       const rule = config.autoLinkRules?.find(rule => rule.id === intent.rule.id);
@@ -315,7 +315,13 @@ export class Engine extends EventEmitter {
     };
     try {
       // A manual binding can resolve even a lost native create ACK, using its current ACL.
-      if (this.store.bindingForEndpoint(intent.endpointId)) { this.store.finalizeAutoLinkIntent(intent.id); return; }
+      const manual = this.store.bindingForEndpoint(intent.endpointId);
+      if (manual) {
+        // A manually chosen target abandons the unused auto-created thread, even if still lazy.
+        if (intent.threadId && intent.threadId !== this.store.getConversation(manual.conversationId)!.threadId &&
+            this.targetFingerprint() === intent.targetFingerprint && client.status().connected && client.isVerifiedVersion()) releasableThreadId = intent.threadId;
+        this.store.finalizeAutoLinkIntent(intent.id); return;
+      }
       if (intent.status !== 'pending' && intent.status !== 'created') return;
       if (!allowed() || !client.status().connected || !client.isVerifiedVersion()) {
         const error = !client.status().connected || !client.isVerifiedVersion()
@@ -334,15 +340,15 @@ export class Engine extends EventEmitter {
       if (!threadId) return;
       // A new native thread is lazy: metadata must materialize it before releasing its writer.
       await client.setThreadName(threadId, this.store.getEndpoint(intent.endpointId)!.title);
-      persistedThreadId = threadId;
+      releasableThreadId = threadId;
       if (allowed()) this.store.finalizeAutoLinkIntent(intent.id);
     } catch (error) {
       const current = this.store.getAutoLinkIntent(intent.id)!;
       // thread/start has no client idempotency key: never repeat an unknown result.
       this.store.updateAutoLinkIntent(intent.id, { status: current.threadId ? 'created' : error instanceof CodexRpcError ? 'failed' : 'uncertain', error: this.options.redact(error) });
     } finally {
-      if (persistedThreadId) {
-        try { await client.releaseThread(persistedThreadId); }
+      if (releasableThreadId) {
+        try { await client.releaseThread(releasableThreadId); }
         catch (error) { this.emit('diagnostic', this.options.redact(error)); }
       }
       this.provisioning.delete(intent.id); this.changed();

@@ -1013,6 +1013,18 @@ describe('automatic native thread creation', () => {
     expect(f.store.bindingForEndpoint(f.endpoint.id)).toBeDefined();
   });
 
+  it('releases an unused lazy thread when a manual binding resolves a failed metadata checkpoint', async () => {
+    const f = autoFixture(); f.codex.setThreadName.mockRejectedValueOnce(new CodexTransportError('Lost metadata ACK'));
+    await f.engine.receive(f.incoming()); await f.engine.settled();
+    expect(f.codex.releaseThread).not.toHaveBeenCalledWith('auto-created-thread');
+    f.store.addBinding(f.conversation.id, 'telegram', f.endpoint.id, ['123']);
+    await f.engine.pump();
+    expect(f.store.bindingForEndpoint(f.endpoint.id)?.conversationId).toBe(f.conversation.id);
+    expect(f.codex.releaseThread).toHaveBeenCalledWith('auto-created-thread');
+    expect(f.codex.createThread).toHaveBeenCalledOnce();
+    expect(f.codex.setThreadName).toHaveBeenCalledOnce();
+  });
+
   it('prefers a manual binding that appeared while native creation was in flight', async () => {
     const f = autoFixture(); const gate = deferred<string>(); f.codex.createThread.mockReturnValue(gate.promise);
     await f.engine.receive(f.incoming());
