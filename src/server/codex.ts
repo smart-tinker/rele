@@ -38,7 +38,7 @@ export interface RequestLocation {
 export interface CodexRuntime { userAgent: string; codexHome: string; platformFamily: string; platformOs: string }
 interface QueueEntry { id: string; clientUserMessageId: string }
 interface HistoryItem { type: string; clientId?: string | null; text?: string; phase?: string | null }
-interface HistoryTurn { id: string; status: string; items: HistoryItem[] }
+interface HistoryTurn { id: string; status: string; completedAt?: number | null; items: HistoryItem[] }
 interface Page<T> { data: T[]; nextCursor: string | null }
 interface RawThread {
   id: string; name?: string | null; cwd: string; preview: string; updatedAt: number;
@@ -161,6 +161,42 @@ export class CodexClient extends EventEmitter {
       name: row.name?.trim() || row.preview?.replace(/\s+/gu, ' ').trim().slice(0, 100) || 'Без названия',
       cwd: row.cwd, preview: row.preview || '', updatedAt: row.updatedAt, status: row.status?.type, archived,
     }));
+  }
+
+  /** Create only an explicitly requested conversation; never use this as a resume fallback. */
+  async createThread(cwd: string): Promise<string> {
+    if (!cwd.trim()) throw new Error('Укажите рабочий каталог нового разговора Codex.');
+    if (!this.state.connected || !this.isVerifiedVersion()) {
+      throw new Error(this.state.error || `Для создания разговора нужен проверенный Codex ${SUPPORTED_CODEX_VERSIONS.join(' или ')}.`);
+    }
+    const response = await this.call<{ thread: RawThread }>('thread/start', { cwd });
+    const thread = response?.thread;
+    if (!thread || typeof thread.id !== 'string' || !thread.id.trim() || !isBindableThread(thread)) {
+      throw new CodexTransportError('Codex не подтвердил идентификатор нового разговора. Проверьте список разговоров перед повтором.', 'thread-start-unconfirmed');
+    }
+    this.subscriptions.add(thread.id);
+    this.subscribed.set(thread.id, Promise.resolve());
+    this.setState({ queueSupported: false, error: undefined });
+    try { await this.probeQueue([thread]); }
+    catch (error) { this.setState({ queueSupported: false, error: this.safeMessage(error) }); }
+    // Preserve the acknowledged ID even if the read-only queue probe fails.
+    return thread.id;
+  }
+
+  /** Native metadata writes also persist a newly created thread before its writer is released. */
+  async setThreadName(threadId: string, name: string): Promise<void> {
+    if (!this.state.connected || !this.isVerifiedVersion()) {
+      throw new Error(this.state.error || `Для названия разговора нужен проверенный Codex ${SUPPORTED_CODEX_VERSIONS.join(' или ')}.`);
+    }
+    const title = [...name.replace(/\p{Cc}/gu, ' ').trim()].slice(0, 200).join('');
+    if (!threadId.trim() || !title) throw new Error('Нужны идентификатор и непустое название разговора Codex.');
+    await this.call('thread/name/set', { threadId, name: title });
+    if (!this.state.queueSupported) {
+      try {
+        await this.call('thread/queue/list', { threadId, limit: 1 });
+        this.setState({ queueSupported: true, error: undefined });
+      } catch (error) { this.setState({ queueSupported: false, error: this.safeMessage(error) }); }
+    }
   }
 
   /** Metadata only: reading does not load a thread or wake its persisted queue. */
@@ -365,6 +401,10 @@ export class CodexClient extends EventEmitter {
         const mixed = turn.items.some(item => item.type === 'userMessage' && item.clientId !== clientId);
         const state = turn.status === 'inProgress' ? 'running' : turn.status;
         if (!['running', 'completed', 'failed', 'interrupted'].includes(state)) throw new Error('Неизвестное состояние хода Codex.');
+        // Native history can normalize a live snapshot to interrupted without a terminal event.
+        if (state === 'interrupted' && (typeof turn.completedAt !== 'number' || !Number.isFinite(turn.completedAt))) {
+          throw new CodexTransportError('Codex пока не подтвердил прерывание запроса. Ожидается сверка завершения без повторной отправки.', 'turn-interruption-unconfirmed');
+        }
         const answers = turn.items.filter(item => item.type === 'agentMessage' && item.phase === 'final_answer');
         const legacy = turn.items.filter(item => item.type === 'agentMessage' && item.phase == null);
         return {
@@ -544,7 +584,7 @@ export class CodexClient extends EventEmitter {
     }
   }
 
-  private isVerifiedVersion(): boolean {
+  isVerifiedVersion(): boolean {
     return SUPPORTED_CODEX_VERSIONS.some(version => version === this.version);
   }
 

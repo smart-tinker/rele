@@ -5,6 +5,7 @@ import type {
   DashboardState,
 } from '../shared/types';
 import { ReleApi } from './client';
+import { AutoLinks } from './AutoLinks';
 import { useAction } from './hooks';
 import { useCodexThreads } from './useCodexThreads';
 import {
@@ -69,6 +70,7 @@ export function Connections({
       <div className="settings-list">
         <TelegramSettings state={state} api={api} refresh={refresh} />
         <SlackSettings state={state} api={api} refresh={refresh} />
+        <AutoLinks state={state} api={api} refresh={refresh} />
         <VoiceSettings state={state} api={api} refresh={refresh} />
       </div>
     </>

@@ -37,7 +37,7 @@ describe('durable Slack passive sync', () => {
     f.trigger(f.message('110.000000', 'Real Slack message'));
     f.store.recordInbound({ control: 'stop', eventId: 'agent-session-stopped:Ev1', endpoint: f.endpoint,
       sender: f.endpoint.people[0], messageId: '120.000000', text: '' });
-    f.store.removeBinding(f.conversation.id, 'slack');
+    f.store.removeBinding(f.conversation.id, f.store.getConversation(f.conversation.id)!.bindings.find(binding => binding.endpointId === f.endpoint.id)!.id);
     const rebound = f.store.createConversation({ name: 'New binding', threadId: 'other-codex', cwd: '/project',
       bindings: [{ platform: 'slack', endpointId: f.endpoint.id, allowedSenderIds: ['U1'] }] });
     const stream = f.store.listSlackSyncStreams().find(row => row.conversationId === rebound.id)!;
@@ -189,7 +189,7 @@ describe('durable Slack passive sync', () => {
     await f.sync.backfill(); expect(f.readThreadPage).not.toHaveBeenCalled();
     expect(await f.sync.drain(f.conversation.id)).toBe(false);
     f.store.updateConversation(f.conversation.id, { paused: false });
-    f.store.removeBinding(f.conversation.id, 'slack');
+    f.store.removeBinding(f.conversation.id, f.store.getConversation(f.conversation.id)!.bindings.find(binding => binding.endpointId === f.endpoint.id)!.id);
     const next = f.store.createConversation({ name: 'New owner', threadId: 'other-codex', cwd: '/other', bindings: [{ platform: 'slack', endpointId: f.endpoint.id, allowedSenderIds: ['U1'] }] });
     const fresh = f.store.recordSlackMessage(f.message('120.000000', 'New owner only'))!;
     expect(f.store.getSlackSyncStream(old.streamId)).toMatchObject({ active: false, codexThreadId: 'original-codex' });
@@ -203,7 +203,7 @@ describe('durable Slack passive sync', () => {
   it('rescans old edits after a same-target unbind and rebind between pump ticks', async () => {
     const f = fixture(); const original = f.store.recordSlackMessage(f.message())!;
     await f.sync.backfill(); expect(await f.sync.drain(f.conversation.id)).toBe(true);
-    f.store.removeBinding(f.conversation.id, 'slack');
+    f.store.removeBinding(f.conversation.id, f.store.getConversation(f.conversation.id)!.bindings.find(binding => binding.endpointId === f.endpoint.id)!.id);
     const edited = f.message(original.messageId, 'Edited while unbound', { kind: 'edit', payload: { text: 'Edited while unbound', edited: { ts: '201.000000' } } });
     expect(f.store.ingest({ eventId: 'message_changed:unbound', endpoint: f.endpoint, sender: edited.sender,
       messageId: edited.messageId, text: edited.text, slack: edited, contextOnly: true, directMention: true }).request).toBeNull();
@@ -229,7 +229,7 @@ describe('durable Slack passive sync', () => {
     f.readThreadPage.mockImplementationOnce(() => new Promise((done, fail) => { resolve = done; reject = fail; }));
     advance(); const inFlight = f.sync.backfill();
     expect(f.readThreadPage.mock.calls.at(-1)?.[1]?.oldest).toBe('200.000000');
-    f.store.removeBinding(f.conversation.id, 'slack');
+    f.store.removeBinding(f.conversation.id, f.store.getConversation(f.conversation.id)!.bindings.find(binding => binding.endpointId === f.endpoint.id)!.id);
     f.store.setBinding(f.conversation.id, 'slack', f.endpoint.id, ['U1']);
     if (result === 'page') resolve({ messages: [f.message('150.000000', 'Stale page')] });
     else reject(new ChannelError('Stale rate limit', true, false, 7000, 429));
@@ -248,7 +248,7 @@ describe('durable Slack passive sync', () => {
   it.each(['proxy', 'websocket'] as const)('allows %s after Slack is detached and fully applied, but retains pending original-destination context', async transport => {
     const f = fixture(); f.store.recordSlackMessage(f.message());
     await f.sync.backfill(); await f.sync.drain(f.conversation.id);
-    f.store.removeBinding(f.conversation.id, 'slack');
+    f.store.removeBinding(f.conversation.id, f.store.getConversation(f.conversation.id)!.bindings.find(binding => binding.endpointId === f.endpoint.id)!.id);
     f.status.transport = transport;
     const status = vi.spyOn(f.codex, 'status');
     expect(await f.sync.drain(f.conversation.id)).toBe(true);
@@ -257,7 +257,7 @@ describe('durable Slack passive sync', () => {
     f.store.setBinding(f.conversation.id, 'slack', f.endpoint.id, ['U1']);
     const pending = f.store.recordSlackMessage(f.message('120.000000', 'Captured before detach'))!;
     f.store.updateSlackSyncEntry(pending.id, { state: 'uncertain', retryAt: new Date(Date.now() + 5000).toISOString() });
-    f.store.removeBinding(f.conversation.id, 'slack');
+    f.store.removeBinding(f.conversation.id, f.store.getConversation(f.conversation.id)!.bindings.find(binding => binding.endpointId === f.endpoint.id)!.id);
     expect(await f.sync.drain(f.conversation.id, '110.000000')).toBe(true);
     expect(await f.sync.drain(f.conversation.id)).toBe(false);
     expect(f.store.getSlackSyncEntry(pending.id)?.state).toBe('uncertain');
@@ -280,7 +280,7 @@ describe('durable Slack passive sync', () => {
     const draining = f.sync.drain(f.conversation.id, entry.messageId);
     await Promise.resolve();
     if (phase === 'release') expect(f.codex.releaseThread).toHaveBeenCalledTimes(1);
-    f.store.removeBinding(f.conversation.id, 'slack');
+    f.store.removeBinding(f.conversation.id, f.store.getConversation(f.conversation.id)!.bindings.find(binding => binding.endpointId === f.endpoint.id)!.id);
     f.store.setBinding(f.conversation.id, 'slack', f.endpoint.id, ['U1']);
     resolve();
     expect(await draining).toBe(false);
@@ -359,4 +359,23 @@ it('fences a stale in-flight page and finishes its old window before rescanning 
   advance(); await f.sync.backfill();
   expect(f.readThreadPage.mock.calls.at(-1)?.[1]?.oldest).toBeUndefined();
   expect(await f.sync.drain(f.conversation.id)).toBe(true);
+});
+
+
+it('merges multiple Slack streams in durable timestamp and revision order within a fixed cutoff', async () => {
+  const f = fixture();
+  const second = { ...f.endpoint, id: 'endpoint-2', threadId: '90.000000' };
+  f.store.upsertEndpoint(second); f.store.addBinding(f.conversation.id, 'slack', second.id, ['U1']);
+  const other = (messageId: string, text: string, extra: Partial<SlackTranscriptMessage> = {}) => f.message(messageId, text,
+    { endpointId: second.id, threadId: second.threadId, ...extra });
+  f.store.recordSlackMessage(f.message('110.000000', 'first-stream'));
+  f.store.recordSlackMessage(other('100.000000', 'second-stream-old'));
+  f.store.recordSlackMessage(other('100.000000', 'second-stream-edit', { kind: 'edit', payload: { edited: { ts: '101.000000' } } }));
+  f.store.recordSlackMessage(f.message('300.000000', 'beyond-fixed-cutoff'));
+  await f.sync.backfill(); advance(); await f.sync.backfill();
+  expect(await f.sync.drain(f.conversation.id, '120.000000')).toBe(true);
+  const applied = f.codex.injectContext.mock.calls.map(([, , text]) => JSON.parse(text.split('<untrusted_text>\n')[1].split('\n</untrusted_text>')[0]));
+  expect(applied.map(entry => entry.text)).toEqual(['second-stream-old', 'second-stream-edit', 'first-stream']);
+  expect(f.store.listSlackSyncStreams().flatMap(stream => f.store.listSlackSyncEntries(stream.id)).find(entry => entry.messageId === '300.000000')?.state).toBe('pending');
+  expect(f.codex.releaseThread).toHaveBeenCalledExactlyOnceWith('original-codex');
 });

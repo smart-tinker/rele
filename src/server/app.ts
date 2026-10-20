@@ -2,6 +2,7 @@ import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
 import { existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
+import path from 'node:path';
 import type { AppConfig, ConfigStore } from './config.js';
 import { mergeConfig, publicConfig } from './config.js';
 import type { Store } from './store.js';
@@ -15,7 +16,7 @@ export interface AppServices {
   store: Store;
   config: ConfigStore;
   engine: Engine;
-  codex: () => Pick<CodexClient, 'listThreads' | 'connect' | 'status'>;
+  codex: () => Pick<CodexClient, 'listThreads' | 'connect' | 'status'> & Partial<Pick<CodexClient, 'runtimeInfo'>>;
   configure: (next: AppConfig) => Promise<void>;
   version: string;
   webDirectory?: string;
@@ -103,6 +104,8 @@ export function createApp(services: AppServices) {
   app.get('/api/codex/discovery', async () => (services.discoverCodex ?? discoverCodex)(
     config.config.codex.codexHome ? { codexHome: config.config.codex.codexHome } : undefined,
   ));
+  const autoLinks = () => store.listAutoLinkIntents().slice(-250).reverse().map(intent => ({ ...intent, ...(intent.error ? { error: config.redact(intent.error) } : {}) }));
+  app.get('/api/auto-links', async () => ({ intents: autoLinks() }));
   app.get('/api/state', async (): Promise<DashboardState> => ({
     version: services.version,
     codex: services.codex().status(),
@@ -110,6 +113,7 @@ export function createApp(services: AppServices) {
       telegram: engine.channels.telegram?.state ?? { configured: !!config.config.telegram.token, connected: false },
       slack: engine.channels.slack?.state ?? { configured: !!config.config.slack.botToken && !!config.config.slack.appToken, connected: false },
     },
+    autoLinks: autoLinks(),
     conversations: store.listConversations(), endpoints: store.listEndpoints().map(endpoint => ({ ...endpoint, title: store.getMeta(`endpoint-alias:${endpoint.id}`) || endpoint.title })), requests: store.listRequests(250), deliveries: store.listDeliveries(500), approvals: store.listApprovals(250), config: publicConfig(config.config),
   }));
   app.get('/api/threads', async request => {
@@ -121,6 +125,15 @@ export function createApp(services: AppServices) {
     if (services.codex() !== codex) throw new ApiError(409, 'Подключение Codex изменилось. Обновите список разговоров.');
     return { threads };
   });
+  const peopleCatalog = new Map<string, { channel: unknown; people: Map<string, boolean> }>();
+  function rememberPeople(channel: unknown, accountId: string, chatId: string, people: Array<{ id: string; isBot?: boolean }>) {
+    const key = JSON.stringify([accountId, chatId]);
+    const known = peopleCatalog.get(key);
+    const entry = known && known.channel === channel ? known : { channel, people: new Map<string, boolean>() };
+    people.forEach(person => entry.people.set(person.id, !!person.isBot || !!entry.people.get(person.id)));
+    peopleCatalog.set(key, entry);
+    while (peopleCatalog.size > 100) peopleCatalog.delete(peopleCatalog.keys().next().value!);
+  }
   function slackCatalog() {
     const channel = engine.channels.slack;
     if (!channel?.state.connected || !channel.listChats || !channel.listThreads || !channel.listPeople) throw new ApiError(503, 'Подключите Slack в разделе «Подключения», чтобы загрузить каталог.');
@@ -149,14 +162,20 @@ export function createApp(services: AppServices) {
     return { ...page, items: page.items.map(namedEndpoint) };
   });
   app.get('/api/catalog/slack/people', async request => {
-    const { query, cursor } = catalogQuery(request.query, ['endpointId']);
+    const { query, cursor } = catalogQuery(request.query, ['endpointId', 'chatId']);
     const channel = slackCatalog();
-    const endpoint = store.getEndpoint(string(query.endpointId, 'обсуждение Slack', 200));
-    if (!endpoint || endpoint.platform !== 'slack' || endpoint.accountId !== channel.state.accountId) throw new ApiError(404, 'Обсуждение не относится к подключённому Slack. Обновите каталог.');
-    const page = await channel.listPeople(endpoint.chatId, cursor);
-    if (engine.channels.slack !== channel) throw new ApiError(409, 'Подключение Slack изменилось. Обновите каталог.');
-    const current = store.getEndpoint(endpoint.id)!;
-    store.upsertEndpoint({ ...current, people: page.items });
+    if ((query.endpointId === undefined) === (query.chatId === undefined)) throw new ApiError(400, 'Выберите чат или обсуждение Slack.');
+    const endpoint = query.endpointId === undefined ? undefined : store.getEndpoint(string(query.endpointId, 'обсуждение Slack', 200));
+    if (query.endpointId !== undefined && (!endpoint || endpoint.platform !== 'slack' || endpoint.accountId !== channel.state.accountId)) throw new ApiError(404, 'Обсуждение не относится к подключённому Slack. Обновите каталог.');
+    const chatId = endpoint?.chatId ?? string(query.chatId, 'канал Slack', 200);
+    const accountId = channel.state.accountId!;
+    const page = await channel.listPeople(chatId, cursor);
+    if (engine.channels.slack !== channel || channel.state.accountId !== accountId) throw new ApiError(409, 'Подключение Slack изменилось. Обновите каталог.');
+    rememberPeople(channel, accountId, chatId, page.items);
+    if (endpoint) {
+      const current = store.getEndpoint(endpoint.id)!;
+      store.upsertEndpoint({ ...current, people: page.items });
+    }
     return page;
   });
   app.get('/api/catalog/telegram', async () => engine.channels.telegram?.discoveryInfo?.() ?? { command: '/rele_register' });
@@ -175,13 +194,48 @@ export function createApp(services: AppServices) {
   app.put('/api/config', async request => {
     if (configuring) throw new ApiError(409, 'Настройки уже сохраняются.');
     configuring = true;
-    try { const next = mergeConfig(config.config, request.body); await services.configure(next); return { config: publicConfig(config.config) }; }
+    try { const next = mergeConfig(config.config, request.body); await validateAutoLinkRules(next); await services.configure(next); return { config: publicConfig(config.config) }; }
     finally { configuring = false; }
   });
 
+  async function validateAutoLinkRules(next: AppConfig) {
+    const target = (value: AppConfig) => JSON.stringify([value.codex.transport, value.codex.executable, value.codex.endpoint, value.codex.codexHome ?? '']);
+    const targetChanged = target(next) !== target(config.config);
+    if (targetChanged && next.autoLinkRules.some(rule => rule.enabled)) throw new ApiError(400, 'Отключите правила автосоздания, затем смените подключение Codex, проверьте рабочие папки и включите правила заново.');
+    if (targetChanged) return;
+    const codex = services.codex();
+    for (const rule of next.autoLinkRules) {
+      const previous = config.config.autoLinkRules?.find(candidate => candidate.id === rule.id);
+      if (previous && JSON.stringify(previous) === JSON.stringify(rule)) continue;
+      // Disabling an existing rule must remain possible while its connector is offline.
+      if (previous && !rule.enabled && JSON.stringify({ ...previous, enabled: false }) === JSON.stringify(rule)) continue;
+      const runtime = codex.runtimeInfo?.();
+      const os = runtime?.platformOs ?? (config.config.codex.transport === 'managed' ? process.platform : undefined);
+      const absolute = os === 'windows' || os === 'win32' ? /^[A-Za-z]:[\\/]/u.test(rule.cwd)
+        : os && ['linux', 'macos', 'darwin', 'freebsd', 'openbsd'].includes(os) ? path.posix.isAbsolute(rule.cwd) && !rule.cwd.startsWith('//') : false;
+      if (!codex.status().connected || !absolute) throw new ApiError(400, 'Подключите Codex и укажите абсолютную рабочую папку его операционной системы.');
+      const channel = engine.channels[rule.platform];
+      if (!next[rule.platform].enabled || !channel?.state.connected || channel.state.accountId !== rule.accountId) throw new ApiError(400, 'Правило должно относиться к текущему подключённому боту.');
+      const endpoints = store.listEndpoints().filter(endpoint => endpoint.platform === rule.platform && endpoint.accountId === rule.accountId && endpoint.chatId === rule.chatId && endpoint.available !== false);
+      let people = new Map(endpoints.flatMap(endpoint => endpoint.people.map(person => [person.id, !!person.isBot] as const)));
+      if (rule.platform === 'slack') {
+        if (!channel.listPeople) throw new ApiError(400, 'Каталог участников Slack недоступен.');
+        // This read also verifies that the selected channel is currently available to this bot.
+        const page = await channel.listPeople(rule.chatId);
+        if (engine.channels.slack !== channel || channel.state.accountId !== rule.accountId || services.codex() !== codex) throw new ApiError(409, 'Подключение изменилось. Обновите каталог.');
+        rememberPeople(channel, rule.accountId, rule.chatId, page.items);
+        people = peopleCatalog.get(JSON.stringify([rule.accountId, rule.chatId]))!.people;
+      } else if (!endpoints.length) throw new ApiError(400, 'Выберите доступный обнаруженный чат Telegram.');
+      if (rule.allowedSenderIds.some(id => !people.has(id))) throw new ApiError(400, 'Выберите отправителей правила из участников выбранного чата.');
+      const direct = rule.platform === 'slack' ? rule.chatId.startsWith('D') : /^\d+$/u.test(rule.chatId);
+      if (direct && (rule.allowAllSenders || rule.allowedSenderIds.some(id => people.get(id) || rule.platform === 'telegram' && id !== rule.chatId))) throw new ApiError(400, 'В личном чате разрешите только людей, участвующих в этом чате.');
+      if (engine.channels[rule.platform] !== channel || !channel.state.connected || channel.state.accountId !== rule.accountId || services.codex() !== codex) throw new ApiError(409, 'Подключение изменилось. Обновите каталог.');
+    }
+  }
+
   function binding(body: unknown, selected?: Platform) {
     const input = object(body);
-    fields(input, selected ? ['endpointId', 'allowedSenderIds'] : ['platform', 'endpointId', 'allowedSenderIds']);
+    fields(input, selected ? ['endpointId', 'allowedSenderIds', 'allowAllSenders', 'requireMention'] : ['platform', 'endpointId', 'allowedSenderIds', 'allowAllSenders', 'requireMention']);
     const source = selected ?? platform(input.platform);
     const endpointId = string(input.endpointId, 'чат', 200);
     const endpoint = store.getEndpoint(endpointId);
@@ -190,9 +244,11 @@ export function createApp(services: AppServices) {
     if (accountId && endpoint.accountId !== accountId) throw new ApiError(400, 'Этот чат относится к другому боту. Обновите каталог.');
     if (endpoint.available === false) throw new ApiError(400, 'У бота больше нет доступа к этому чату. Добавьте бота и обновите каталог.');
     if (source === 'telegram' && endpoint.isForum && !endpoint.threadId && !endpoint.generalTopic) throw new ApiError(400, 'Выберите тему внутри группы Telegram.');
+    for (const key of ['allowAllSenders', 'requireMention']) if (input[key] !== undefined && typeof input[key] !== 'boolean') throw new ApiError(400, 'Некорректная политика доступа подключения.');
+    if (input.allowAllSenders && (source === 'slack' ? !/^[CG][A-Z0-9]+$/u.test(endpoint.chatId) : !/^-\d+$/u.test(endpoint.chatId))) throw new ApiError(400, 'В личных чатах выберите отдельных людей.');
     const senders = input.allowedSenderIds;
     if (!Array.isArray(senders) || senders.length > 100 || senders.some(id => typeof id !== 'string' || !endpoint.people.some(person => person.id === id))) throw new ApiError(400, 'Выберите отправителей из участников чата.');
-    return { platform: source, endpointId, allowedSenderIds: [...new Set(senders as string[])] };
+    return { platform: source, endpointId, allowedSenderIds: [...new Set(senders as string[])], ...(input.allowAllSenders !== undefined ? { allowAllSenders: input.allowAllSenders as boolean } : {}), ...(input.requireMention !== undefined ? { requireMention: input.requireMention as boolean } : {}) };
   }
   app.post('/api/conversations', async request => {
     const input = object(request.body);
@@ -204,7 +260,7 @@ export function createApp(services: AppServices) {
     const thread = (await codex.listThreads()).find(candidate => candidate.id === threadId);
     if (services.codex() !== codex) throw new ApiError(409, 'Подключение Codex изменилось. Обновите список разговоров.');
     if (!thread || thread.archived || thread.cwd !== cwd) throw new ApiError(400, 'Тред или рабочий каталог изменился. Обновите список Codex; архивный разговор сначала восстановите в Codex.');
-    if (input.bindings !== undefined && (!Array.isArray(input.bindings) || input.bindings.length > 2)) throw new ApiError(400, 'У связки может быть один Telegram и один Slack.');
+    if (input.bindings !== undefined && (!Array.isArray(input.bindings) || input.bindings.length > 100)) throw new ApiError(400, 'У связки может быть не более 100 подключений.');
     const bindings = (input.bindings as unknown[] | undefined)?.map(value => binding(value));
     const conversation = store.createConversation({ name, threadId, cwd, bindings });
     return { conversation };
@@ -244,17 +300,39 @@ export function createApp(services: AppServices) {
     const conversation = store.updateConversation(request.params.id, patch);
     return { conversation };
   });
-  app.put<{ Params: { id: string; platform: string } }>('/api/conversations/:id/bindings/:platform', async request => {
-    const selected = platform(request.params.platform);
-    const value = binding(request.body, selected);
-    if (!store.getConversation(request.params.id)) throw new ApiError(404, 'Связка не найдена.');
-    store.setBinding(request.params.id, selected, value.endpointId, value.allowedSenderIds);
-    return { conversation: store.getConversation(request.params.id) };
+  app.post<{ Params: { id: string } }>('/api/conversations/:id/bindings', async request => {
+    const conversation = store.getConversation(request.params.id);
+    if (!conversation) throw new ApiError(404, 'Связка не найдена.');
+    if (conversation.bindings.length >= 100) throw new ApiError(400, 'У связки может быть не более 100 подключений.');
+    const value = binding(request.body);
+    store.addBinding(conversation.id, value.platform, value.endpointId, value.allowedSenderIds, value);
+    return { conversation: store.getConversation(conversation.id) };
   });
-  app.delete<{ Params: { id: string; platform: string } }>('/api/conversations/:id/bindings/:platform', async request => {
-    if (!store.getConversation(request.params.id)) throw new ApiError(404, 'Связка не найдена.');
-    store.removeBinding(request.params.id, platform(request.params.platform));
-    return { conversation: store.getConversation(request.params.id) };
+  function selectedBinding(conversationId: string, bindingId: string) {
+    const conversation = store.getConversation(conversationId);
+    if (!conversation) throw new ApiError(404, 'Связка не найдена.');
+    // Old panels address a platform. Never let that route modify several independent origins.
+    if (bindingId === 'slack' || bindingId === 'telegram') {
+      const matches = conversation.bindings.filter(item => item.platform === bindingId);
+      if (matches.length > 1) throw new ApiError(409, 'Укажите отдельное подключение этой связки. Обновите панель.');
+      return { conversation, value: matches[0], legacy: bindingId };
+    }
+    const value = store.getBinding(conversationId, bindingId);
+    if (!value) throw new ApiError(404, 'Подключение не относится к этой связке.');
+    return { conversation, value };
+  }
+  app.put<{ Params: { id: string; bindingId: string } }>('/api/conversations/:id/bindings/:bindingId', async request => {
+    const selected = selectedBinding(request.params.id, request.params.bindingId);
+    if (!selected.value && selected.conversation.bindings.length >= 100) throw new ApiError(400, 'У связки может быть не более 100 подключений.');
+    const value = binding(request.body, selected.value?.platform ?? platform(selected.legacy));
+    if (selected.value) store.updateBinding(selected.conversation.id, selected.value.id, value.endpointId, value.allowedSenderIds, value);
+    else store.addBinding(selected.conversation.id, value.platform, value.endpointId, value.allowedSenderIds, value);
+    return { conversation: store.getConversation(selected.conversation.id) };
+  });
+  app.delete<{ Params: { id: string; bindingId: string } }>('/api/conversations/:id/bindings/:bindingId', async request => {
+    const selected = selectedBinding(request.params.id, request.params.bindingId);
+    if (selected.value) store.removeBinding(selected.conversation.id, selected.value.id);
+    return { conversation: store.getConversation(selected.conversation.id) };
   });
   app.post<{ Params: { id: string } }>('/api/requests/:id/cancel', async request => { await engine.cancel(request.params.id); return { ok: true }; });
   app.post<{ Params: { id: string } }>('/api/requests/:id/resume', async request => { await engine.resume(request.params.id); return { ok: true }; });

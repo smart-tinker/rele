@@ -496,7 +496,7 @@ export class SlackChannel implements Channel {
     return {
       // app_mention and message may describe the same message with distinct envelope/event IDs.
       eventId: `message:${event.channel}:${event.ts}${kind === 'message' ? '' : `:${kind}:${createHash('sha256').update(JSON.stringify(slack.payload)).digest('hex').slice(0, 16)}`}`, endpoint, sender: person, messageId: event.ts, text, slack, directMention,
-      contextOnly: kind !== 'message' || !!event.subtype && !['file_share', 'bot_message', 'me_message', 'thread_broadcast'].includes(event.subtype) || !stableUser || person.id === this.botUserId || person.id === 'USLACKBOT' || !!person.isBot && !directMention || !text && !file,
+      contextOnly: kind !== 'message' || !!event.subtype && !['file_share', 'bot_message', 'me_message', 'thread_broadcast'].includes(event.subtype) || !stableUser || person.id === this.botUserId || person.id === 'USLACKBOT' || !text && !file,
       ...(file ? { audio: { platform: 'slack' as const, fileId: String(file.id), url: file.url_private_download, name: readableTitle(file.name, 'audio'), mimeType: file.mimetype, size: file.size } } : {}),
     };
   }

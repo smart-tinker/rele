@@ -666,3 +666,17 @@ describe('Telegram audio download', () => {
     await expect(h.channel.download({ platform: 'telegram', fileId: 'large-file', name: 'voice.oga', size: 20 * 1024 * 1024 + 1 }, join(dir, 'large.oga'))).rejects.toThrow(/20 МБ/);
   });
 });
+
+
+it('recognizes explicit native mention entities and never turns /start into an agent task', async () => {
+  const h = harness(); await h.channel.start();
+  h.push([
+    { update_id: 1, message: telegramMessage({ text: '@rele_test_bot work', entities: [{ type: 'mention', offset: 0, length: 14 }] }) },
+    { update_id: 2, message: telegramMessage({ text: 'rele_test_bot plain text' }) },
+    { update_id: 3, message: telegramMessage({ text: 'hello', entities: [{ type: 'text_mention', offset: 0, length: 5, user: { id: 999 } }] }) },
+    { update_id: 4, message: privateMessage({ text: '/start' }) },
+  ]);
+  await vi.waitFor(() => expect(h.offset).toBe(5));
+  expect(h.callbacks.message).toHaveBeenCalledTimes(3);
+  expect(vi.mocked(h.callbacks.message).mock.calls.map(([message]) => message.directMention)).toEqual([true, false, true]);
+});

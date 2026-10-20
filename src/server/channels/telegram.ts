@@ -266,7 +266,7 @@ export class TelegramChannel implements Channel {
       await this.replyToCommand(reply, chatId, threadId, signal);
       return;
     }
-    if (message.forum_topic_created || message.forum_topic_edited) return;
+    if (command?.[1].toLowerCase() === 'start' || message.forum_topic_created || message.forum_topic_edited) return;
     const audioSource = object(message.voice) ?? object(message.audio) ??
       (typeof object(message.document)?.mime_type === 'string' && (object(message.document)!.mime_type as string).startsWith('audio/') ? object(message.document) : undefined);
     let audio: AudioAttachment | undefined;
@@ -278,8 +278,22 @@ export class TelegramChannel implements Channel {
     }
     if (!text.trim() && !audio) return;
     const inbound: InboundMessage = { eventId: String(update.update_id), endpoint, sender, messageId, text: cancelCommand ? '/rele_cancel' : text, audio,
-      replyToMessageId: numericId(object(message.reply_to_message)?.message_id) };
+      replyToMessageId: numericId(object(message.reply_to_message)?.message_id),
+      directMention: this.hasDirectMention(message, text) };
     await abortable(this.callbacks.message(inbound), signal);
+  }
+
+  private hasDirectMention(message: ObjectValue, text: string): boolean {
+    const entities = message.text ? message.entities : message.caption_entities;
+    if (!Array.isArray(entities)) return false;
+    return entities.some(value => {
+      const entity = object(value);
+      if (entity?.type === 'text_mention') return numericId(object(entity.user)?.id) === this.accountId;
+      if (entity?.type !== 'mention' && entity?.type !== 'bot_command' || !Number.isSafeInteger(entity.offset) || !Number.isSafeInteger(entity.length)) return false;
+      const token = text.slice(entity.offset as number, (entity.offset as number) + (entity.length as number));
+      return !!this.botUsername && (entity.type === 'mention' ? token.toLowerCase() === `@${this.botUsername.toLowerCase()}`
+        : token.toLowerCase().endsWith(`@${this.botUsername.toLowerCase()}`));
+    });
   }
 
   private remember(endpoint: Endpoint): Endpoint {

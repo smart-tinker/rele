@@ -3,17 +3,19 @@ import { spawn } from 'node:child_process';
 import { mkdir, readFile, writeFile, rename, chmod, rm, link } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import type { CodexConnectionTarget, PublicConfig } from '../shared/types.js';
+import type { AutoLinkRule, CodexConnectionTarget, PublicConfig } from '../shared/types.js';
 
 export interface AppConfig {
   codex: CodexConnectionTarget & { token?: string };
   telegram: { enabled: boolean; token?: string };
   slack: { enabled: boolean; botToken?: string; appToken?: string };
   voice: PublicConfig['voice'];
+  autoLinkRules: AutoLinkRule[];
 }
 
 export const defaultConfig: AppConfig = {
   codex: { transport: 'managed', executable: 'codex', endpoint: '' },
+  autoLinkRules: [],
   telegram: { enabled: false },
   slack: { enabled: false },
   voice: { enabled: false, python: process.platform === 'win32' ? 'python' : 'python3', model: '', language: 'ru', device: 'cpu' },
@@ -54,10 +56,49 @@ function text(value: unknown, name: string, max = 4096): string {
   return value.trim();
 }
 
+/** Workspaces are selected on the Codex host; accept either local absolute syntax here. */
+export function isLocalWorkspace(value: string): boolean {
+  return !!value && value.length <= 4096 && !/[\x00-\x1f\x7f]/u.test(value)
+    && (/^\/(?!\/)/u.test(value) || /^[A-Za-z]:[\\/]/u.test(value));
+}
+
+function autoLinkRules(value: unknown): AutoLinkRule[] {
+  if (!Array.isArray(value) || value.length > 100) throw new Error('Допустимо не более 100 правил автосоздания.');
+  const ids = new Set<string>();
+  const scopes = new Set<string>();
+  return value.map(item => {
+    const rule = record(item);
+    if (Object.keys(rule).some(key => !['id', 'enabled', 'platform', 'accountId', 'chatId', 'cwd', 'allowedSenderIds', 'requireMention', 'allowAllSenders'].includes(key))) throw new Error('Неизвестное поле правила автосоздания.');
+    const identifier = (key: string) => {
+      const result = text(rule[key], key, 200);
+      if (!result || /[\x00-\x1f\x7f]/u.test(result)) throw new Error('Некорректный идентификатор правила автосоздания.');
+      return result;
+    };
+    const id = identifier('id');
+    if (ids.has(id)) throw new Error('Идентификаторы правил должны быть уникальны.');
+    ids.add(id);
+    if (rule.platform !== 'slack' && rule.platform !== 'telegram') throw new Error('Неизвестный мессенджер правила.');
+    if (typeof rule.enabled !== 'boolean' || (rule.requireMention !== undefined && typeof rule.requireMention !== 'boolean') || (rule.allowAllSenders !== undefined && typeof rule.allowAllSenders !== 'boolean')) throw new Error('Состояние правила и упоминания должно быть логическим.');
+    const accountId = identifier('accountId');
+    const chatId = identifier('chatId');
+    const scope = JSON.stringify([rule.platform, accountId, chatId]);
+    if (scopes.has(scope)) throw new Error('Для чата допустимо только одно правило автосоздания.');
+    scopes.add(scope);
+    const cwd = text(rule.cwd, 'рабочая папка');
+    if (!isLocalWorkspace(cwd)) throw new Error('Рабочая папка должна быть абсолютным локальным путём.');
+    const group = rule.platform === 'slack' ? /^[CG][A-Z0-9]+$/u.test(chatId) : /^-\d+$/u.test(chatId);
+    if (rule.allowAllSenders && !group) throw new Error('Доступ всех участников допустим только для группы или канала. Для личных чатов выберите людей.');
+    const senders = rule.allowedSenderIds;
+    if (!Array.isArray(senders) || (!rule.allowAllSenders && !senders.length) || senders.length > 100 || senders.some(sender => typeof sender !== 'string' || !sender.trim() || sender.length > 200 || /[\x00-\x1f\x7f]/u.test(sender))) throw new Error('Разрешите от 1 до 100 отправителей правила.');
+    return { id, enabled: rule.enabled, platform: rule.platform, accountId, chatId, cwd, allowedSenderIds: [...new Set(senders as string[])], requireMention: rule.requireMention ?? true, ...(rule.allowAllSenders !== undefined ? { allowAllSenders: rule.allowAllSenders } : {}) };
+  });
+}
+
 export function mergeConfig(current: AppConfig, input: unknown): AppConfig {
   const patch = record(input);
   const next = structuredClone(current);
-  for (const key of Object.keys(patch)) if (!['codex', 'telegram', 'slack', 'voice'].includes(key)) throw new Error('Неизвестный раздел настроек.');
+  next.autoLinkRules = autoLinkRules('autoLinkRules' in patch ? patch.autoLinkRules : current.autoLinkRules ?? []);
+  for (const key of Object.keys(patch)) if (!['codex', 'telegram', 'slack', 'voice', 'autoLinkRules'].includes(key)) throw new Error('Неизвестный раздел настроек.');
   for (const section of ['codex', 'telegram', 'slack', 'voice'] as const) {
     if (!(section in patch)) continue;
     const changes = record(patch[section]);
@@ -107,6 +148,7 @@ export function publicConfig(config: AppConfig): PublicConfig {
     telegram: { enabled: config.telegram.enabled, tokenConfigured: !!config.telegram.token },
     slack: { enabled: config.slack.enabled, botTokenConfigured: !!config.slack.botToken, appTokenConfigured: !!config.slack.appToken },
     voice: { ...config.voice },
+    autoLinkRules: structuredClone(config.autoLinkRules ?? []),
   };
 }
 

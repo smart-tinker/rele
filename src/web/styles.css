@@ -1747,3 +1747,6 @@ tbody tr:hover {
     scroll-behavior: auto !important;
   }
 }
+
+.binding-cells { display: grid; gap: 12px; }
+.binding-draft + .binding-draft { border-top: 1px solid var(--border); padding-top: 16px; }

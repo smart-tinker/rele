@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
-import { randomUUID } from 'node:crypto';
-import type { Approval, ApprovalQuestion, InboundMessage, Platform, ReleRequest } from '../shared/types.js';
+import { createHash, randomUUID } from 'node:crypto';
+import type { Approval, ApprovalQuestion, AutoLinkIntent, InboundMessage, Platform, ReleRequest } from '../shared/types.js';
 import { CodexClient, CodexRpcError, CodexThreadBusyError, type CodexNotification, type CodexServerRequest, type RequestLocation } from './codex.js';
 import { Store } from './store.js';
 import type { AppConfig } from './config.js';
@@ -9,7 +9,7 @@ import { transcribeAudio } from './voice.js';
 import { SlackSync } from './slack-sync.js';
 import { splitSlackReply } from './channels/slack-format.js';
 
-export type CodexGateway = Pick<CodexClient, 'status' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'interrupt' | 'findRequest' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Pick<EventEmitter, 'on' | 'off'>;
+export type CodexGateway = Pick<CodexClient, 'status' | 'isVerifiedVersion' | 'createThread' | 'setThreadName' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'interrupt' | 'findRequest' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Pick<EventEmitter, 'on' | 'off'>;
 export interface EngineOptions {
   config: () => AppConfig;
   temporaryRoot: string;
@@ -27,6 +27,8 @@ export class Engine extends EventEmitter {
   private tasks = new Set<Promise<unknown>>();
   private dispatching = new Set<string>();
   private reconciling = new Set<string>();
+  private reconcileAgain = new Set<string>();
+  private provisioning = new Set<string>();
   private ownedThreads = new Set<string>();
   private releasing = new Map<string, Promise<void>>();
   private retryThreadAfter = new Map<string, number>();
@@ -136,7 +138,12 @@ export class Engine extends EventEmitter {
         }
       }
     } else {
-      this.store.ingest(message);
+      const config = this.options.config();
+      const rule = config.autoLinkRules?.find(rule => rule.enabled && rule.platform === message.endpoint.platform &&
+        rule.accountId === message.endpoint.accountId && rule.chatId === message.endpoint.chatId);
+      const channel = this.channels[message.endpoint.platform];
+      this.store.ingest(message, rule && config[rule.platform].enabled && channel?.state.accountId === rule.accountId
+        ? { rule, targetFingerprint: this.targetFingerprint() } : undefined);
     }
     this.changed();
     this.track(this.pump());
@@ -241,7 +248,7 @@ export class Engine extends EventEmitter {
   }
 
   async reconcile(id: string): Promise<void> {
-    if (this.reconciling.has(id)) return;
+    if (this.reconciling.has(id)) { this.reconcileAgain.add(id); return; }
     const request = this.store.getRequest(id);
     if (!request || terminal(request.status) || ['queued', 'transcribing'].includes(request.status)) return;
     this.reconciling.add(id);
@@ -263,6 +270,7 @@ export class Engine extends EventEmitter {
       if (!terminal(this.store.getRequest(id)!.status)) this.store.updateRequest(id, { status: 'uncertain', error: this.options.redact(error) });
     } finally {
       this.reconciling.delete(id);
+      if (this.reconcileAgain.delete(id) && !this.stopped) this.track(this.reconcile(id));
       await this.releaseIdleThread(request.conversationId);
       this.changed();
     }
@@ -272,7 +280,10 @@ export class Engine extends EventEmitter {
   async pump(): Promise<void> {
     if (this.stopped) return;
     const work: Promise<unknown>[] = [this.deliver()];
-    if (!this.suspended) await this.slackSync.backfill();
+    if (!this.suspended) {
+      await Promise.allSettled(this.store.listAutoLinkIntents().filter(intent => intent.status !== 'completed').map(intent => this.provision(intent)));
+      await this.slackSync.backfill();
+    }
     if (this.stopped) { await Promise.allSettled(work); return; }
     if (!this.suspended && this.codex.status().connected) for (const conversation of this.store.listConversations()) {
       if (!conversation.paused && !this.dispatching.has(conversation.id) && !this.releasing.has(conversation.id)
@@ -283,6 +294,59 @@ export class Engine extends EventEmitter {
       for (const request of this.store.activeRequests()) if (!['queued', 'transcribing'].includes(request.status) && !this.dispatching.has(request.conversationId)) work.push(this.reconcile(request.id));
     }
     await Promise.allSettled(work);
+  }
+
+  private targetFingerprint(): string {
+    const { transport, executable, endpoint, codexHome } = this.options.config().codex;
+    return createHash('sha256').update(JSON.stringify([transport, executable, endpoint, codexHome ?? null])).digest('hex');
+  }
+
+  private async provision(intent: AutoLinkIntent): Promise<void> {
+    if (this.provisioning.has(intent.id)) return;
+    this.provisioning.add(intent.id);
+    const client = this.codex;
+    let persistedThreadId: string | undefined;
+    const allowed = () => {
+      const config = this.options.config();
+      const rule = config.autoLinkRules?.find(rule => rule.id === intent.rule.id);
+      const account = this.channels[intent.rule.platform]?.state;
+      return !this.stopped && !this.suspended && config[intent.rule.platform].enabled && client === this.codex && account?.connected && account.accountId === intent.rule.accountId &&
+        this.targetFingerprint() === intent.targetFingerprint && !!rule && JSON.stringify(rule) === JSON.stringify(intent.rule) && rule.enabled;
+    };
+    try {
+      // A manual binding can resolve even a lost native create ACK, using its current ACL.
+      if (this.store.bindingForEndpoint(intent.endpointId)) { this.store.finalizeAutoLinkIntent(intent.id); return; }
+      if (intent.status !== 'pending' && intent.status !== 'created') return;
+      if (!allowed() || !client.status().connected || !client.isVerifiedVersion()) {
+        const error = !client.status().connected || !client.isVerifiedVersion()
+          ? intent.status === 'pending' ? 'Ожидается подключённый проверенный Codex. Создание ещё не отправлялось.'
+            : 'Тред уже создан. Ожидается подключённый проверенный Codex для продолжения.'
+          : 'Правило или подключение изменились. Принятые события сохранены; проверьте автосоздание.';
+        if (intent.error !== error) this.store.updateAutoLinkIntent(intent.id, { error });
+        return;
+      }
+      let threadId = intent.threadId;
+      if (intent.status === 'pending') {
+        if (!this.store.claimAutoLinkIntent(intent.id)) return;
+        threadId = await client.createThread(intent.rule.cwd);
+        this.store.updateAutoLinkIntent(intent.id, { status: 'created', threadId, error: undefined });
+      }
+      if (!threadId) return;
+      // A new native thread is lazy: metadata must materialize it before releasing its writer.
+      await client.setThreadName(threadId, this.store.getEndpoint(intent.endpointId)!.title);
+      persistedThreadId = threadId;
+      if (allowed()) this.store.finalizeAutoLinkIntent(intent.id);
+    } catch (error) {
+      const current = this.store.getAutoLinkIntent(intent.id)!;
+      // thread/start has no client idempotency key: never repeat an unknown result.
+      this.store.updateAutoLinkIntent(intent.id, { status: current.threadId ? 'created' : error instanceof CodexRpcError ? 'failed' : 'uncertain', error: this.options.redact(error) });
+    } finally {
+      if (persistedThreadId) {
+        try { await client.releaseThread(persistedThreadId); }
+        catch (error) { this.emit('diagnostic', this.options.redact(error)); }
+      }
+      this.provisioning.delete(intent.id); this.changed();
+    }
   }
 
   async settled(): Promise<void> { await this.events; await Promise.allSettled([...this.tasks]); }
@@ -296,7 +360,8 @@ export class Engine extends EventEmitter {
       const waiting = this.store.listPendingRequests().find(row => row.conversationId === conversationId);
       if (this.store.activeRequests().some(row => row.conversationId === conversationId && row.status !== 'queued')) return;
       const client = this.codex;
-      const cutoff = waiting?.origin.platform === 'slack' ? waiting.origin.messageId : undefined;
+      const cutoff = waiting ? waiting.origin.platform === 'slack' ? waiting.origin.messageId
+        : `${Math.floor(Date.parse(waiting.createdAt) / 1000)}.${String(Date.parse(waiting.createdAt) % 1000).padStart(3, '0')}000` : undefined;
       if (!await this.slackSync.drain(conversationId, cutoff)) {
         const error = this.store.listSlackSyncStreams().find(stream => stream.conversationId === conversationId &&
           (stream.active || this.store.hasPendingSlackSyncEntries(stream.id, cutoff)) && stream.error)?.error

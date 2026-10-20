@@ -33,7 +33,7 @@ function matches(query: string, ...values: Array<string | undefined>): boolean {
     .includes(query.trim().toLocaleLowerCase('ru'));
 }
 
-function useCatalog<T extends { id: string }>(
+export function useCatalog<T extends { id: string }>(
   api: ReleApi,
   path: string | undefined,
   refresh?: () => Promise<void>,
@@ -109,7 +109,7 @@ function useCatalog<T extends { id: string }>(
   };
 }
 
-function CatalogControls({
+export function CatalogControls({
   catalog,
   label,
   disabled,
@@ -160,13 +160,12 @@ function CatalogControls({
 function owner(
   state: DashboardState,
   endpointId: string,
-  conversationId?: string,
+  bindingId?: string,
 ) {
   return state.conversations.find(
     (conversation) =>
-      conversation.id !== conversationId &&
       conversation.bindings.some(
-        (binding) => binding.endpointId === endpointId,
+        (binding) => binding.id !== bindingId && binding.endpointId === endpointId,
       ),
   );
 }
@@ -174,9 +173,9 @@ function owner(
 function optionReason(
   state: DashboardState,
   endpoint: Endpoint,
-  conversationId?: string,
+  bindingId?: string,
 ): string {
-  const occupied = owner(state, endpoint.id, conversationId);
+  const occupied = owner(state, endpoint.id, bindingId);
   return occupied
     ? `В связке «${occupied.name}»`
     : endpoint.available === false
@@ -200,7 +199,7 @@ interface PickerProps {
   value: string;
   onChange: (endpoint: Endpoint | undefined) => void;
   disabled: boolean;
-  conversationId?: string;
+  bindingId?: string;
 }
 
 const telegramGroupKey = (endpoint: Endpoint) =>
@@ -213,7 +212,7 @@ export function TelegramCatalogPicker({
   value,
   onChange,
   disabled,
-  conversationId,
+  bindingId,
 }: PickerProps) {
   const endpoints = accountEndpoints(state, 'telegram');
   const selected = endpoints.find((endpoint) => endpoint.id === value);
@@ -358,7 +357,7 @@ export function TelegramCatalogPicker({
                 ),
             )
             .map((endpoint) => {
-              const reason = optionReason(state, endpoint, conversationId);
+              const reason = optionReason(state, endpoint, bindingId);
               return (
                 <option
                   key={endpoint.id}
@@ -444,7 +443,7 @@ export function SlackCatalogPicker({
   value,
   onChange,
   disabled,
-  conversationId,
+  bindingId,
 }: PickerProps) {
   const known = accountEndpoints(state, 'slack');
   const selected = known.find((endpoint) => endpoint.id === value);
@@ -562,7 +561,7 @@ export function SlackCatalogPicker({
             >
               <option value="">Не подключать</option>
               {filteredThreads.map((endpoint) => {
-                const reason = optionReason(state, endpoint, conversationId);
+                const reason = optionReason(state, endpoint, bindingId);
                 return (
                   <option
                     key={endpoint.id}
@@ -609,8 +608,12 @@ export function AllowedSenders({
   value,
   onChange,
   disabled,
+  wholeChat = false,
+  humansOnly = false,
 }: {
   endpoint: Endpoint;
+  wholeChat?: boolean;
+  humansOnly?: boolean;
   accountId?: string;
   api: ReleApi;
   refresh: () => Promise<void>;
@@ -622,12 +625,12 @@ export function AllowedSenders({
   const catalog = useCatalog<Person>(
     api,
     endpoint.platform === 'slack' && sameAccount
-      ? `/api/catalog/slack/people?endpointId=${encodeURIComponent(endpoint.id)}`
+      ? `/api/catalog/slack/people?${wholeChat ? `chatId=${encodeURIComponent(endpoint.chatId)}` : `endpointId=${encodeURIComponent(endpoint.id)}`}`
       : undefined,
     refresh,
   );
   const [query, setQuery] = useState('');
-  const people = mergeItems(endpoint.people, catalog.items);
+  const people = mergeItems(endpoint.people, catalog.items).filter(person => !humansOnly || !person.isBot);
   const unavailable = value.filter(
     (id) => !people.some((person) => person.id === id),
   );

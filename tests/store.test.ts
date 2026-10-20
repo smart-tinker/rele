@@ -85,7 +85,7 @@ describe('Store inbox and bindings', () => {
     expect(store.getRequest(accepted.id)?.status).toBe('queued');
     store.updateConversation(conv.id, { paused: false });
     expect(store.claimNextRequest(conv.id)?.id).toBe(accepted.id);
-    store.removeBinding(conv.id, 'slack');
+    store.removeBinding(conv.id, store.getConversation(conv.id)!.bindings.find(binding => binding.platform === 'slack')!.id);
     expect(store.ingest(message(ep, 'removed')).request).toBeNull();
   });
 
@@ -374,7 +374,7 @@ describe('Store durability and recovery', () => {
     const check = new DatabaseSync(path);
     try {
       expect(check.prepare('PRAGMA journal_mode').get()?.journal_mode).toBe('wal');
-      expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(4);
+      expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(5);
       expect(check.prepare('PRAGMA quick_check').get()?.quick_check).toBe('ok');
       expect(check.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     } finally { check.close(); }
@@ -388,7 +388,7 @@ describe('Store durability and recovery', () => {
     original.setMeta('endpoint-alias:slack-1', 'Мой разговор');
     original.close();
     const old = new DatabaseSync(path);
-    old.exec('DROP TABLE slack_sync_entries; DROP TABLE slack_sync_streams; ALTER TABLE endpoints DROP COLUMN catalog; PRAGMA user_version = 2;');
+    old.exec('DROP INDEX inbound_auto_link; ALTER TABLE inbound_events DROP COLUMN auto_link_intent_id; DROP TABLE auto_link_intents; DROP TABLE slack_sync_entries; DROP TABLE slack_sync_streams; ALTER TABLE endpoints DROP COLUMN catalog; PRAGMA user_version = 2;');
     old.close();
     const upgraded = open(path);
     expect(upgraded.getConversation(conv.id)).toEqual(conv);
@@ -446,7 +446,7 @@ describe('durable Slack transcript sync', () => {
     const original = request(oldStore);
     oldStore.close();
     const old = new DatabaseSync(path);
-    old.exec('DROP TABLE slack_sync_entries; DROP TABLE slack_sync_streams; PRAGMA user_version = 3;');
+    old.exec('DROP INDEX inbound_auto_link; ALTER TABLE inbound_events DROP COLUMN auto_link_intent_id; DROP TABLE auto_link_intents; DROP TABLE slack_sync_entries; DROP TABLE slack_sync_streams; PRAGMA user_version = 3;');
     old.close();
     const upgraded = open(path);
     const [stream] = upgraded.listSlackSyncStreams();
@@ -553,7 +553,7 @@ describe('durable Slack transcript sync', () => {
     store.updateSlackSyncStream(entry.streamId, checkpoint);
     store.setBinding(conv.id, 'slack', endpoint().id, []);
     expect(store.getSlackSyncStream(entry.streamId)).toMatchObject(checkpoint);
-    store.removeBinding(conv.id, 'slack');
+    store.removeBinding(conv.id, store.getConversation(conv.id)!.bindings.find(binding => binding.platform === 'slack')!.id);
     const reset = { cursor: undefined, coveredThrough: undefined, scanUntil: undefined, scanOldest: undefined,
       state: 'backfill', error: undefined, retryAt: undefined };
     expect(store.getSlackSyncStream(entry.streamId)).toMatchObject({ ...reset, active: false, codexThreadId: conv.threadId });
@@ -629,5 +629,33 @@ describe('Slack transcript identity guards', () => {
     expect(store.listSlackSyncEntries(entries[0].streamId)).toHaveLength(100);
     expect(store.hasPendingSlackSyncEntries(entries[0].streamId, entries[0].messageId)).toBe(true);
     expect(store.latestSlackMessageId(entries[0].streamId)).toBe(entries.at(-1)!.messageId);
+  });
+});
+
+
+describe('shared conversation Slack backlog ordering', () => {
+  it('orders pending entries across streams by source timestamp then durable insertion order, including revision ties', () => {
+    const store = open();
+    const firstEndpoint = endpoint();
+    const secondEndpoint = endpoint({ id: 'second-stream', chatId: 'other-channel' });
+    const conv = conversation(store, firstEndpoint);
+    store.upsertEndpoint(secondEndpoint);
+    store.addBinding(conv.id, 'slack', secondEndpoint.id, ['user-1']);
+    const first = store.recordSlackMessage(transcript(firstEndpoint, '1770000002.000001'))!;
+    const older = store.recordSlackMessage(transcript(secondEndpoint, '1770000001.000001'))!;
+    const revision = store.recordSlackMessage(transcript(firstEndpoint, '1770000002.000001', { kind: 'edit', text: 'Edited revision' }))!;
+    const tied = store.recordSlackMessage(transcript(secondEndpoint, '1770000002.000001'))!;
+    expect(store.listPendingSlackSyncEntries(conv.id).map(entry => entry.id)).toEqual([older.id, first.id, revision.id, tied.id]);
+    expect(store.listPendingSlackSyncEntries(conv.id, '1770000001.000001').map(entry => entry.id)).toEqual([older.id]);
+    expect(store.listPendingSlackSyncEntries(conv.id, undefined, 2).map(entry => entry.id)).toEqual([older.id, first.id]);
+    store.updateSlackSyncEntry(older.id, { state: 'applied' });
+    store.updateSlackSyncEntry(first.id, { state: 'uncertain', retryAt: new Date(Date.now() + 60_000).toISOString() });
+    store.updateSlackSyncEntry(revision.id, { state: 'applying' });
+    expect(store.listPendingSlackSyncEntries(conv.id).map(entry => entry.id)).toEqual([tied.id]);
+    const unrelated = endpoint({ id: 'unrelated', chatId: 'unrelated-channel' });
+    const other = conversation(store, unrelated, 'unrelated-codex');
+    store.recordSlackMessage(transcript(unrelated, '1770000000.000001'));
+    expect(store.listPendingSlackSyncEntries(conv.id).map(entry => entry.id)).toEqual([tied.id]);
+    expect(store.listPendingSlackSyncEntries(other.id)).toHaveLength(1);
   });
 });

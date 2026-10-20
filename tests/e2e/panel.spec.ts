@@ -827,6 +827,7 @@ test('changing bot accounts resets catalogs and the Telegram picker while an old
   page,
 }) => {
   const state = fixtureState();
+  const originalSlackBindingId = state.conversations[0].bindings.find(binding => binding.platform === 'slack')!.id;
   const catalog: {
     chats: CatalogPage<CatalogChat>[];
     telegram?: { botUrl?: string; command: string };
@@ -908,7 +909,7 @@ test('changing bot accounts resets catalogs and the Telegram picker while an old
     .click();
   await expect
     .poll(() => api.mutations.at(-1)?.path)
-    .toBe('/api/conversations/conversation-0/bindings/slack');
+    .toBe(`/api/conversations/conversation-0/bindings/${originalSlackBindingId}`);
   expect(api.mutations.at(-1)?.method).toBe('DELETE');
 });
 

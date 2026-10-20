@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import math
 import os
 import pathlib
 import socket
@@ -146,6 +147,8 @@ approval_policy="on-request"
 approvals_reviewer="user"
 sandbox_mode="read-only"
 cli_auth_credentials_store="file"
+[features]
+plugins=false
 [model_providers.mock_provider]
 name="Rele local protocol fixture"
 base_url="http://127.0.0.1:{provider_port}/v1"
@@ -289,6 +292,14 @@ supports_websockets=false
         assert not raw_receipts(rollout,raw_item),'Interrupted pending input unexpectedly persisted'
         assert result(await b.call('thread/read',{'threadId':thread}))['thread']['status']['type']=='idle'
         receipt_history=result(await b.call('thread/turns/list',{'threadId':thread,'limit':100,'itemsView':'full'}))
+        for attempt in range(100):
+            aborted_history=next(turn for turn in receipt_history['data'] if turn['id']==receipt_turn)
+            completed_at=aborted_history.get('completedAt')
+            if aborted_history['status']=='interrupted' and type(completed_at) in (int,float) and math.isfinite(completed_at): break
+            await asyncio.sleep(.02)
+            receipt_history=result(await b.call('thread/turns/list',{'threadId':thread,'limit':100,'itemsView':'full'}))
+        else: raise AssertionError('Native abort history lacks finite completedAt evidence')
+        report['checks']['native_abort_history_has_finite_completion_timestamp']=True
         receipt_started=sum(event.get('method')=='turn/started' for event in b.events)
         assert result(await b.call('thread/inject_items',{'threadId':thread,'items':[raw_item]}))=={}
         assert len(await persisted_receipt(rollout,raw_item))==1
@@ -361,6 +372,33 @@ supports_websockets=false
         restored=await c.wait(lambda x:x.get('method')=='item/started' and x['params']['item'].get('clientId')==recovery_id)
         await c.wait(lambda x:x.get('method')=='turn/completed' and x['params']['turn']['id']==restored['params']['turnId'])
         report['checks']['reconnected_client_sees_queued_completion']=True
+        # A brand-new thread must persist passive context before its first model turn.
+        fresh=result(await c.call('thread/start',{'cwd':str(workspace)}))['thread']['id']
+        fresh_before=len(records)
+        fresh_item={'type':'message','id':'rele_slack_'+str(uuid.uuid4()),'role':'user',
+            'content':[{'type':'input_text','text':'First-turn passive Slack canary '+str(uuid.uuid4())}]}
+        assert result(await c.call('thread/inject_items',{'threadId':fresh,'items':[fresh_item]}))=={}
+        fresh_rollout=pathlib.Path(result(await c.call('thread/read',{'threadId':fresh}))['thread']['path']).resolve()
+        assert fresh_rollout.is_relative_to(home.resolve()),fresh_rollout
+        assert len(await persisted_receipt(fresh_rollout,fresh_item))==1
+        fresh_history=result(await c.call('thread/turns/list',{'threadId':fresh,'limit':10,'itemsView':'full'}))
+        assert fresh_history['data']==[],fresh_history
+        assert len(records)==fresh_before,'First passive injection started a model request'
+        assert not any(event.get('method')=='turn/started' and event['params'].get('threadId')==fresh for event in c.events)
+        report['checks']['new_thread_passive_context_persists_before_first_model_or_turn']=True
+        fresh_request=str(uuid.uuid4())
+        result(await c.call('thread/queue/add',{'threadId':fresh,'clientUserMessageId':fresh_request,
+            'input':[{'type':'text','text':'first authorized request after passive Slack context'}]}))
+        fresh_own=await c.wait(lambda event:event.get('method')=='item/started'
+            and event['params'].get('threadId')==fresh and event['params']['item'].get('clientId')==fresh_request)
+        fresh_done=await c.wait(lambda event:event.get('method')=='turn/completed'
+            and event['params']['turn']['id']==fresh_own['params']['turnId'])
+        assert fresh_done['params']['turn']['status']=='completed',fresh_done
+        assert len(records)==fresh_before+1,'First authorized request created extra model calls'
+        assert fresh_item['content'][0]['text'] in json.dumps(records[fresh_before]['body'])
+        fresh_history=result(await c.call('thread/turns/list',{'threadId':fresh,'limit':10,'itemsView':'full'}))
+        assert len(fresh_history['data'])==1 and fresh_history['data'][0]['id']==fresh_own['params']['turnId'],fresh_history
+        report['checks']['first_authorized_model_request_contains_new_thread_passive_context']=True
         # Check the project's real adapter through the official byte proxy.
         for client in clients: await client.close()
         clients.clear()

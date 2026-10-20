@@ -172,7 +172,9 @@ export function fixtureState(empty = false): DashboardState {
     requests: empty ? [] : [fixtureRequest('request-running', 'running')],
     deliveries: [],
     approvals: [],
+    autoLinks: [],
     config: {
+      autoLinkRules: [],
       codex: {
         transport: 'managed',
         executable: 'codex',
@@ -317,7 +319,7 @@ export async function installApi(
                 id: endpoint.chatId,
                 name: endpoint.chatTitle || endpoint.title,
                 subtitle: '',
-                kind: 'channel' as const,
+                kind: endpoint.chatId.startsWith('D') ? 'direct' as const : 'channel' as const,
               },
             ]),
         ).values(),
@@ -360,10 +362,10 @@ export async function installApi(
       url.pathname === '/api/catalog/slack/people'
     ) {
       const endpoint = state.endpoints.find(
-        (item) => item.id === url.searchParams.get('endpointId'),
+        (item) => item.id === url.searchParams.get('endpointId') || item.chatId === url.searchParams.get('chatId'),
       );
       const found = catalogPage(
-        catalog.people?.[endpoint?.id ?? ''] ?? [
+        catalog.people?.[url.searchParams.get('chatId') ?? endpoint?.id ?? ''] ?? [
           { items: endpoint?.people ?? [] },
         ],
         url.searchParams.get('cursor'),
@@ -427,25 +429,14 @@ export async function installApi(
       await route.fulfill({ json: { ok: true } });
       return;
     }
-    const bindingMatch = url.pathname.match(
-      /^\/api\/conversations\/([^/]+)\/bindings\/(telegram|slack)$/,
-    );
+    const bindingMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/bindings(?:\/([^/]+))?$/);
     if (bindingMatch) {
-      const conversation = state.conversations.find(
-        (item) => item.id === bindingMatch[1],
-      )!;
-      conversation.bindings = conversation.bindings.filter(
-        (item) => item.platform !== bindingMatch[2],
-      );
-      if (request.method() === 'PUT')
-        conversation.bindings.push({
-          id: `binding-${bindingMatch[2]}`,
-          conversationId: conversation.id,
-          platform: bindingMatch[2] as Platform,
-          endpointId: body!.endpointId,
-          allowedSenderIds: body!.allowedSenderIds,
-        });
-      await route.fulfill({ json: { ok: true } });
+      const conversation = state.conversations.find(item => item.id === bindingMatch[1])!;
+      const binding = conversation.bindings.find(item => item.id === bindingMatch[2]);
+      if (request.method() === 'POST') conversation.bindings.push({ ...body!, id: `added-binding-${mutations.length}` } as any);
+      if (request.method() === 'PUT' && binding) Object.assign(binding, body);
+      if (request.method() === 'DELETE') conversation.bindings = conversation.bindings.filter(item => item.id !== bindingMatch[2]);
+      await route.fulfill({ json: { conversation } });
       return;
     }
     const requestMatch = url.pathname.match(
@@ -485,6 +476,7 @@ export async function installApi(
     }
     if (url.pathname === '/api/config') {
       for (const [section, values] of Object.entries(body ?? {})) {
+        if (section === 'autoLinkRules') { state.config.autoLinkRules = structuredClone(values as any); continue; }
         for (const [key, value] of Object.entries(
           values as Record<string, unknown>,
         )) {
