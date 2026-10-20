@@ -136,7 +136,16 @@ windowsTest('killing only the Windows helper stops its whole job and releases a 
     expect(host.child.kill('SIGKILL')).toBe(true);
     await bounded(host.closed, 16000, 'Killing the helper left an inherited output pipe open');
     await expect.poll(() => [...running.ownedPids].some(isRunning), { timeout: 2000, interval: 20 }).toBe(false);
-    await rename(lockedFile, movedFile);
+    // Windows may finish releasing file handles after the owned PIDs disappear.
+    const releaseDeadline = performance.now() + 2000;
+    for (;;) {
+      try { await rename(lockedFile, movedFile); break; }
+      catch (error) {
+        if (!['EPERM', 'EACCES', 'EBUSY'].includes((error as NodeJS.ErrnoException).code || '')
+          || performance.now() >= releaseDeadline) throw error;
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+    }
     expect(await readFile(movedFile, 'utf8')).toBe('owned fixture content\n');
   } finally { await cleanup(host, directory); }
 }, 45000);
