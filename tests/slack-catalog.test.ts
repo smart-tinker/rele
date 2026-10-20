@@ -28,7 +28,7 @@ async function fixture(handlers: Record<string, Handler> = {}, knownEndpoints: E
   const fetcher = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
     const method = new URL(String(input)).pathname.split('/').at(-1)!;
     const form = new Headers(init?.headers).get('content-type')?.startsWith('application/x-www-form-urlencoded');
-    if (['conversations.members', 'users.info'].includes(method) && !form) {
+    if (['conversations.members', 'users.info', 'conversations.replies'].includes(method) && !form) {
       return Response.json({ ok: false, error: method === 'conversations.members' ? 'invalid_arguments' : 'user_not_found' });
     }
     const body = form ? Object.fromEntries(new URLSearchParams(String(init?.body))) : JSON.parse(String(init?.body));
@@ -40,6 +40,7 @@ async function fixture(handlers: Record<string, Handler> = {}, knownEndpoints: E
       'users.info': value => ({ ok: true, user: { id: value.user, profile: { display_name: value.user === 'UANNA' ? 'Анна' : 'Борис' } } }),
       'conversations.members': () => ({ ok: true, members: ['UBOT', 'UANNA', 'UBORIS'] }),
       'conversations.history': () => ({ ok: true, messages: [] }),
+      'conversations.replies': () => ({ ok: true, messages: [] }),
     };
     const handler = handlers[method] ?? defaults[method];
     if (!handler) throw new Error('Unexpected synthetic Slack call');
@@ -67,6 +68,86 @@ function savedEndpoint(accountId: string, name: string): Endpoint {
     people: [{ id: 'UANNA', name }], updatedAt: '2026-10-18T00:00:00Z',
   };
 }
+
+function transcriptTarget() {
+  const endpoint = savedEndpoint('TONE:UBOT', 'Анна');
+  return { endpointId: endpoint.id, accountId: endpoint.accountId, chatId: endpoint.chatId, threadId: endpoint.threadId };
+}
+
+describe('Slack transcript pages', () => {
+  it('reads one form page with bounds and preserves peer/self/block/file/edit/deleted messages without callbacks', async () => {
+    const target = transcriptTarget();
+    const root = { type: 'message', ts: target.threadId, user: 'UANNA', text: 'Начало', reply_count: 90, event_ts: 'noisy' };
+    const reply = { type: 'message', ts: '1770000001.000001', thread_ts: target.threadId, user: 'UPEER', bot_id: 'BPEER', subtype: 'bot_message', text: '', blocks: [{ type: 'section', text: { type: 'plain_text', text: 'я'.repeat(60_000) } }], files: [{ id: 'FONE', name: 'Отчёт.pdf', mimetype: 'application/pdf', token: 'must-not-store' }], attachments: [{ text: 'Вложение' }], bot_profile: { name: 'noise' } };
+    const edited = { ...reply, ts: '1770000002.000001', text: 'Изменено', edited: { user: 'UPEER', ts: '1770000003.000001' } };
+    const { channel, callbacks, callsFor } = await fixture({
+      'conversations.replies': body => body.cursor ? { ok: true, messages: [], response_metadata: { next_cursor: '' } } : { ok: true, messages: [root, reply, { ...reply, ts: '1770000001.000002', user: 'UBOT', bot_id: 'BSELF' }, edited, { subtype: 'message_deleted', deleted_ts: '1770000004.000001', previous_message: { ...root, ts: '1770000004.000001', thread_ts: target.threadId } }], response_metadata: { next_cursor: 'next-transcript' } },
+    });
+    const page = await channel.readThreadPage(target, { oldest: '1770000000.100000', latest: '1770000099.000001' });
+    expect(page.messages).toHaveLength(5);
+    expect(page.messages[1].text).toContain('я'.repeat(60_000));
+    expect(page.messages[1]).toMatchObject({ endpointId: target.endpointId, threadId: target.threadId, sender: { id: 'UPEER', isBot: true }, payload: { blocks: reply.blocks, attachments: reply.attachments, files: [{ id: 'FONE', name: 'Отчёт.pdf' }] } });
+    expect(page.messages[2].sender.isBot).toBe(true);
+    expect(page.messages[3]).toMatchObject({ kind: 'edit', payload: { edited: { ts: '1770000003.000001' } } });
+    expect(page.messages[4].kind).toBe('deleted');
+    expect(JSON.stringify(page.messages)).not.toMatch(/must-not-store|bot_profile|reply_count|event_ts/);
+    expect(page.nextCursor).toBe('next-transcript');
+    expect(callsFor('conversations.replies')).toHaveLength(1);
+    expect(callsFor('conversations.replies')[0].body).toEqual({ channel: 'CONE', ts: target.threadId, limit: '100', inclusive: 'true', oldest: '1770000000.100000', latest: '1770000099.000001' });
+    await expect(channel.readThreadPage(target, { cursor: page.nextCursor })).resolves.toEqual({ messages: [], nextCursor: undefined });
+    expect(callbacks.message).not.toHaveBeenCalled();
+    expect(callbacks.action).not.toHaveBeenCalled();
+    expect(callbacks.endpoint).not.toHaveBeenCalled();
+  });
+
+  it('refuses mismatched account/endpoint/bounds before reading', async () => {
+    const { channel, callsFor } = await fixture();
+    const target = transcriptTarget();
+    await expect(channel.readThreadPage({ ...target, accountId: 'TOTHER:UBOT' })).rejects.toThrow();
+    await expect(channel.readThreadPage({ ...target, endpointId: 'different' })).rejects.toThrow();
+    await expect(channel.readThreadPage(target, { oldest: 'not-ts' })).rejects.toThrow();
+    await expect(channel.readThreadPage(target, { cursor: 'bad\nheader' })).rejects.toThrow();
+    expect(callsFor('conversations.replies')).toHaveLength(0);
+  });
+
+  it('preserves valid unknown-subtype messages rather than rejecting the history page', async () => {
+    const target = transcriptTarget();
+    const { channel } = await fixture({ 'conversations.replies': () => ({ ok: true, messages: [{ type: 'message', subtype: 'assistant_app_thread', ts: target.threadId, text: 'Контекст приложения' }] }) });
+    const page = await channel.readThreadPage(target);
+    expect(page.messages).toHaveLength(1);
+    expect(page.messages[0]).toMatchObject({ text: 'Контекст приложения', payload: { subtype: 'assistant_app_thread' } });
+  });
+
+  it.each([
+    { messages: [{ type: 'message', ts: '1770000001.1', thread_ts: '1770000099.0' }] },
+    { messages: [{ type: 'message', ts: '1770000000.123456', channel: 'COTHER' }] },
+    { messages: [{ type: 'message', ts: 1770000000.123456 }] },
+    { messages: [], response_metadata: { next_cursor: { bad: true } } },
+  ])('rejects mismatched source identities and malformed cursors', async payload => {
+    const { channel } = await fixture({ 'conversations.replies': () => ({ ok: true, ...payload }) });
+    await expect(channel.readThreadPage(transcriptTarget())).rejects.toThrow();
+  });
+
+  it('rejects an old history page after same-account restart', async () => {
+    let finish!: (value: unknown) => void;
+    const deferred = new Promise(resolve => { finish = resolve; });
+    const { channel, callsFor } = await fixture({ 'conversations.replies': () => deferred });
+    const pending = channel.readThreadPage(transcriptTarget());
+    const rejection = expect(pending).rejects.toThrow('Подключение Slack изменилось');
+    await vi.waitFor(() => expect(callsFor('conversations.replies')).toHaveLength(1));
+    await channel.stop();
+    await channel.start();
+    finish({ ok: true, messages: [] });
+    await rejection;
+  });
+
+  it('propagates read throttling as retryable without uncertainty or sends', async () => {
+    const { channel, callsFor } = await fixture({ 'conversations.replies': () => new Response('', { status: 429, headers: { 'retry-after': '5' } }) });
+    await expect(channel.readThreadPage(transcriptTarget())).rejects.toMatchObject({ retryable: true, uncertain: false, retryAfterMs: 5000 });
+    expect(callsFor('conversations.replies')).toHaveLength(1);
+    expect(callsFor('chat.postMessage')).toHaveLength(0);
+  });
+});
 
 describe('Slack bot conversation catalog', () => {
   it('loads members and profiles when Slack rejects JSON arguments', async () => {
@@ -163,12 +244,12 @@ describe('Slack bot conversation catalog', () => {
     expect(callsFor('conversations.replies')).toEqual([]);
   });
 
-  it('pages members, resolves names, and excludes bots and deleted users', async () => {
+  it('pages members, offers peer agents, and excludes only self, Slackbot and deleted users', async () => {
     const { channel, callsFor } = await fixture({
       'conversations.members': body => body.cursor ? {
         ok: true, members: ['UBORIS'], response_metadata: { next_cursor: '' },
       } : {
-        ok: true, members: ['UBOT', 'UANNA', 'UANNA', 'UOTHERBOT', 'UDELETED', 'UAPP'],
+        ok: true, members: ['UBOT', 'USLACKBOT', 'UANNA', 'UANNA', 'UOTHERBOT', 'UDELETED', 'UAPP'],
         response_metadata: { next_cursor: 'people-page-2' },
       },
       'users.info': body => ({ ok: true, user: {
@@ -177,7 +258,7 @@ describe('Slack bot conversation catalog', () => {
       } }),
     });
     const first = await channel.listPeople('CONE');
-    expect(first).toEqual({ items: [{ id: 'UANNA', name: 'Анна' }], nextCursor: 'people-page-2' });
+    expect(first).toEqual({ items: [{ id: 'UANNA', name: 'Анна' }, { id: 'UOTHERBOT', name: 'Борис', isBot: true }, { id: 'UAPP', name: 'Борис', isBot: true }], nextCursor: 'people-page-2' });
     expect(await channel.listPeople('CONE', first.nextCursor)).toEqual({ items: [{ id: 'UBORIS', name: 'Борис' }], nextCursor: undefined });
     expect(callsFor('conversations.members').map(call => call.body)).toEqual([
       { channel: 'CONE', limit: '20' }, { channel: 'CONE', limit: '20', cursor: 'people-page-2' },

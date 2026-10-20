@@ -32,13 +32,19 @@ Manifest подписывает приложение на `app_mention`, `messag
 
 Каталог, история и участники загружаются постранично. Поиск в панели относится к уже загруженным вариантам; для более старых записей используйте «Загрузить ещё». Чтение истории не создаёт запросов Codex. Видимость ограничена членством бота, scopes, сохранённой историей workspace и лимитами Slack API. При отказе по scopes проверьте разрешения и переустановите приложение с актуальным manifest.
 
-Повторные `message` и `app_mention` объединяются по каналу и timestamp сообщения. Бот не реагирует на собственные ответы, других ботов, правки и удаления.
+Повторные `message` и `app_mention` объединяются по каналу и timestamp сообщения. Все доступные сообщения связанного треда, включая других ботов, собственные ответы и наблюдённые правки/удаления, сохраняются как контекст. Для запуска отметьте отправителя в связке; другому боту дополнительно нужно новое прямое упоминание Rele. Цитата, код, старое упоминание в правке и пересылаемое вложение не запускают задачу.
+
+Для полного контекста выберите режим Codex «Сервер Rele». В настройках связки откройте «Журнал контекста Slack»: там видны исходные сообщения, загрузка истории, передача и ошибки. Старая история загружается целиком постранично, без запуска задач. Во время чужого/активного хода контекст ждёт, затем переносится в простое. Пассивные записи доступны модели, но не отображаются отдельными сообщениями Desktop. При обрыве пассивная цитата может повториться; задачи с неизвестным результатом не отправляются повторно автоматически.
+
+Во время работы используется штатный индикатор Slack через `assistant.threads.setStatus` (scope `chat:write`), с периодическим продлением и очисткой. Rich-ответы передаются native Markdown blocks: заголовки, списки, код, ссылки и таблицы. Длинные таблицы делятся с заголовком; превышающие ограничения сетки строки отображаются кодом. Сообщения Codex с локальными ссылками на файлы получают читаемый путь вместо служебной директивы.
+
+История ограничена сохранёнными и доступными боту данными Slack: уже исчезнувшие сообщения невозможно получить задним числом. Сохраняются текст, blocks, attachments и metadata файлов; содержимое произвольных файлов автоматически не скачивается.
 
 Slack не требует отдельного названия у треда. В каталоге Rele использует начало корневого сообщения, канал, дату и число ответов. Обсуждения, обнаруженные по входящим событиям, доступны и в сохранённом списке. Название можно заменить локальной подписью.
 
 Подтверждения приходят с кнопками в исходный тред. Один обычный вопрос можно завершить следующим текстом в том же треде от исходного отправителя. Пока вопрос открыт, такое сообщение считается ответом на уточнение. Для нескольких вопросов и секретных полей используется панель.
 
-Источники: [Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/), [app token](https://docs.slack.dev/reference/methods/apps.connections.open/), [users.conversations](https://docs.slack.dev/reference/methods/users.conversations/), [conversations.history](https://docs.slack.dev/reference/methods/conversations.history/), [conversations.members](https://docs.slack.dev/reference/methods/conversations.members/), [conversations.replies](https://docs.slack.dev/reference/methods/conversations.replies/).
+Источники: [Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/), [app token](https://docs.slack.dev/reference/methods/apps.connections.open/), [users.conversations](https://docs.slack.dev/reference/methods/users.conversations/), [conversations.history](https://docs.slack.dev/reference/methods/conversations.history/), [conversations.members](https://docs.slack.dev/reference/methods/conversations.members/), [conversations.replies](https://docs.slack.dev/reference/methods/conversations.replies/), [native Markdown](https://docs.slack.dev/reference/block-kit/blocks/markdown-block/), [индикатор работы](https://docs.slack.dev/reference/methods/assistant.threads.setStatus/).
 
 ## Смена токенов
 

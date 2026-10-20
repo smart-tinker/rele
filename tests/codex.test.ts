@@ -25,6 +25,9 @@ async function managedFixture(options: {
   resume?: 'busy' | 'wrong';
   release?: 'early' | 'delayed' | 'notLoaded' | 'silent';
   dropAck?: boolean;
+  contextRead?: 'busy' | 'wrong';
+  contextQueue?: 'pending' | 'afterResume';
+  dropInjectAck?: boolean;
   malformed?: boolean;
   codexHome?: string;
   auto?: boolean;
@@ -42,7 +45,7 @@ async function managedFixture(options: {
     const record = value => appendFileSync(log, JSON.stringify(value) + '\\n');
     const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
     record({ event: 'start', pid: process.pid, argv: process.argv.slice(2), home: process.env.CODEX_HOME, marker: process.env.RELE_CODEX_TEST_MARKER });
-    let released;
+    let released, resumed = false;
     for await (const line of createInterface({ input: process.stdin })) {
       const message = JSON.parse(line);
       record(message);
@@ -54,8 +57,12 @@ async function managedFixture(options: {
           reply({ userAgent: 'rele/' + (options.version || '0.163.0') + ' (Fixture)', codexHome: process.env.CODEX_HOME || ${JSON.stringify(directory)}, platformFamily: 'fixture', platformOs: process.platform });
           break;
         case 'thread/list': reply({ data: [thread], nextCursor: null }); break;
-        case 'thread/queue/list': case 'thread/turns/list': reply({ data: [], nextCursor: null }); break;
+        case 'thread/queue/list':
+          reply({ data: options.contextQueue === 'pending' || options.contextQueue === 'afterResume' && resumed ? [{ id: 'other-queue', clientUserMessageId: 'other-request' }] : [], nextCursor: null });
+          break;
+        case 'thread/turns/list': reply({ data: [], nextCursor: null }); break;
         case 'thread/resume':
+          resumed = true;
           if (options.resume === 'busy') send({ id: message.id, error: { code: -32600, message: 'thread ' + message.params.threadId + ' already has an active writer' } });
           else reply({ thread: { ...thread, id: options.resume === 'wrong' ? 'unexpected-fork' : message.params.threadId } });
           break;
@@ -73,7 +80,11 @@ async function managedFixture(options: {
           break;
         case 'thread/read':
           if (message.params.threadId === 'fixture-release-now') send({ method: 'thread/closed', params: { threadId: released } });
-          reply({ thread });
+          reply({ thread: { ...thread, id: options.contextRead === 'wrong' ? 'unexpected-context-thread' : thread.id, status: { type: options.contextRead === 'busy' ? 'active' : 'idle' } } });
+          break;
+        case 'thread/inject_items':
+          if (options.dropInjectAck) process.exit(0);
+          reply({});
           break;
         default: send({ id: message.id, error: { code: -32601, message: 'Unknown fixture method' } });
       }
@@ -424,6 +435,82 @@ describe('Codex shared-runtime adapter', () => {
     const client = new CodexClient({ transport: 'websocket', endpoint, executable: 'codex' });
     await expect(client.connect()).rejects.toThrow('локальный');
     expect(client.status().connected).toBe(false);
+  });
+});
+
+describe('Codex passive context', () => {
+  it('rejects shared runtimes before any context mutation or writer acquisition', async () => {
+    const f = await fixture();
+    await f.client.connect();
+    const before = f.calls.length;
+    await expect(f.client.injectContext(threadId, 'slack-entry', 'Passive Slack transcript')).rejects.toThrow('управляемом');
+    expect(f.calls).toHaveLength(before);
+  });
+
+  it.each(['0.163.0', '0.163.0-alpha.10.2'])('injects raw user context into the same idle writer on verified %s without creating a turn', async version => {
+    const f = await managedFixture({ version });
+    await f.client.connect();
+    await f.client.injectContext(threadId, 'slack-entry', 'Passive Slack transcript');
+    const calls = await f.calls();
+    const original = calls.find(call => call.method === 'thread/resume');
+    expect(original?.params).toEqual({ threadId, excludeTurns: true });
+    expect(calls.find(call => call.method === 'thread/read')?.params).toEqual({ threadId });
+    expect(calls.find(call => call.method === 'thread/inject_items')?.params).toEqual({
+      threadId, items: [{ type: 'message', id: 'rele_slack_slack-entry', role: 'user', content: [{ type: 'input_text', text: 'Passive Slack transcript' }] }],
+    });
+    const methods = calls.map(call => call.method);
+    expect(methods.indexOf('thread/queue/list')).toBeLessThan(methods.indexOf('thread/resume'));
+    expect(calls.filter(call => call.method === 'thread/queue/list').at(-1)?.params).toEqual({ threadId, limit: 1 });
+    expect(methods.some(method => ['thread/start', 'thread/fork', 'turn/start', 'thread/queue/add'].includes(method ?? ''))).toBe(false);
+    await f.client.releaseThread(threadId);
+    expect((await f.calls()).filter(call => call.method === 'thread/unsubscribe')).toHaveLength(1);
+  });
+
+  it('keeps the exact runtime gate for passive context', async () => {
+    const f = await managedFixture({ version: '0.163.0-alpha.10.3' });
+    await f.client.connect();
+    await expect(f.client.injectContext(threadId, 'entry', 'Context')).rejects.toThrow('проверенного Codex');
+    expect((await f.calls()).some(call => ['thread/resume', 'thread/inject_items'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it.each(['pending', 'afterResume'] as const)('does not inject when the native queue is %s', async contextQueue => {
+    const f = await managedFixture({ contextQueue });
+    await f.client.connect();
+    await expect(f.client.injectContext(threadId, 'entry', 'Context')).rejects.toBeInstanceOf(CodexThreadBusyError);
+    const calls = await f.calls();
+    expect(calls.some(call => ['thread/inject_items', 'thread/queue/add', 'turn/start'].includes(call.method ?? ''))).toBe(false);
+    if (contextQueue === 'pending') expect(calls.some(call => call.method === 'thread/resume')).toBe(false);
+  });
+
+  it('does not inject into an active turn', async () => {
+    const f = await managedFixture({ contextRead: 'busy' });
+    await f.client.connect();
+    await expect(f.client.injectContext(threadId, 'entry', 'Context')).rejects.toBeInstanceOf(CodexThreadBusyError);
+    expect((await f.calls()).some(call => call.method === 'thread/inject_items')).toBe(false);
+  });
+
+  it('preserves the original writer ownership fence', async () => {
+    const f = await managedFixture({ resume: 'busy' });
+    await f.client.connect();
+    await expect(f.client.injectContext(threadId, 'entry', 'Context')).rejects.toBeInstanceOf(CodexThreadBusyError);
+    expect((await f.calls()).some(call => call.method === 'thread/inject_items')).toBe(false);
+  });
+
+  it('fails closed if the read identity differs from the subscribed thread', async () => {
+    const f = await managedFixture({ contextRead: 'wrong' });
+    await f.client.connect();
+    await expect(f.client.injectContext(threadId, 'entry', 'Context')).rejects.toMatchObject({ code: 'thread-identity-mismatch' });
+    expect(f.client.status().connected).toBe(false);
+    expect((await f.calls()).some(call => call.method === 'thread/inject_items')).toBe(false);
+  });
+
+  it('propagates unknown transport outcomes and never replays an injection itself', async () => {
+    const f = await managedFixture({ dropInjectAck: true });
+    await f.client.connect();
+    await expect(f.client.injectContext(threadId, 'entry', 'Context')).rejects.toBeInstanceOf(CodexTransportError);
+    await f.client.connect();
+    expect((await f.calls()).filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
+    expect((await f.calls()).filter(call => call.method === 'thread/resume')).toHaveLength(1);
   });
 });
 

@@ -637,13 +637,13 @@ export function AllowedSenders({
       <legend>Кто может отправлять запросы</legend>
       <p className="field-hint">
         Разрешите хотя бы одного отправителя. Все участники связки используют
-        общий контекст Codex.
+        общий контекст Codex. {endpoint.platform === 'slack' && 'Все сообщения обсуждения, включая ботов, передаются как контекст. Отмеченный бот запускает запрос только по новому упоминанию Rele.'}
       </p>
       {endpoint.platform === 'slack' && sameAccount && (
         <div className="catalog-people-tools">
           <Field
             label="Поиск участников Slack"
-            hint="Поиск по загруженным участникам. Доступ выдаётся только отмеченным людям."
+            hint="Поиск по загруженным участникам и ботам. Запуск разрешён только отмеченным отправителям."
           >
             <input
               type="search"
@@ -675,7 +675,7 @@ export function AllowedSenders({
                   )
                 }
               />
-              <span>{person.name}</span>
+              <span>{person.name}{person.isBot && ' · бот, запуск по @Rele'}</span>
             </label>
           ))}
         </div>

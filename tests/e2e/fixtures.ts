@@ -271,6 +271,10 @@ export async function installApi(
       await route.fulfill({ json: state });
       return;
     }
+    if (request.method() === 'GET' && /^\/api\/conversations\/[^/]+\/slack-sync$/.test(url.pathname)) {
+      await route.fulfill({ json: { streams: [], entries: [] } });
+      return;
+    }
     if (request.method() === 'GET' && url.pathname === '/api/codex/discovery') {
       await route.fulfill({ json: catalog.discovery ?? fixtureDiscovery() });
       return;

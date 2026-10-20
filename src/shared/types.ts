@@ -1,5 +1,5 @@
 export type Platform = 'telegram' | 'slack';
-export interface Person { id: string; name: string }
+export interface Person { id: string; name: string; isBot?: boolean }
 
 export interface CatalogPage<T> { items: T[]; nextCursor?: string }
 export interface CatalogChat {
@@ -66,6 +66,18 @@ export interface AudioAttachment {
   size?: number;
 }
 
+export interface SlackTranscriptMessage {
+  endpointId: string;
+  accountId: string;
+  chatId: string;
+  threadId: string;
+  messageId: string;
+  sender: Person;
+  text: string;
+  payload: Record<string, unknown>;
+  kind: 'message' | 'edit' | 'deleted';
+}
+
 export interface InboundMessage {
   eventId: string;
   endpoint: Endpoint;
@@ -74,6 +86,9 @@ export interface InboundMessage {
   text: string;
   audio?: AudioAttachment;
   replyToMessageId?: string;
+  slack?: SlackTranscriptMessage;
+  contextOnly?: boolean;
+  directMention?: boolean;
 }
 
 export type RequestStatus = 'queued' | 'transcribing' | 'starting' | 'running' | 'waiting_approval' | 'completed' | 'failed' | 'interrupted' | 'cancelled' | 'uncertain';
@@ -213,4 +228,28 @@ export interface DashboardState {
   deliveries: Delivery[];
   approvals: Approval[];
   config: PublicConfig;
+}
+
+export type SlackSyncEntryState = 'pending' | 'applying' | 'applied' | 'uncertain';
+export interface SlackSyncJournal {
+  streams: Array<{
+    id: string;
+    endpointId: string;
+    title: string;
+    active: boolean;
+    paused: boolean;
+    state: 'backfill' | 'ready' | 'blocked';
+    coveredThrough?: string;
+    error?: string;
+    counts: Record<SlackSyncEntryState, number>;
+  }>;
+  streamId?: string;
+  entries: Array<{
+    id: string;
+    message: SlackTranscriptMessage;
+    state: SlackSyncEntryState;
+    error?: string;
+    createdAt: string;
+  }>;
+  nextOffset?: number;
 }

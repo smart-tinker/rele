@@ -9,6 +9,7 @@ import type {
 import { ReleApi, safeHref } from './client';
 import { useAction } from './hooks';
 import { useCodexThreads } from './useCodexThreads';
+import { SlackSyncJournal } from './SlackSyncJournal';
 import {
   AllowedSenders,
   SlackCatalogPicker,
@@ -818,6 +819,7 @@ function EditConversation({
           refresh={refresh}
         />
       ))}
+      <SlackSyncJournal api={api} conversationId={conversation.id} />
     </div>
   );
 }

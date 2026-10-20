@@ -4,10 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type WebSocket from 'ws';
-import type { Delivery, InboundMessage } from '../src/shared/types.js';
+import type { Delivery, Endpoint, InboundMessage } from '../src/shared/types.js';
 import { SlackChannel } from '../src/server/channels/slack.js';
 import {
   ChannelError,
+  endpointId,
   type ChannelCallbacks,
 } from '../src/server/channels/common.js';
 
@@ -43,6 +44,8 @@ async function makeChannel(
     message?: ChannelCallbacks['message'];
     action?: ChannelCallbacks['action'];
     postMessage?: () => Promise<Response>;
+    api?: (method: string, body: Record<string, unknown>) => Response | undefined | Promise<Response | undefined>;
+    knownEndpoints?: Endpoint[];
   } = {},
 ) {
   const socket = new FakeSocket();
@@ -54,11 +57,16 @@ async function makeChannel(
   const action =
     options.action ??
     vi.fn<ChannelCallbacks['action']>().mockResolvedValue(undefined);
+  const status = vi.fn();
   const fetcher = vi
     .fn<typeof fetch>()
     .mockImplementation(async (input, init) => {
       const url = String(input);
       calls.push({ url, init });
+      const form = new Headers(init?.headers).get('content-type')?.startsWith('application/x-www-form-urlencoded');
+      const body = form ? Object.fromEntries(new URLSearchParams(String(init?.body))) : init?.body ? JSON.parse(String(init.body)) : {};
+      const override = await options.api?.(url.split('/').at(-1)!, body);
+      if (override) return override;
       if (url === 'https://slack.com/api/auth.test')
         return Response.json({
           ok: true,
@@ -99,9 +107,10 @@ async function makeChannel(
   const channel = new SlackChannel(
     'SLACK_TOKEN_PLACEHOLDER_4051722',
     'SLACK_TOKEN_PLACEHOLDER_6612940',
-    { message, endpoint: endpoints, action, status: vi.fn() },
+    { message, endpoint: endpoints, action, status },
     {
       fetch: fetcher,
+      knownEndpoints: options.knownEndpoints,
       socket: () => {
         queueMicrotask(() => socket.emit('open'));
         return socket as unknown as WebSocket;
@@ -110,7 +119,7 @@ async function makeChannel(
   );
   live.push(channel);
   await channel.start();
-  return { channel, socket, calls, fetcher, endpoints, message, action };
+  return { channel, socket, calls, fetcher, endpoints, message, action, status };
 }
 
 function envelope(
@@ -221,7 +230,7 @@ describe('Slack Socket Mode durability and identity', () => {
     expect(named.people).toContainEqual({ id: 'UANNA', name: 'Анна (пример)' });
   });
 
-  it('ignores bot messages and another workspace without emitting a user request', async () => {
+  it('persists self and peer bot messages while rejecting another workspace', async () => {
     const { socket, message } = await makeChannel();
     socket.receive(envelope('env-self', 'message', { user: 'UBOT' }));
     socket.receive(envelope('env-bot', 'message', { bot_id: 'BOTHER' }));
@@ -229,7 +238,105 @@ describe('Slack Socket Mode durability and identity', () => {
     foreign.payload.team_id = 'TOTHER';
     socket.receive(foreign);
     await vi.waitFor(() => expect(socket.sent).toHaveLength(2));
-    expect(message).not.toHaveBeenCalled();
+    expect(message).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(message).mock.calls[0][0]).toMatchObject({ contextOnly: true, sender: { id: 'UBOT', isBot: true } });
+    expect(vi.mocked(message).mock.calls[1][0]).toMatchObject({ contextOnly: false, directMention: true, sender: { id: 'UANNA', isBot: true } });
+  });
+
+  it('requires a fresh body mention for peer agents and never wakes itself', async () => {
+    const { socket, message } = await makeChannel();
+    socket.receive(envelope('peer-passive', 'message', { user: 'UPEER', bot_id: 'BPEER', text: 'Готово', ts: '1000.1002' }));
+    socket.receive(envelope('peer-block', 'message', { user: 'UPEER', bot_id: 'BPEER', text: '', blocks: [{ type: 'rich_text', elements: [{ type: 'rich_text_quote', elements: [{ type: 'user', user_id: 'UBOT' }] }] }], ts: '1000.1003' }));
+    socket.receive(envelope('peer-direct', 'message', { user: 'UPEER', bot_id: 'BPEER', text: '<@UBOT> Проверь', ts: '1000.1004' }));
+    socket.receive(envelope('self-direct', 'message', { user: 'UBOT', text: '<@UBOT> Мой ответ', ts: '1000.1005' }));
+    await vi.waitFor(() => expect(message).toHaveBeenCalledTimes(4));
+    const received = vi.mocked(message).mock.calls.map(([value]) => value);
+    expect(received.map(value => value.contextOnly)).toEqual([true, true, false, true]);
+    expect(received.map(value => value.directMention)).toEqual([false, false, true, true]);
+    expect(received[0].endpoint.people).toContainEqual({ id: 'UPEER', name: 'Бот Slack', isBot: true });
+    expect(received[3].endpoint.people.some(person => person.id === 'UBOT')).toBe(false);
+  });
+
+  it('keeps complete visible payload and distinct edit/delete receipts from inner source identity', async () => {
+    const { socket, message } = await makeChannel();
+    const long = 'я'.repeat(60_000);
+    const original = { type: 'message', user: 'UANNA', ts: '1000.1001', thread_ts: '1000.1000', text: long, blocks: [{ type: 'section', text: { type: 'mrkdwn', text: long } }], files: [{ id: 'FONE', name: 'Отчёт.pdf', mimetype: 'application/pdf', url_private: 'https://files.slack.com/files-pri/one', token: 'synthetic-exclude' }], attachments: [{ text: 'Приложение' }], bot_profile: { name: 'noise' }, reply_count: 7 };
+    socket.receive(envelope('full-original', 'message', original));
+    socket.receive(envelope('full-edit', 'message', { subtype: 'message_changed', ts: '9999.1', thread_ts: '9999.0', message: { ...original, text: long + ' изменено', edited: { user: 'UANNA', ts: '1001.1' } } }));
+    socket.receive(envelope('full-delete', 'message', { subtype: 'message_deleted', ts: '9999.2', deleted_ts: '1000.1001', previous_message: original }));
+    await vi.waitFor(() => expect(message).toHaveBeenCalledTimes(3));
+    const received = vi.mocked(message).mock.calls.map(([value]) => value);
+    expect(received.every(value => value.endpoint.threadId === '1000.1000' && value.messageId === '1000.1001')).toBe(true);
+    expect(new Set(received.map(value => value.eventId)).size).toBe(3);
+    expect(received.map(value => value.slack?.kind)).toEqual(['message', 'edit', 'deleted']);
+    expect(received.map(value => value.contextOnly)).toEqual([false, true, true]);
+    expect(received[0].text).toHaveLength(60_000);
+    expect(received[0].slack?.payload).toMatchObject({ text: long, blocks: original.blocks, attachments: original.attachments, files: [{ id: 'FONE', name: 'Отчёт.pdf', mimetype: 'application/pdf' }] });
+    expect(JSON.stringify(received[0].slack?.payload)).not.toMatch(/synthetic-exclude|bot_profile|reply_count|event_ts/);
+  });
+
+  it.each(['> <@UBOT> цитата', '`<@UBOT>`', '``<@UBOT>``', '``a ` <@UBOT> b``', '```md\n<@UBOT>\n```', '~~~\n<@UBOT>\n~~~'])('does not wake a peer for a quoted/code-only mention: %s', async text => {
+    const { socket, message } = await makeChannel();
+    socket.receive(envelope('quoted-peer', 'message', { user: 'UPEER', bot_id: 'BPEER', text }));
+    await vi.waitFor(() => expect(message).toHaveBeenCalledOnce());
+    expect(vi.mocked(message).mock.calls[0][0]).toMatchObject({ directMention: false, contextOnly: true });
+  });
+
+  it('recognizes app traffic and remembered bot roles even without a bot_message subtype', async () => {
+    const known: Endpoint = { id: endpointId('slack', 'TEXAMPLE:UBOT', 'CEXAMPLE', '1000.1000'), platform: 'slack', accountId: 'TEXAMPLE:UBOT', chatId: 'CEXAMPLE', threadId: '1000.1000', title: 'Thread', subtitle: 'Slack', people: [{ id: 'UPEER', name: 'Другой агент', isBot: true }], updatedAt: '2026-10-20T00:00:00Z' };
+    const { socket, message } = await makeChannel({ knownEndpoints: [known] });
+    socket.receive(envelope('remembered-peer', 'message', { user: 'UPEER', text: 'Сводка' }));
+    socket.receive(envelope('app-peer', 'message', { user: 'UAPP', app_id: 'AOTHER', text: 'Сводка', ts: '1000.1002' }));
+    socket.receive(envelope('remember-app-role', 'message', { user: 'UAPP', text: 'Сводка в другом треде', ts: '1000.1003', thread_ts: '1000.0999' }));
+    await vi.waitFor(() => expect(message).toHaveBeenCalledTimes(3));
+    for (const [received] of vi.mocked(message).mock.calls) expect(received).toMatchObject({ sender: { isBot: true }, directMention: false, contextOnly: true });
+  });
+
+  it('persists unknown message subtypes as context without making them task candidates', async () => {
+    const { socket, message } = await makeChannel();
+    socket.receive(envelope('system-context', 'message', { subtype: 'assistant_app_thread', text: '<@UBOT> Context' }));
+    await vi.waitFor(() => expect(message).toHaveBeenCalledOnce());
+    expect(vi.mocked(message).mock.calls[0][0]).toMatchObject({ contextOnly: true, slack: { payload: { subtype: 'assistant_app_thread' } } });
+  });
+
+  it('persists block-only/file-only app posts without adding fake authors to selectable people', async () => {
+    const { socket, message } = await makeChannel();
+    socket.receive(envelope('block-only', 'message', { user: undefined, bot_id: 'BHOOK', subtype: 'bot_message', text: '', blocks: [{ type: 'section', text: { type: 'plain_text', text: 'CI завершён' } }] }));
+    socket.receive(envelope('file-only', 'message', { user: undefined, text: '', subtype: 'file_share', ts: '1000.1002', files: [{ id: 'FONE', title: 'Схема', mimetype: 'image/png' }] }));
+    await vi.waitFor(() => expect(message).toHaveBeenCalledTimes(2));
+    const received = vi.mocked(message).mock.calls.map(([value]) => value);
+    expect(received[0]).toMatchObject({ sender: { id: 'bot:BHOOK', isBot: true }, text: 'CI завершён', contextOnly: true });
+    expect(received[1]).toMatchObject({ sender: { id: 'slack:unknown' }, text: '', contextOnly: true, slack: { payload: { files: [{ title: 'Схема' }] } } });
+    expect(received.every(value => value.endpoint.people.length === 0)).toBe(true);
+  });
+
+  it('keeps non-audio uploads as context while allowing a human voice task', async () => {
+    const { socket, message } = await makeChannel();
+    socket.receive(envelope('human-file', 'message', { text: '', subtype: 'file_share', files: [{ id: 'FPDF', name: 'Отчёт.pdf', mimetype: 'application/pdf' }] }));
+    socket.receive(envelope('human-voice', 'message', { text: '', subtype: 'file_share', ts: '1000.1002', files: [{ id: 'FAUDIO', name: 'Сообщение.ogg', mimetype: 'audio/ogg', url_private_download: 'https://files.slack.com/files-pri/audio.ogg' }] }));
+    await vi.waitFor(() => expect(message).toHaveBeenCalledTimes(2));
+    const received = vi.mocked(message).mock.calls.map(([value]) => value);
+    expect(received[0]).toMatchObject({ contextOnly: true, text: '', slack: { payload: { files: [{ id: 'FPDF' }] } } });
+    expect(received[0].audio).toBeUndefined();
+    expect(received[1]).toMatchObject({ contextOnly: false, audio: { fileId: 'FAUDIO', mimeType: 'audio/ogg' } });
+  });
+
+  it.each([
+    { name: 'native user', mention: true, blocks: [{ type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'user', user_id: 'UBOT' }, { type: 'text', text: ' Проверь' }] }] }] },
+    { name: 'native quote', mention: false, blocks: [{ type: 'rich_text', elements: [{ type: 'rich_text_quote', elements: [{ type: 'user', user_id: 'UBOT' }, { type: 'text', text: ' Проверь' }] }] }] },
+    { name: 'preformatted', mention: false, blocks: [{ type: 'rich_text', elements: [{ type: 'rich_text_preformatted', elements: [{ type: 'user', user_id: 'UBOT' }, { type: 'text', text: ' Проверь' }] }] }] },
+    { name: 'code style', mention: false, blocks: [{ type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'user', user_id: 'UBOT', style: { code: true } }, { type: 'text', text: ' Проверь' }] }] }] },
+    { name: 'markdown', mention: true, blocks: [{ type: 'markdown', text: '<@UBOT> Проверь' }] },
+    { name: 'mrkdwn', mention: true, blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '<@UBOT> Проверь' } }] },
+    { name: 'quoted mrkdwn', mention: false, blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '> <@UBOT> Проверь' } }] },
+    { name: 'inline code', mention: false, blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '`<@UBOT>` Проверь' } }] },
+    { name: 'forwarded metadata', mention: false, blocks: [{ type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: 'Проверь' }] }], forwarded: { type: 'user', user_id: 'UBOT' } }] },
+    { name: 'attachment', mention: false, attachments: [{ blocks: [{ type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'user', user_id: 'UBOT' }, { type: 'text', text: ' Проверь' }] }] }] }] },
+  ])('only accepts fresh rendered current-block mentions: $name', async ({ mention, ...payload }) => {
+    const { socket, message } = await makeChannel();
+    socket.receive(envelope('peer-native', 'message', { user: 'UPEER', bot_id: 'BPEER', text: '', ...payload }));
+    await vi.waitFor(() => expect(message).toHaveBeenCalledOnce());
+    expect(vi.mocked(message).mock.calls[0][0]).toMatchObject({ directMention: mention, contextOnly: !mention });
   });
 });
 
@@ -241,13 +348,43 @@ describe('Slack origin-bound delivery', () => {
     expect(JSON.parse(String(sent.init?.body))).toMatchObject({
       channel: 'CEXAMPLE',
       thread_ts: '1000.1000',
-      text: 'Пример &lt;@everyone&gt; &amp; ответ',
+      text: 'Пример @\u200beveryone &amp; ответ',
+      blocks: [{ type: 'markdown', text: 'Пример @\u200beveryone & ответ' }],
       mrkdwn: false,
       parse: 'none',
       link_names: false,
       unfurl_links: false,
       unfurl_media: false,
     });
+  });
+
+  it('preserves Markdown tables and citations only for answer deliveries', async () => {
+    const { channel, calls } = await makeChannel();
+    const text = '| Файл |\n| --- |\n| Пример |\n:codex-file-citation{path="C:/Отчёт.md" purpose="source"}';
+    await channel.deliver({ ...delivery(), body: text });
+    await channel.deliver({ ...delivery(), kind: 'error', body: text });
+    const posts = calls.filter(call => call.url.endsWith('/chat.postMessage')).map(call => JSON.parse(String(call.init?.body)));
+    expect(posts[0].blocks).toEqual([{ type: 'markdown', text: text.replace(':codex-file-citation{path="C:/Отчёт.md" purpose="source"}', '`C:/Отчёт.md`') }]);
+    expect(posts[1].blocks).toBeUndefined();
+    expect(posts[1].text).toBe(text);
+  });
+
+  it('sets and clears only the original account/thread status without a status callback loop', async () => {
+    const { channel, calls, status } = await makeChannel({ api: method => method === 'assistant.threads.setStatus' ? Response.json({ ok: true }) : undefined });
+    const before = status.mock.calls.length;
+    await channel.setThreadStatus(delivery().origin, 'Думаю…');
+    await channel.setThreadStatus(delivery().origin, '');
+    const updates = calls.filter(call => call.url.endsWith('/assistant.threads.setStatus'));
+    expect(updates.map(call => JSON.parse(String(call.init?.body)))).toEqual([{ channel_id: 'CEXAMPLE', thread_ts: '1000.1000', status: 'Думаю…' }, { channel_id: 'CEXAMPLE', thread_ts: '1000.1000', status: '' }]);
+    expect(updates.every(call => new Headers(call.init?.headers).get('content-type')?.startsWith('application/json'))).toBe(true);
+    expect(status).toHaveBeenCalledTimes(before);
+    await expect(channel.setThreadStatus(delivery('TOTHER:UBOT').origin, 'wrong')).rejects.toThrow('Подключение Slack изменилось');
+    expect(calls.filter(call => call.url.endsWith('/assistant.threads.setStatus'))).toHaveLength(2);
+  });
+
+  it('propagates a native status failure to its manager', async () => {
+    const { channel } = await makeChannel({ api: method => method === 'assistant.threads.setStatus' ? Response.json({ ok: false, error: 'missing_scope' }) : undefined });
+    await expect(channel.setThreadStatus(delivery().origin, 'Думаю…')).rejects.toMatchObject({ retryable: false, uncertain: false });
   });
 
   it('never sends a request through a different installation/account', async () => {

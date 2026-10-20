@@ -238,6 +238,34 @@ export class CodexClient extends EventEmitter {
     }
   }
 
+  /** Passive user context only; caller serializes this with requests and releases our writer. */
+  async injectContext(threadId: string, entryId: string, text: string): Promise<void> {
+    if (this.config.transport !== 'managed' || !this.stdio) throw new Error('Фоновый контекст доступен только в управляемом Codex Rele.');
+    if (!entryId.trim() || !text.trim()) throw new Error('Фоновому контексту нужны постоянный идентификатор и непустой текст.');
+    this.requireQueue();
+    if (!this.isVerifiedVersion()) throw new Error(`Для фонового контекста нужен проверенный Codex ${SUPPORTED_CODEX_VERSION}.`);
+    // Resume may drain a persisted queue. Check before acquiring the original writer too.
+    const pending = await this.call<Page<QueueEntry>>('thread/queue/list', { threadId, limit: 1 });
+    if (!Array.isArray(pending?.data)) throw new CodexTransportError('Codex вернул некорректную очередь фонового контекста.', 'invalid-protocol');
+    if (pending.data.length || pending.nextCursor) throw new CodexThreadBusyError(threadId);
+    await this.subscribe(threadId);
+    const response = await this.call<{ thread: RawThread }>('thread/read', { threadId });
+    if (response?.thread?.id !== threadId) {
+      const error = new CodexTransportError('Codex вернул другой разговор при проверке фонового контекста. Исходная связка сохранена.', 'thread-identity-mismatch');
+      await this.disconnect(error.message, error.code);
+      this.scheduleReconnect();
+      throw error;
+    }
+    if (response.thread.status?.type !== 'idle') throw new CodexThreadBusyError(threadId);
+    const queue = await this.call<Page<QueueEntry>>('thread/queue/list', { threadId, limit: 1 });
+    if (!Array.isArray(queue?.data)) throw new CodexTransportError('Codex вернул некорректную очередь фонового контекста.', 'invalid-protocol');
+    if (queue.data.length || queue.nextCursor) throw new CodexThreadBusyError(threadId);
+    // Raw item IDs are attribution, not server idempotency keys. Never retry the RPC here.
+    await this.call('thread/inject_items', {
+      threadId, items: [{ type: 'message', id: `rele_slack_${entryId}`, role: 'user', content: [{ type: 'input_text', text }] }],
+    });
+  }
+
   async enqueue(threadId: string, text: string, clientUserMessageId: string): Promise<{ queuedSubmissionId: string }> {
     if (!text.trim()) throw new Error('Нельзя отправить пустой запрос Codex.');
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(clientUserMessageId)) {

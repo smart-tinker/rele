@@ -6,8 +6,10 @@ import { Store } from './store.js';
 import type { AppConfig } from './config.js';
 import { ChannelError, splitReply, type ApprovalAction, type Channel } from './channels/common.js';
 import { transcribeAudio } from './voice.js';
+import { SlackSync } from './slack-sync.js';
+import { splitSlackReply } from './channels/slack-format.js';
 
-export type CodexGateway = Pick<CodexClient, 'status' | 'subscribe' | 'releaseThread' | 'enqueue' | 'interrupt' | 'findRequest' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Pick<EventEmitter, 'on' | 'off'>;
+export type CodexGateway = Pick<CodexClient, 'status' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'interrupt' | 'findRequest' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Pick<EventEmitter, 'on' | 'off'>;
 export interface EngineOptions {
   config: () => AppConfig;
   temporaryRoot: string;
@@ -38,18 +40,26 @@ export class Engine extends EventEmitter {
   private resolutions = new Set<string>();
   private lastReconcile = 0;
   private suspended = false;
+  private readonly slackSync: SlackSync;
+  private slackConnection?: string;
   private readonly notification = (event: CodexNotification) => this.event(() => this.onNotification(event));
   private readonly serverRequest = (event: CodexServerRequest) => this.event(() => this.onServerRequest(event));
   private readonly connection = () => this.connectionChanged();
 
   constructor(readonly store: Store, public codex: CodexGateway, private readonly options: EngineOptions) {
     super();
+    this.slackSync = new SlackSync(store, () => this.channels.slack, () => this.codex);
     codex.on('notification', this.notification);
     codex.on('request', this.serverRequest);
     codex.on('status', this.connection);
   }
 
   suspend(value: boolean): void { this.suspended = value; }
+  channelStatus(): void {
+    const channel = this.channels.slack;
+    const identity = JSON.stringify([channel?.state.accountId, channel?.state.connected]);
+    if (this.slackConnection !== identity) { this.slackConnection = identity; this.slackSync.invalidate(); }
+  }
   replaceCodex(next: CodexGateway): void {
     this.codex.off('notification', this.notification); this.codex.off('request', this.serverRequest); this.codex.off('status', this.connection);
     this.expireApprovals(); this.epoch = randomUUID(); this.connected = false;
@@ -83,7 +93,7 @@ export class Engine extends EventEmitter {
     if (this.stopped) throw new ChannelError('Rele завершает работу; событие будет доставлено повторно.', true);
     // Telegram has an explicit reply target. Even a stale approval reply remains
     // an approval receipt, never a new agent task. Slack uses its active question.
-    const approval = message.endpoint.platform === 'telegram'
+    const approval = message.contextOnly ? undefined : message.endpoint.platform === 'telegram'
       ? message.replyToMessageId ? this.store.findReplyApproval(message.endpoint, message.replyToMessageId) : undefined
       : this.store.listApprovals(1000).find(candidate => {
         if (candidate.status !== 'pending' || candidate.questions?.length !== 1 || candidate.questions[0].isSecret) return false;
@@ -223,6 +233,8 @@ export class Engine extends EventEmitter {
   async pump(): Promise<void> {
     if (this.stopped) return;
     const work: Promise<unknown>[] = [this.deliver()];
+    if (!this.suspended) await this.slackSync.backfill();
+    if (this.stopped) { await Promise.allSettled(work); return; }
     if (!this.suspended && this.codex.status().connected) for (const conversation of this.store.listConversations()) {
       if (!conversation.paused && !this.dispatching.has(conversation.id) && !this.releasing.has(conversation.id)
           && Date.now() >= (this.retryThreadAfter.get(conversation.id) ?? 0)) work.push(this.dispatch(conversation.id));
@@ -243,14 +255,22 @@ export class Engine extends EventEmitter {
     try {
       const conversation = this.store.getConversation(conversationId)!;
       const waiting = this.store.listPendingRequests().find(row => row.conversationId === conversationId);
-      if (!waiting || this.store.activeRequests().some(row => row.conversationId === conversationId && row.status !== 'queued')) return;
+      if (this.store.activeRequests().some(row => row.conversationId === conversationId && row.status !== 'queued')) return;
       const client = this.codex;
+      const cutoff = waiting?.origin.platform === 'slack' ? waiting.origin.messageId : undefined;
+      if (!await this.slackSync.drain(conversationId, cutoff)) {
+        const error = this.store.listSlackSyncStreams().find(stream => stream.conversationId === conversationId && stream.error)?.error;
+        if (waiting && error) this.store.updateRequest(waiting.id, { error });
+        return;
+      }
+      if (!waiting || client !== this.codex || this.stopped || this.suspended) return;
       await client.subscribe(conversation.threadId);
       if (client !== this.codex) { await client.releaseThread(conversation.threadId); return; }
       this.ownedThreads.add(conversationId);
-      if (!this.codex.status().queueSupported || this.stopped || this.suspended) return;
+      if (!this.codex.status().queueSupported || this.stopped || this.suspended || this.store.getRequest(waiting.id)?.status !== 'queued') return;
       request = this.store.claimNextRequest(conversationId);
       if (!request) return;
+      if (request.id !== waiting.id) { this.store.updateRequest(request.id, { status: 'queued' }); request = undefined; return; }
       this.retryThreadAfter.delete(conversationId);
       if (request.error) request = this.store.updateRequest(request.id, { error: undefined });
       if (request.audio) {
@@ -325,6 +345,7 @@ export class Engine extends EventEmitter {
         try {
           const remoteMessageId = await channel.deliver(delivery, approval);
           this.store.updateDelivery(delivery.id, { status: 'sent', remoteMessageId, error: undefined });
+          this.emit('delivered', delivery);
         } catch (error) {
           const classified = error instanceof ChannelError ? error : new ChannelError('Результат доставки неизвестен.', false, true);
           this.store.updateDelivery(delivery.id, {
@@ -435,7 +456,7 @@ export class Engine extends EventEmitter {
   private finishFromHistory(request: ReleRequest, found: RequestLocation): void {
     if (found.mixed || this.isMixed(request.id)) { this.store.setMeta(`mixed:${request.id}`, '1'); this.store.finishRequest(request.id, { status: 'failed', turnId: found.turnId, error: mixedMessage }, []); return; }
     if (found.state === 'completed') {
-      this.store.finishRequest(request.id, { status: 'completed', turnId: found.turnId, error: undefined }, splitReply(found.text ?? '').map((body, ordinal) => ({ key: `answer:${ordinal}`, ordinal, kind: 'answer' as const, body })));
+      this.store.finishRequest(request.id, { status: 'completed', turnId: found.turnId, error: undefined }, (request.origin.platform === 'slack' ? splitSlackReply(found.text ?? '') : splitReply(found.text ?? '')).map((body, ordinal) => ({ key: `answer:${ordinal}`, ordinal, kind: 'answer' as const, body })));
     } else if (found.state === 'failed' || found.state === 'interrupted') {
       const error = found.state === 'interrupted' ? 'Выполнение запроса остановлено в Codex.' : 'Codex завершил запрос с ошибкой. Подробности доступны в Codex.';
       this.store.finishRequest(request.id, { status: found.state, turnId: found.turnId, error }, [{ key: 'terminal:error', ordinal: 0, kind: 'error', body: error }]);

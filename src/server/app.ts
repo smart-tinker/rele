@@ -7,7 +7,7 @@ import { mergeConfig, publicConfig } from './config.js';
 import type { Store } from './store.js';
 import type { Engine } from './engine.js';
 import type { CodexClient } from './codex.js';
-import type { DashboardState, Endpoint, Platform } from '../shared/types.js';
+import type { DashboardState, Endpoint, Platform, SlackSyncJournal } from '../shared/types.js';
 import { ChannelError } from './channels/common.js';
 import { discoverCodex } from './codex-discovery.js';
 
@@ -208,6 +208,32 @@ export function createApp(services: AppServices) {
     const bindings = (input.bindings as unknown[] | undefined)?.map(value => binding(value));
     const conversation = store.createConversation({ name, threadId, cwd, bindings });
     return { conversation };
+  });
+  app.get<{ Params: { id: string } }>('/api/conversations/:id/slack-sync', async (request): Promise<SlackSyncJournal> => {
+    const conversationId = string(request.params.id, 'связка', 200);
+    if (!store.getConversation(conversationId)) throw new ApiError(404, 'Связка не найдена.');
+    const query = object(request.query); fields(query, ['streamId', 'offset', 'limit']);
+    const streamId = query.streamId === undefined ? undefined : string(query.streamId, 'журнал Slack', 200);
+    const integer = (value: unknown, fallback: number, minimum: number, maximum: number): number => {
+      if (value === undefined) return fallback;
+      if (typeof value !== 'string' || !/^\d+$/u.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) < minimum || Number(value) > maximum) throw new ApiError(400, 'Некорректная страница журнала Slack.');
+      return Number(value);
+    };
+    const offset = integer(query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+    const limit = integer(query.limit, 50, 1, 100);
+    const streams = store.listSlackSyncStreams().filter(stream => stream.conversationId === conversationId);
+    const selected = streamId === undefined ? streams[0] : streams.find(stream => stream.id === streamId);
+    if (streamId !== undefined && !selected) throw new ApiError(404, 'Журнал Slack не относится к этой связке.');
+    const page = selected ? store.listSlackSyncEntries(selected.id, { offset, limit: limit + 1 }) : [];
+    return {
+      streams: streams.map(stream => ({ id: stream.id, endpointId: stream.endpointId,
+        title: store.getMeta(`endpoint-alias:${stream.endpointId}`) || store.getEndpoint(stream.endpointId)?.title || 'Обсуждение Slack',
+        active: stream.active, paused: stream.paused, state: stream.state, coveredThrough: stream.coveredThrough,
+        error: stream.error, counts: store.getSlackSyncCounts(stream.id) })),
+      ...(selected ? { streamId: selected.id } : {}),
+      entries: page.slice(0, limit).map(entry => ({ id: entry.id, message: entry.message, state: entry.state, error: entry.error, createdAt: entry.createdAt })),
+      ...(page.length > limit ? { nextOffset: offset + limit } : {}),
+    };
   });
   app.patch<{ Params: { id: string } }>('/api/conversations/:id', async request => {
     const input = object(request.body); fields(input, ['name', 'paused']);
