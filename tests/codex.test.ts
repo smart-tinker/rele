@@ -229,7 +229,7 @@ describe('Codex shared-runtime adapter', () => {
     expect(result.message).not.toContain('synthetic-private');
   });
 
-  it('initializes the experimental protocol and lists paginated names without resuming threads', async () => {
+  it.each([false, true])('lists every page of ordinary conversations without resuming them (refresh: %s)', async refresh => {
     const f = await fixture({
       'thread/list': message => message.params.cursor
         ? { data: [{ ...rawThread, id: 'second', name: null, preview: '  Название\nиз контекста  ' }], nextCursor: null }
@@ -238,14 +238,57 @@ describe('Codex shared-runtime adapter', () => {
     await f.client.connect();
     expect(f.client.status()).toMatchObject({ connected: true, queueSupported: true, desktopVerified: false, name: 'Codex 0.163.0' });
     expect(f.calls[0]).toMatchObject({ method: 'initialize', params: { capabilities: { experimentalApi: true } } });
-    const threads = await f.client.listThreads();
+    const threads = await f.client.listThreads({ refresh });
     expect(threads.map(thread => thread.name)).toEqual(['Релиз Rele', 'Название из контекста']);
-    for (const call of f.calls.filter(call => call.method === 'thread/list')) {
-      expect(call.params).toMatchObject({ archived: false, sourceKinds: expect.arrayContaining(['cli', 'vscode', 'appServer', 'exec']) });
+    const listings = f.calls.filter(call => call.method === 'thread/list');
+    expect(listings).toHaveLength(3);
+    expect(listings[0].params).toMatchObject({ useStateDbOnly: true });
+    for (const call of listings) {
+      expect(call.params).toMatchObject({ archived: false, sourceKinds: ['cli', 'vscode', 'exec', 'appServer'] });
     }
-    expect(f.calls.some(call => call.method === 'thread/resume')).toBe(false);
+    for (const call of listings.slice(1)) expect(call.params).toMatchObject({ useStateDbOnly: !refresh });
+    expect(listings[2].params.cursor).toBe('page-2');
+    expect(f.calls.filter(call => call.method === 'thread/queue/list')).toHaveLength(1);
+    expect(f.calls.some(call => ['thread/resume', 'thread/queue/add', 'thread/unarchive'].includes(call.method ?? ''))).toBe(false);
     await f.client.readThread(threadId);
     expect(f.calls.at(-1)).toMatchObject({ method: 'thread/read', params: { threadId } });
+  });
+
+  it('filters technical metadata while preserving every normal source and user titles', async () => {
+    const normal = ['cli', 'vscode', 'exec', 'appServer'].map(source => ({
+      ...rawThread, id: `normal-${source}`, source, name: source === 'cli' ? 'Guardian review' : source,
+    }));
+    const technical = [
+      { ...rawThread, id: 'guardian', source: { subAgent: { other: 'guardian' } }, name: 'Renamed review' },
+      { ...rawThread, id: 'review', source: { subAgent: 'review' } },
+      { ...rawThread, id: 'compact', source: { subAgent: 'compact' } },
+      { ...rawThread, id: 'spawn', source: { subAgent: { thread_spawn: { parent_thread_id: threadId } } } },
+      { ...rawThread, id: 'child', source: 'appServer', parentThreadId: threadId },
+      { ...rawThread, id: 'temporary', source: 'cli', ephemeral: true },
+      { ...rawThread, id: 'unknown', source: 'unknown' },
+    ];
+    const f = await fixture({ 'thread/list': () => ({ data: [...technical, ...normal], nextCursor: null }) });
+    await f.client.connect();
+    const threads = await f.client.listThreads();
+    expect(threads.map(thread => thread.id)).toEqual(normal.map(thread => thread.id));
+    expect(threads[0].name).toBe('Guardian review');
+    expect(f.calls.filter(call => call.method === 'thread/queue/list').map(call => call.params.threadId)).toEqual(['normal-cli']);
+    expect(f.calls.some(call => ['thread/resume', 'thread/queue/add', 'thread/unarchive'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it('checks queue support using full refresh results after an empty indexed catalog', async () => {
+    const f = await fixture({
+      'thread/list': message => ({ data: message.params.useStateDbOnly ? [] : [rawThread], nextCursor: null }),
+    });
+    await f.client.connect();
+    expect(f.client.status()).toMatchObject({ connected: true, queueSupported: false });
+    expect(await f.client.listThreads()).toEqual([]);
+    expect(f.calls.filter(call => call.method === 'thread/queue/list')).toHaveLength(0);
+    expect(await f.client.listThreads({ refresh: true })).toMatchObject([{ id: threadId }]);
+    expect(f.client.status()).toMatchObject({ queueSupported: true, error: undefined });
+    expect(f.calls.filter(call => call.method === 'thread/list')).toHaveLength(3);
+    expect(f.calls.filter(call => call.method === 'thread/queue/list')).toHaveLength(1);
+    expect(f.calls.some(call => ['thread/resume', 'thread/queue/add', 'thread/unarchive'].includes(call.method ?? ''))).toBe(false);
   });
 
   it('lists archived conversations without restoring, resuming or queuing them', async () => {

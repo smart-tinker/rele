@@ -440,6 +440,11 @@ test('Codex catalog searches previews and folders while occupied and archived co
     dialog.getByRole('button', { name: 'Создать связку', exact: true }),
   ).toBeDisabled();
   expect(api.reads).toContain('/api/threads?archived=true');
+  expect(api.reads.some((url) => url.includes('refresh=true'))).toBe(false);
+  await dialog.getByRole('button', { name: 'Обновить разговоры', exact: true }).click();
+  await expect.poll(() => api.reads).toContain('/api/threads?archived=false&refresh=true');
+  await expect.poll(() => api.reads).toContain('/api/threads?archived=true&refresh=true');
+  await expect(choice.locator('option[value="thread-archived"]')).toBeDisabled();
   expect(api.mutations).toEqual([]);
 });
 
@@ -687,9 +692,11 @@ test('Telegram groups forum topics for the current bot, preserves aliases and di
     'href',
     'https://t.me/example_rele_bot?startgroup=rele_register',
   );
+  await expect(dialog.getByText('/rele_register [имя]', { exact: true })).toBeVisible();
   await expect(
     dialog.getByText('/rele_register@example_rele_bot [имя]', { exact: true }),
   ).toBeVisible();
+  await expect(dialog.getByText(/Если бот не отвечает в группе/)).toBeVisible();
   const registered = {
     ...forum,
     id: 'tg-topic-registered',

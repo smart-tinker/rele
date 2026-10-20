@@ -27,7 +27,11 @@ async function fixture(handlers: Record<string, Handler> = {}, knownEndpoints: E
   };
   const fetcher = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
     const method = new URL(String(input)).pathname.split('/').at(-1)!;
-    const body = JSON.parse(String(init?.body));
+    const form = new Headers(init?.headers).get('content-type')?.startsWith('application/x-www-form-urlencoded');
+    if (['conversations.members', 'users.info'].includes(method) && !form) {
+      return Response.json({ ok: false, error: method === 'conversations.members' ? 'invalid_arguments' : 'user_not_found' });
+    }
+    const body = form ? Object.fromEntries(new URLSearchParams(String(init?.body))) : JSON.parse(String(init?.body));
     calls.push({ method, body, authorization: new Headers(init?.headers).get('authorization') });
     const defaults: Record<string, Handler> = {
       'auth.test': () => ({ ok: true, team_id: 'TONE', user_id: 'UBOT', team: 'Команда' }),
@@ -65,6 +69,14 @@ function savedEndpoint(accountId: string, name: string): Endpoint {
 }
 
 describe('Slack bot conversation catalog', () => {
+  it('loads members and profiles when Slack rejects JSON arguments', async () => {
+    const { channel } = await fixture();
+    expect(await channel.listPeople('CONE')).toEqual({
+      items: [{ id: 'UANNA', name: 'Анна' }, { id: 'UBORIS', name: 'Борис' }],
+      nextCursor: undefined,
+    });
+  });
+
   it('pages all four conversation types with human DM and MPIM names using the bot token', async () => {
     const { channel, callbacks, callsFor } = await fixture({
       'users.conversations': body => body.cursor ? {
@@ -168,7 +180,7 @@ describe('Slack bot conversation catalog', () => {
     expect(first).toEqual({ items: [{ id: 'UANNA', name: 'Анна' }], nextCursor: 'people-page-2' });
     expect(await channel.listPeople('CONE', first.nextCursor)).toEqual({ items: [{ id: 'UBORIS', name: 'Борис' }], nextCursor: undefined });
     expect(callsFor('conversations.members').map(call => call.body)).toEqual([
-      { channel: 'CONE', limit: 20 }, { channel: 'CONE', limit: 20, cursor: 'people-page-2' },
+      { channel: 'CONE', limit: '20' }, { channel: 'CONE', limit: '20', cursor: 'people-page-2' },
     ]);
     expect(callsFor('users.info').filter(call => call.body.user === 'UBOT')).toEqual([]);
   });

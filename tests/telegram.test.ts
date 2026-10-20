@@ -379,7 +379,7 @@ describe('Telegram chat discovery', () => {
     expect(h.channel.state.error ?? '').not.toContain(TOKEN);
   });
 
-  it('registers names and people without executing Codex in an existing binding and retains metadata after restart', async () => {
+  it.each(['/rele_register', '/rele_register@RELE_TEST_BOT'])('registers names and people with %s without executing Codex in an existing binding and retains metadata after restart', async (command) => {
     const directory = mkdtempSync(join(tmpdir(), 'rele-telegram-catalog-'));
     directories.push(directory);
     const file = join(directory, 'rele.sqlite');
@@ -395,7 +395,7 @@ describe('Telegram chat discovery', () => {
     const h = harness({ knownEndpoints: store.listEndpoints(), callbacks: { endpoint: endpoint => store.upsertEndpoint(endpoint), message } });
     await h.channel.start();
     h.push([
-      { update_id: 1, message: telegramMessage({ text: '/rele_register@RELE_TEST_BOT Release planning' }) },
+      { update_id: 1, message: telegramMessage({ text: `${command} Release planning` }) },
       { update_id: 2, message: telegramMessage({ text: '/rele_register@some_other_bot Must not rename' }) },
       { update_id: 3, message: privateMessage({ text: '/rele_register' }) },
       { update_id: 4, message: telegramMessage({ message_thread_id: undefined, is_topic_message: undefined, chat: { id: -100456, type: 'group', title: 'Operations' }, text: '/rele_register' }) },

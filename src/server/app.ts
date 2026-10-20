@@ -113,10 +113,11 @@ export function createApp(services: AppServices) {
     conversations: store.listConversations(), endpoints: store.listEndpoints().map(endpoint => ({ ...endpoint, title: store.getMeta(`endpoint-alias:${endpoint.id}`) || endpoint.title })), requests: store.listRequests(250), deliveries: store.listDeliveries(500), approvals: store.listApprovals(250), config: publicConfig(config.config),
   }));
   app.get('/api/threads', async request => {
-    const query = object(request.query); fields(query, ['archived']);
+    const query = object(request.query); fields(query, ['archived', 'refresh']);
     if (query.archived !== undefined && query.archived !== 'true' && query.archived !== 'false') throw new ApiError(400, 'Некорректный фильтр архива Codex.');
+    if (query.refresh !== undefined && query.refresh !== 'true' && query.refresh !== 'false') throw new ApiError(400, 'Некорректный режим обновления каталога Codex.');
     const codex = services.codex();
-    const threads = await codex.listThreads({ archived: query.archived === 'true' });
+    const threads = await codex.listThreads({ archived: query.archived === 'true', ...(query.refresh === 'true' ? { refresh: true } : {}) });
     if (services.codex() !== codex) throw new ApiError(409, 'Подключение Codex изменилось. Обновите список разговоров.');
     return { threads };
   });

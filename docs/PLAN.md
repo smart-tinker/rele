@@ -12,7 +12,7 @@
 | 6. Установка | Windows Setup / native launcher / пользовательская задача; Debian / systemd; portable runtime; SHA-256; backup / restore | Реальные install → restart → upgrade → uninstall smoke обеих ОС плюс архивы |
 | 7. Выпуск | Автоматическая публикация только явного -rc.N после зелёного CI | Stable после фактического закрытия Desktop / messenger условий |
 
-Рабочий кандидат: **0.1.0-rc.4**. Каталог разговоров: [issue #4](https://github.com/smart-tinker/rele/issues/4), [пользовательский сценарий](CATALOG.md). Установщики и автоматический поиск Codex: [установка](INSTALLATION.md), [issue #8](https://github.com/smart-tinker/rele/issues/8). Точные результаты и сборки доступны в GitHub Actions соответствующего commit. Первоначальные плановые варианты заменены проверенными решениями из [ARCHITECTURE.md](ARCHITECTURE.md).
+Рабочий кандидат: **0.1.0-rc.5**. [Изменения rc.5](RC5.md): исправление списка участников Slack, короткая регистрация Telegram и быстрый каталог обычных разговоров Codex. Каталог разговоров: [issue #4](https://github.com/smart-tinker/rele/issues/4), [пользовательский сценарий](CATALOG.md). Установщики и автоматический поиск Codex: [установка](INSTALLATION.md), [issue #8](https://github.com/smart-tinker/rele/issues/8). Точные результаты и сборки доступны в GitHub Actions соответствующего commit. Первоначальные плановые варианты заменены проверенными решениями из [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Принятые ограничения
 

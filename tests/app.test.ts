@@ -671,6 +671,14 @@ describe('conversation discovery API', () => {
     expect(f.store.listRequests()).toEqual([]);
   });
 
+  it('requests a full Codex catalog refresh only when explicitly selected', async () => {
+    const f = makeApp();
+    const response = await f.app.inject({ url: '/api/threads?refresh=true', headers });
+    expect(response.statusCode).toBe(200);
+    expect(f.codex.listThreads).toHaveBeenLastCalledWith({ archived: false, refresh: true });
+    expect((await f.app.inject({ url: '/api/threads?refresh=maybe', headers })).statusCode).toBe(400);
+  });
+
   it('offers archived Codex metadata for inspection but refuses to bind it', async () => {
     const f = makeApp();
     const archive = await f.app.inject({ url: '/api/threads?archived=true', headers });

@@ -408,7 +408,10 @@ export class SlackChannel implements Channel {
     const accountId = this.accountId;
     const signal = this.abort.signal;
     let response: Response;
-    try { response = await this.fetcher(`https://slack.com/api/${method}`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json; charset=utf-8' }, body: JSON.stringify(body), signal: AbortSignal.any([signal, AbortSignal.timeout(20_000)]) }); }
+    // These Slack read methods ignore JSON arguments on the live bot API.
+    const form = method === 'conversations.members' || method === 'users.info';
+    const payload = form ? new URLSearchParams(body).toString() : JSON.stringify(body);
+    try { response = await this.fetcher(`https://slack.com/api/${method}`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': form ? 'application/x-www-form-urlencoded; charset=utf-8' : 'application/json; charset=utf-8' }, body: payload, signal: AbortSignal.any([signal, AbortSignal.timeout(20_000)]) }); }
     catch { throw new ChannelError('Соединение со Slack прервано.', !sending, sending); }
     const retrySeconds = Number(response.headers.get('retry-after'));
     const retryAfterMs = Number.isFinite(retrySeconds) && retrySeconds > 0 ? Math.max(1000, Math.min(3600_000, retrySeconds * 1000)) : 30_000;

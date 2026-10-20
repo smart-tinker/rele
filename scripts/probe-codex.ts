@@ -10,6 +10,7 @@ const { values } = parseArgs({ options: {
   'codex-home': { type: 'string' },
   thread: { type: 'string' },
   archived: { type: 'boolean' },
+  refresh: { type: 'boolean' },
   'token-env': { type: 'string' },
   help: { type: 'boolean' },
 } });
@@ -23,6 +24,7 @@ npm run probe:codex -- --transport websocket --endpoint ws://127.0.0.1:4500 [--t
 
 Optional --thread UUID reads existing thread metadata without resuming it.
 Optional --archived lists archived metadata without restoring conversations.
+Optional --refresh scans rollouts to refresh the Codex metadata index; defaults to the fast indexed catalog.
 Managed starts an owned child and closes it after reading. Other modes attach to an existing server.
 This probe does not create or resume threads, submit model input, or change authentication.
 The runtime PID and CODEX_HOME help compare two attachments; Windows Desktop live verification is separate.`);
@@ -37,7 +39,7 @@ The runtime PID and CODEX_HOME help compare two attachments; Windows Desktop liv
     await client.connect();
     const runtime = client.runtimeInfo();
     const diagnostics = await client.diagnostics();
-    const threads = await client.listThreads({ archived: values.archived });
+    const threads = await client.listThreads({ archived: values.archived, refresh: values.refresh });
     const thread = values.thread ? await client.readThread(values.thread) : undefined;
     console.log(JSON.stringify({
       status: client.status(), runtime, runtimeProcessId: diagnostics.process.id,

@@ -698,7 +698,7 @@ export function CodexSettings({
             icon="refresh"
             busy={threadsLoading}
             disabled={!state.codex.connected || action.busy}
-            onClick={() => void loadThreads()}
+            onClick={() => void loadThreads(true)}
           >
             Обновить разговоры
           </Button>
