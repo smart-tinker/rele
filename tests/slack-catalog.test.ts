@@ -20,19 +20,20 @@ class FakeSocket extends EventEmitter {
 }
 
 async function fixture(handlers: Record<string, Handler> = {}, knownEndpoints: Endpoint[] = []) {
-  const calls: Array<{ method: string; body: Json; authorization: string | null }> = [];
+  const calls: Array<{ method: string; body: Json; form: boolean; authorization: string | null }> = [];
   const callbacks: ChannelCallbacks = {
     message: vi.fn().mockResolvedValue(undefined), endpoint: vi.fn(),
     action: vi.fn().mockResolvedValue(undefined), status: vi.fn(),
   };
   const fetcher = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
     const method = new URL(String(input)).pathname.split('/').at(-1)!;
-    const form = new Headers(init?.headers).get('content-type')?.startsWith('application/x-www-form-urlencoded');
+    const form = new Headers(init?.headers).get('content-type')?.startsWith('application/x-www-form-urlencoded') === true;
     if (['conversations.members', 'users.info', 'conversations.replies'].includes(method) && !form) {
       return Response.json({ ok: false, error: method === 'conversations.members' ? 'invalid_arguments' : 'user_not_found' });
     }
     const body = form ? Object.fromEntries(new URLSearchParams(String(init?.body))) : JSON.parse(String(init?.body));
-    calls.push({ method, body, authorization: new Headers(init?.headers).get('authorization') });
+    calls.push({ method, body, form, authorization: new Headers(init?.headers).get('authorization') });
+    if (method === 'users.conversations' && !form) return Response.json({ ok: true, channels: [{ id: 'CONE', name: 'general' }] });
     const defaults: Record<string, Handler> = {
       'auth.test': () => ({ ok: true, team_id: 'TONE', user_id: 'UBOT', team: 'Команда' }),
       'apps.connections.open': () => ({ ok: true, url: 'wss://wss-primary.slack.com/test' }),
@@ -182,13 +183,115 @@ describe('Slack bot conversation catalog', () => {
     ]);
     expect(second.nextCursor).toBeUndefined();
     expect(callsFor('users.conversations').map(call => call.body)).toEqual([
-      { types: 'public_channel,private_channel,im,mpim', exclude_archived: true, limit: 100 },
-      { types: 'public_channel,private_channel,im,mpim', exclude_archived: true, limit: 100, cursor: 'chat-page-2' },
+      { types: 'public_channel,private_channel,im,mpim', exclude_archived: 'true', limit: '100' },
+      { types: 'public_channel,private_channel,im,mpim', exclude_archived: 'true', limit: '100', cursor: 'chat-page-2' },
     ]);
-    expect(callsFor('users.conversations').every(call => call.authorization === 'Bearer SLACK_TOKEN_PLACEHOLDER_7827226')).toBe(true);
+    expect(callsFor('users.conversations').every(call => call.form && call.authorization === 'Bearer SLACK_TOKEN_PLACEHOLDER_7827226')).toBe(true);
     expect(callsFor('users.info').filter(call => call.body.user === 'UANNA')).toHaveLength(1);
     expect(callbacks.message).not.toHaveBeenCalled();
     expect(callbacks.action).not.toHaveBeenCalled();
+  });
+
+  it('uses granted bot scopes and form pagination to restore a saved DM without requiring mpim:read', async () => {
+    const previous: Endpoint = { ...savedEndpoint('TONE:UBOT', 'Старое имя'),
+      id: endpointId('slack', 'TONE:UBOT', 'DANNA', '1770000000.123456'), chatId: 'DANNA', available: false };
+    const { channel, callbacks, callsFor } = await fixture({
+      'auth.test': () => Response.json({ ok: true, team_id: 'TONE', user_id: 'UBOT', team: 'Команда' }, {
+        headers: { 'x-oauth-scopes': 'chat:write, channels:read,groups:read,im:read,im:history' },
+      }),
+      // The app token's scopes must not replace the bot token's grants.
+      'apps.connections.open': () => Response.json({ ok: true, url: 'wss://wss-primary.slack.com/test' }, {
+        headers: { 'x-oauth-scopes': 'connections:write' },
+      }),
+      'users.conversations': body => body.cursor ? {
+        ok: true, channels: [{ id: 'DANNA', is_im: true, user: 'UANNA' }],
+      } : { ok: true, channels: [{ id: 'CONE', name: 'general' }], response_metadata: { next_cursor: 'dm-page+2/==' } },
+    }, [previous]);
+    const first = await channel.listChats();
+    expect(first.nextCursor).toBe('dm-page+2/==');
+    expect(first.warning).toBe('Каталог Slack частичный: не выданы разрешения mpim:read. Чтобы добавить остальные типы чатов, обновите разрешения приложения в workspace.');
+    const second = await channel.listChats(first.nextCursor);
+    expect(second).toMatchObject({ items: [{ id: 'DANNA', name: 'Анна', kind: 'direct' }], warning: first.warning });
+    expect(second.nextCursor).toBeUndefined();
+    expect(callsFor('users.conversations').map(call => call.body)).toEqual([
+      { types: 'public_channel,private_channel,im', exclude_archived: 'true', limit: '100' },
+      { types: 'public_channel,private_channel,im', exclude_archived: 'true', limit: '100', cursor: 'dm-page+2/==' },
+    ]);
+    expect(callbacks.endpoint).toHaveBeenCalledExactlyOnceWith({ ...previous, available: true, updatedAt: expect.any(String) });
+    expect(await channel.listPeople('DANNA')).toEqual({ items: [{ id: 'UANNA', name: 'Анна' }] });
+    expect(callsFor('conversations.info')).toEqual([]);
+    expect(callsFor('conversations.members')).toEqual([]);
+    expect(callsFor('users.info').map(call => call.body)).toEqual([{ user: 'UANNA' }]);
+    expect(callbacks.message).not.toHaveBeenCalled();
+    expect(callbacks.action).not.toHaveBeenCalled();
+  });
+
+  it.each(['', 'chat:write,im:history'])('rejects a known token with no catalog read scopes before requesting a default public catalog (%s)', async scopes => {
+    const { channel, callbacks, callsFor } = await fixture({
+      'auth.test': () => Response.json({ ok: true, team_id: 'TONE', user_id: 'UBOT', team: 'Команда' }, { headers: { 'x-oauth-scopes': scopes } }),
+    }, [savedEndpoint('TONE:UBOT', 'Анна')]);
+    await expect(channel.listChats()).rejects.toThrow('Для каталога Slack не выданы разрешения channels:read, groups:read, im:read, mpim:read.');
+    expect(callsFor('users.conversations')).toEqual([]);
+    expect(callbacks.endpoint).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, 'channels:read,groups:read,im:read,mpim:read'])('keeps all four types without a partial warning when bot scope coverage is unknown or complete (%s)', async scopes => {
+    const { channel, callsFor } = await fixture({
+      'auth.test': () => Response.json({ ok: true, team_id: 'TONE', user_id: 'UBOT', team: 'Команда' }, {
+        headers: scopes === undefined ? {} : { 'x-oauth-scopes': scopes },
+      }),
+      'apps.connections.open': () => Response.json({ ok: true, url: 'wss://wss-primary.slack.com/test' }, { headers: { 'x-oauth-scopes': 'connections:write' } }),
+    });
+    expect((await channel.listChats()).warning).toBeUndefined();
+    expect(callsFor('users.conversations')[0].body.types).toBe('public_channel,private_channel,im,mpim');
+  });
+
+  it('replaces scope coverage after an account change, including a missing header', async () => {
+    let team = 'TONE';
+    const { channel, callsFor } = await fixture({
+      'auth.test': () => Response.json({ ok: true, team_id: team, user_id: 'UBOT', team }, {
+        headers: team === 'TONE' ? { 'x-oauth-scopes': 'im:read' } : {},
+      }),
+      'users.conversations': () => ({ ok: true, channels: [] }),
+    });
+    expect((await channel.listChats()).warning).toContain('channels:read, groups:read, mpim:read');
+    expect(callsFor('users.conversations')[0].body.types).toBe('im');
+    await channel.stop(); team = 'TTWO'; await channel.start();
+    expect((await channel.listChats()).warning).toBeUndefined();
+    expect(callsFor('users.conversations')[1].body.types).toBe('public_channel,private_channel,im,mpim');
+  });
+
+  it.each([
+    { chatId: 'DANNA', scopes: 'channels:read,groups:read,mpim:read', missing: 'im:read' },
+    { chatId: 'CONE', scopes: 'channels:read,im:read,mpim:read', missing: 'groups:read' },
+    { chatId: 'GGROUP', scopes: 'channels:read,groups:read,im:read', missing: 'mpim:read' },
+  ])('does not infer absent membership when a possible $chatId conversation type was not scanned', async ({ chatId, scopes, missing }) => {
+    const previous = { ...savedEndpoint('TONE:UBOT', 'Анна'),
+      id: endpointId('slack', 'TONE:UBOT', chatId, '1770000000.123456'), chatId };
+    const { channel, callbacks, callsFor } = await fixture({
+      'auth.test': () => Response.json({ ok: true, team_id: 'TONE', user_id: 'UBOT', team: 'Команда' }, { headers: { 'x-oauth-scopes': scopes } }),
+      'users.conversations': () => ({ ok: true, channels: [] }),
+    }, [previous]);
+    await expect(channel.listPeople(chatId)).rejects.toThrow(`Не удалось проверить доступ к разговору Slack: не выданы разрешения ${missing}.`);
+    expect(callbacks.endpoint).not.toHaveBeenCalled();
+    expect(callsFor('conversations.info')).toEqual([]);
+    expect(callsFor('conversations.members')).toEqual([]);
+    expect(callsFor('users.info')).toEqual([]);
+  });
+
+  it('still rejects absent DM membership when only the unrelated mpim scope is missing', async () => {
+    const previous = { ...savedEndpoint('TONE:UBOT', 'Анна'),
+      id: endpointId('slack', 'TONE:UBOT', 'DANNA', '1770000000.123456'), chatId: 'DANNA' };
+    const { channel, callbacks, callsFor } = await fixture({
+      'auth.test': () => Response.json({ ok: true, team_id: 'TONE', user_id: 'UBOT', team: 'Команда' }, {
+        headers: { 'x-oauth-scopes': 'channels:read,groups:read,im:read' },
+      }),
+      'users.conversations': () => ({ ok: true, channels: [] }),
+    }, [previous]);
+    await expect(channel.listPeople('DANNA')).rejects.toThrow('Разговор недоступен боту Slack.');
+    expect(callbacks.endpoint).toHaveBeenCalledExactlyOnceWith({ ...previous, available: false, updatedAt: expect.any(String) });
+    expect(callsFor('conversations.info')).toEqual([]);
+    expect(callsFor('users.info')).toEqual([]);
   });
 
   it('keeps pagination when a page contains only archived or unavailable conversations', async () => {
@@ -428,6 +531,7 @@ describe('Slack bot conversation catalog', () => {
 
   it('reports missing scopes without echoing API data or tokens', async () => {
     const { channel } = await fixture({
+      'auth.test': () => Response.json({ ok: true, team_id: 'TONE', user_id: 'UBOT', team: 'Команда' }, { headers: { 'x-oauth-scopes': 'channels:read,groups:read,im:read' } }),
       'users.conversations': () => ({ ok: false, error: 'missing_scope', needed: 'SLACK_TOKEN_PLACEHOLDER_7827226' }),
     });
     await expect(channel.listChats()).rejects.toMatchObject({

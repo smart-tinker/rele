@@ -165,7 +165,9 @@ jobs:
 
           Both installers include Node.js 24.19.0 and production dependencies. Codex discovery checks Desktop backend locations, versioned Windows CLI directories, running process metadata, and local CLI installations. Opening the installed application uses an expiring single-use login link. Existing chat bindings and saved tokens survive upgrades. Portable ZIP/TAR packages remain available.
 
-          New in rc.10: Mention settings refer to the connected agent by its messenger identity, with no invented @Rele handle. Local source renaming is explicitly labelled as affecting Rele only. Mention parsing, permissions, and SQLite schema remain unchanged. See docs/RC10.md.
+          New in rc.11: Slack conversation discovery uses form-encoded types and cursor, filters conversation types by granted bot read scopes, and reports partial catalogs without blocking available direct messages. Membership validation stays authoritative; accessible DM entries recover their availability. See docs/RC11.md.
+
+          Previously in rc.10: Mention settings refer to the connected agent by its messenger identity, with no invented @Rele handle. Local source renaming is explicitly labelled as affecting Rele only. Mention parsing, permissions, and SQLite schema remain unchanged. See docs/RC10.md.
 
           Previously in rc.9: One Codex thread accepts multiple Slack and Telegram origins with independent routing. Explicit per-chat rules create one new native thread for an unbound authorized conversation; human-only DM allowlists and group-wide optional mention gates are preserved in the resulting binding. Unknown thread/start acknowledgements are never retried automatically. Terminal interruption requires completion evidence, avoiding a transient history race. SQLite migrates v4 to v5; back up before upgrading and use a compatible pre-migration backup for rollback. See docs/RC9.md.
 

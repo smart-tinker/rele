@@ -7,6 +7,9 @@ import { escapeSlackText, formatSlackReply } from './slack-format.js';
 type Json = Record<string, any>;
 const SLACK_TS = /^\d+\.\d+$/u;
 const SLACK_USER = /^[UW][A-Z0-9]+$/u;
+const CONVERSATION_TYPES = [
+  ['public_channel', 'channels:read'], ['private_channel', 'groups:read'], ['im', 'im:read'], ['mpim', 'mpim:read'],
+] as const;
 const PAYLOAD_NOISE = new Set(['token', 'access_token', 'refresh_token', 'authorization', 'response_url', 'bot_profile', 'user_profile', 'event_ts', 'client_msg_id', 'team', 'channel', 'reply_count', 'reply_users', 'reply_users_count', 'latest_reply', 'last_read', 'subscribed', 'reactions']);
 
 function visiblePayload(value: unknown): any {
@@ -74,6 +77,7 @@ export class SlackChannel implements Channel {
   private profiles = new Map<string, Json>();
   private channelNames = new Map<string, string>();
   private conversations = new Map<string, Json>();
+  private catalogScopes?: Set<string>;
   private refreshing = new Set<string>();
   private abort = new AbortController();
 
@@ -177,7 +181,7 @@ export class SlackChannel implements Channel {
       });
     }
     this.requireAccount(accountId, signal);
-    return { items, nextCursor: page.nextCursor };
+    return { items, nextCursor: page.nextCursor, ...(page.warning ? { warning: page.warning } : {}) };
   }
 
   async listThreads(chatId: string, cursor?: string): Promise<CatalogPage<Endpoint>> {
@@ -283,8 +287,12 @@ export class SlackChannel implements Channel {
   private async conversationPage(cursor?: string): Promise<CatalogPage<Json>> {
     const accountId = this.requireAccount();
     const signal = this.abort.signal;
+    const types = CONVERSATION_TYPES.filter(([, scope]) => this.catalogScopes === undefined || this.catalogScopes.has(scope));
+    const missing = CONVERSATION_TYPES.filter(([, scope]) => this.catalogScopes !== undefined && !this.catalogScopes.has(scope)).map(([, scope]) => scope);
+    if (!types.length) throw new ChannelError(`Для каталога Slack не выданы разрешения ${missing.join(', ')}. Обновите разрешения приложения в workspace.`);
+    const warning = missing.length ? `Каталог Slack частичный: не выданы разрешения ${missing.join(', ')}. Чтобы добавить остальные типы чатов, обновите разрешения приложения в workspace.` : undefined;
     const data = await this.api('users.conversations', {
-      types: 'public_channel,private_channel,im,mpim', exclude_archived: true, limit: 100, ...(cursor ? { cursor } : {}),
+      types: types.map(([type]) => type).join(','), exclude_archived: true, limit: 100, ...(cursor ? { cursor } : {}),
     });
     this.requireAccount(accountId, signal);
     if (!Array.isArray(data.channels)) throw new ChannelError('Slack вернул неразборчивый каталог разговоров.');
@@ -294,7 +302,7 @@ export class SlackChannel implements Channel {
       this.conversations.set(conversation.id, conversation);
       this.setAvailability(conversation.id, true, accountId, signal);
     }
-    return { items, nextCursor: this.nextCursor(data) };
+    return { items, nextCursor: this.nextCursor(data), ...(warning ? { warning } : {}) };
   }
 
   private async requireConversation(chatId: string): Promise<Json> {
@@ -312,6 +320,9 @@ export class SlackChannel implements Channel {
       if (cursor && cursors.has(cursor)) throw new ChannelError('Slack повторил страницу каталога. Обновите каталог.');
       if (cursor) cursors.add(cursor);
     } while (cursor);
+    const scopes = chatId.startsWith('D') ? ['im:read'] : chatId.startsWith('C') ? ['channels:read', 'groups:read'] : ['groups:read', 'mpim:read'];
+    const missing = scopes.filter(scope => this.catalogScopes !== undefined && !this.catalogScopes.has(scope));
+    if (missing.length) throw new ChannelError(`Не удалось проверить доступ к разговору Slack: не выданы разрешения ${missing.join(', ')}. Обновите разрешения приложения в workspace.`);
     this.setAvailability(chatId, false, accountId, signal);
     throw new ChannelError('Разговор недоступен боту Slack. Добавьте Rele в разговор и обновите каталог.');
   }
@@ -527,7 +538,7 @@ export class SlackChannel implements Channel {
     const signal = this.abort.signal;
     let response: Response;
     // These Slack read methods ignore JSON arguments on the live bot API.
-    const form = ['conversations.members', 'users.info', 'conversations.replies'].includes(method);
+    const form = ['users.conversations', 'conversations.members', 'users.info', 'conversations.replies'].includes(method);
     const payload = form ? new URLSearchParams(body).toString() : JSON.stringify(body);
     try { response = await this.fetcher(`https://slack.com/api/${method}`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': form ? 'application/x-www-form-urlencoded; charset=utf-8' : 'application/json; charset=utf-8' }, body: payload, signal: AbortSignal.any([signal, AbortSignal.timeout(20_000)]) }); }
     catch { throw new ChannelError('Соединение со Slack прервано.', !sending, sending); }
@@ -543,6 +554,11 @@ export class SlackChannel implements Channel {
       }
       const known: Record<string, string> = { invalid_auth: 'Неверный токен Slack.', token_revoked: 'Токен Slack отозван.', missing_scope: 'Приложению Slack не хватает разрешений. Обновите разрешения и переустановите приложение в workspace.', not_in_channel: 'Добавьте бота Slack в канал.', channel_not_found: 'Канал Slack недоступен.', no_permission: 'Боту Slack недоступен этот разговор.', not_allowed_token_type: 'Неподдерживаемый тип токена Slack.', user_not_found: 'Участник Slack недоступен.', account_inactive: 'Учётная запись Slack отключена.', is_archived: 'Канал Slack архивирован.' };
       throw new ChannelError(known[data.error] ?? 'Slack отклонил запрос.', !sending && response.status >= 500, sending && response.status >= 500);
+    }
+    if (method === 'auth.test' && token === this.botToken) {
+      if (this.stopped || signal !== this.abort.signal || signal.aborted) throw new ChannelError('Подключение Slack изменилось. Подключите Slack и обновите каталог.');
+      const scopes = response.headers.get('x-oauth-scopes');
+      this.catalogScopes = scopes === null ? undefined : new Set(scopes.split(',').map(scope => scope.trim()));
     }
     return data;
   }

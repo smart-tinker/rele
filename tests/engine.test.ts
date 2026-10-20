@@ -973,6 +973,51 @@ describe('automatic native thread creation', () => {
     await fresh.engine.settled(); expect(fresh.codex.createThread).toHaveBeenCalledOnce();
   });
 
+  it('creates from an unmentioned allowed Slack human DM and returns the answer to its original DM root', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture();
+    const human = { id: 'U1', name: 'Allowed human' };
+    const bot = { id: 'UPEERBOT', name: 'Peer bot', isBot: true };
+    const endpoint = { ...f.eps.slack, id: 'auto-slack-dm', chatId: 'DPRIVATE', threadId: '170010.000001', people: [human, bot] };
+    const nativeId = 'auto-slack-dm-native';
+    f.codex.createThread.mockResolvedValue(nativeId);
+    f.store.upsertEndpoint(endpoint);
+    f.config.slack.enabled = true;
+    f.config.autoLinkRules = [{ id: 'slack-human-dm', enabled: true, platform: 'slack', accountId: endpoint.accountId,
+      chatId: endpoint.chatId, cwd: '/projects/slack-dm', allowedSenderIds: [human.id, bot.id], requireMention: true }];
+    await f.engine.receive(slackInbound(f, 'bot-dm', '170010.000002', 'Bot must not create a conversation', { endpoint, sender: bot, directMention: true }));
+    await f.engine.settled();
+    expect(f.codex.createThread).not.toHaveBeenCalled();
+    expect(f.store.listAutoLinkIntents()).toEqual([]);
+    expect(f.store.listRequests()).toEqual([]);
+
+    const incoming = slackInbound(f, 'human-dm', '170010.000003', 'Please check the project', { endpoint, sender: human, directMention: false });
+    await f.engine.receive(incoming); await f.engine.settled();
+    for (let scan = 0; scan < 4 && !f.codex.enqueue.mock.calls.length; scan++) {
+      vi.setSystemTime(Date.now() + 2000); await f.engine.pump(); await f.engine.settled();
+    }
+    expect(f.codex.createThread).toHaveBeenCalledExactlyOnceWith('/projects/slack-dm');
+    const conversation = f.store.listConversations().find(row => row.threadId === nativeId)!;
+    const request = f.store.listRequests()[0];
+    const origin = { platform: 'slack', accountId: endpoint.accountId, endpointId: endpoint.id, chatId: 'DPRIVATE',
+      threadId: endpoint.threadId, senderId: human.id, senderName: human.name, messageId: incoming.messageId };
+    expect(f.store.listRequests()).toHaveLength(1);
+    expect(request).toMatchObject({ conversationId: conversation.id, text: incoming.text, origin });
+    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(nativeId, incoming.text, request.id);
+    expect(f.codex.injectContext.mock.calls.some(([threadId, , text]) => threadId === nativeId && text.includes(incoming.text))).toBe(true);
+    expect(f.codex.injectContext.mock.invocationCallOrder.at(-1)!).toBeLessThan(f.codex.enqueue.mock.invocationCallOrder[0]);
+    f.codex.locations.set(request.id, { state: 'running', turnId: 'dm-turn' });
+    f.codex.notification({ method: 'item/started', params: { threadId: nativeId, turnId: 'dm-turn', item: { type: 'userMessage', clientId: request.id } } });
+    await f.engine.settled();
+    f.codex.locations.set(request.id, { state: 'completed', turnId: 'dm-turn', text: 'DM answer' });
+    f.codex.notification({ method: 'turn/completed', params: { threadId: nativeId, turn: { id: 'dm-turn', status: 'completed' } } });
+    await f.engine.settled(); await f.engine.pump();
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'completed', origin });
+    expect(f.slack.deliver).toHaveBeenCalledOnce();
+    expect(f.slack.deliver.mock.calls[0][0]).toMatchObject({ requestId: request.id, kind: 'answer', body: 'DM answer', origin });
+    expect(f.telegram.deliver).not.toHaveBeenCalled();
+  });
+
   it('never repeats thread/start after an unknown ACK, including after restart', async () => {
     const f = autoFixture(); f.codex.createThread.mockRejectedValue(new CodexTransportError('Lost create ACK'));
     await f.engine.receive(f.incoming()); await f.engine.settled();
