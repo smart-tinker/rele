@@ -72,6 +72,9 @@ export class Engine extends EventEmitter {
   start(): void {
     this.stopped = false;
     this.store.recoverInterrupted();
+    for (const request of this.store.activeRequests()) if (request.status !== 'queued' && !this.store.getMeta(`request-started:${request.id}`)) {
+      this.store.setMeta(`request-started:${request.id}`, String(Date.now()));
+    }
     this.expireApprovals();
     this.connectionChanged();
     this.timer = setInterval(() => this.track(this.pump()), 1000);
@@ -91,18 +94,17 @@ export class Engine extends EventEmitter {
 
   async receive(message: InboundMessage): Promise<void> {
     if (this.stopped) throw new ChannelError('Rele завершает работу; событие будет доставлено повторно.', true);
-    if (!message.contextOnly && !message.audio && /^(?:rele:cancel|\/rele_cancel)$/iu.test(message.text.trim())) {
+    if (message.control === 'stop' || !message.contextOnly && !message.audio && /^(?:rele:cancel|\/rele_cancel)$/iu.test(message.text.trim())) {
       if (this.store.recordInbound(message).duplicate) return;
-      const requests = this.store.activeRequests().filter(request => this.sameOrigin(request, message));
+      const requests = this.store.activeRequests().filter(request => this.sameOrigin(request, message)
+        // A delayed native Stop must not reach the next run, even if it was queued before the click.
+        && (!message.control || request.status !== 'queued' && Number(this.store.getMeta(`request-started:${request.id}`) ?? Infinity) <= Number(message.messageId) * 1000));
       const request = requests.find(request => request.status !== 'queued') ?? requests[0];
       if (request) {
-        let body: string;
-        try {
-          await this.cancel(request.id);
-          body = this.store.getRequest(request.id)?.status === 'cancelled'
-            ? 'Запрос отменён в Rele.' : 'Отмена передана Codex. Rele проверит завершение выполнения.';
-        } catch (error) { body = this.options.redact(error); }
-        this.store.addDeliveries(request.id, [{ key: `control:${message.eventId}`, ordinal: 0, kind: 'error', body }]);
+        const cancellation = this.cancelFromOrigin(request.id, message.eventId);
+        // Socket Mode ACK follows the durable intent, without waiting for native RPC.
+        if (message.control) this.track(cancellation);
+        else await cancellation;
       }
       this.changed();
       this.track(this.pump());
@@ -136,6 +138,18 @@ export class Engine extends EventEmitter {
     } else {
       this.store.ingest(message);
     }
+    this.changed();
+    this.track(this.pump());
+  }
+
+  private async cancelFromOrigin(requestId: string, eventId: string): Promise<void> {
+    let body: string;
+    try {
+      await this.cancel(requestId);
+      body = this.store.getRequest(requestId)?.status === 'cancelled'
+        ? 'Запрос отменён в Rele.' : 'Отмена передана Codex. Rele проверит завершение выполнения.';
+    } catch (error) { body = this.options.redact(error); }
+    this.store.addDeliveries(requestId, [{ key: `control:${eventId}`, ordinal: 0, kind: 'error', body }]);
     this.changed();
     this.track(this.pump());
   }

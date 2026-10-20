@@ -1,20 +1,20 @@
 import type { Origin, ReleRequest } from '../shared/types.js';
+import type { SlackSessionStatus } from './channels/common.js';
 
 const refreshMs = 45_000;
 const retryMs = 15_000;
-// Slack treats every non-empty status as processing; waiting states must stay clear.
 const statuses = {
-  queued: [0, ''],
-  waiting_approval: [0, ''],
-  transcribing: [1, 'Распознаёт аудио…'],
-  starting: [0, ''],
-  running: [2, 'Выполняет запрос…'],
-  uncertain: [0, ''],
+  queued: [0, 'active'],
+  waiting_approval: [3, 'suspended'],
+  transcribing: [1, 'processing'],
+  starting: [0, 'active'],
+  running: [2, 'processing'],
+  uncertain: [0, 'active'],
 } as const;
 
 type Target = {
   origin: Origin;
-  status: string;
+  status: SlackSessionStatus;
   active: boolean;
   revision: number;
   sentRevision: number;
@@ -31,7 +31,7 @@ export class SlackActivity {
 
   constructor(
     private readonly readRequests: () => ReleRequest[],
-    private readonly send: (origin: Origin, status: string) => Promise<void>,
+    private readonly send: (origin: Origin, status: SlackSessionStatus) => Promise<void>,
     private readonly diagnostic: (error: unknown) => void,
   ) {}
 
@@ -45,7 +45,7 @@ export class SlackActivity {
 
   refresh(force = false): void {
     if (this.stopped) return;
-    const current = new Map<string, { origin: Origin; priority: number; status: string }>();
+    const current = new Map<string, { origin: Origin; priority: number; status: SlackSessionStatus }>();
     try {
       for (const request of this.readRequests()) {
         const origin = request.origin;
@@ -62,8 +62,8 @@ export class SlackActivity {
     });
     for (const [key, target] of this.targets) {
       target.active = current.has(key);
-      const status = current.get(key)?.status ?? '';
-      if (target.status !== status || (force && status)) {
+      const status = current.get(key)?.status ?? 'active';
+      if (target.status !== status || (force && status !== 'active')) {
         target.status = status;
         target.revision++;
         target.retryAt = 0;
@@ -78,7 +78,7 @@ export class SlackActivity {
     this.timer = undefined;
     for (const [key, target] of this.targets) {
       target.active = false;
-      if (target.status) { target.status = ''; target.revision++; }
+      if (target.status !== 'active') { target.status = 'active'; target.revision++; }
       target.retryAt = 0;
       this.flush(key, target);
     }
@@ -86,14 +86,14 @@ export class SlackActivity {
   }
 
   private needsSend(target: Target): boolean {
-    return Date.now() >= target.retryAt && (target.sentRevision !== target.revision || (!!target.status && Date.now() - target.sentAt >= refreshMs));
+    return Date.now() >= target.retryAt && (target.sentRevision !== target.revision || (target.status !== 'active' && Date.now() - target.sentAt >= refreshMs));
   }
 
   private flush(key: string, target: Target): void {
     if (target.task || !this.needsSend(target)) return;
     target.task = this.write(target).finally(() => {
       target.task = undefined;
-      if (!target.active && !target.status && target.sentRevision === target.revision) this.targets.delete(key);
+      if (!target.active && target.status === 'active' && target.sentRevision === target.revision) this.targets.delete(key);
       else this.flush(key, target);
     });
   }

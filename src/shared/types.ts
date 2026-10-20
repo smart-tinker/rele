@@ -79,6 +79,8 @@ export interface SlackTranscriptMessage {
 }
 
 export interface InboundMessage {
+  // Native controls are inbox receipts, never Slack transcript messages or new tasks.
+  control?: 'stop';
   eventId: string;
   endpoint: Endpoint;
   sender: Person;

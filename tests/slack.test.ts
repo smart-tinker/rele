@@ -209,6 +209,36 @@ describe('Slack Socket Mode durability and identity', () => {
     );
   });
 
+  it('delivers native Stop as a durable control, without fabricating a Slack transcript message', async () => {
+    const known: Endpoint = { id: endpointId('slack', 'TEXAMPLE:UBOT', 'CEXAMPLE', '1000.1000'), platform: 'slack', accountId: 'TEXAMPLE:UBOT', chatId: 'CEXAMPLE', threadId: '1000.1000', title: 'Thread', subtitle: 'Slack', people: [{ id: 'UANNA', name: 'Anna' }], updatedAt: '2026-10-20T00:00:00Z' };
+    let commit!: () => void;
+    const persisted = new Promise<void>(resolve => { commit = resolve; });
+    const message = vi.fn<ChannelCallbacks['message']>().mockRejectedValueOnce(new Error('Synthetic disk error')).mockImplementationOnce(() => persisted);
+    const { socket, channel } = await makeChannel({ message, knownEndpoints: [known] });
+    const stop = envelope('native-stop', 'message', { type: 'agent_session_stopped', event_ts: '1000.2000', streaming_message_ts: [] });
+    socket.receive(stop);
+    await vi.waitFor(() => expect(channel.state.error).toContain('Не удалось сохранить событие'));
+    expect(socket.sent).toEqual([]);
+    socket.receive(stop);
+    await vi.waitFor(() => expect(message).toHaveBeenCalledTimes(2));
+    expect(message.mock.calls[1][0]).toEqual({ control: 'stop', eventId: 'agent-session-stopped:outer-native-stop', endpoint: known, sender: known.people[0], messageId: '1000.2000', text: '' });
+    expect(socket.sent).toEqual([]);
+    commit();
+    await vi.waitFor(() => expect(socket.sent).toEqual([JSON.stringify({ envelope_id: 'native-stop' })]));
+  });
+
+  it('rejects foreign and malformed native Stop events before the control callback', async () => {
+    const known: Endpoint = { id: endpointId('slack', 'TEXAMPLE:UBOT', 'CEXAMPLE', '1000.1000'), platform: 'slack', accountId: 'TEXAMPLE:UBOT', chatId: 'CEXAMPLE', threadId: '1000.1000', title: 'Thread', subtitle: 'Slack', people: [], updatedAt: '2026-10-20T00:00:00Z' };
+    const { socket, message } = await makeChannel({ knownEndpoints: [known] });
+    const stop = envelope('foreign-stop', 'message', { type: 'agent_session_stopped', event_ts: '1000.2000', streaming_message_ts: [] });
+    socket.receive({ ...stop, payload: { ...stop.payload, team_id: 'TOTHER' } });
+    for (const patch of [{ channel: 'COTHER' }, { thread_ts: '1000.9999' }, { thread_ts: undefined }, { user: 'invalid' }, { event_ts: undefined }]) {
+      socket.receive(envelope('invalid-stop', 'message', { type: 'agent_session_stopped', event_ts: '1000.2000', ...patch }));
+    }
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(5));
+    expect(message).not.toHaveBeenCalled();
+  });
+
   it('normalizes app_mention and message to the same dedupe identity and named endpoint', async () => {
     const received: InboundMessage[] = [];
     const { socket, endpoints } = await makeChannel({
@@ -370,21 +400,36 @@ describe('Slack origin-bound delivery', () => {
   });
 
   it('sets and clears only the original account/thread status without a status callback loop', async () => {
-    const { channel, calls, status } = await makeChannel({ api: method => method === 'assistant.threads.setStatus' ? Response.json({ ok: true }) : undefined });
+    const { channel, calls, status } = await makeChannel({ api: method => method === 'agents.sessions.setStatus' ? Response.json({ ok: true }) : undefined });
     const before = status.mock.calls.length;
-    await channel.setThreadStatus(delivery().origin, 'Думаю…');
-    await channel.setThreadStatus(delivery().origin, '');
-    const updates = calls.filter(call => call.url.endsWith('/assistant.threads.setStatus'));
-    expect(updates.map(call => JSON.parse(String(call.init?.body)))).toEqual([{ channel_id: 'CEXAMPLE', thread_ts: '1000.1000', status: 'Думаю…' }, { channel_id: 'CEXAMPLE', thread_ts: '1000.1000', status: '' }]);
+    await channel.setThreadStatus(delivery().origin, 'processing');
+    await channel.setThreadStatus(delivery().origin, 'active');
+    const updates = calls.filter(call => call.url.endsWith('/agents.sessions.setStatus'));
+    expect(updates.map(call => JSON.parse(String(call.init?.body)))).toEqual([{ channel_id: 'CEXAMPLE', thread_ts: '1000.1000', status: 'processing' }, { channel_id: 'CEXAMPLE', thread_ts: '1000.1000', status: 'active' }]);
     expect(updates.every(call => new Headers(call.init?.headers).get('content-type')?.startsWith('application/json'))).toBe(true);
     expect(status).toHaveBeenCalledTimes(before);
-    await expect(channel.setThreadStatus(delivery('TOTHER:UBOT').origin, 'wrong')).rejects.toThrow('Подключение Slack изменилось');
-    expect(calls.filter(call => call.url.endsWith('/assistant.threads.setStatus'))).toHaveLength(2);
+    await expect(channel.setThreadStatus(delivery('TOTHER:UBOT').origin, 'processing')).rejects.toThrow('Подключение Slack изменилось');
+    expect(calls.filter(call => call.url.endsWith('/agents.sessions.setStatus'))).toHaveLength(2);
   });
 
   it('propagates a native status failure to its manager', async () => {
-    const { channel } = await makeChannel({ api: method => method === 'assistant.threads.setStatus' ? Response.json({ ok: false, error: 'missing_scope' }) : undefined });
-    await expect(channel.setThreadStatus(delivery().origin, 'Думаю…')).rejects.toMatchObject({ retryable: false, uncertain: false });
+    const { channel } = await makeChannel({ api: method => method === 'agents.sessions.setStatus' ? Response.json({ ok: false, error: 'missing_scope' }) : undefined });
+    await expect(channel.setThreadStatus(delivery().origin, 'processing')).rejects.toMatchObject({ retryable: false, uncertain: false });
+  });
+
+  it('reports a missing native Stop subscription once and clears it when fixed', async () => {
+    let subscribed = false;
+    const { channel, status } = await makeChannel({ api: method => method === 'agents.sessions.setStatus'
+      ? Response.json({ ok: true, response_metadata: { warnings: subscribed ? [] : ['missing_agent_session_stopped_event_subscription'] } }) : undefined });
+    const before = status.mock.calls.length;
+    await channel.setThreadStatus(delivery().origin, 'processing');
+    expect(channel.state.error).toContain('agent_session_stopped');
+    await channel.setThreadStatus(delivery().origin, 'processing');
+    expect(status).toHaveBeenCalledTimes(before + 1);
+    subscribed = true;
+    await channel.setThreadStatus(delivery().origin, 'active');
+    expect(channel.state.error).toBeUndefined();
+    expect(status).toHaveBeenCalledTimes(before + 2);
   });
 
   it('never sends a request through a different installation/account', async () => {

@@ -438,6 +438,82 @@ describe('Engine approvals', () => {
     expect(f.store.listDeliveries().find(row => row.key === 'control:cancel-control')?.origin).toEqual(request.origin);
   });
 
+  it('uses native Slack Stop to interrupt the exact origin once, retaining the receipt across restart', async () => {
+    const f = fixture(); const request = await acceptRequest(f); await running(f, request);
+    const control = f.message('slack', 'agent-session-stopped:Ev1', { control: 'stop', text: '', messageId: `${Math.floor(Date.now() / 1000) + 1}.000001` });
+    for (const patch of [{ endpoint: { ...control.endpoint, id: 'other-account', accountId: 'other' } }, { endpoint: { ...control.endpoint, id: 'other-chat', chatId: 'other' } }, { endpoint: { ...control.endpoint, id: 'other-thread', threadId: 'other' } }, { sender: { id: 'other', name: 'Other' } }]) {
+      await f.engine.receive({ ...control, ...patch, eventId: `wrong-${JSON.stringify(patch)}` });
+    }
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+    f.codex.interrupt.mockImplementationOnce(async () => { expect(f.store.recordInbound(control).duplicate).toBe(true); });
+    await f.engine.receive(control); await f.engine.receive(control); await f.engine.settled();
+    expect(f.codex.interrupt).toHaveBeenCalledExactlyOnceWith(THREAD, 'turn-1');
+    expect(f.store.listRequests()).toHaveLength(1);
+    expect(f.store.listDeliveries().find(row => row.key === `control:${control.eventId}`)?.origin).toEqual(request.origin);
+    await f.engine.stop(); f.store.close();
+    const restarted = fixture({ path: f.path, start: false });
+    await restarted.engine.receive(control);
+    expect(restarted.codex.interrupt).not.toHaveBeenCalled();
+    expect(restarted.store.listRequests()).toHaveLength(1);
+  });
+
+  it('does not let a delayed native Stop cancel a later message or a merely queued request', async () => {
+    const f = fixture();
+    const request = await acceptRequest(f, 'slack', 'later');
+    const control = f.message('slack', 'agent-session-stopped:old', { control: 'stop', text: '', messageId: '1.000001' });
+    await running(f, request); await f.engine.receive(control);
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+    expect(f.store.getRequest(request.id)?.status).toBe('running');
+    const idle = fixture(); idle.codex.connected = false;
+    const queued = await acceptRequest(idle, 'slack', 'queued');
+    await idle.engine.receive(idle.message('slack', 'agent-session-stopped:queued', { control: 'stop', text: '', messageId: '999999.999999' }));
+    expect(idle.store.getRequest(queued.id)?.status).toBe('queued');
+    expect(idle.codex.deleteQueued).not.toHaveBeenCalled();
+    expect(idle.codex.enqueue).not.toHaveBeenCalled();
+  });
+
+  it('does not redirect a delayed Stop to a request that was queued before the click', async () => {
+    const f = fixture(); const first = await acceptRequest(f); await running(f, first);
+    const next = await acceptRequest(f, 'slack', 'already-queued');
+    expect(f.store.getRequest(next.id)?.status).toBe('queued');
+    const clickMs = Date.now() + 100;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(clickMs + 1000);
+    try {
+      f.codex.complete(first.id, 'First response'); await f.engine.settled();
+      await f.engine.pump(); await f.engine.settled();
+      await running(f, next, 'next-turn');
+      expect(Number(f.store.getMeta(`request-started:${next.id}`))).toBeGreaterThan(clickMs);
+      await f.engine.receive(f.message('slack', 'agent-session-stopped:delayed', { control: 'stop', text: '', messageId: String(clickMs / 1000) }));
+      await f.engine.settled();
+      expect(f.codex.interrupt).not.toHaveBeenCalled();
+      expect(f.store.getRequest(next.id)?.status).toBe('running');
+    } finally { clock.mockRestore(); }
+  });
+
+  it('returns native Stop after its durable receipt while the exact-target cancellation RPC is pending', async () => {
+    const f = fixture(); const request = await acceptRequest(f); await running(f, request);
+    const native = deferred<RequestLocation>();
+    f.codex.findRequest.mockImplementationOnce(() => native.promise);
+    const control = f.message('slack', 'agent-session-stopped:slow-rpc', { control: 'stop', text: '', messageId: `${Math.floor(Date.now() / 1000) + 1}.000001` });
+    await f.engine.receive(control);
+    expect(f.store.recordInbound(control).duplicate).toBe(true);
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+    native.resolve({ state: 'running', turnId: 'turn-1' });
+    await f.engine.settled();
+    expect(f.codex.interrupt).toHaveBeenCalledExactlyOnceWith(THREAD, 'turn-1');
+  });
+
+  it('keeps native Stop out of Codex when another client has mixed the turn', async () => {
+    const f = fixture(); const request = await acceptRequest(f); await running(f, request);
+    f.store.setMeta(`mixed:${request.id}`, '1');
+    await f.engine.receive(f.message('slack', 'agent-session-stopped:mixed', { control: 'stop', text: '', messageId: `${Math.floor(Date.now() / 1000) + 1}.000001` }));
+    await f.engine.settled();
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+    expect(f.codex.deleteQueued).not.toHaveBeenCalled();
+    expect(f.store.listRequests()).toHaveLength(1);
+    expect(f.store.listDeliveries()[0].body).toContain('смешанного хода');
+  });
+
   it.each([true, false])('refuses to interrupt mixed turns, including a persisted mixed flag=%s', async persisted => {
     const f = fixture(); const request = await acceptRequest(f, 'telegram'); await running(f, request);
     if (persisted) f.store.setMeta(`mixed:${request.id}`, '1');

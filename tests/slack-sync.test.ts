@@ -32,6 +32,22 @@ function fixture() {
 }
 
 describe('durable Slack passive sync', () => {
+  it('never imports a native Stop receipt as a phantom message when binding a new stream', async () => {
+    const f = fixture();
+    f.trigger(f.message('110.000000', 'Real Slack message'));
+    f.store.recordInbound({ control: 'stop', eventId: 'agent-session-stopped:Ev1', endpoint: f.endpoint,
+      sender: f.endpoint.people[0], messageId: '120.000000', text: '' });
+    f.store.removeBinding(f.conversation.id, 'slack');
+    const rebound = f.store.createConversation({ name: 'New binding', threadId: 'other-codex', cwd: '/project',
+      bindings: [{ platform: 'slack', endpointId: f.endpoint.id, allowedSenderIds: ['U1'] }] });
+    const stream = f.store.listSlackSyncStreams().find(row => row.conversationId === rebound.id)!;
+    expect(f.store.listSlackSyncEntries(stream.id).map(entry => entry.messageId)).toEqual(['110.000000']);
+    await f.sync.backfill();
+    expect(await f.sync.drain(rebound.id)).toBe(true);
+    expect(f.codex.injectContext).toHaveBeenCalledOnce();
+    expect(f.codex.injectContext.mock.calls[0][2]).toContain('Real Slack message');
+  });
+
   it('waits for every history page before task context and never retro-triggers history', async () => {
     const f = fixture();
     const trigger = f.trigger(f.message('120.000000', 'Authorized task'));

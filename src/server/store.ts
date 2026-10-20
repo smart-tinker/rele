@@ -348,6 +348,7 @@ export class Store {
       // Existing receipts remain useful when upgrading, even before Slack backfill succeeds.
       for (const receipt of this.db.prepare('SELECT payload,request_id FROM inbound_events WHERE endpoint_id=? ORDER BY rowid').all(row.endpoint_id)) {
         const inbound = json<InboundMessage>(receipt.payload);
+        if (inbound.control) continue;
         const message = inbound.slack ?? { endpointId: inbound.endpoint.id, accountId: inbound.endpoint.accountId,
           chatId: inbound.endpoint.chatId, threadId: inbound.endpoint.threadId, messageId: inbound.messageId,
           sender: inbound.sender, text: inbound.text, payload: { text: inbound.text, ...(inbound.audio ? { audio: inbound.audio } : {}) }, kind: 'message' as const };
@@ -531,6 +532,7 @@ export class Store {
       if (!row) return undefined;
       const id = row.id as string;
       this.db.prepare("UPDATE requests SET status='starting',updated_at=? WHERE id=?").run(new Date().toISOString(), id);
+      this.setMeta(`request-started:${id}`, String(Date.now()));
       return this.getRequest(id)!;
     });
   }
