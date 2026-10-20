@@ -380,7 +380,7 @@ function BindingFields({
             disabled={disabled}
           />}
           <label className="check-row"><input type="checkbox" checked={!!value.allowAllSenders} disabled={disabled || (endpoint.platform === 'slack' ? !/^[CG][A-Z0-9]+$/u.test(endpoint.chatId) : !/^-\d+$/u.test(endpoint.chatId))} onChange={event => onChange({ ...value, allowAllSenders: event.target.checked, ...(event.target.checked ? { allowedSenderIds: [] } : {}) })} /><span>Разрешить всем участникам группы, включая агентов</span></label>
-          <label className="check-row"><input type="checkbox" checked={!!value.requireMention} disabled={disabled} onChange={event => onChange({ ...value, requireMention: event.target.checked })} /><span>В группах запускать только при упоминании Rele</span></label>
+          <label className="check-row"><input type="checkbox" checked={!!value.requireMention} disabled={disabled} onChange={event => onChange({ ...value, requireMention: event.target.checked })} /><span>В группах запускать только при упоминании подключённого агента</span></label>
         </>
       )}
     </>
@@ -467,7 +467,7 @@ function EndpointNameEditor({
         <button
           type="button"
           className="text-button"
-          aria-label={`Переименовать разговор ${platformLabel(endpoint.platform)}`}
+          aria-label={`Изменить название разговора ${platformLabel(endpoint.platform)} только в Rele`}
           disabled={disabled}
           onClick={() => {
             setTitle(endpoint.title);
@@ -475,7 +475,7 @@ function EndpointNameEditor({
             setEditing(true);
           }}
         >
-          Переименовать в Rele
+          Изменить название только в Rele
         </button>
       )}
     </div>
