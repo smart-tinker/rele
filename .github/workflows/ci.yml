@@ -5,6 +5,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      windows_session_probe:
+        description: 'Run only the disposable Windows RDP and InteractiveToken canary'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -14,7 +19,29 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  windows-session-probe:
+    name: Diagnose Windows session only
+    if: github.event_name == 'workflow_dispatch' && inputs.windows_session_probe == true
+    runs-on: windows-2025
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Check isolated RDP session and non-elevated scheduled action
+        shell: pwsh
+        run: .\scripts\windows\ci-standard-user-canary.ps1
+      - name: Keep bounded session evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: windows-session-probe
+          path: windows-standard-user-results.json
+          if-no-files-found: error
+          retention-days: 14
+
   verify:
+    if: github.event_name != 'workflow_dispatch' || inputs.windows_session_probe != true
     name: Verify and package (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
