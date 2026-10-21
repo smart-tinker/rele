@@ -10,6 +10,14 @@ function Token-Elevated {
     if ($LASTEXITCODE -ne 0) { throw 'Fixture process token could not be verified.' }
     return ($result | ConvertFrom-Json).elevated
 }
+function Read-RdpMode {
+    $result = @{ fDenyTSConnections = (Get-Item -LiteralPath $terminalPath).GetValue('fDenyTSConnections', $null) }
+    try {
+        $mode = Get-CimInstance -Namespace 'root/cimv2/TerminalServices' -ClassName Win32_TerminalServiceSetting -Property AllowTSConnections, PolicySourceAllowTSConnections
+        $result.allowTSConnections = [int]$mode.AllowTSConnections; $result.policySourceAllowTSConnections = [int]$mode.PolicySourceAllowTSConnections
+    } catch { $result.errorHResult = ('0x{0:X8}' -f $_.Exception.HResult) }
+    return $result
+}
 function Remove-Canary([string]$Sid) {
     $scheduler = New-Object -ComObject 'Schedule.Service'; $scheduler.Connect(); $folder = $scheduler.GetFolder('\')
     $name = 'Rele-CI-Canary-' + $Nonce
@@ -96,6 +104,8 @@ if (Test-Path -LiteralPath $FixtureRoot) { throw 'Fixture directory already exis
 New-Item -ItemType Directory -Path $FixtureRoot | Out-Null
 $user = $null; $child = $null; $credential = $null; $password = $null; $rdp = $null
 $rdpSettingsChanged = $false; $serviceStartupChanged = $false; $serviceStarted = $false
+$rdpStartedAt = $null; $rdpModeBefore = $null; $rdpModeAfter = $null; $rdpTransport = @{}
+$rdpClientLog = 'Microsoft-Windows-TerminalServices-RDPClient/Operational'
 $terminalPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
 try {
     $bytes = New-Object byte[] 32; $random = [Security.Cryptography.RandomNumberGenerator]::Create(); $random.GetBytes($bytes); $random.Dispose()
@@ -116,6 +126,13 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Loopback RDP fixture helper compilation failed.' }
     [Reflection.Assembly]::Load([IO.File]::ReadAllBytes($rdpAssembly)) | Out-Null
     Remove-Item -LiteralPath $rdpAssembly
+    try {
+        $provider = Get-WinEvent -ListProvider 'Microsoft-Windows-TerminalServices-ClientActiveXCore'
+        if (@($provider.LogLinks | Where-Object { $_.LogName -eq $rdpClientLog }).Count -ne 1) { throw 'The fixed RDP client diagnostic channel is unavailable.' }
+        & (Join-Path ([Environment]::GetFolderPath('System')) 'wevtutil.exe') sl $rdpClientLog /e:true
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot enable the fixed RDP client diagnostic channel.' }
+    } catch { $rdpTransport.logSetupErrorHResult = ('0x{0:X8}' -f $_.Exception.HResult) }
+    $rdpModeBefore = Read-RdpMode
     $priorDeny = (Get-Item -LiteralPath $terminalPath).GetValue('fDenyTSConnections', $null)
     if ($null -eq $priorDeny -or $priorDeny -ne 0) { Set-ItemProperty -LiteralPath $terminalPath -Name fDenyTSConnections -Value 0; $rdpSettingsChanged = $true }
     $service = Get-Service -Name TermService
@@ -127,7 +144,9 @@ try {
         if ([DateTime]::UtcNow -ge $listenerDeadline) { throw 'The disposable runner RDP listener did not become ready.' }
         Start-Sleep -Milliseconds 100
     }
+    $rdpModeAfter = Read-RdpMode
     $rdp = [FixtureRdpSession]::new($account, $env:COMPUTERNAME, $password, $sid)
+    $rdpStartedAt = [DateTime]::UtcNow
     $rdp.Connect()
     @{ nonce = $Nonce; sid = $sid; rdpSessionId = $rdp.SessionId } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8
     $credential = New-Object System.Management.Automation.PSCredential ($env:COMPUTERNAME + '\' + $account), $password
@@ -168,6 +187,24 @@ try {
     if (-not (Test-Path -LiteralPath $publishedResult)) { @{ result = 'failed'; stage = 'rdp-session'; error = $_.Exception.Message; errorHResult = ('0x{0:X8}' -f $_.Exception.HResult) } | ConvertTo-Json | Set-Content -LiteralPath $publishedResult -Encoding UTF8 }
     throw
 } finally {
+    if ($rdpStartedAt) {
+        try {
+            $connections = @(Get-NetTCPConnection -OwningProcess $PID -RemoteAddress '127.0.0.1' -RemotePort 3389 -ErrorAction SilentlyContinue)
+            $rdpTransport.loopbackConnectionCount = $connections.Count; $rdpTransport.tcpStates = @($connections | ForEach-Object { [int]$_.State })
+        } catch { $rdpTransport.tcpErrorHResult = ('0x{0:X8}' -f $_.Exception.HResult) }
+        $rdpTransport.events = @()
+        try {
+            $since = $rdpStartedAt.ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')
+            $xpath = "*[System[Execution[@ProcessID='$PID'] and TimeCreated[@SystemTime>='$since']]]"
+            foreach ($event in @(Get-WinEvent -LogName $rdpClientLog -FilterXPath $xpath -MaxEvents 32 -ErrorAction Stop)) {
+                $record = @{ eventId = [int]$event.Id }; $xml = [xml]$event.ToXml()
+                foreach ($datum in @($xml.Event.EventData.Data)) {
+                    if ([string]$datum.Name -in @('ErrorCode', 'Error', 'Status', 'Result', 'ResultCode', 'HRESULT', 'DisconnectReason', 'ExtendedDisconnectReason', 'Reason', 'State') -and [string]$datum.InnerText -match '^(0[xX][0-9a-fA-F]{1,16}|-?[0-9]{1,20})$') { $record[[string]$datum.Name] = [string]$datum.InnerText }
+                }
+                $rdpTransport.events += $record
+            }
+        } catch { $rdpTransport.eventsErrorHResult = ('0x{0:X8}' -f $_.Exception.HResult) }
+    }
     $credential = $null; if ($password) { $password.Dispose() }
     $cleanupFailures = @()
     $cleanupStep = 0
@@ -189,6 +226,9 @@ try {
     if (Test-Path -LiteralPath $publishedResult) {
         $result = Get-Content -LiteralPath $publishedResult -Raw | ConvertFrom-Json
         if ($rdp) { $result | Add-Member -Force -NotePropertyName rdpDiagnostics -NotePropertyValue $rdp.Diagnostics }
+        $result | Add-Member -NotePropertyName rdpTransport -NotePropertyValue $rdpTransport
+        $result | Add-Member -NotePropertyName rdpModeBefore -NotePropertyValue $rdpModeBefore
+        $result | Add-Member -NotePropertyName rdpModeAfter -NotePropertyValue $rdpModeAfter
         if ($cleanupFailures.Count -ne 0) { $result.result = 'failed'; $result | Add-Member -NotePropertyName cleanupErrors -NotePropertyValue $cleanupFailures }
         $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $publishedResult -Encoding UTF8
     }
