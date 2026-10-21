@@ -86,7 +86,7 @@ export function Conversations({ state, api, refresh, onNavigate }: {
           <Icon name="search" />
           <input
             aria-label="Найти группу или тред"
-            placeholder="Чат, тема или разговор Codex"
+            placeholder="Название чата или темы"
             value={query}
             onChange={event => setQuery(event.target.value)}
           />
