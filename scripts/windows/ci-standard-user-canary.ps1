@@ -1,7 +1,7 @@
 param([ValidateSet('Parent', 'Child')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce, [switch]$RunGates, [switch]$InstallerOnly, [switch]$MstscControl, [ValidateSet('Shared', 'Installer')][string]$Phase = 'Installer')
 $ErrorActionPreference = 'Stop'
 if ($InstallerOnly -and (-not $RunGates -or $Phase -eq 'Shared')) { throw 'InstallerOnly requires RunGates and the Installer phase.' }
-if ($MstscControl -and ($Mode -ne 'Parent' -or $RunGates)) { throw 'MstscControl is a parent-only session probe.' }
+if ($MstscControl -and $Mode -ne 'Parent') { throw 'MstscControl is a parent-only CI RDP control.' }
 $sourceRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $shell = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'PowerShell\7\pwsh.exe'
 if (-not (Test-Path -LiteralPath $shell) -or [Diagnostics.FileVersionInfo]::GetVersionInfo($shell).FileMajorPart -ne 7) { throw 'The trusted PowerShell 7 installation is required for this CI canary.' }
@@ -36,15 +36,20 @@ function Remove-FixtureProfile([string]$Sid, [hashtable]$Facts) {
     $deadline = [DateTime]::UtcNow.AddSeconds(20); $lastError = $null
     do {
         $profile = Get-CimInstance Win32_UserProfile -Filter ("SID='$Sid'")
-        if (-not $profile) { return }
-        if ($profile.Special) { throw 'Refusing to remove a special user profile.' }
-        if (-not $profile.Loaded) {
+        if ($profile -and $profile.Special) { throw 'Refusing to remove a special user profile.' }
+        if ($profile -and -not $profile.Loaded) {
             try { $profile | Remove-CimInstance; $lastError = $null } catch { $lastError = $_.Exception }
-            if (-not (Get-CimInstance Win32_UserProfile -Filter ("SID='$Sid'"))) { return }
+            $profile = Get-CimInstance Win32_UserProfile -Filter ("SID='$Sid'")
+        }
+        if (-not $profile) {
+            $remainingHive = [Microsoft.Win32.Registry]::Users.OpenSubKey($Sid)
+            try { if (-not $remainingHive) { $Facts.profileAbsent = $true; $Facts.hivePresent = $false; return } }
+            finally { if ($remainingHive) { $remainingHive.Dispose() } }
         }
         Start-Sleep -Milliseconds 250
     } while ([DateTime]::UtcNow -lt $deadline)
     $Facts.cimLoaded = [bool]$profile.Loaded
+    $Facts.profileAbsent = $null -eq $profile
     $hive = $null; $profileKey = $null
     try {
         $hive = [Microsoft.Win32.Registry]::Users.OpenSubKey($Sid)

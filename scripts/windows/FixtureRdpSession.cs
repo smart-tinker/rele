@@ -239,6 +239,7 @@ public sealed class FixtureRdpSession : IDisposable
     private Process mstsc;
     private int mstscPid, mstscGuiError;
     private int certificatePromptSeen, certificateYesCount, certificateClickCount, certificateClickDelivered, certificateConfirmed;
+    private int logoffRemainingIds, logoffRemainingOwned, logoffRemainingIdState = -1;
     private IntPtr certificateDialog;
     private readonly List<Dictionary<string, object>> mstscWindows = new List<Dictionary<string, object>>();
     public List<Dictionary<string, object>> MstscWindows { get { return mstscWindows; } }
@@ -260,7 +261,8 @@ public sealed class FixtureRdpSession : IDisposable
         { "phase", phase }, { "phaseBeforeClose", phaseBeforeClose }, { "connected", connected }, { "extendedReason", extendedReason }, { "credentialPromptPolicyStage", credentialPromptPolicyStage }, { "connectingCount", eventCounts[1] }, { "connectedCount", eventCounts[2] }, { "loginCompleteCount", eventCounts[3] }, { "loginCompleteSeen", eventCounts[3] == 0 ? 0 : 1 },
         { "disconnectedCount", eventCounts[4] }, { "disconnectedCode", disconnectedCode }, { "fatalCount", eventCounts[10] }, { "fatalCode", fatalCode }, { "logonCount", eventCounts[22] }, { "logonCode", logonCode },
         { "ownWtsCount", ownWtsCount }, { "ownWtsState", ownWtsState }, { "confirmCloseCount", eventCounts[15] }, { "closeConfirmed", closeConfirmed ? 1 : 0 }, { "closeStatus", closeStatus }, { "closeErrorHResult", closeError }, { "mstscControl", mstscControl ? 1 : 0 }, { "mstscPid", mstscPid }, { "mstscGuiErrorHResult", mstscGuiError },
-        { "mstscCertificatePromptSeen", certificatePromptSeen }, { "mstscCertificateYesCount", certificateYesCount }, { "mstscCertificateClickCount", certificateClickCount }, { "mstscCertificateClickDelivered", certificateClickDelivered }, { "mstscCertificateConfirmed", certificateConfirmed } }; } }
+        { "mstscCertificatePromptSeen", certificatePromptSeen }, { "mstscCertificateYesCount", certificateYesCount }, { "mstscCertificateClickCount", certificateClickCount }, { "mstscCertificateClickDelivered", certificateClickDelivered }, { "mstscCertificateConfirmed", certificateConfirmed },
+        { "logoffRemainingIds", logoffRemainingIds }, { "logoffRemainingOwned", logoffRemainingOwned }, { "logoffRemainingIdState", logoffRemainingIdState } }; } }
     private void Record(int id, int code) { phase = id; Interlocked.Increment(ref eventCounts[id]); if (id == 4) disconnectedCode = code; if (id == 10) fatalCode = code; if (id == 22) logonCode = code; if (id == 15 && code == 1) closeConfirmed = true; }
 
     public FixtureRdpSession(string user, string domain, SecureString password, string sid)
@@ -557,10 +559,18 @@ public sealed class FixtureRdpSession : IDisposable
             loggingOff.Add(session.Id);
         }
         DateTime deadline = DateTime.UtcNow.AddSeconds(10);
-        // A logging-off session can clear its username before it has terminated.
-        // Wait for the exact sessions we logged off, independently of their changing owner metadata.
-        while (Sessions().Exists(delegate(Session session) { return loggingOff.Contains(session.Id); }))
+        // A retained/reused numeric ID alone does not establish that our fresh SID is logged on.
+        // The caller also requires the exact SID's profile and registry hive to be absent.
+        while (true)
         {
+            int ids = 0, owned = 0, firstState = -1;
+            foreach (Session session in Sessions())
+            {
+                if (loggingOff.Contains(session.Id)) { if (ids++ == 0) firstState = session.State; }
+                if (Owned(session.Id)) owned++;
+            }
+            logoffRemainingIds = ids; logoffRemainingOwned = owned; logoffRemainingIdState = firstState;
+            if (owned == 0) break;
             if (DateTime.UtcNow >= deadline) throw new InvalidOperationException("The isolated RDP fixture session did not log off.");
             Thread.Sleep(100);
         }

@@ -63,7 +63,7 @@ jobs:
           RELE_MSTSC_PROBE: ${{ inputs.windows_mstsc_probe }}
         run: |
           if ($env:RELE_INSTALLER_PROBE -eq 'true') {
-            .\scripts\windows\ci-standard-user-canary.ps1 -RunGates -InstallerOnly
+            .\scripts\windows\ci-standard-user-canary.ps1 -RunGates -InstallerOnly -MstscControl:($env:RELE_MSTSC_PROBE -eq 'true')
           } elseif ($env:RELE_MSTSC_PROBE -eq 'true') {
             .\scripts\windows\ci-standard-user-canary.ps1 -MstscControl
           } else {
