@@ -205,7 +205,8 @@ request_max_retries=0
 stream_max_retries=0
 '''
     base_env = {key: value for key, value in os.environ.items() if key.upper() in
-                ('PATH', 'LANG', 'LC_ALL', 'TMPDIR', 'TEMP', 'TMP', 'SYSTEMROOT')}
+                ('PATH', 'LANG', 'LC_ALL', 'TMPDIR', 'TEMP', 'TMP', 'SYSTEMROOT', 'WINDIR',
+                 'COMSPEC', 'SYSTEMDRIVE', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA')}
     base_env.update({'NO_PROXY': '127.0.0.1,localhost', 'no_proxy': '127.0.0.1,localhost',
                      'HTTP_PROXY': 'http://127.0.0.1:9', 'HTTPS_PROXY': 'http://127.0.0.1:9',
                      'ALL_PROXY': 'http://127.0.0.1:9'})
@@ -232,6 +233,39 @@ stream_max_retries=0
             process.kill()
             await process.wait()
             raise
+
+    async def windows_dpapi(env):
+        # Match ConfigStore's PowerShell, input pipe and 15-second deadline, but
+        # report only fixed stages from a synthetic CurrentUser roundtrip.
+        script = '''$ErrorActionPreference='Stop'; try {
+[Console]::Error.WriteLine('dpapi:started');
+Add-Type -AssemblyName System.Security;
+[Console]::Error.WriteLine('dpapi:assembly-ready');
+$s=[Console]::In.ReadToEnd();
+[Console]::Error.WriteLine('dpapi:input-read');
+if ($s -cne 'rele-shared-dpapi-fixture') { throw 'Synthetic input mismatch' };
+$b=[Text.Encoding]::UTF8.GetBytes($s);
+$p=[Security.Cryptography.ProtectedData]::Protect($b,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser);
+[Console]::Error.WriteLine('dpapi:protected');
+$u=[Security.Cryptography.ProtectedData]::Unprotect($p,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser);
+if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mismatch' };
+[Console]::Error.WriteLine('dpapi:roundtrip');
+} catch { [Console]::Error.WriteLine('dpapi:failed'); exit 1 }'''
+        process = await spawn(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', script], env, REPO)
+        drainer = drainers[-1]
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 15
+        process.stdin.write(b'rele-shared-dpapi-fixture')
+        await process.stdin.drain()
+        try:
+            output = await output_and_exit(process, max(0, deadline - loop.time()))
+            await asyncio.wait_for(asyncio.shield(drainer), max(0, deadline - loop.time()))
+        finally:
+            report['windowsDpapiStages'] = [line for line in errors if line.startswith('dpapi:')]
+        assert process.returncode == 0 and not output, 'Synthetic Windows DPAPI roundtrip failed'
+        assert report['windowsDpapiStages'][-5:] == ['dpapi:started', 'dpapi:assembly-ready',
+            'dpapi:input-read', 'dpapi:protected', 'dpapi:roundtrip'], 'Synthetic Windows DPAPI stages incomplete'
+        report['checks']['windowsDpapi'] = True
 
     async def native(env, operation):
         process = await spawn([str(args.cli), 'app-server', 'daemon', operation], env, root)
@@ -274,15 +308,24 @@ stream_max_retries=0
         home.mkdir(parents=True)
         workspace.mkdir()
         (home / 'config.toml').write_text(config, encoding='utf-8')
+        env = {**base_env, 'CODEX_HOME': str(home), 'RELE_DATA_DIR': str(directory / 'rele')}
         # Disable the optional native updater before any start: package installation
         # must come entirely from the already installed, validated npm vendor tree.
         settings = home / 'app-server-daemon'
-        settings.mkdir()
+        if os.name == 'nt':
+            # Let the native lifecycle create its exact owner-private Windows DACL.
+            # Stop on this fresh profile only initializes state; it starts no backend.
+            assert not settings.exists() and not (home / 'app-server-control/app-server-control.sock').exists()
+            assert (await native(env, 'stop'))['status'] == 'notRunning'
+            assert settings.is_dir()
+        else:
+            settings.mkdir()
         (settings / 'settings.json').write_text(json.dumps({'shutdownGraceSeconds': 1,
             'updater': {'autoUpdateEnabled': False}}), encoding='utf-8')
-        env = {**base_env, 'CODEX_HOME': str(home), 'RELE_DATA_DIR': str(directory / 'rele')}
         engine = peer = observer = None
         try:
+            if os.name == 'nt':
+                await windows_dpapi(env)
             await driver(env, workspace, prepare=True)
             assert not (home / 'app-server-control/app-server-control.sock').exists()
             if order == 'rele-first':
