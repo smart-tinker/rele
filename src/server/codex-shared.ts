@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { realpath, stat } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -61,6 +62,21 @@ function sharedHome(env: NodeJS.ProcessEnv): string {
   const home = (process.platform === 'win32' ? environmentValue(env, 'CODEX_HOME') : env.CODEX_HOME) || path.join(homedir(), '.codex');
   if (!isLocalCodexHome(home)) throw new SharedCodexError('Общему Codex нужен абсолютный локальный профиль.', 'invalid-shared-profile');
   return home;
+}
+
+/** Fingerprints must keep the same profile identity before its native directories exist. */
+export function effectiveSharedCodexHome(env: NodeJS.ProcessEnv = process.env): string {
+  let directory = sharedHome(env);
+  const missing: string[] = [];
+  for (;;) {
+    try { return path.join(realpathSync.native(directory), ...missing.reverse()); }
+    catch (error) {
+      const parent = path.dirname(directory);
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || parent === directory) throw error;
+      missing.push(path.basename(directory));
+      directory = parent;
+    }
+  }
 }
 
 /** Resolve only installed files and version metadata; this never starts the daemon. */

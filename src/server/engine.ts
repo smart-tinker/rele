@@ -8,6 +8,7 @@ import { ChannelError, splitReply, type ApprovalAction, type Channel } from './c
 import { transcribeAudio } from './voice.js';
 import { SlackSync } from './slack-sync.js';
 import { splitSlackReply } from './channels/slack-format.js';
+import { effectiveSharedCodexHome } from './codex-shared.js';
 
 export type CodexGateway = Pick<CodexClient, 'status' | 'isVerifiedVersion' | 'createThread' | 'setThreadName' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'interrupt' | 'findRequest' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Pick<EventEmitter, 'on' | 'off'>;
 export interface EngineOptions {
@@ -299,7 +300,12 @@ export class Engine extends EventEmitter {
 
   targetFingerprint(): string {
     const { transport, executable, endpoint, codexHome } = this.options.config().codex;
-    return createHash('sha256').update(JSON.stringify([transport, executable, endpoint, codexHome ?? null])).digest('hex');
+    let home = codexHome ?? null;
+    if (transport === 'shared' && !codexHome) {
+      home = effectiveSharedCodexHome();
+      if (process.platform === 'win32') home = home.toLowerCase();
+    }
+    return createHash('sha256').update(JSON.stringify([transport, executable, endpoint, home])).digest('hex');
   }
 
   private currentAutoRule(endpointId: string): AutoLinkIntent['rule'] | undefined {

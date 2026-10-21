@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -136,6 +137,7 @@ afterEach(async () => {
   for (const { engine } of fixtures) await engine.stop();
   for (const { store } of fixtures.splice(0)) store.close();
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
+  vi.unstubAllEnvs();
   vi.useRealTimers();
 });
 
@@ -1021,6 +1023,65 @@ describe('automatic native thread creation', () => {
     expect(f.store.listAutoLinkIntents()[0].status).toBe('pending');
     f.codex.verifiedVersion = true; await f.engine.pump();
     expect(f.codex.createThread).toHaveBeenCalledOnce();
+  });
+
+  it('keeps an accepted inherited-profile intent pending after restart into another profile', async () => {
+    const profileA = mkdtempSync(join(tmpdir(), 'rele-profile-A-')), profileB = mkdtempSync(join(tmpdir(), 'rele-profile-B-'));
+    directories.push(profileA, profileB);
+    vi.stubEnv('CODEX_HOME', profileA);
+    const f = autoFixture(); f.codex.connected = false;
+    await f.engine.receive(f.incoming()); await f.engine.settled();
+    const intent = f.store.listAutoLinkIntents()[0];
+    expect(intent.status).toBe('pending');
+    await f.engine.stop(); f.store.close(); fixtures.splice(fixtures.findIndex(row => row.engine === f.engine), 1);
+
+    vi.stubEnv('CODEX_HOME', profileB);
+    const restarted = fixture({ path: f.path });
+    restarted.config.telegram.enabled = true;
+    restarted.config.autoLinkRules = f.config.autoLinkRules;
+    expect(restarted.engine.targetFingerprint()).not.toBe(intent.targetFingerprint);
+    await restarted.engine.pump(); await restarted.engine.settled();
+    expect(restarted.store.listAutoLinkIntents()[0]).toMatchObject({ status: 'pending', targetFingerprint: intent.targetFingerprint });
+    expect(restarted.codex.createThread).not.toHaveBeenCalled();
+    expect(restarted.codex.enqueue).not.toHaveBeenCalled();
+    expect(restarted.store.bindingForEndpoint(f.endpoint.id)).toBeUndefined();
+
+    vi.stubEnv('CODEX_HOME', profileA);
+    await restarted.engine.pump(); await restarted.engine.settled();
+    expect(restarted.codex.createThread).toHaveBeenCalledExactlyOnceWith(intent.rule.cwd);
+    expect(restarted.codex.enqueue).toHaveBeenCalledOnce();
+  });
+
+  it('keeps inherited profile aliases and later native directory creation on the same fingerprint', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'rele-profile-alias-'));
+    directories.push(directory);
+    const physical = join(directory, 'physical'), alias = join(directory, 'alias');
+    mkdirSync(physical);
+    symlinkSync(physical, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    vi.stubEnv('CODEX_HOME', join(alias, 'new', 'profile'));
+    const f = autoFixture(); f.codex.connected = false;
+    await f.engine.receive(f.incoming()); await f.engine.settled();
+    const fingerprint = f.engine.targetFingerprint();
+    mkdirSync(join(physical, 'new', 'profile'), { recursive: true });
+    vi.stubEnv('CODEX_HOME', join(physical, 'new', 'profile'));
+    expect(f.engine.targetFingerprint()).toBe(fingerprint);
+    f.codex.connected = true;
+    await f.engine.pump(); await f.engine.settled();
+    expect(f.codex.createThread).toHaveBeenCalledOnce();
+    expect(f.codex.enqueue).toHaveBeenCalledOnce();
+    expect(f.config.codex).not.toHaveProperty('codexHome');
+  });
+
+  it.each(['managed', 'proxy', 'websocket', 'explicit-shared'] as const)('preserves existing raw target fingerprints for %s', target => {
+    const f = fixture();
+    f.config.codex = { transport: target === 'explicit-shared' ? 'shared' : target, executable: 'codex', endpoint: '',
+      ...(target === 'explicit-shared' ? { codexHome: join(dirname(f.path), 'explicit-profile') } : {}) };
+    const { transport, executable, endpoint, codexHome } = f.config.codex;
+    const expected = createHash('sha256').update(JSON.stringify([transport, executable, endpoint, codexHome ?? null])).digest('hex');
+    vi.stubEnv('CODEX_HOME', '/inherited/profile-A');
+    expect(f.engine.targetFingerprint()).toBe(expected);
+    vi.stubEnv('CODEX_HOME', '/inherited/profile-B');
+    expect(f.engine.targetFingerprint()).toBe(expected);
   });
 
   it('does not create on denied, context-only, control, unmentioned or administrative messages', async () => {
