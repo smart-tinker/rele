@@ -240,9 +240,13 @@ try {
     $arguments = '-NoProfile -NonInteractive -File ' + (Quote $PSCommandPath) + ' -Mode Child -FixtureRoot ' + (Quote $FixtureRoot) + ' -Nonce ' + $Nonce
     if ($RunGates) { $arguments += ' -RunGates' }
     if ($InstallerOnly) { $arguments += ' -InstallerOnly' }
+    # RDP already loaded this exact user's hive and stays alive until this child exits.
+    $profileHive = [Microsoft.Win32.Registry]::Users.OpenSubKey($sid)
+    try { if ($marker.phase -ne 'Installer' -or $null -eq $profileHive) { throw 'The isolated RDP installer profile is not loaded.' } }
+    finally { if ($profileHive) { $profileHive.Dispose() } }
     $childDeadline = if ($RunGates) { [Math]::Max(0, [int](($gatesDeadline - [DateTime]::UtcNow).TotalMilliseconds)) } else { 60000 }
     if ($childDeadline -le 0) { throw 'The standard-user native gates exceeded their common deadline.' }
-    $child = Start-Process -FilePath $shell -ArgumentList $arguments -Credential $credential -LoadUserProfile -UseNewEnvironment -WorkingDirectory $FixtureRoot -RedirectStandardOutput (Join-Path $FixtureRoot 'stdout.log') -RedirectStandardError (Join-Path $FixtureRoot 'stderr.log') -PassThru
+    $child = Start-Process -FilePath $shell -ArgumentList $arguments -Credential $credential -LoadUserProfile:$false -UseNewEnvironment -WorkingDirectory $FixtureRoot -RedirectStandardOutput (Join-Path $FixtureRoot 'stdout.log') -RedirectStandardError (Join-Path $FixtureRoot 'stderr.log') -PassThru
     $credential = $null; $password.Dispose(); $password = $null
     if ($RunGates) { $childDeadline = [Math]::Max(0, [int](($gatesDeadline - [DateTime]::UtcNow).TotalMilliseconds)) }
     if ($childDeadline -le 0) { throw 'The standard-user native gates exceeded their common deadline.' }
