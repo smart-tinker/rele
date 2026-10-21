@@ -61,8 +61,8 @@ if ($Mode -eq 'Child') {
         $action = $definition.Actions.Create(0); $action.Path = $shell; $action.WorkingDirectory = $FixtureRoot
         $action.Arguments = '-NoProfile -NonInteractive -File ' + (Quote $PSCommandPath) + ' -Mode Canary -FixtureRoot ' + (Quote $FixtureRoot) + ' -Nonce ' + $Nonce
         $task = $folder.RegisterTaskDefinition(('Rele-CI-Canary-' + $Nonce), $definition, 2, $sid, $null, 3, $null)
-        $evidence.runMode = 'as-self'
-        $running = $task.RunEx($null, 1, 0, $null)
+        $evidence.runMode = 'registered-user'
+        $running = $task.Run($null)
         $evidence.runReturned = $true
         $deadline = [DateTime]::UtcNow.AddSeconds(20); $receiptPath = Join-Path $FixtureRoot 'canary.json'
         while ([DateTime]::UtcNow -lt $deadline -and (-not (Test-Path -LiteralPath $receiptPath) -or $task.LastTaskResult -ne 0)) { Start-Sleep -Milliseconds 100 }
@@ -103,7 +103,9 @@ if ($LASTEXITCODE -ne 0) { throw 'Cannot enable the disposable runner Task Sched
 $FixtureRoot = Join-Path ([IO.Path]::GetPathRoot($env:RUNNER_TEMP)) ('rc-' + $Nonce.Substring(0, 8))
 if (Test-Path -LiteralPath $FixtureRoot) { throw 'Fixture directory already exists.' }
 New-Item -ItemType Directory -Path $FixtureRoot | Out-Null
-$user = $null; $child = $null; $credential = $null; $password = $null
+$user = $null; $child = $null; $credential = $null; $password = $null; $rdp = $null
+$rdpSettingsChanged = $false; $serviceStartupChanged = $false; $serviceStarted = $false
+$terminalPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
 try {
     $bytes = New-Object byte[] 32; $random = [Security.Cryptography.RandomNumberGenerator]::Create(); $random.GetBytes($bytes); $random.Dispose()
     $password = ConvertTo-SecureString ('Aa1!' + [Convert]::ToBase64String($bytes)) -AsPlainText -Force; [Array]::Clear($bytes, 0, $bytes.Length)
@@ -111,11 +113,31 @@ try {
     $sid = $user.SID.Value
     if (@(Get-LocalGroupMember -SID 'S-1-5-32-545' | Where-Object { $_.SID.Value -eq $sid }).Count -eq 0) { Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $account }
     if (@(Get-LocalGroupMember -SID 'S-1-5-32-544' | Where-Object { $_.SID.Value -eq $sid }).Count -ne 0) { throw 'Fixture user must not be an administrator.' }
+    Add-LocalGroupMember -SID 'S-1-5-32-555' -Member $account
     & icacls.exe $sourceRoot /grant ('*' + $sid + ':(OI)(CI)(RX)') /T /C | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant fixture source read access.' }
     & icacls.exe $FixtureRoot /grant ('*' + $sid + ':(OI)(CI)(M)') /T /C | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant fixture write access.' }
     @{ nonce = $Nonce; sid = $sid } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8
+    $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+    $rdpAssembly = Join-Path $FixtureRoot 'FixtureRdpSession.dll'
+    & $compiler /nologo /target:library /platform:x64 /codepage:65001 /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:Microsoft.CSharp.dll ('/out:' + $rdpAssembly) (Join-Path $PSScriptRoot 'FixtureRdpSession.cs')
+    if ($LASTEXITCODE -ne 0) { throw 'Loopback RDP fixture helper compilation failed.' }
+    [Reflection.Assembly]::Load([IO.File]::ReadAllBytes($rdpAssembly)) | Out-Null
+    Remove-Item -LiteralPath $rdpAssembly
+    $priorDeny = (Get-Item -LiteralPath $terminalPath).GetValue('fDenyTSConnections', $null)
+    if ($null -eq $priorDeny -or $priorDeny -ne 0) { Set-ItemProperty -LiteralPath $terminalPath -Name fDenyTSConnections -Value 0; $rdpSettingsChanged = $true }
+    $service = Get-Service -Name TermService
+    $priorServiceStartup = $service.StartType
+    if ($priorServiceStartup -eq 'Disabled') { Set-Service -Name TermService -StartupType Manual; $serviceStartupChanged = $true }
+    if ($service.Status -ne 'Running') { Start-Service -Name TermService; $serviceStarted = $true }
+    $listenerDeadline = [DateTime]::UtcNow.AddSeconds(10)
+    while (-not (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)) {
+        if ([DateTime]::UtcNow -ge $listenerDeadline) { throw 'The disposable runner RDP listener did not become ready.' }
+        Start-Sleep -Milliseconds 100
+    }
+    $rdp = [FixtureRdpSession]::new($account, $env:COMPUTERNAME, $password, $sid)
+    $rdp.Connect()
     $credential = New-Object System.Management.Automation.PSCredential ($env:COMPUTERNAME + '\' + $account), $password
     $arguments = '-NoProfile -NonInteractive -File ' + (Quote $PSCommandPath) + ' -Mode Child -FixtureRoot ' + (Quote $FixtureRoot) + ' -Nonce ' + $Nonce
     $child = Start-Process -FilePath $shell -ArgumentList $arguments -Credential $credential -LoadUserProfile -UseNewEnvironment -WorkingDirectory $FixtureRoot -RedirectStandardOutput (Join-Path $FixtureRoot 'stdout.log') -RedirectStandardError (Join-Path $FixtureRoot 'stderr.log') -PassThru
@@ -124,6 +146,7 @@ try {
     $resultPath = Join-Path $FixtureRoot 'windows-standard-user-results.json'
     if (Test-Path -LiteralPath $resultPath) {
         $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+        $result | Add-Member -NotePropertyName verifiedRdpSessionId -NotePropertyValue $rdp.SessionId
         $ownEvents = @()
         try {
             $ownTaskXPath = "*[EventData[Data[@Name='TaskName']='\Rele-CI-Canary-$Nonce']]"
@@ -148,13 +171,29 @@ try {
         Copy-Item -LiteralPath $resultPath -Destination (Join-Path $sourceRoot 'windows-standard-user-results.json')
     }
     if ($child.ExitCode -ne 0) { foreach ($log in @('stdout.log', 'stderr.log')) { Get-Content -LiteralPath (Join-Path $FixtureRoot $log) -Tail 30 | Write-Output }; throw 'Standard-user InteractiveToken canary failed; native gates must not run in this environment.' }
+} catch {
+    $publishedResult = Join-Path $sourceRoot 'windows-standard-user-results.json'
+    if (-not (Test-Path -LiteralPath $publishedResult)) { @{ result = 'failed'; stage = 'rdp-session'; error = $_.Exception.Message; errorHResult = ('0x{0:X8}' -f $_.Exception.HResult) } | ConvertTo-Json | Set-Content -LiteralPath $publishedResult -Encoding UTF8 }
+    throw
 } finally {
     $credential = $null; if ($password) { $password.Dispose() }
-    if ($child -and -not $child.HasExited) { Stop-Process -Id $child.Id -Force }
-    if ($user) {
-        Remove-Canary $user.SID.Value
-        Remove-LocalUser -SID $user.SID
-        Get-CimInstance Win32_UserProfile | Where-Object { $_.SID -eq $user.SID.Value } | Remove-CimInstance
+    $cleanupFailures = @()
+    foreach ($action in @(
+        { if ($child -and -not $child.HasExited) { Stop-Process -Id $child.Id -Force } },
+        { if ($rdp) { $rdp.Dispose() } },
+        { if ($rdpSettingsChanged) { if ($null -eq $priorDeny) { Remove-ItemProperty -LiteralPath $terminalPath -Name fDenyTSConnections } else { Set-ItemProperty -LiteralPath $terminalPath -Name fDenyTSConnections -Value $priorDeny } } },
+        { if ($serviceStarted) { Stop-Service -Name TermService } },
+        { if ($serviceStartupChanged) { Set-Service -Name TermService -StartupType $priorServiceStartup } },
+        { if ($user) { Remove-Canary $user.SID.Value } },
+        { if ($user) { Remove-LocalUser -SID $user.SID } },
+        { if ($user) { Get-CimInstance Win32_UserProfile | Where-Object { $_.SID -eq $user.SID.Value } | Remove-CimInstance } },
+        { Remove-Item -LiteralPath $FixtureRoot -Recurse -Force }
+    )) { try { & $action } catch { $cleanupFailures += ('0x{0:X8}' -f $_.Exception.HResult) } }
+    if ($cleanupFailures.Count -ne 0) {
+        $publishedResult = Join-Path $sourceRoot 'windows-standard-user-results.json'
+        $result = Get-Content -LiteralPath $publishedResult -Raw | ConvertFrom-Json
+        $result.result = 'failed'; $result | Add-Member -NotePropertyName cleanupErrorHResults -NotePropertyValue $cleanupFailures
+        $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $publishedResult -Encoding UTF8
+        throw 'The isolated Windows canary cleanup did not complete.'
     }
-    Remove-Item -LiteralPath $FixtureRoot -Recurse -Force
 }
