@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -9,9 +9,11 @@ const directories: string[] = [];
 afterEach(async () => { for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true }); });
 
 async function fixture() {
-  const home = await mkdtemp(path.join(tmpdir(), 'rele-shared-test-'));
+  const home = await realpath(await mkdtemp(path.join(tmpdir(), 'rele-shared-test-')));
   directories.push(home);
   const socketPath = path.join(home, 'app-server-control', 'app-server-control.sock');
+  // A ready native daemon creates this directory before reporting its socket.
+  await mkdir(path.dirname(socketPath));
   const executable = path.join(home, process.platform === 'win32' ? 'codex.exe' : 'codex');
   const target: CodexConnectionTarget = { transport: 'shared', executable: path.join(home, 'codex.mjs'), endpoint: '', codexHome: home };
   const daemon = { status: 'running', managedCodexPath: executable, managedCodexVersion: '0.163.0', socketPath };
@@ -48,7 +50,7 @@ describe('native shared Codex lifecycle', () => {
 
   it('lets the native singleton recover its stale socket instead of creating a private server', async () => {
     const f = await fixture();
-    await mkdir(path.dirname(f.socketPath)); await writeFile(f.socketPath, 'synthetic-stale-socket');
+    await writeFile(f.socketPath, 'synthetic-stale-socket');
     f.run.mockImplementation(async (_command, args) => ({ code: args.at(-1) === 'version' ? 1 : 0,
       stdout: args.at(-1) === '--version' ? 'codex-cli 0.163.0' : JSON.stringify({ ...f.daemon, status: 'started' }) }));
     await ensureSharedCodex(f.target, f.options);
@@ -109,6 +111,19 @@ describe('native shared Codex lifecycle', () => {
     expect(result.codexHome).toBe(f.home);
     expect(target).not.toHaveProperty('codexHome');
     expect(f.run.mock.calls.every(([, , , env]) => env.CODEX_HOME === f.home)).toBe(true);
+  });
+
+  it('accepts the same selected profile through a directory alias and returns its canonical home', async () => {
+    const f = await fixture();
+    const directory = await mkdtemp(path.join(tmpdir(), 'rele-shared-alias-'));
+    directories.push(directory);
+    const alias = path.join(directory, 'profile');
+    await symlink(f.home, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    const target = { ...f.target, codexHome: alias };
+    f.daemon.socketPath = path.join(alias, 'app-server-control', 'app-server-control.sock');
+    const result = await ensureSharedCodex(target, f.options);
+    expect(result).toMatchObject({ transport: 'proxy', codexHome: f.home, endpoint: f.daemon.socketPath });
+    expect(target.codexHome).toBe(alias);
   });
 
   it('uses the external systemd daemon socket without starting a daemon in the service cgroup', async () => {
