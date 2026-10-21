@@ -217,6 +217,12 @@ public sealed class FixtureRdpSession : IDisposable
     private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
     [DllImport("user32.dll", ExactSpelling = true)]
     private static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll", ExactSpelling = true)]
+    private static extern bool IsWindowEnabled(IntPtr window);
+    [DllImport("user32.dll", ExactSpelling = true)]
+    private static extern IntPtr GetParent(IntPtr window);
+    [DllImport("user32.dll", ExactSpelling = true)]
+    private static extern IntPtr GetDlgItem(IntPtr dialog, int id);
     [DllImport("user32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
     private static extern int GetClassNameW(IntPtr window, StringBuilder name, int capacity);
     [DllImport("user32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
@@ -225,11 +231,15 @@ public sealed class FixtureRdpSession : IDisposable
     private static extern int GetDlgCtrlID(IntPtr window);
     [DllImport("user32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
     private static extern IntPtr SendMessageTimeoutW(IntPtr window, uint message, UIntPtr capacity, StringBuilder text, uint flags, uint timeout, out UIntPtr result);
+    [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", ExactSpelling = true, SetLastError = true)]
+    private static extern IntPtr SendCertificateClick(IntPtr window, uint message, UIntPtr parameter, IntPtr value, uint flags, uint timeout, out UIntPtr result);
     private const string CredentialTarget = "TERMSRV/127.0.0.1";
     private bool mstscControl, credentialOwned;
     private string credentialComment;
     private Process mstsc;
     private int mstscPid, mstscGuiError;
+    private int certificatePromptSeen, certificateYesCount, certificateClickCount, certificateClickDelivered, certificateConfirmed;
+    private IntPtr certificateDialog;
     private readonly List<Dictionary<string, object>> mstscWindows = new List<Dictionary<string, object>>();
     public List<Dictionary<string, object>> MstscWindows { get { return mstscWindows; } }
 
@@ -249,7 +259,8 @@ public sealed class FixtureRdpSession : IDisposable
     public Dictionary<string, int> Diagnostics { get { return new Dictionary<string, int> {
         { "phase", phase }, { "phaseBeforeClose", phaseBeforeClose }, { "connected", connected }, { "extendedReason", extendedReason }, { "credentialPromptPolicyStage", credentialPromptPolicyStage }, { "connectingCount", eventCounts[1] }, { "connectedCount", eventCounts[2] }, { "loginCompleteCount", eventCounts[3] }, { "loginCompleteSeen", eventCounts[3] == 0 ? 0 : 1 },
         { "disconnectedCount", eventCounts[4] }, { "disconnectedCode", disconnectedCode }, { "fatalCount", eventCounts[10] }, { "fatalCode", fatalCode }, { "logonCount", eventCounts[22] }, { "logonCode", logonCode },
-        { "ownWtsCount", ownWtsCount }, { "ownWtsState", ownWtsState }, { "confirmCloseCount", eventCounts[15] }, { "closeConfirmed", closeConfirmed ? 1 : 0 }, { "closeStatus", closeStatus }, { "closeErrorHResult", closeError }, { "mstscControl", mstscControl ? 1 : 0 }, { "mstscPid", mstscPid }, { "mstscGuiErrorHResult", mstscGuiError } }; } }
+        { "ownWtsCount", ownWtsCount }, { "ownWtsState", ownWtsState }, { "confirmCloseCount", eventCounts[15] }, { "closeConfirmed", closeConfirmed ? 1 : 0 }, { "closeStatus", closeStatus }, { "closeErrorHResult", closeError }, { "mstscControl", mstscControl ? 1 : 0 }, { "mstscPid", mstscPid }, { "mstscGuiErrorHResult", mstscGuiError },
+        { "mstscCertificatePromptSeen", certificatePromptSeen }, { "mstscCertificateYesCount", certificateYesCount }, { "mstscCertificateClickCount", certificateClickCount }, { "mstscCertificateClickDelivered", certificateClickDelivered }, { "mstscCertificateConfirmed", certificateConfirmed } }; } }
     private void Record(int id, int code) { phase = id; Interlocked.Increment(ref eventCounts[id]); if (id == 4) disconnectedCode = code; if (id == 10) fatalCode = code; if (id == 22) logonCode = code; if (id == 15 && code == 1) closeConfirmed = true; }
 
     public FixtureRdpSession(string user, string domain, SecureString password, string sid)
@@ -297,6 +308,8 @@ public sealed class FixtureRdpSession : IDisposable
         mstscPid = mstsc.Id;
         while (DateTime.UtcNow < deadline)
         {
+            ConfirmMstscCertificate(deadline);
+            if (DateTime.UtcNow >= deadline) break;
             int count = 0;
             foreach (Session session in Sessions())
                 if (Owned(session.Id)) { count++; ownWtsState = session.State; if (session.State == 0) SessionId = session.Id; }
@@ -307,6 +320,66 @@ public sealed class FixtureRdpSession : IDisposable
         }
         CaptureMstscWindows();
         throw new InvalidOperationException("The mstsc control did not create the isolated user's active RDP session.");
+    }
+
+    private bool OwnedVisibleWindow(IntPtr window, string expectedClass)
+    {
+        uint owner; GetWindowThreadProcessId(window, out owner);
+        if (owner != mstscPid || !IsWindowVisible(window)) return false;
+        var name = new StringBuilder(80); GetClassNameW(window, name, name.Capacity);
+        return name.ToString() == expectedClass;
+    }
+
+    private string MstscLabel(IntPtr window, string expectedClass)
+    {
+        if ((expectedClass != "Static" && expectedClass != "Button") || !OwnedVisibleWindow(window, expectedClass)) return null;
+        var text = new StringBuilder(161); UIntPtr copied;
+        return SendMessageTimeoutW(window, 0x000D, new UIntPtr((uint)text.Capacity), text, 0x0003, 100, out copied) == IntPtr.Zero ? null : text.ToString();
+    }
+
+    private bool IsMstscCertificateDialog(IntPtr window)
+    {
+        if (!OwnedVisibleWindow(window, "#32770")) return false;
+        var title = new StringBuilder(161); GetWindowTextW(window, title, title.Capacity);
+        return title.ToString() == "Remote Desktop Connection" &&
+            MstscLabel(GetDlgItem(window, 14001), "Static") == "The remote computer could not be authenticated due to problems with its security certificate. It may be unsafe to proceed." &&
+            MstscLabel(GetDlgItem(window, 13444), "Static") == "The certificate is not from a trusted certifying authority." &&
+            MstscLabel(GetDlgItem(window, 13449), "Static") == "Do you want to connect despite these certificate errors?";
+    }
+
+    private void ConfirmMstscCertificate(DateTime deadline)
+    {
+        if (certificateClickCount != 0) { if (!IsWindowVisible(certificateDialog)) certificateConfirmed = 1; return; }
+        var dialogs = new List<IntPtr>(); int windows = 0; bool complete = true;
+        EnumWindows(delegate(IntPtr window, IntPtr unused)
+        {
+            if (DateTime.UtcNow >= deadline) { complete = false; return false; }
+            uint owner; GetWindowThreadProcessId(window, out owner); if (owner != mstscPid) return true;
+            if (++windows > 16) { complete = false; return false; }
+            if (IsMstscCertificateDialog(window)) dialogs.Add(window);
+            return true;
+        }, IntPtr.Zero);
+        if (dialogs.Count == 0) return;
+        certificatePromptSeen = 1;
+        if (!complete || dialogs.Count != 1) { CaptureMstscWindows(); throw new InvalidOperationException("The owned mstsc certificate dialog was ambiguous."); }
+        IntPtr dialog = dialogs[0]; var buttons = new List<IntPtr>(); int children = 0;
+        EnumChildWindows(dialog, delegate(IntPtr child, IntPtr unused)
+        {
+            if (++children > 64 || DateTime.UtcNow >= deadline) { complete = false; return false; }
+            if (GetParent(child) != dialog || !OwnedVisibleWindow(child, "Button") || !IsWindowEnabled(child)) return true;
+            string text = MstscLabel(child, "Button"); if (text == "Yes" || text == "&Yes") buttons.Add(child);
+            return true;
+        }, IntPtr.Zero);
+        certificateYesCount = buttons.Count;
+        if (!complete || buttons.Count != 1) { CaptureMstscWindows(); throw new InvalidOperationException("The owned mstsc certificate confirmation button was ambiguous."); }
+        IntPtr button = buttons[0]; string label = MstscLabel(button, "Button");
+        if (!IsMstscCertificateDialog(dialog) || GetParent(button) != dialog || !OwnedVisibleWindow(button, "Button") || !IsWindowEnabled(button) || (label != "Yes" && label != "&Yes"))
+        { CaptureMstscWindows(); throw new InvalidOperationException("The owned mstsc certificate dialog changed before confirmation."); }
+        if (DateTime.UtcNow >= deadline) return;
+        certificateDialog = dialog; certificateClickCount = 1; UIntPtr ignored;
+        // One click on the specifically verified loopback certificate dialog, never general dialog input.
+        certificateClickDelivered = SendCertificateClick(button, 0x00F5, UIntPtr.Zero, IntPtr.Zero, 0x0003, 100, out ignored) == IntPtr.Zero ? 0 : 1; // BM_CLICK
+        if (!IsWindowVisible(dialog)) certificateConfirmed = 1;
     }
 
     private void CaptureMstscWindows()
