@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { discoverCodex, runCodexProbe, WINDOWS_CODEX_METADATA_SCRIPT, type CodexDiscoveryOptions } from '../src/server/codex-discovery.js';
+import { discoverCodex, runCodexProbe, WINDOWS_CODEX_PROCESS_PROVIDER_SCRIPT, WINDOWS_CODEX_METADATA_SCRIPT, WINDOWS_CODEX_PROCESS_METADATA_SCRIPT, type CodexDiscoveryOptions } from '../src/server/codex-discovery.js';
 import { codexEnvironment, resolveCodexLaunch } from '../src/server/codex-launch.js';
 
 const win = path.win32;
@@ -11,6 +11,14 @@ const npmShim = win.join(npmRoot, 'codex.cmd');
 const npmPackage = win.join(npmRoot, 'node_modules', '@openai', 'codex');
 const npmEntry = win.join(npmPackage, 'bin', 'codex.js');
 const socket = 'C:\\Users\\Example User\\.codex\\app-server-control\\app-server-control.sock';
+
+function windowsMetadataFixture(provider: string, script: string, appx = 'function Get-AppxPackage { [CmdletBinding()] param([string]$Name); @() }') {
+  expect(script.split(WINDOWS_CODEX_PROCESS_PROVIDER_SCRIPT)).toHaveLength(2);
+  const fake = '$script:releFixtureQueries = 0; $script:releFixtureClosures = 0\n' + provider + '\nfunction Close-ReleProcessQuery { $script:releFixtureClosures++ }\n';
+  const fixtureScript = script.replace(WINDOWS_CODEX_PROCESS_PROVIDER_SCRIPT, fake);
+  const verify = "if ($script:releFixtureQueries -lt 1 -or $script:releFixtureClosures -ne $script:releFixtureQueries) { throw 'The fixture process queries were not called and closed' };\n";
+  return runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', appx + '\n' + fixtureScript + '\n' + verify], 25_000);
+}
 
 function windowsFixture(metadata: object = { processes: [], packages: [], issues: [] }, extra: string[] = []) {
   const files = new Set(extra.map(value => win.normalize(value).toLowerCase()));
@@ -33,6 +41,24 @@ function windowsFixture(metadata: object = { processes: [], packages: [], issues
 }
 
 describe('Codex installation and existing Desktop discovery', () => {
+  it('uses a separate process-only ownership scan while ordinary discovery retains packages', async () => {
+    const f = windowsFixture();
+    f.run.mockImplementation(async (_command, args) => ({ stdout: JSON.stringify({ processes: [], packages: [], issues: [] }), code: 0 }));
+    await discoverCodex({ ...f.options, processesOnly: true });
+    expect(f.run.mock.calls[0][1]).toContain(WINDOWS_CODEX_PROCESS_METADATA_SCRIPT);
+    expect(f.run.mock.calls[0][2]).toBe(8_000);
+    await discoverCodex(f.options);
+    expect(f.run.mock.calls[1][1]).toContain(WINDOWS_CODEX_METADATA_SCRIPT);
+  });
+
+  it('reports only a fixed failed probe stage and reason', async () => {
+    const f = windowsFixture();
+    f.run.mockRejectedValue(Object.assign(new Error('probe-timeout'), { stage: 'owner-query', sensitive: 'synthetic-secret' }));
+    const result = await discoverCodex({ ...f.options, processesOnly: true });
+    expect(result.issues.map(issue => issue.code)).toContain('windows-probe-timeout-owner-query');
+    expect(JSON.stringify(result)).not.toContain('synthetic-secret');
+  });
+
   it('prefers an existing Desktop WebSocket and only returns filtered process metadata', async () => {
     const f = windowsFixture({
       processes: [{ executable: desktop, processId: 1234, listenKind: 'websocket', listen: 'ws://127.0.0.1:45678', commandLine: 'synthetic-private-arguments', auth: 'synthetic-secret' }],
@@ -234,11 +260,87 @@ describe('Codex installation and existing Desktop discovery', () => {
     await expect(runCodexProbe(process.execPath, ['-e', 'require("node:fs").writeSync(1, "x".repeat(200000))'], 4_000)).rejects.toThrow('probe-output-limit');
   });
 
-  it.skipIf(process.platform !== 'win32')('parses real PowerShell fixture command lines and emits only allowed same-user metadata', async () => {
+  it.each(['process-provider', 'owner-query', 'json-provider'])('captures fixed %s stage without publishing other child stderr', async stage => {
+    const error = await runCodexProbe(process.execPath, ['-e', `process.stderr.write("synthetic-secret\\nrele-discovery:${stage}\\nrele-discovery:synthetic-secret\\n"); setInterval(() => {}, 1000)`], 250).catch(error => error);
+    expect(error).toMatchObject({ message: 'probe-timeout', stage });
+    expect(JSON.stringify(error)).not.toContain('synthetic-secret');
+  });
+
+  it.skipIf(process.platform !== 'win32')('verifies the real current-user WMI owner and closes its query resources', async () => {
+    const script = String.raw`
+$ErrorActionPreference = 'Stop'
+$stage = 'provider-load'
+$query = $null
+try {
+  [Console]::Error.WriteLine('rele-discovery:process-provider')
+  ${WINDOWS_CODEX_PROCESS_PROVIDER_SCRIPT}
+  try {
+    $stage = 'process-query'
+    [Console]::Error.WriteLine('rele-discovery:process-query')
+    $query = Get-ReleProcessQuery "ProcessId = $PID"
+    $stage = 'row-count'
+    if ($query.objects.Count -ne 1) { throw 'Current process query did not return one row' }
+    $stage = 'row-path'
+    if (-not $query.objects[0].psbase.Path.RelativePath) { throw 'Current process query did not return a locatable row' }
+    $stage = 'owner-query'
+    [Console]::Error.WriteLine('rele-discovery:owner-query')
+    $owner = Get-ReleProcessOwner ($query.objects[0])
+    $stage = 'owner-check'
+    if ($owner.ReturnValue -ne 0 -or $owner.Sid -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) { throw 'Current process owner was not confirmed' }
+  } finally {
+    if ($query) {
+      $beforeClose = $stage; $stage = 'query-close'
+      [Console]::Error.WriteLine('rele-discovery:done')
+      Close-ReleProcessQuery $query; $stage = $beforeClose
+    }
+  }
+} catch {
+  $exception = $_.Exception
+  while ($exception.InnerException) { $exception = $exception.InnerException }
+  [Console]::Out.Write('provider-failed:' + $stage + ':' + $exception.GetType().FullName + ':0x' + $exception.HResult.ToString('X8'))
+  exit 1
+}
+[Console]::Out.Write('provider-current-user-ok')
+`;
+    const result = await runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], 8_000).catch(error => ({
+      error: ['probe-timeout', 'probe-output-limit', 'probe-unavailable'].includes(error?.message) ? error.message : 'probe-error',
+      // Reuse a whitelisted marker so this diagnostic leaves the product probe unchanged.
+      stage: error?.stage === 'done' ? 'query-close' : error?.stage,
+    }));
+    expect(result).toEqual({ code: 0, stdout: 'provider-current-user-ok', stage: 'done' });
+  }, 10_000);
+
+  it.skipIf(process.platform !== 'win32')('completes a process-only scan without calling optional Appx discovery', async () => {
     const fixtures = String.raw`
-function Get-CimInstance {
-  [CmdletBinding()] param([string]$ClassName, [string]$Filter, [string[]]$Property)
-  @(
+function Get-ReleProcessQuery([string]$filter, [bool]$parentOnly = $false) {
+  $script:releFixtureQueries++
+  if ($filter -like 'ProcessId = *') {
+    if (-not $parentOnly -or $filter -ne 'ProcessId = 3') { throw 'Parent query must use its narrow projection' }
+    return @{ objects = @() }
+  }
+  if ($parentOnly) { throw 'Main query must include app-server fields' }
+  @{ objects = @(
+    [pscustomobject]@{ ProcessId = 1; ExecutablePath = $null; CommandLine = $null },
+    [pscustomobject]@{ ProcessId = 2; ParentProcessId = 3; ExecutablePath = 'C:\Fixture\codex.exe'; CommandLine = 'codex.exe app-server --listen stdio://' }
+  ) }
+}
+function Get-ReleProcessOwner($process) {
+  @{ ReturnValue = 0; Sid = $(if ($process.ProcessId -eq 1) { 'another-user' } else { [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }) }
+}
+`;
+    const result = await windowsMetadataFixture(fixtures, WINDOWS_CODEX_PROCESS_METADATA_SCRIPT, "function Get-AppxPackage { throw 'Appx must not run' }");
+    expect(result.code).toBe(0);
+    expect(result.stage).toBe('done');
+    expect(JSON.parse(result.stdout)).toEqual({ processes: [], packages: [], issues: [] });
+  }, 35_000);
+
+  it.skipIf(process.platform !== 'win32').each(['owner', 'fields'])('parses same-user metadata and fails closed on unreadable %s', async unavailable => {
+    const fixtures = String.raw`
+$releFixtureMissingFields = ${unavailable === 'fields' ? '$true' : '$false'}
+function Get-ReleProcessQuery {
+  [CmdletBinding()] param([string]$Filter, [bool]$ParentOnly = $false)
+  $script:releFixtureQueries++
+  @{ objects = @(
     [pscustomobject]@{ ProcessId = 101; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\resources\codex.exe'; CommandLine = '"C:\Program Files\Codex\resources\codex.exe" -c model="synthetic-private-option" app-server --listen "ws://127.0.0.1:45678"' },
     [pscustomobject]@{ ProcessId = 102; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\resources\codex.exe'; CommandLine = 'codex.exe app-server --listen stdio://' },
     [pscustomobject]@{ ProcessId = 103; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\resources\codex.exe'; CommandLine = 'codex.exe app-server --listen=ws://localhost:45678/?token=synthetic-secret' },
@@ -247,22 +349,24 @@ function Get-CimInstance {
     [pscustomobject]@{ ProcessId = 106; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\Codex.exe'; CommandLine = 'Codex.exe --synthetic-gui-argument' },
     [pscustomobject]@{ ProcessId = 107; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\resources\codex.exe'; CommandLine = 'codex.exe app-server proxy' },
     [pscustomobject]@{ ProcessId = 108; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\resources\codex.exe'; CommandLine = 'codex.exe app-server --listen "unix://C:\Example User\custom.sock"' },
-    [pscustomobject]@{ ProcessId = 109; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\resources\codex.exe'; CommandLine = 'codex.exe app-server --listen=unix://' }
-  )
+    [pscustomobject]@{ ProcessId = 109; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\resources\codex.exe'; CommandLine = 'codex.exe app-server --listen=unix://' },
+    [pscustomobject]@{ ProcessId = 110; ParentProcessId = 1; ExecutablePath = $(if (-not $releFixtureMissingFields) { 'C:\Program Files\Codex\resources\codex.exe' }); CommandLine = $(if (-not $releFixtureMissingFields) { 'codex.exe app-server --listen=stdio://' }) }
+  ) }
 }
-function Invoke-CimMethod {
-  [CmdletBinding()] param($InputObject, [string]$MethodName)
+function Get-ReleProcessOwner {
+  [CmdletBinding()] param($InputObject)
+  if ($InputObject.ProcessId -eq 110 -and -not $releFixtureMissingFields) { return [pscustomobject]@{ ReturnValue = 2; Sid = $null } }
   [pscustomobject]@{ ReturnValue = 0; Sid = $(if ($InputObject.ProcessId -eq 105) { 'another-user' } else { [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }) }
 }
-function Get-AppxPackage { [CmdletBinding()] param([string]$Name); @() }
 `;
     // This parser fixture includes cold PowerShell startup on a shared CI runner.
     // Its deadline is separate from production probe budgets and the limit test above.
-    const result = await runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', fixtures + WINDOWS_CODEX_METADATA_SCRIPT], 25_000);
+    const result = await windowsMetadataFixture(fixtures, WINDOWS_CODEX_METADATA_SCRIPT);
     expect(result.code).toBe(0);
+    expect(result.stage).toBe('done');
     const parsed = JSON.parse(result.stdout);
-    expect(parsed.issues).toEqual([]);
-    expect(parsed.processes.map((item: { processId: number }) => item.processId)).toEqual([101, 102, 103, 104, 108, 109]);
+    expect(parsed.issues).toEqual(['process-owner-unavailable']);
+    expect(parsed.processes.map((item: { processId: number }) => item.processId), `Synthetic fixture JSON: ${result.stdout}`).toEqual([101, 102, 103, 104, 108, 109]);
     expect(parsed.processes[0]).toMatchObject({ listenKind: 'websocket', listen: 'ws://127.0.0.1:45678/' });
     expect(parsed.processes[1]).toMatchObject({ listenKind: 'stdio', listen: null });
     expect(parsed.processes[2]).toMatchObject({ listenKind: 'unsupported', listen: null });

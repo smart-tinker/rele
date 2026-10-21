@@ -14,6 +14,7 @@ import { discoverCodex } from './codex-discovery.js';
 import { codexEnvironment, environmentValue, resolveCodexLaunch } from './codex-launch.js';
 import { CodexContextReceipts } from './codex-context-receipts.js';
 import { CodexStdioError, CodexStdioTransport } from './codex-stdio.js';
+import { ensureSharedCodex, SharedCodexError } from './codex-shared.js';
 
 export { SUPPORTED_CODEX_VERSION } from '../shared/codex-runtime.js';
 // Keep user conversations from every normal client; technical subagents are not binding targets.
@@ -91,7 +92,7 @@ export function classifyCodexConnectionFailure(value: string, fallback = 'connec
   return { code: fallback, message: 'Не удалось подключиться к существующему Codex app-server. Проверьте выбранную установку и локальный адрес подключения.' };
 }
 
-/** Own a stdio child or attach to an explicit existing server; never start a daemon. */
+/** Attach to the native shared daemon, own a private child, or use an explicit server. */
 export class CodexClient extends EventEmitter {
   private socket?: WebSocket;
   private proxy?: ChildProcessWithoutNullStreams;
@@ -113,7 +114,7 @@ export class CodexClient extends EventEmitter {
   private state: CodexConnectionState;
   private discovery?: { at: number; result: CodexDiscoveryResult };
 
-  constructor(private readonly config: CodexConfig, private readonly options: { discover?: typeof discoverCodex; releaseTimeoutMs?: number } = {}) {
+  constructor(private readonly config: CodexConfig, private readonly options: { discover?: typeof discoverCodex; shared?: typeof ensureSharedCodex; releaseTimeoutMs?: number } = {}) {
     super();
     this.state = {
       configured: config.transport !== 'websocket' ? !!config.executable : isLocalEndpoint(config.endpoint ?? ''),
@@ -136,7 +137,7 @@ export class CodexClient extends EventEmitter {
     clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
     this.connecting = this.open().catch(async error => {
-      await this.disconnect(this.safeMessage(error), error instanceof CodexTransportError ? error.code : 'connection-failed');
+      await this.disconnect(this.safeMessage(error), error instanceof CodexTransportError || error instanceof SharedCodexError ? error.code : 'connection-failed');
       this.scheduleReconnect();
       throw error;
     }).finally(() => { this.connecting = undefined; });
@@ -337,10 +338,10 @@ export class CodexClient extends EventEmitter {
     if (shared && !await receipt()) throw new Error('Codex принял контекст, но сохранённая запись пока не подтверждена. Контекст остаётся в ожидании.');
   }
 
-  private async localContextHome(runtime: CodexRuntime | undefined): Promise<string> {
+  private async localContextHome(runtime: CodexRuntime | undefined, selectedHome?: string): Promise<string> {
     const error = 'Для пассивного контекста общего Codex нужен локальный runtime с тем же профилем Rele.';
     const os = process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'macos' : process.platform;
-    const expected = this.config.codexHome || (process.platform === 'win32' ? environmentValue(process.env, 'CODEX_HOME') : process.env.CODEX_HOME) || path.join(homedir(), '.codex');
+    const expected = selectedHome || this.config.codexHome || (process.platform === 'win32' ? environmentValue(process.env, 'CODEX_HOME') : process.env.CODEX_HOME) || path.join(homedir(), '.codex');
     try {
       if (!runtime || runtime.platformOs !== os || runtime.platformFamily !== (process.platform === 'win32' ? 'windows' : 'unix')
         || !isLocalCodexHome(runtime.codexHome) || !isLocalCodexHome(expected)) throw new Error();
@@ -444,7 +445,8 @@ export class CodexClient extends EventEmitter {
     this.version = undefined;
     this.setState({ connected: false, queueSupported: false, codexHome: undefined, error: undefined, errorCode: undefined });
     let target: CodexConnectionTarget = { executable: this.config.executable, transport: this.config.transport, endpoint: this.config.endpoint ?? '', ...(this.config.codexHome ? { codexHome: this.config.codexHome } : {}) };
-    if (target.transport !== 'websocket' && target.executable === 'codex') {
+    if (target.transport === 'shared') target = await (this.options.shared ?? ensureSharedCodex)(target, { ...(this.options.discover ? { discover: this.options.discover } : {}) });
+    else if (target.transport !== 'websocket' && target.executable === 'codex') {
       const result = this.discovery && Date.now() - this.discovery.at < 15_000
         ? this.discovery.result : await (this.options.discover ?? discoverCodex)(this.config.codexHome ? { codexHome: this.config.codexHome } : undefined);
       this.discovery = { at: Date.now(), result };
@@ -468,7 +470,7 @@ export class CodexClient extends EventEmitter {
       }
     }
     if (this.stopped) throw new CodexTransportError('Соединение закрыто.');
-    this.setState({ executable: target.executable, transport: target.transport, endpoint: target.endpoint });
+    this.setState({ executable: target.executable, transport: this.config.transport === 'shared' ? 'shared' : target.transport, endpoint: target.endpoint });
     let failure: ConnectionFailure | undefined;
     const diagnostic = (chunk: string) => {
       diagnosticTail = (diagnosticTail + chunk).slice(-8_192);
@@ -547,6 +549,10 @@ export class CodexClient extends EventEmitter {
     });
     await this.send({ method: 'initialized' });
     if (typeof this.runtime?.userAgent !== 'string' || typeof this.runtime.codexHome !== 'string') throw new CodexTransportError('Codex вернул некорректные сведения о сервере.', 'invalid-protocol');
+    if (this.config.transport === 'shared') {
+      try { await this.localContextHome(this.runtime, target.codexHome); }
+      catch { throw new SharedCodexError('Общий Codex использует другой профиль или платформу. Выберите исходный локальный профиль; запись остановлена.', 'shared-profile-mismatch'); }
+    }
     this.version = this.runtime.userAgent.match(/\/(\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?)(?=\s|$)/u)?.[1];
     this.setState({ name: this.version ? `Codex ${this.version}` : 'Codex', connected: true, codexHome: this.runtime.codexHome });
     if (!this.isVerifiedVersion()) {

@@ -135,7 +135,7 @@ test('disconnected and failing Codex catalogs never appear as empty and can reco
   await expect(page.getByRole('table')).toContainText('Пример: новый проект');
 });
 
-test('managed is the default and recommends a usable Desktop executable independently of its external connection', async ({
+test('saved managed mode recommends a usable Desktop executable independently of its external connection', async ({
   page,
 }, testInfo) => {
   const state = fixtureState(true);
@@ -283,7 +283,7 @@ test('managed is the default and recommends a usable Desktop executable independ
 });
 
 for (const transport of ['proxy', 'websocket'] as const) {
-  test(`saved ${transport} stays external until an explicit change and never carries its endpoint into managed mode`, async ({ page }) => {
+  test(`saved ${transport} stays external until an explicit change and never carries its endpoint into shared mode`, async ({ page }) => {
     const state = fixtureState(true);
     const saved: CodexConnectionTarget = {
       executable: '/opt/example/external/codex',
@@ -301,7 +301,7 @@ for (const transport of ['proxy', 'websocket'] as const) {
     await expect(page.getByLabel('Исполняемый файл Codex', { exact: true })).toHaveValue(saved.executable);
     await expect(page.getByLabel(transport === 'proxy' ? 'Локальный сокет Codex' : 'Адрес app-server', { exact: true })).toHaveValue(saved.endpoint);
     await expect(page.getByLabel('Папка профиля Codex', { exact: true })).toHaveValue('/profiles/legacy');
-    await expect(page.getByRole('button', { name: 'Перейти на сервер Rele', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Перейти на общий Codex', exact: true })).toBeVisible();
     await expect(page.getByText('CLI: 0.163.0-alpha.10.2', { exact: false })).toBeVisible();
     expect(api.mutations).toEqual([]);
     await page.getByRole('button', { name: 'Сохранить Codex', exact: true }).click();
@@ -317,14 +317,14 @@ for (const transport of ['proxy', 'websocket'] as const) {
       });
     }
     const writesBefore = api.mutations.length;
-    await page.getByRole('button', { name: 'Перейти на сервер Rele', exact: true }).click();
-    await expect(page.getByLabel('Режим работы', { exact: true })).toHaveValue('managed');
+    await page.getByRole('button', { name: 'Перейти на общий Codex', exact: true }).click();
+    await expect(page.getByLabel('Режим работы', { exact: true })).toHaveValue('shared');
     await expect(page.getByRole('radio', { name: /Находить Codex автоматически/ })).toBeChecked();
     await expect(page.getByLabel('Папка профиля Codex', { exact: true })).toHaveValue('/profiles/legacy');
     expect(api.mutations).toHaveLength(writesBefore);
     await page.getByRole('button', { name: 'Сохранить Codex', exact: true }).click();
     await expect.poll(() => api.mutations.at(-1)?.body).toEqual({
-      codex: { executable: 'codex', transport: 'managed', endpoint: '', codexHome: '/profiles/legacy' },
+      codex: { executable: 'codex', transport: 'shared', endpoint: '', codexHome: '/profiles/legacy' },
     });
   });
 }
@@ -364,4 +364,27 @@ test('an actual profile change clears the previous thread catalog even when save
   release();
   await expect(page.getByRole('table')).toContainText(secondThread.name);
   await expect(page.getByLabel('Папка профиля Codex', { exact: true })).toHaveValue('');
+});
+
+
+test('shared mode saves an automatic policy without a transient endpoint and preserves its profile', async ({ page }, testInfo) => {
+  const state = fixtureState(true);
+  state.config.codex = { executable: 'codex', transport: 'shared', endpoint: '', codexHome: '/profiles/shared', tokenConfigured: false };
+  state.codex = { ...state.codex, transport: 'shared', endpoint: '/profiles/shared/app-server-control/app-server-control.sock', codexHome: '/profiles/shared' };
+  const api = await installApi(page, state);
+  await openPanel(page);
+  await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  await expect(page.getByLabel('Режим работы', { exact: true })).toHaveValue('shared');
+  await expect(page.getByRole('radio', { name: /Находить Codex автоматически/ })).toBeChecked();
+  await expect(page.getByText('Rele подключается к общему Codex или запускает его.', { exact: false })).toBeVisible();
+  expect(api.mutations).toEqual([]);
+  await page.getByRole('button', { name: 'Выбрать рекомендуемый', exact: true }).click();
+  await expect(page.getByRole('radio', { name: /Находить Codex автоматически/ })).toBeChecked();
+  await page.getByRole('button', { name: 'Сохранить Codex', exact: true }).click();
+  await expect.poll(() => api.mutations.at(-1)?.body).toEqual({ codex: { executable: 'codex', transport: 'shared', endpoint: '', codexHome: '/profiles/shared' } });
+  await page.screenshot({ path: testInfo.outputPath('shared-desktop.png'), fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.getByLabel('Режим работы', { exact: true })).toHaveValue('shared');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath('shared-mobile.png'), fullPage: true });
 });

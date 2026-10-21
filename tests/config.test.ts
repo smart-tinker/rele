@@ -8,7 +8,8 @@ import {
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import * as childProcess from 'node:child_process';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ConfigStore,
   defaultConfig,
@@ -18,6 +19,8 @@ import {
   mergeConfig,
   publicConfig,
 } from '../src/server/config.js';
+
+vi.mock('node:child_process', { spy: true });
 
 const syntheticSecrets = {
   codex: 'synthetic-codex-secret',
@@ -48,8 +51,8 @@ function configured() {
 }
 
 describe('configuration validation and public projection', () => {
-  it('defaults to a managed server while inheriting the native Codex home', () => {
-    expect(defaultConfig.codex).toEqual({ transport: 'managed', executable: 'codex', endpoint: '' });
+  it('defaults to the shared native server while inheriting the Codex home', () => {
+    expect(defaultConfig.codex).toEqual({ transport: 'shared', executable: 'codex', endpoint: '' });
     const selected = mergeConfig(defaultConfig, { codex: { codexHome: resolve('synthetic-codex-home') } });
     expect(publicConfig(selected).codex.codexHome).toBe(resolve('synthetic-codex-home'));
     expect(mergeConfig(selected, { codex: { codexHome: '' } }).codex).not.toHaveProperty('codexHome');
@@ -57,12 +60,12 @@ describe('configuration validation and public projection', () => {
     expect(defaultConfig.codex).not.toHaveProperty('codexHome');
   });
 
-  it('clears the old address only when explicitly switching to a managed server', () => {
+  it.each(['shared', 'managed'] as const)('clears the old address only when explicitly switching to %s', transport => {
     const current = mergeConfig(defaultConfig, { codex: { transport: 'websocket', endpoint: 'ws://127.0.0.1:4500', codexHome: resolve('native-home') } });
-    expect(mergeConfig(current, { codex: { transport: 'managed' } }).codex).toMatchObject({ transport: 'managed', endpoint: '', codexHome: current.codex.codexHome });
+    expect(mergeConfig(current, { codex: { transport } }).codex).toMatchObject({ transport, endpoint: '', codexHome: current.codex.codexHome });
     expect(mergeConfig(current, { telegram: { enabled: false } }).codex).toEqual(current.codex);
     expect(() => mergeConfig(defaultConfig, { codex: { endpoint: 'ws://127.0.0.1:4500' } })).toThrow('endpoint');
-    expect(() => mergeConfig(current, { codex: { transport: 'managed', endpoint: 'ws://127.0.0.1:4501' } })).toThrow('endpoint');
+    expect(() => mergeConfig(current, { codex: { transport, endpoint: 'ws://127.0.0.1:4501' } })).toThrow('endpoint');
   });
 
   it('accepts only an absolute local Codex home for the native platform', () => {
@@ -275,23 +278,31 @@ describe('configuration storage and panel credentials', () => {
   });
 
   it.runIf(process.platform === 'win32')(
-    'round-trips Windows DPAPI for the current user without storing plaintext secrets',
+    'round-trips Windows DPAPI without module autoload or plaintext secrets',
     async () => {
-      const root = await directory();
-      const first = new ConfigStore(root);
-      await first.load();
-      await first.save(configured());
-      const raw = await readFile(join(root, 'config.json'), 'utf8');
-      expect(JSON.parse(raw).encoding).toBe('dpapi');
-      for (const secret of [
-        first.panelToken,
-        ...Object.values(syntheticSecrets),
-      ])
-        expect(raw).not.toContain(secret);
-      const restored = new ConfigStore(root);
-      await restored.load();
-      expect(restored.config).toEqual(first.config);
-      expect(restored.authorized(`Bearer ${first.panelToken}`)).toBe(true);
+      const nativeSpawn = (await vi.importActual<typeof import('node:child_process')>('node:child_process')).spawn;
+      const spawn = vi.spyOn(childProcess, 'spawn').mockImplementation(((command: string, args: readonly string[], options: childProcess.SpawnOptions) => {
+        return nativeSpawn(command, [...args.slice(0, -1), `$ErrorActionPreference='Stop'; $PSModuleAutoLoadingPreference='None'; ${args.at(-1)}`], options);
+      }) as typeof childProcess.spawn);
+      try {
+        const root = await directory();
+        const first = new ConfigStore(root);
+        await first.load();
+        await first.save(configured());
+        const raw = await readFile(join(root, 'config.json'), 'utf8');
+        expect(JSON.parse(raw).encoding).toBe('dpapi');
+        for (const secret of [
+          first.panelToken,
+          ...Object.values(syntheticSecrets),
+        ])
+          expect(raw).not.toContain(secret);
+        const restored = new ConfigStore(root);
+        await restored.load();
+        expect(restored.config).toEqual(first.config);
+        expect(restored.authorized(`Bearer ${first.panelToken}`)).toBe(true);
+      } finally {
+        spawn.mockRestore();
+      }
     },
   );
 });

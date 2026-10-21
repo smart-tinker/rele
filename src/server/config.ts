@@ -14,7 +14,7 @@ export interface AppConfig {
 }
 
 export const defaultConfig: AppConfig = {
-  codex: { transport: 'managed', executable: 'codex', endpoint: '' },
+  codex: { transport: 'shared', executable: 'codex', endpoint: '' },
   autoLinkRules: [],
   telegram: { enabled: false },
   slack: { enabled: false },
@@ -122,11 +122,11 @@ export function mergeConfig(current: AppConfig, input: unknown): AppConfig {
       }
     }
   }
-  if (!['managed', 'proxy', 'websocket'].includes(next.codex.transport)) throw new Error('Неизвестный транспорт Codex.');
+  if (!['shared', 'managed', 'proxy', 'websocket'].includes(next.codex.transport)) throw new Error('Неизвестный транспорт Codex.');
   if (!next.codex.executable || /[\r\n]/u.test(next.codex.executable)) throw new Error('Укажите путь к Codex CLI.');
   if (next.codex.codexHome && !isLocalCodexHome(next.codex.codexHome)) throw new Error('Профиль Codex должен быть абсолютным локальным путём без сетевых каталогов.');
-  if (next.codex.transport === 'managed' && current.codex.transport !== 'managed' && next.codex.endpoint === current.codex.endpoint) next.codex.endpoint = '';
-  if (next.codex.transport === 'managed' && next.codex.endpoint) throw new Error('В режиме Rele не нужен адрес app-server. Оставьте endpoint пустым.');
+  if (['shared', 'managed'].includes(next.codex.transport) && current.codex.transport !== next.codex.transport && next.codex.endpoint === current.codex.endpoint) next.codex.endpoint = '';
+  if (['shared', 'managed'].includes(next.codex.transport) && next.codex.endpoint) throw new Error('В автоматическом режиме не нужен адрес app-server. Оставьте endpoint пустым.');
   // Older panels submit the now-hidden WebSocket field when switching to proxy.
   if (next.codex.transport === 'proxy' && current.codex.transport === 'websocket' && next.codex.endpoint === current.codex.endpoint) next.codex.endpoint = '';
   if (next.codex.transport === 'proxy' && next.codex.endpoint && !isLocalSocketPath(next.codex.endpoint)) throw new Error('Для локального proxy нужен абсолютный путь к сокету, а не WebSocket URL. Для автоматического подключения оставьте адрес пустым.');
@@ -153,7 +153,7 @@ export function publicConfig(config: AppConfig): PublicConfig {
 }
 
 async function protectWindows(input: string, decrypt: boolean): Promise<string> {
-  const script = 'Add-Type -AssemblyName System.Security; $s=[Console]::In.ReadToEnd(); ' + (decrypt
+  const script = "[void][Reflection.Assembly]::Load('System.Security, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'); $s=[Console]::In.ReadToEnd(); " + (decrypt
     ? '$b=[Convert]::FromBase64String($s); $p=[Security.Cryptography.ProtectedData]::Unprotect($b,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser); [Console]::Out.Write([Text.Encoding]::UTF8.GetString($p))'
     : '$b=[Text.Encoding]::UTF8.GetBytes($s); $p=[Security.Cryptography.ProtectedData]::Protect($b,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser); [Console]::Out.Write([Convert]::ToBase64String($p))');
   return new Promise((resolve, reject) => {

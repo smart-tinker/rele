@@ -8,6 +8,7 @@ const root = '/opt/rele';
 const configuration = '/etc/rele/service.json';
 const restartFile = '/var/lib/rele/restart.json';
 const dropIn = '/etc/systemd/system/rele.service.d/rele-user.conf';
+const sharedDropIn = '/etc/systemd/system/rele-codex.service.d/rele-user.conf';
 const [command = 'open', ...arguments_] = process.argv.slice(2);
 const isRoot = process.getuid?.() === 0;
 
@@ -44,16 +45,16 @@ async function saved() {
 }
 function environment(config) {
   const owner = account(config.user);
-  return { RELE_DATA_DIR: config.dataDirectory, CODEX_HOME: config.codexHome, RELE_PORT: String(config.port),
+  return { RELE_DATA_DIR: config.dataDirectory, CODEX_HOME: config.codexHome, RELE_PORT: String(config.port), RELE_CODEX_DAEMON_EXTERNAL: '1',
     PATH: `${root}/runtime:${owner.directory}/.local/bin:${owner.directory}/.npm-global/bin:/usr/local/bin:/usr/bin:/bin` };
 }
-function asOwner(config, args, options = {}) {
+function asOwner(config, args, options = {}, script = 'main.js') {
   const owner = account(config.user);
   const vars = environment(config);
   if (isRoot) return run('/usr/sbin/runuser', ['-u', owner.user, '--', '/usr/bin/env', ...Object.entries(vars).map(([key, value]) => `${key}=${value}`),
-    path.join(root, 'runtime/node'), path.join(root, 'dist/server/main.js'), ...args], options);
+    path.join(root, 'runtime/node'), path.join(root, 'dist/server', script), ...args], options);
   if (process.getuid() !== owner.uid) throw new Error(`Rele установлен для ${owner.user}. Выполните команду под этой учётной записью.`);
-  return run(path.join(root, 'runtime/node'), [path.join(root, 'dist/server/main.js'), ...args], { ...options, env: { ...process.env, ...vars } });
+  return run(path.join(root, 'runtime/node'), [path.join(root, 'dist/server', script), ...args], { ...options, env: { ...process.env, ...vars } });
 }
 async function ready(config) {
   const deadline = Date.now() + 15_000;
@@ -87,10 +88,13 @@ async function configure(config, restart = null) {
   await stopLegacyUserService(config);
   await mkdir(path.dirname(configuration), { recursive: true, mode: 0o755 });
   await mkdir(path.dirname(dropIn), { recursive: true, mode: 0o755 });
+  await mkdir(path.dirname(sharedDropIn), { recursive: true, mode: 0o755 });
   await writeFile(configuration, JSON.stringify(config, null, 2) + '\n', { mode: 0o644 });
   const variables = Object.entries(environment(config)).map(([key, value]) => `Environment=${quote(`${key}=${value}`)}`).join('\n');
-  await writeFile(dropIn, `[Service]\nUser=${config.user}\n${variables}\n`, { mode: 0o644 });
+  for (const file of [dropIn, sharedDropIn]) await writeFile(file, `[Service]\nUser=${config.user}\n${variables}\n`, { mode: 0o644 });
   ctl(['daemon-reload']);
+  if (restart?.sharedEnabled ?? restart?.enabled ?? true) ctl(['enable', 'rele-codex.timer']);
+  if (restart?.sharedActive ?? restart?.active ?? true) ctl(['start', 'rele-codex.timer']);
   if (!restart || restart.enabled) ctl(['enable', 'rele.service']);
   if (!restart || restart.active) { ctl(['restart', 'rele.service']); await ready(config); }
   await rm(restartFile, { force: true });
@@ -112,7 +116,10 @@ async function main() {
   // needs neither user credentials nor access to the user's data.
   if (command === '--package-remove') {
     requireRoot();
-    if (existsSync('/run/systemd/system')) ctl(['disable', '--now', 'rele.service']);
+    if (existsSync('/run/systemd/system')) {
+      ctl(['disable', '--now', 'rele-codex.timer', 'rele.service']);
+      ctl(['stop', 'rele-codex.service']); // Only the short starter; the native daemon remains alive.
+    }
     await rm(restartFile, { force: true }); return;
   }
   const config = await saved();
@@ -130,8 +137,10 @@ async function main() {
     if (!config) return;
     await mkdir(path.dirname(restartFile), { recursive: true, mode: 0o755 });
     await writeFile(restartFile, JSON.stringify({ enabled: ctl(['is-enabled', '--quiet', 'rele.service'], true).status === 0,
-      active: ctl(['is-active', '--quiet', 'rele.service'], true).status === 0 }), { mode: 0o600 });
-    ctl(['stop', 'rele.service']);
+      active: ctl(['is-active', '--quiet', 'rele.service'], true).status === 0,
+      sharedEnabled: ctl(['is-enabled', '--quiet', 'rele-codex.timer'], true).status === 0,
+      sharedActive: ctl(['is-active', '--quiet', 'rele-codex.timer'], true).status === 0 }), { mode: 0o600 });
+    ctl(['stop', 'rele-codex.timer', 'rele-codex.service', 'rele.service']);
     if (existsSync(path.join(config.dataDirectory, 'config.json'))) asOwner(config, ['backup'], { stdio: 'inherit' });
     return;
   }
@@ -144,7 +153,7 @@ async function main() {
       if (config && user !== config.user) throw new Error(`Служба уже принадлежит ${config.user}. Сначала удалите пакет с purge; сохранённые пользовательские данные останутся на месте.`);
       const next = validate({ ...config, user, ...(values['--data-dir'] ? { dataDirectory: values['--data-dir'] } : {}),
         ...(values['--codex-home'] ? { codexHome: values['--codex-home'] } : {}), ...(values['--port'] ? { port: values['--port'] } : {}) });
-      if (config) { ctl(['stop', 'rele.service']); if (existsSync(path.join(config.dataDirectory, 'config.json'))) asOwner(config, ['backup'], { stdio: 'inherit' }); }
+      if (config) { ctl(['stop', 'rele-codex.timer', 'rele-codex.service', 'rele.service']); if (existsSync(path.join(config.dataDirectory, 'config.json'))) asOwner(config, ['backup'], { stdio: 'inherit' }); }
       await configure(next); return;
     }
     if (!['start', 'stop', 'restart', 'status'].includes(action) || args.length) throw new Error('Команды службы: install, start, stop, restart, status.');
@@ -153,6 +162,14 @@ async function main() {
     const result = run('/usr/bin/systemctl', [action, 'rele.service', '--no-pager'], { stdio: 'inherit', allowFailure: action === 'status' });
     if (['start', 'restart'].includes(action)) await ready(config);
     process.exitCode = result.status; return;
+  }
+  if (command === 'codex') {
+    if (config) asOwner(config, ['--rele-cli', ...arguments_], { stdio: 'inherit', timeout: 0 }, 'codex-cli.js');
+    else {
+      if (isRoot) throw new Error('Запустите общий Codex под назначенным владельцем профиля.');
+      run(path.join(root, 'runtime/node'), [path.join(root, 'dist/server/codex-cli.js'), '--rele-cli', ...arguments_], { stdio: 'inherit', timeout: 0 });
+    }
+    return;
   }
   if (config) { asOwner(config, [command, ...arguments_], { stdio: 'inherit' }); return; }
   if (isRoot && !['help', '--help', 'version', '--version'].includes(command)) throw new Error('Назначьте обычного владельца Codex: sudo rele service install --user <имя>.');

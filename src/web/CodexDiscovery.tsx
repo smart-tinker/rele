@@ -8,7 +8,7 @@ import { errorText, ReleApi } from './client';
 import { Button, Notice, Status } from './ui';
 
 export const automaticCodex: CodexConnectionTarget = {
-  transport: 'managed',
+  transport: 'shared',
   executable: 'codex',
   endpoint: '',
 };
@@ -79,16 +79,19 @@ export function CodexDiscovery({
     path: 'Команда в PATH',
     standard: 'Стандартный каталог',
   };
+  const startsServer = transport === 'shared' || transport === 'managed';
   const recommended =
-    transport === 'managed'
-      ? discovery?.recommendedManaged
+    transport === 'shared'
+      ? discovery?.recommendedManaged && automaticCodex
+      : startsServer
+      ? discovery?.recommendedManaged && { ...discovery.recommendedManaged, transport }
       : discovery?.recommended?.transport === transport
         ? discovery.recommended
         : undefined;
   return (
     <fieldset className="codex-discovery">
       <legend>Выбор Codex</legend>
-      {transport === 'managed' && (
+      {startsServer && (
         <label className="check-row">
           <input
             type="radio"
@@ -100,8 +103,9 @@ export function CodexDiscovery({
           <span>
             <strong>Находить Codex автоматически</strong>
             <small>
-              Rele выберет подходящий Codex и запустит свой сервер. Можно
-              использовать Codex из установленного Desktop.
+              {transport === 'shared'
+                ? 'Rele найдёт установленный Codex и общий сервер. При отсутствии сервера запустит штатный daemon Codex.'
+                : 'Rele выберет подходящий Codex и запустит отдельный сервер.'}
             </small>
           </span>
         </label>
@@ -143,8 +147,8 @@ export function CodexDiscovery({
         <div className="discovery-options">
           {discovery.installations.map((installation, index) => {
             const connection =
-              transport === 'managed'
-                ? installation.managedConnection
+              startsServer
+                ? installation.managedConnection && { ...installation.managedConnection, transport }
                 : installation.connection?.transport === transport
                   ? installation.connection
                   : undefined;
@@ -185,15 +189,15 @@ export function CodexDiscovery({
                       : {connection.endpoint}
                     </small>
                   )}
-                  {connection?.transport === 'managed' && (
-                    <small>Доступен для сервера Rele</small>
+                  {connection && startsServer && (
+                    <small>{transport === 'shared' ? 'Запуск общего Codex требует полного пакета CLI' : 'Доступен для сервера Rele'}</small>
                   )}
                   {isRecommended && <Status tone="good">Рекомендуется</Status>}
                   {!connection && (
                     <small>
-                      {transport === 'managed'
+                      {startsServer
                         ? 'Запуск этого Codex не подтверждён. Проверьте сообщение ниже или укажите путь вручную.'
-                        : 'Внешнее подключение этим способом не найдено. Укажите параметры вручную или выберите «Сервер Rele».'}
+                        : 'Внешнее подключение этим способом не найдено. Укажите параметры вручную или выберите «Общий Codex».'}
                     </small>
                   )}
                 </span>
@@ -217,7 +221,7 @@ export function CodexDiscovery({
           </Notice>
         ))}
       <p className="field-hint">
-        {transport === 'managed'
+        {startsServer
           ? 'Это установленные версии Codex. Какая из них запущена для Rele, показано в фактическом подключении после сохранения.'
           : 'Найденный файл и версия CLI ещё не подтверждают соединение с существующим сервером. Фактическое подключение показано выше.'}
       </p>
@@ -232,7 +236,7 @@ export function CodexDiscovery({
         <span>
           <strong>Указать параметры вручную</strong>
           <small>
-            {transport === 'managed'
+            {startsServer
               ? 'Путь к исполняемому файлу Codex.'
               : 'Путь к исполняемому файлу или адрес существующего сервера.'}
           </small>

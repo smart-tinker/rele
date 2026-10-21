@@ -146,6 +146,59 @@ async function until(predicate: () => boolean): Promise<void> {
   }
 }
 
+describe('Codex native shared policy', () => {
+  async function sharedFixture(implicitProfile = false) {
+    const home = await mkdtemp(path.join(tmpdir(), 'rele-shared-client-'));
+    cleanup.push(() => rm(home, { recursive: true, force: true }));
+    const f = await fixture({ initialize: () => ({ userAgent: 'codex/0.163.0-alpha.11 (Fixture)', codexHome: home,
+      platformFamily: process.platform === 'win32' ? 'windows' : 'unix', platformOs: process.platform === 'win32' ? 'windows' : process.platform }) }, home);
+    if (implicitProfile) vi.stubEnv('CODEX_HOME', home);
+    const target = { transport: 'shared' as const, executable: 'codex', endpoint: '', ...(!implicitProfile ? { codexHome: home } : {}) };
+    const shared = vi.fn().mockResolvedValue({ ...target, transport: 'websocket', endpoint: f.endpoint, codexHome: home });
+    const client = new CodexClient(target, { shared });
+    cleanup.push(() => client.close());
+    return { ...f, client, peer: f.client, target, shared, home };
+  }
+
+  it.each([false, true])('keeps policy stable and closes only its connection (implicit profile: %s)', async implicitProfile => {
+    const f = await sharedFixture(implicitProfile);
+    await f.client.connect();
+    expect(f.shared).toHaveBeenCalledWith(f.target, {});
+    expect(f.client.status()).toMatchObject({ connected: true, transport: 'shared', queueSupported: true, codexHome: f.home, name: 'Codex 0.163.0-alpha.11' });
+    expect(f.target).toMatchObject({ transport: 'shared', endpoint: '' });
+    await f.client.subscribe(threadId);
+    await f.client.releaseThread(threadId);
+    expect(f.calls.some(call => call.method === 'thread/unsubscribe')).toBe(false);
+    await f.client.close();
+    await f.peer.connect();
+    expect(f.peer.status().connected).toBe(true);
+    expect((await f.peer.listThreads())[0].id).toBe(threadId);
+  });
+
+  it.each([false, true])('rejects a different profile before any catalog or queue call (implicit profile: %s)', async implicitProfile => {
+    const f = await sharedFixture(implicitProfile);
+    f.handlers.initialize = () => ({ userAgent: 'codex/0.163.0 (Fixture)', codexHome: path.join(f.home, 'different'),
+      platformFamily: process.platform === 'win32' ? 'windows' : 'unix', platformOs: process.platform === 'win32' ? 'windows' : process.platform });
+    await expect(f.client.connect()).rejects.toMatchObject({ code: 'shared-profile-mismatch' });
+    expect(f.client.status()).toMatchObject({ connected: false, queueSupported: false, errorCode: 'shared-profile-mismatch' });
+    expect(f.calls.map(call => call.method)).toEqual(['initialize', 'initialized']);
+  });
+
+  it('re-resolves after disconnect and reconciles an accepted UUID without repeating queue/add', async () => {
+    const f = await sharedFixture(), clientId = randomUUID();
+    f.handlers['thread/queue/add'] = (_message, socket) => { socket.close(); return noResponse; };
+    f.handlers['thread/queue/list'] = () => ({ data: [{ id: 'accepted', clientUserMessageId: clientId }], nextCursor: null });
+    await f.client.connect();
+    await expect(f.client.enqueue(threadId, 'Original shared request', clientId)).rejects.toBeInstanceOf(CodexTransportError);
+    await f.client.connect();
+    expect(f.shared).toHaveBeenCalledTimes(2);
+    expect(await f.client.findRequest(threadId, clientId)).toEqual({ state: 'queued', queuedSubmissionId: 'accepted' });
+    expect(f.calls.filter(call => call.method === 'thread/queue/add')).toHaveLength(1);
+    expect(f.calls.filter(call => call.method === 'thread/resume').every(call => call.params.threadId === threadId)).toBe(true);
+    expect(f.calls.some(call => ['thread/start', 'thread/fork', 'turn/start'].includes(call.method ?? ''))).toBe(false);
+  });
+});
+
 describe('Codex shared-runtime adapter', () => {
   it('automatically resolves the default CLI to a discovered existing Desktop server and keeps version gates', async () => {
     const f = await fixture({ initialize: () => ({ userAgent: 'rele/0.164.0 (Windows)', codexHome: '/isolated', platformFamily: 'windows', platformOs: 'windows' }) });

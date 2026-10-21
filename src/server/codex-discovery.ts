@@ -9,34 +9,77 @@ import { codexEnvironment, environmentValue, fileExists, isDesktopLauncher, reso
 
 // Command lines are inspected inside this fixed script and never returned. No auth,
 // history, environment, or Codex configuration files are read during discovery.
+export const WINDOWS_CODEX_PROCESS_PROVIDER_SCRIPT = String.raw`
+[void][Reflection.Assembly]::Load('System.Management, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a')
+function Close-ReleProcessQuery($query) {
+  try { foreach ($row in $query.objects) { $row.Dispose() } }
+  finally { try { if ($query.collection) { $query.collection.Dispose() } } finally { $query.searcher.Dispose() } }
+}
+function Get-ReleProcessQuery([string]$filter, [bool]$parentOnly = $false) {
+  $fields = if ($parentOnly) { 'Name,ExecutablePath,ParentProcessId' } else { 'Name,ExecutablePath,CommandLine,ProcessId,ParentProcessId' }
+  $query = @{ searcher = [Management.ManagementObjectSearcher]::new('root\CIMV2', "SELECT $fields FROM Win32_Process WHERE $filter"); collection = $null; objects = [Collections.Generic.List[object]]::new() }
+  try {
+    $query.searcher.Options.EnsureLocatable = $true
+    $query.collection = $query.searcher.Get()
+    foreach ($row in $query.collection) { $query.objects.Add($row) }
+    return $query
+  } catch { Close-ReleProcessQuery $query; throw }
+}
+function Get-ReleProcessOwner($process) {
+  $owner = $null
+  try {
+    $owner = $process.InvokeMethod('GetOwnerSid', $null, $null)
+    return @{ ReturnValue = $owner.ReturnValue; Sid = $owner.Sid }
+  } finally { if ($owner) { $owner.Dispose() } }
+}
+`;
 export const WINDOWS_CODEX_METADATA_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-$processes = @()
-$packages = @()
+[Console]::Error.WriteLine('rele-discovery:startup')
+$processes = [Collections.Generic.List[object]]::new()
+$packages = [Collections.Generic.List[object]]::new()
 $issues = @()
 $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+function Add-ReleJsonRecord([Collections.Generic.List[object]]$records, [hashtable]$values) {
+  $record = [Collections.Generic.Dictionary[string,object]]::new()
+  foreach ($key in $values.Keys) { $record.Add([string]$key, $values[$key]) }
+  $records.Add($record)
+}
+$query = $null
 try {
-  foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name = 'codex.exe'")) {
-    if (-not $process.ExecutablePath -or -not $process.CommandLine) { continue }
+  [Console]::Error.WriteLine('rele-discovery:process-provider')
+  ${WINDOWS_CODEX_PROCESS_PROVIDER_SCRIPT}
+  [Console]::Error.WriteLine('rele-discovery:process-query')
+  $query = Get-ReleProcessQuery "Name = 'codex.exe'"
+  foreach ($process in $query.objects) {
+    try {
+      [Console]::Error.WriteLine('rele-discovery:owner-query')
+      $owner = Get-ReleProcessOwner $process
+      if ($owner.ReturnValue -ne 0 -or -not $owner.Sid) { $issues += 'process-owner-unavailable'; continue }
+      if ($owner.Sid -ne $sid) { continue }
+    } catch { $issues += 'process-owner-unavailable'; continue }
+    if (-not $process.ExecutablePath -or -not $process.CommandLine) { $issues += 'process-owner-unavailable'; continue }
+    [Console]::Error.WriteLine('rele-discovery:process-parse')
     $words = @([regex]::Matches($process.CommandLine, '"[^"]*"|[^\s]+') | ForEach-Object { $_.Value.Trim('"') })
     $index = [Array]::IndexOf($words, 'app-server')
     if ($index -lt 0 -or ($index + 1 -lt $words.Count -and $words[$index + 1] -eq 'proxy')) { continue }
-    try {
-      $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid
-      if ($owner.ReturnValue -ne 0 -or $owner.Sid -ne $sid) { continue }
-    } catch { $issues += 'process-owner-unavailable'; continue }
     $desktop = $process.ExecutablePath -match '(?i)[\\/]resources[\\/]codex\.exe$'
     $parentId = $process.ParentProcessId
     for ($depth = 0; -not $desktop -and $parentId -gt 0 -and $depth -lt 4; $depth++) {
-      $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $parentId" -Property Name,ExecutablePath,ParentProcessId -ErrorAction SilentlyContinue
-      if (-not $parent) { break }
-      if ($parent.Name -match '^(?i:Codex|ChatGPT)\.exe$' -and $parent.ExecutablePath) {
-        $parentRoot = [IO.Path]::GetDirectoryName($parent.ExecutablePath)
-        $desktop = (Test-Path -LiteralPath (Join-Path $parentRoot 'resources\app.asar')) -or (Test-Path -LiteralPath (Join-Path $parentRoot 'resources\codex.exe'))
-      }
-      $parentId = $parent.ParentProcessId
+      [Console]::Error.WriteLine('rele-discovery:parent-query')
+      $parents = $null
+      try {
+        $parents = Get-ReleProcessQuery "ProcessId = $parentId" $true
+        if ($parents.objects.Count -eq 0) { break }
+        $parent = $parents.objects[0]
+        if ($parent.Name -match '^(?i:Codex|ChatGPT)\.exe$' -and $parent.ExecutablePath) {
+          $parentRoot = [IO.Path]::GetDirectoryName($parent.ExecutablePath)
+          $desktop = [IO.File]::Exists([IO.Path]::Combine($parentRoot, 'resources\app.asar')) -or [IO.File]::Exists([IO.Path]::Combine($parentRoot, 'resources\codex.exe'))
+        }
+        $parentId = $parent.ParentProcessId
+      } finally { if ($parents) { Close-ReleProcessQuery $parents } }
     }
     if (-not $desktop) { continue }
     $listen = $null
@@ -72,25 +115,58 @@ try {
         else { $socketInvalid = $true }
       }
     }
-    $processes += [pscustomobject]@{ executable = $process.ExecutablePath; processId = [int]$process.ProcessId; listenKind = $listenKind; listen = $listen; socket = $socket; socketDefault = $socketDefault; socketInvalid = $socketInvalid }
+    Add-ReleJsonRecord $processes @{ executable = [string]$process.ExecutablePath; processId = [int]$process.ProcessId; listenKind = $listenKind; listen = $listen; socket = $socket; socketDefault = $socketDefault; socketInvalid = $socketInvalid }
   }
-} catch { $issues += 'process-discovery-unavailable' }
-try {
-  $packages = @(Get-AppxPackage -Name 'OpenAI.*' | Where-Object { $_.Name -in @('OpenAI.Codex', 'OpenAI.ChatGPT') -and $_.InstallLocation } | ForEach-Object { [pscustomobject]@{ location = $_.InstallLocation; name = $_.Name } })
-} catch { $issues += 'package-discovery-unavailable' }
-[pscustomobject]@{ processes = @($processes); packages = @($packages); issues = @($issues | Select-Object -Unique) } | ConvertTo-Json -Depth 5 -Compress
+} catch { $issues += 'process-discovery-unavailable' } finally { if ($query) { Close-ReleProcessQuery $query } }
+if (-not $releProcessesOnly) { try {
+  [Console]::Error.WriteLine('rele-discovery:packages')
+  foreach ($package in @(Get-AppxPackage -Name 'OpenAI.*')) {
+    if ($package.Name -in @('OpenAI.Codex', 'OpenAI.ChatGPT') -and $package.InstallLocation) { Add-ReleJsonRecord $packages @{ location = [string]$package.InstallLocation; name = [string]$package.Name } }
+  }
+} catch { $issues += 'package-discovery-unavailable' } }
+[Console]::Error.WriteLine('rele-discovery:json-provider')
+[void][Reflection.Assembly]::Load('System.Runtime.Serialization, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089')
+[Console]::Error.WriteLine('rele-discovery:json')
+$uniqueIssues = @()
+foreach ($issue in $issues) { if ($uniqueIssues -notcontains $issue) { $uniqueIssues += [string]$issue } }
+$settings = [Runtime.Serialization.Json.DataContractJsonSerializerSettings]::new()
+$settings.UseSimpleDictionaryFormat = $true
+$settings.EmitTypeInformation = [Runtime.Serialization.EmitTypeInformation]::Never
+# Keep dictionary records in a declared dictionary-array contract. A dictionary
+# nested under Object is otherwise serialized as enumerable Key/Value entries.
+$recordArrayType = [Collections.Generic.Dictionary[string,object][]]
+$fields = @(
+  @{ name = 'processes'; type = $recordArrayType; value = [Collections.Generic.Dictionary[string,object][]]$processes.ToArray() },
+  @{ name = 'packages'; type = $recordArrayType; value = [Collections.Generic.Dictionary[string,object][]]$packages.ToArray() },
+  @{ name = 'issues'; type = [string[]]; value = [string[]]$uniqueIssues }
+)
+$jsonFields = [Collections.Generic.List[string]]::new()
+foreach ($field in $fields) {
+  $serializer = [Runtime.Serialization.Json.DataContractJsonSerializer]::new($field.type, $settings)
+  $stream = [IO.MemoryStream]::new()
+  try { $serializer.WriteObject($stream, $field.value); $jsonFields.Add('"' + $field.name + '":' + [Text.Encoding]::UTF8.GetString($stream.ToArray())) }
+  finally { $stream.Dispose() }
+}
+[Console]::Out.Write('{' + [string]::Join(',', $jsonFields.ToArray()) + '}')
+[Console]::Error.WriteLine('rele-discovery:done')
 `;
+export const WINDOWS_CODEX_PROCESS_METADATA_SCRIPT = '$releProcessesOnly = $true\n' + WINDOWS_CODEX_METADATA_SCRIPT;
 
-interface CommandResult { stdout: string; code: number | null }
+interface CommandResult { stdout: string; code: number | null; stage?: string }
 export interface CodexDiscoveryOptions {
   platform?: NodeJS.Platform;
   env?: NodeJS.ProcessEnv;
   home?: string;
   codexHome?: string;
+  processesOnly?: boolean;
   exists?: (file: string) => Promise<boolean>;
   readText?: (file: string) => Promise<string>;
   readDirectory?: (directory: string) => Promise<string[]>;
   run?: (command: string, args: string[], timeoutMs: number) => Promise<CommandResult>;
+}
+
+function probeStage(value: unknown): string | undefined {
+  return typeof value === 'string' && ['startup', 'process-provider', 'process-query', 'process-parse', 'owner-query', 'parent-query', 'packages', 'json-provider', 'json', 'done'].includes(value) ? value : undefined;
 }
 interface WindowsProcess {
   executable: string;
@@ -110,14 +186,15 @@ interface Candidate {
 /** Bounded, shell-free metadata/version probes. Child stderr is never published. */
 export function runCodexProbe(command: string, args: string[], timeoutMs: number): Promise<CommandResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     let stdout = '';
+    let stderrLine = '', stage: string | undefined;
     let settled = false;
     const finish = (error?: Error, code: number | null = null) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      error ? reject(error) : resolve({ stdout, code });
+      error ? reject(Object.assign(error, stage ? { stage } : {})) : resolve({ stdout, code, ...(stage ? { stage } : {}) });
     };
     const stop = () => {
       if (process.platform === 'win32' && child.pid) {
@@ -128,11 +205,17 @@ export function runCodexProbe(command: string, args: string[], timeoutMs: number
         cleanup.once('close', () => { clearTimeout(killTimer); child.kill(); });
       } else child.kill();
       child.stdout.destroy();
+      child.stderr.destroy();
     };
     const timer = setTimeout(() => { stop(); finish(new Error('probe-timeout')); }, timeoutMs);
     child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
       stdout += chunk;
       if (stdout.length > 128 * 1024) { stop(); finish(new Error('probe-output-limit')); }
+    });
+    child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
+      const lines = (stderrLine + chunk).split(/\r?\n/u);
+      stderrLine = lines.pop()!.slice(-128);
+      for (const line of lines) if (line.startsWith('rele-discovery:')) stage = probeStage(line.slice(15)) ?? stage;
     });
     child.once('error', () => finish(new Error('probe-unavailable')));
     child.once('close', code => finish(undefined, code));
@@ -187,10 +270,16 @@ async function collectCodex(options: CodexDiscoveryOptions): Promise<CodexDiscov
   };
   if (platform === 'win32') {
     const systemRoot = environmentValue(env, 'SystemRoot') || 'C:\\Windows';
+    let stage = 'startup';
     try {
-      const result = await run(paths.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_CODEX_METADATA_SCRIPT], 8_000);
-      if (result.code !== 0) throw new Error('metadata-unavailable');
-      const metadata = object(JSON.parse(result.stdout.replace(/^\uFEFF/u, '')));
+      const script = options.processesOnly ? WINDOWS_CODEX_PROCESS_METADATA_SCRIPT : WINDOWS_CODEX_METADATA_SCRIPT;
+      const result = await run(paths.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command', script], 8_000);
+      stage = probeStage(result.stage) ?? stage;
+      if (result.code !== 0) throw new Error('metadata-exit');
+      let parsed: unknown;
+      try { parsed = JSON.parse(result.stdout.replace(/^\uFEFF/u, '')); }
+      catch { throw new Error('metadata-json'); }
+      const metadata = object(parsed);
       if (!metadata || !Array.isArray(metadata.processes) || !Array.isArray(metadata.packages)) throw new Error('invalid-metadata');
       for (const value of metadata.processes) {
         const process = object(value);
@@ -211,8 +300,12 @@ async function collectCodex(options: CodexDiscoveryOptions): Promise<CodexDiscov
       if (Array.isArray(metadata.issues)) for (const code of new Set(metadata.issues)) {
         if (typeof code === 'string' && ['process-discovery-unavailable', 'process-owner-unavailable', 'package-discovery-unavailable'].includes(code)) issues.push({ code, message: code === 'package-discovery-unavailable' ? 'Windows не предоставил список пакетов Codex. Проверяем обычные каталоги установки и PATH.' : 'Windows не предоставил все сведения о серверных процессах Codex текущего пользователя.' });
       }
-    } catch {
+    } catch (error) {
+      const cause: Record<string, string> = { 'probe-timeout': 'timeout', 'probe-unavailable': 'unavailable', 'probe-output-limit': 'output-limit', 'metadata-exit': 'exit', 'metadata-json': 'json', 'invalid-metadata': 'json' };
+      const reason = error instanceof Error ? cause[error.message] ?? 'failed' : 'failed';
+      stage = probeStage(object(error)?.stage) ?? stage;
       issues.push({ code: 'windows-discovery-unavailable', message: 'Не удалось получить сведения Windows о процессах и пакетах Codex. Проверяем обычные каталоги установки и PATH.' });
+      issues.push({ code: `windows-probe-${reason}-${stage}`, message: 'Этап и категория ошибки проверки Windows; содержимое процесса не публикуется.' });
     }
     const local = environmentValue(env, 'LOCALAPPDATA');
     const roaming = environmentValue(env, 'APPDATA');

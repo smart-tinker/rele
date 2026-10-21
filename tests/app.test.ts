@@ -956,7 +956,7 @@ describe('automatic rules remain scoped to the selected Codex target', () => {
     const rejected = await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { codex } });
     expect(rejected.statusCode).toBe(400);
     expect(rejected.json().error).toContain('Отключите правила');
-    expect(f.config.config.codex.transport).toBe('managed');
+    expect(f.config.config.codex.transport).toBe('shared');
     expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { codex, autoLinkRules: [{ ...rule, enabled: false }] } })).statusCode).toBe(200);
     f.codex.runtimeInfo.mockReturnValue({ platformOs: 'windows', platformFamily: 'windows', codexHome: 'C:\\Users\\Example\\.codex', userAgent: 'test' });
     expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [rule] } })).statusCode).toBe(400);
@@ -1289,7 +1289,7 @@ describe('source access and native thread routing', () => {
     expect((await put(f, endpoint, 'access', { mode: 'all' })).statusCode).toBe(200);
     const codex = { transport: 'websocket', endpoint: 'ws://127.0.0.1:9077' };
     expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { codex } })).statusCode).toBe(400);
-    expect(f.config.config.codex.transport).toBe('managed');
+    expect(f.config.config.codex.transport).toBe('shared');
     expect((await put(f, endpoint, 'access', { mode: 'off' })).statusCode).toBe(200);
     expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { codex } })).statusCode).toBe(200);
     f.codex.runtimeInfo.mockReturnValue({ platformOs: 'windows', platformFamily: 'windows', codexHome: 'C:\\Users\\Example\\.codex', userAgent: 'test' });

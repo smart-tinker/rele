@@ -143,7 +143,7 @@ export function fixtureState(empty = false): DashboardState {
         };
       });
   return {
-    version: '0.1.0-rc.5',
+    version: '0.1.0-rc.13',
     codex: {
       configured: true,
       connected: true,

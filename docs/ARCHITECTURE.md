@@ -75,9 +75,13 @@ TelegramChannel использует только Bot API. События соо
 
 Частичный уникальный индекс SQLite запрещает два активных запроса одной связки. Разные связки могут выполняться независимо.
 
-Поддержка записи ограничена точными версиями 0.163.0 и 0.163.0-alpha.10.2; CI проверяет обе версии на обеих ОС. Наличие API-метода само по себе недостаточно: клиент проверяет версию runtime и успешный queue/list настоящего треда. Непроверенная версия остаётся доступной для просмотра.
+Поддержка записи ограничена точными версиями 0.163.0, 0.163.0-alpha.10.2 и 0.163.0-alpha.11; CI проверяет все три версии на обеих ОС. Наличие API-метода само по себе недостаточно: клиент проверяет версию runtime и успешный queue/list настоящего треда. Непроверенная версия остаётся доступной для просмотра.
 
 ## Сервер и профиль Codex
+
+Рекомендуемый `shared` хранит политику обнаружения, а не динамический endpoint. Для `executable=codex` сначала используется существующий native package `CODEX_HOME/packages/app-server-daemon/current`, затем установленный CLI. Read-only `app-server daemon version` проверяет работающий singleton, `daemon start` создаёт отсутствующий через штатные locks/проверку socket. При известном private Desktop и отсутствии native socket новый owner не создаётся молча. Proxy подключается к canonical socket исходного профиля; initialize повторно проверяет профиль/платформу перед очередью. Ручной executable сохраняет свой буквальный смысл; для переживания обновлений используйте автообнаружение.
+
+Linux .deb запускает native daemon отдельным oneshot+timer вне cgroup Rele. Windows outer Job разрешает явный native breakaway; private ProcessHost остаётся ограниченным. Shared shutdown закрывает только connection/proxy. Rele не вызывает обновление native package и не меняет настройки штатного updater Codex; его собственная политика остаётся в ведении Codex. Неподдерживаемая версия не получает shared-подключение. Windows Desktop adapter использует immutable cache с собственным Node и WS framing, поэтому не удерживает заменяемые program files Rele. User environment integration восстанавливает только собственную пару CLI_PATH/FORCE_CLI.
 
 В режиме managed Rele запускает foreground `codex app-server --listen stdio://` как собственный дочерний процесс. JSON-RPC передаётся строками NDJSON через stdin/stdout, stderr используется только для ограниченной диагностики. Запуск выполняется без shell. Явный `codexHome` задаёт CODEX_HOME только дочернему процессу; без него наследуется окружение и стандартный профиль пользователя. Отдельная копия истории, private CODEX_HOME и подмена sqlite_path не создаются.
 
@@ -143,7 +147,7 @@ Windows хранит конфигурацию через DPAPI CurrentUser. Linu
 
 ## Сборка и выпуск
 
-CI работает на native Windows и Ubuntu. Он выполняет типизацию, автоматические тесты, реальные Codex protocol и managed-engine probes обеих точных версий с mock provider, браузерные сценарии и проверки распакованного portable runtime. Дополнительная проверка распознавания использует публичные fixtures без пользовательских данных.
+CI работает на native Windows и Ubuntu. Он выполняет типизацию, автоматические тесты, реальные Codex protocol и managed-engine и native-shared probes трёх точных версий с mock provider, браузерные сценарии и проверки распакованного portable runtime. Дополнительная проверка распознавания использует публичные fixtures без пользовательских данных.
 
 Пакеты включают Node, production dependencies, веб-интерфейс, launcher, installer текущего пользователя, документацию и SHA-256. Модель распознавания и Codex не включаются.
 
