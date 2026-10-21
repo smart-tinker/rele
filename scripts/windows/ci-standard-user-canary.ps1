@@ -155,8 +155,11 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant fixture write access.' }
     $marker = @{ nonce = $Nonce; sid = $sid; runGates = $RunGates.IsPresent }
     if ($RunGates) {
-        $marker.node = (Get-Command node.exe -CommandType Application).Source
-        $marker.python = (Get-Command python.exe -CommandType Application).Source
+        $marker.node = (Get-Command node.exe -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
+        $marker.python = (Get-Command python.exe -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
+        foreach ($executable in @($marker.node, $marker.python)) {
+            if ($executable -isnot [string] -or -not [IO.Path]::IsPathFullyQualified($executable) -or [IO.Path]::GetExtension($executable) -ne '.exe' -or -not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw 'An isolated gate runtime must resolve to one fully qualified executable.' }
+        }
         $marker.prefixes = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11') | ForEach-Object { Join-Path $env:RUNNER_TEMP ('codex-probe-' + $_) }
         foreach ($path in (@((Split-Path $marker.node), (Split-Path $marker.python)) + $marker.prefixes)) {
             if (-not (Test-Path -LiteralPath $path -PathType Container) -or -not [IO.Path]::IsPathRooted($path)) { throw 'An isolated gate runtime or native package is unavailable.' }
