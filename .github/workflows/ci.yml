@@ -63,7 +63,7 @@ jobs:
           done
           npm run package
       - name: Check isolated RDP session and requested gate
-        shell: ${{ inputs.windows_probe_shell == 'powershell' && inputs.windows_installer_probe != true && 'powershell' || 'pwsh' }}
+        shell: ${{ github.event.inputs.windows_probe_shell == 'powershell' && github.event.inputs.windows_installer_probe != 'true' && 'powershell' || 'pwsh' }}
         env:
           RELE_INSTALLER_PROBE: ${{ inputs.windows_installer_probe }}
         run: |
