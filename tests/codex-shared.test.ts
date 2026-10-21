@@ -89,13 +89,13 @@ describe('native shared Codex lifecycle', () => {
     expect(f.run.mock.calls.some(([, args]) => args.at(-1) === 'start')).toBe(false);
   });
 
-  it('keeps ownership failure diagnostics fixed and never starts on a failed process-only scan', async () => {
+  it.each(['process-module', 'owner-query'])('keeps %s failure diagnostics fixed and never starts on a failed process-only scan', async stage => {
     const f = await fixture();
     f.run.mockResolvedValueOnce({ code: 0, stdout: 'codex-cli 0.163.0' }).mockResolvedValueOnce({ code: 1, stdout: '' });
     f.discovery.issues.push({ code: 'windows-discovery-unavailable', message: 'synthetic-secret' },
-      { code: 'windows-probe-timeout-owner-query', message: 'synthetic-secret' });
+      { code: `windows-probe-timeout-${stage}`, message: 'synthetic-secret' });
     const error = await ensureSharedCodex(f.target, f.options).catch(error => error);
-    expect(error).toMatchObject({ code: 'shared-owner-unknown', message: expect.stringContaining('windows-probe-timeout-owner-query') });
+    expect(error).toMatchObject({ code: 'shared-owner-unknown', message: expect.stringContaining(`windows-probe-timeout-${stage}`) });
     expect(error.message).not.toContain('synthetic-secret');
     expect(f.discover).toHaveBeenCalledWith(expect.objectContaining({ processesOnly: true }));
     expect(f.run.mock.calls.some(([, args]) => args.at(-1) === 'start')).toBe(false);

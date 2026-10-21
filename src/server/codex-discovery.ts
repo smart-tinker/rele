@@ -19,11 +19,13 @@ $packages = @()
 $issues = @()
 $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 try {
+  [Console]::Error.WriteLine('rele-discovery:process-module')
+  Import-Module CimCmdlets -ErrorAction Stop
   [Console]::Error.WriteLine('rele-discovery:process-query')
-  foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name = 'codex.exe'")) {
+  foreach ($process in @(CimCmdlets\Get-CimInstance Win32_Process -Filter "Name = 'codex.exe'")) {
     try {
       [Console]::Error.WriteLine('rele-discovery:owner-query')
-      $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid
+      $owner = CimCmdlets\Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid
       if ($owner.ReturnValue -ne 0 -or -not $owner.Sid) { $issues += 'process-owner-unavailable'; continue }
       if ($owner.Sid -ne $sid) { continue }
     } catch { $issues += 'process-owner-unavailable'; continue }
@@ -36,7 +38,7 @@ try {
     $parentId = $process.ParentProcessId
     for ($depth = 0; -not $desktop -and $parentId -gt 0 -and $depth -lt 4; $depth++) {
       [Console]::Error.WriteLine('rele-discovery:parent-query')
-      $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $parentId" -Property Name,ExecutablePath,ParentProcessId -ErrorAction SilentlyContinue
+      $parent = CimCmdlets\Get-CimInstance Win32_Process -Filter "ProcessId = $parentId" -Property Name,ExecutablePath,ParentProcessId -ErrorAction SilentlyContinue
       if (-not $parent) { break }
       if ($parent.Name -match '^(?i:Codex|ChatGPT)\.exe$' -and $parent.ExecutablePath) {
         $parentRoot = [IO.Path]::GetDirectoryName($parent.ExecutablePath)
@@ -86,7 +88,7 @@ if (-not $releProcessesOnly) { try {
   $packages = @(Get-AppxPackage -Name 'OpenAI.*' | Where-Object { $_.Name -in @('OpenAI.Codex', 'OpenAI.ChatGPT') -and $_.InstallLocation } | ForEach-Object { [pscustomobject]@{ location = $_.InstallLocation; name = $_.Name } })
 } catch { $issues += 'package-discovery-unavailable' } }
 [Console]::Error.WriteLine('rele-discovery:json')
-[pscustomobject]@{ processes = @($processes); packages = @($packages); issues = @($issues | Select-Object -Unique) } | ConvertTo-Json -Depth 5 -Compress
+[pscustomobject]@{ processes = @($processes); packages = @($packages); issues = @($issues | Microsoft.PowerShell.Utility\Select-Object -Unique) } | Microsoft.PowerShell.Utility\ConvertTo-Json -Depth 5 -Compress
 [Console]::Error.WriteLine('rele-discovery:done')
 `;
 export const WINDOWS_CODEX_PROCESS_METADATA_SCRIPT = '$releProcessesOnly = $true\n' + WINDOWS_CODEX_METADATA_SCRIPT;
@@ -105,7 +107,7 @@ export interface CodexDiscoveryOptions {
 }
 
 function probeStage(value: unknown): string | undefined {
-  return typeof value === 'string' && ['startup', 'process-query', 'process-parse', 'owner-query', 'parent-query', 'packages', 'json', 'done'].includes(value) ? value : undefined;
+  return typeof value === 'string' && ['startup', 'process-module', 'process-query', 'process-parse', 'owner-query', 'parent-query', 'packages', 'json', 'done'].includes(value) ? value : undefined;
 }
 interface WindowsProcess {
   executable: string;

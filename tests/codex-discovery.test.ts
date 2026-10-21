@@ -12,6 +12,11 @@ const npmPackage = win.join(npmRoot, 'node_modules', '@openai', 'codex');
 const npmEntry = win.join(npmPackage, 'bin', 'codex.js');
 const socket = 'C:\\Users\\Example User\\.codex\\app-server-control\\app-server-control.sock';
 
+function windowsMetadataFixture(cim: string, script: string, appx = 'function Get-AppxPackage { [CmdletBinding()] param([string]$Name); @() }') {
+  const prefix = `New-Module -Name CimCmdlets -ScriptBlock {\n${cim}\nExport-ModuleMember -Function Get-CimInstance, Invoke-CimMethod\n} | Import-Module -Global;\n`;
+  return runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', prefix + appx + '\n' + script], 25_000);
+}
+
 function windowsFixture(metadata: object = { processes: [], packages: [], issues: [] }, extra: string[] = []) {
   const files = new Set(extra.map(value => win.normalize(value).toLowerCase()));
   const run = vi.fn<CodexDiscoveryOptions['run'] extends ((...args: infer A) => infer R) | undefined ? (...args: A) => R : never>(async (command, args) => {
@@ -252,15 +257,15 @@ describe('Codex installation and existing Desktop discovery', () => {
     await expect(runCodexProbe(process.execPath, ['-e', 'require("node:fs").writeSync(1, "x".repeat(200000))'], 4_000)).rejects.toThrow('probe-output-limit');
   });
 
-  it('captures fixed probe stages without publishing other child stderr', async () => {
-    const error = await runCodexProbe(process.execPath, ['-e', 'process.stderr.write("synthetic-secret\\nrele-discovery:owner-query\\nrele-discovery:synthetic-secret\\n"); setInterval(() => {}, 1000)'], 250).catch(error => error);
-    expect(error).toMatchObject({ message: 'probe-timeout', stage: 'owner-query' });
+  it.each(['process-module', 'owner-query'])('captures fixed %s stage without publishing other child stderr', async stage => {
+    const error = await runCodexProbe(process.execPath, ['-e', `process.stderr.write("synthetic-secret\\nrele-discovery:${stage}\\nrele-discovery:synthetic-secret\\n"); setInterval(() => {}, 1000)`], 250).catch(error => error);
+    expect(error).toMatchObject({ message: 'probe-timeout', stage });
     expect(JSON.stringify(error)).not.toContain('synthetic-secret');
   });
 
   it.skipIf(process.platform !== 'win32')('completes a process-only scan without calling optional Appx discovery', async () => {
-    const fixtures = "function Get-CimInstance { [pscustomobject]@{ ProcessId = 1; ExecutablePath = $null; CommandLine = $null } }; function Invoke-CimMethod { [pscustomobject]@{ ReturnValue = 0; Sid = 'another-user' } }; function Get-AppxPackage { throw 'Appx must not run' }; ";
-    const result = await runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', fixtures + WINDOWS_CODEX_PROCESS_METADATA_SCRIPT], 25_000);
+    const fixtures = "function Get-CimInstance { [pscustomobject]@{ ProcessId = 1; ExecutablePath = $null; CommandLine = $null } }; function Invoke-CimMethod { [pscustomobject]@{ ReturnValue = 0; Sid = 'another-user' } }; ";
+    const result = await windowsMetadataFixture(fixtures, WINDOWS_CODEX_PROCESS_METADATA_SCRIPT, "function Get-AppxPackage { throw 'Appx must not run' }");
     expect(result.code).toBe(0);
     expect(JSON.parse(result.stdout)).toEqual({ processes: [], packages: [], issues: [] });
   }, 35_000);
@@ -288,11 +293,10 @@ function Invoke-CimMethod {
   if ($InputObject.ProcessId -eq 110 -and -not $releFixtureMissingFields) { return [pscustomobject]@{ ReturnValue = 2; Sid = $null } }
   [pscustomobject]@{ ReturnValue = 0; Sid = $(if ($InputObject.ProcessId -eq 105) { 'another-user' } else { [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }) }
 }
-function Get-AppxPackage { [CmdletBinding()] param([string]$Name); @() }
 `;
     // This parser fixture includes cold PowerShell startup on a shared CI runner.
     // Its deadline is separate from production probe budgets and the limit test above.
-    const result = await runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', fixtures + WINDOWS_CODEX_METADATA_SCRIPT], 25_000);
+    const result = await windowsMetadataFixture(fixtures, WINDOWS_CODEX_METADATA_SCRIPT);
     expect(result.code).toBe(0);
     const parsed = JSON.parse(result.stdout);
     expect(parsed.issues).toEqual(['process-owner-unavailable']);
