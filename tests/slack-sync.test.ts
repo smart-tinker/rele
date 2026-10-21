@@ -379,3 +379,34 @@ it('merges multiple Slack streams in durable timestamp and revision order within
   expect(f.store.listSlackSyncStreams().flatMap(stream => f.store.listSlackSyncEntries(stream.id)).find(entry => entry.messageId === '300.000000')?.state).toBe('pending');
   expect(f.codex.releaseThread).toHaveBeenCalledExactlyOnceWith('original-codex');
 });
+
+
+it('stops new source context while off but drains prior captured entries and rescans after enabling', async () => {
+  const f = fixture();
+  const accepted = f.store.recordSlackMessage(f.message('110.000000', 'Captured before off'))!;
+  f.store.setSourceAccess(f.endpoint.id, { mode: 'off' });
+  expect(f.store.recordSlackMessage(f.message('120.000000', 'Do not project while off'))).toBeUndefined();
+  await f.sync.backfill();
+  expect(f.readThreadPage).not.toHaveBeenCalled();
+  expect(await f.sync.drain(f.conversation.id)).toBe(true);
+  expect(f.codex.injectContext).toHaveBeenCalledExactlyOnceWith('original-codex', accepted.id, expect.stringContaining('Captured before off'));
+  expect(f.store.listSlackSyncEntries(accepted.streamId)).toHaveLength(1);
+  f.store.setSourceAccess(f.endpoint.id, { mode: 'all' });
+  f.readThreadPage.mockResolvedValueOnce({ messages: [f.message('120.000000', 'Full context after explicit enabling')] });
+  advance(); await f.sync.backfill();
+  expect(f.readThreadPage.mock.calls[0][1]?.oldest).toBeUndefined();
+  expect(await f.sync.drain(f.conversation.id)).toBe(true);
+  expect(f.codex.injectContext.mock.calls.at(-1)?.[2]).toContain('Full context after explicit enabling');
+  expect(f.store.listRequests()).toEqual([]);
+});
+
+it('rejects an in-flight page after source access turns off', async () => {
+  const f = fixture();
+  let finish!: (value: { messages: SlackTranscriptMessage[] }) => void;
+  f.readThreadPage.mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
+  const reading = f.sync.backfill();
+  f.store.setSourceAccess(f.endpoint.id, { mode: 'off' });
+  finish({ messages: [f.message('130.000000', 'Old in-flight response')] }); await reading;
+  expect(f.store.listSlackSyncEntries(f.store.listSlackSyncStreams()[0].id)).toEqual([]);
+  expect(f.codex.injectContext).not.toHaveBeenCalled();
+});

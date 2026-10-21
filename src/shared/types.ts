@@ -27,6 +27,21 @@ export interface Endpoint {
   available?: boolean;
 }
 
+export type ReactionMode = 'off' | 'mention' | 'all';
+
+export interface SourceAccess {
+  endpointId: string;
+  mode: ReactionMode;
+  allowedSenderIds: string[];
+  legacy: boolean;
+}
+
+export interface SourceRoute {
+  endpointId: string;
+  mode: 'none' | 'manual' | 'auto';
+  cwd?: string;
+}
+
 export interface Binding {
   id: string;
   conversationId: string;
@@ -249,6 +264,8 @@ export interface PublicConfig {
 }
 
 export interface DashboardState {
+  sourceAccess?: SourceAccess[];
+  sourceRoutes?: SourceRoute[];
   autoLinks?: AutoLinkIntent[];
   version: string;
   codex: CodexConnectionState;

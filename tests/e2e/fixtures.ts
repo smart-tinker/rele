@@ -10,6 +10,8 @@ import type {
   Platform,
   Person,
   ReleRequest,
+  SourceAccess,
+  SourceRoute,
 } from '../../src/shared/types';
 
 // Entirely fictional data. Never imported by the production application.
@@ -244,6 +246,21 @@ export async function installApi(
   const sourceTitles = new Map(
     state.endpoints.map((item) => [item.id, item.title]),
   );
+  const sourceAccess = (endpoint: Endpoint): SourceAccess => {
+    const saved = state.sourceAccess?.find(item => item.endpointId === endpoint.id);
+    if (saved) return saved;
+    const binding = state.conversations.flatMap(item => item.bindings).find(item => item.endpointId === endpoint.id);
+    const rule = state.config.autoLinkRules?.find(item => item.enabled && item.platform === endpoint.platform && item.accountId === endpoint.accountId && item.chatId === endpoint.chatId);
+    const policy = binding ?? rule;
+    return { endpointId: endpoint.id, mode: policy && (policy.allowAllSenders || policy.allowedSenderIds.length) ? policy.requireMention ? 'mention' : 'all' : 'off', allowedSenderIds: policy?.allowedSenderIds ?? [], legacy: !!policy };
+  };
+  const sourceRoute = (endpoint: Endpoint): SourceRoute => {
+    const saved = state.sourceRoutes?.find(item => item.endpointId === endpoint.id);
+    if (saved) return saved;
+    const bound = state.conversations.some(item => item.bindings.some(binding => binding.endpointId === endpoint.id));
+    const rule = state.config.autoLinkRules?.find(item => item.enabled && item.platform === endpoint.platform && item.accountId === endpoint.accountId && item.chatId === endpoint.chatId);
+    return { endpointId: endpoint.id, mode: bound ? 'manual' : rule ? 'auto' : 'none', ...(rule && !bound ? { cwd: rule.cwd } : {}) };
+  };
   let offline = false;
   let mutationError = '';
   const catalogPage = <T>(
@@ -270,7 +287,7 @@ export async function installApi(
     }
     if (request.method() === 'GET') reads.push(url.pathname + url.search);
     if (request.method() === 'GET' && url.pathname === '/api/state') {
-      await route.fulfill({ json: state });
+      await route.fulfill({ json: { ...state, sourceAccess: state.endpoints.map(sourceAccess), sourceRoutes: state.endpoints.map(sourceRoute) } });
       return;
     }
     if (request.method() === 'GET' && /^\/api\/conversations\/[^/]+\/slack-sync$/.test(url.pathname)) {
@@ -389,6 +406,42 @@ export async function installApi(
     if (mutationError) {
       await route.fulfill({ status: 409, json: { error: mutationError } });
       return;
+    }
+    const sourceMatch = url.pathname.match(/^\/api\/endpoints\/([^/]+)\/(route|access)$/);
+    if (sourceMatch && request.method() === 'PUT') {
+      const endpoint = state.endpoints.find(item => item.id === decodeURIComponent(sourceMatch[1]));
+      if (!endpoint) { await route.fulfill({ status: 404, json: { error: 'Источник не найден.' } }); return; }
+      if (sourceMatch[2] === 'access') {
+        const previous = sourceAccess(endpoint);
+        const access: SourceAccess = { endpointId: endpoint.id, mode: body!.mode, allowedSenderIds: body!.allowedSenderIds ?? previous.allowedSenderIds, legacy: false };
+        state.sourceAccess = [...(state.sourceAccess ?? []).filter(item => item.endpointId !== endpoint.id), access];
+      } else {
+        const pending = state.autoLinks?.find(item => item.endpointId === endpoint.id && item.status !== 'completed');
+        if (pending && (!body!.resolveAutoLinkId || body!.resolveAutoLinkId !== pending.id || !['uncertain', 'failed', 'created'].includes(pending.status))) {
+          await route.fulfill({ status: 409, json: { error: 'Сначала проверьте сохранённое автосоздание этого источника.' } }); return;
+        }
+        if (body!.resolveAutoLinkId && !pending) { await route.fulfill({ status: 409, json: { error: 'Запись автосоздания изменилась.' } }); return; }
+        if (state.requests.some(item => item.origin.endpointId === endpoint.id && !['completed','failed','cancelled','interrupted'].includes(item.status))) {
+          await route.fulfill({ status: 409, json: { error: 'Сначала завершите запросы этого источника.' } }); return;
+        }
+        const previous = state.conversations.flatMap(item => item.bindings).find(item => item.endpointId === endpoint.id);
+        if (!state.sourceAccess?.some(item => item.endpointId === endpoint.id)) state.sourceAccess = [...(state.sourceAccess ?? []), previous ? sourceAccess(endpoint) : { endpointId: endpoint.id, mode: 'off', allowedSenderIds: [], legacy: false }];
+        let target: Conversation | undefined;
+        if (typeof body!.threadId === 'string') {
+          target = state.conversations.find(item => item.threadId === body!.threadId);
+          if (!target) {
+            const native = threads.find(item => item.id === body!.threadId)!;
+            target = { id: `routed-conversation-${mutations.length}`, name: native.name, threadId: native.id, cwd: native.cwd, paused: false, bindings: [], createdAt: now, updatedAt: now };
+            state.conversations.push(target);
+          }
+        }
+        for (const conversation of state.conversations) conversation.bindings = conversation.bindings.filter(item => item.endpointId !== endpoint.id);
+        if (target) target.bindings.push({ ...(previous ?? { id: `route-binding-${mutations.length}`, platform: endpoint.platform, endpointId: endpoint.id, allowedSenderIds: [] }), conversationId: target.id });
+        const selected: SourceRoute = { endpointId: endpoint.id, mode: target ? 'manual' : body!.autoCreateCwd ? 'auto' : 'none', ...(body!.autoCreateCwd ? { cwd: body!.autoCreateCwd } : {}) };
+        state.sourceRoutes = [...(state.sourceRoutes ?? []).filter(item => item.endpointId !== endpoint.id), selected];
+        if (pending && body!.resolveAutoLinkId && target) { pending.status = 'completed'; pending.conversationId = target.id; }
+      }
+      await route.fulfill({ json: { ok: true } }); return;
     }
     if (request.method() === 'POST' && url.pathname === '/api/conversations') {
       const conversation: Conversation = {
@@ -516,5 +569,5 @@ export async function installApi(
 
 export async function openPanel(page: Page) {
   await page.goto(`/#token=${panelToken}`);
-  await page.getByRole('heading', { level: 1, name: 'Связки' }).waitFor();
+  await page.getByRole('heading', { level: 1, name: 'Связи' }).waitFor();
 }

@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import type { AppConfig, ConfigStore } from './config.js';
-import { mergeConfig, publicConfig } from './config.js';
+import { isLocalCodexHome, isLocalWorkspace, mergeConfig, publicConfig } from './config.js';
 import type { Store } from './store.js';
 import type { Engine } from './engine.js';
 import type { CodexClient } from './codex.js';
@@ -106,16 +106,21 @@ export function createApp(services: AppServices) {
   ));
   const autoLinks = () => store.listAutoLinkIntents().slice(-250).reverse().map(intent => ({ ...intent, ...(intent.error ? { error: config.redact(intent.error) } : {}) }));
   app.get('/api/auto-links', async () => ({ intents: autoLinks() }));
-  app.get('/api/state', async (): Promise<DashboardState> => ({
-    version: services.version,
-    codex: services.codex().status(),
-    connections: {
-      telegram: engine.channels.telegram?.state ?? { configured: !!config.config.telegram.token, connected: false },
-      slack: engine.channels.slack?.state ?? { configured: !!config.config.slack.botToken && !!config.config.slack.appToken, connected: false },
-    },
-    autoLinks: autoLinks(),
-    conversations: store.listConversations(), endpoints: store.listEndpoints().map(endpoint => ({ ...endpoint, title: store.getMeta(`endpoint-alias:${endpoint.id}`) || endpoint.title })), requests: store.listRequests(250), deliveries: store.listDeliveries(500), approvals: store.listApprovals(250), config: publicConfig(config.config),
-  }));
+  app.get('/api/state', async (): Promise<DashboardState> => {
+    const endpoints = store.listEndpoints().map(namedEndpoint);
+    return {
+      version: services.version,
+      codex: services.codex().status(),
+      connections: {
+        telegram: engine.channels.telegram?.state ?? { configured: !!config.config.telegram.token, connected: false },
+        slack: engine.channels.slack?.state ?? { configured: !!config.config.slack.botToken && !!config.config.slack.appToken, connected: false },
+      },
+      autoLinks: autoLinks(),
+      sourceAccess: endpoints.map(endpoint => store.getSourceAccess(endpoint.id, legacyRule(endpoint))),
+      sourceRoutes: endpoints.map(endpoint => store.getSourceRoute(endpoint.id, legacyRule(endpoint))),
+      conversations: store.listConversations(), endpoints, requests: store.listRequests(250), deliveries: store.listDeliveries(500), approvals: store.listApprovals(250), config: publicConfig(config.config),
+    };
+  });
   app.get('/api/threads', async request => {
     const query = object(request.query); fields(query, ['archived', 'refresh']);
     if (query.archived !== undefined && query.archived !== 'true' && query.archived !== 'false') throw new ApiError(400, 'Некорректный фильтр архива Codex.');
@@ -179,6 +184,105 @@ export function createApp(services: AppServices) {
     return page;
   });
   app.get('/api/catalog/telegram', async () => engine.channels.telegram?.discoveryInfo?.() ?? { command: '/rele_register' });
+  let configuring = false;
+  function legacyRule(endpoint: Endpoint) {
+    return config.config.autoLinkRules.find(rule => rule.enabled && rule.platform === endpoint.platform && rule.accountId === endpoint.accountId && rule.chatId === endpoint.chatId);
+  }
+  function sourceEndpoint(id: string, active: boolean) {
+    const endpoint = store.getEndpoint(string(id, 'источник', 200));
+    if (!endpoint) throw new ApiError(404, 'Источник не найден.');
+    const channel = engine.channels[endpoint.platform];
+    if (active && configuring) throw new ApiError(409, 'Настройки сохраняются. Дождитесь завершения подключения.');
+    if (active && endpoint.platform === 'telegram' && endpoint.isForum && !endpoint.threadId && !endpoint.generalTopic) throw new ApiError(400, 'Выберите тему внутри группы Telegram.');
+    if (active && (!config.config[endpoint.platform].enabled || !channel?.state.connected || channel.state.accountId !== endpoint.accountId || endpoint.available === false)) throw new ApiError(400, 'Выберите доступный источник текущего подключённого бота.');
+    return { endpoint, channel };
+  }
+  function checkSource(source: ReturnType<typeof sourceEndpoint>) {
+    if (configuring) throw new ApiError(409, 'Настройки сохраняются. Дождитесь завершения подключения.');
+    const current = store.getEndpoint(source.endpoint.id);
+    if (!current || current.accountId !== source.endpoint.accountId || current.chatId !== source.endpoint.chatId || current.threadId !== source.endpoint.threadId || current.available === false || engine.channels[current.platform] !== source.channel || !source.channel?.state.connected || source.channel.state.accountId !== current.accountId || !config.config[current.platform].enabled) throw new ApiError(409, 'Подключение источника изменилось. Обновите каталог.');
+  }
+  function validWorkspace(codex: ReturnType<AppServices['codex']>, cwd: string): boolean {
+    const os = codex.runtimeInfo?.()?.platformOs ?? (config.config.codex.transport === 'managed' ? process.platform : undefined);
+    return isLocalWorkspace(cwd) && (os === 'windows' || os === 'win32' ? isLocalCodexHome(cwd, 'win32')
+      : !!os && ['linux', 'macos', 'darwin', 'freebsd', 'openbsd'].includes(os) && isLocalCodexHome(cwd, 'linux'));
+  }
+  function automaticWorkspace(codex: ReturnType<AppServices['codex']>, cwd: string) {
+    const status = codex.status();
+    if (!status.connected || !status.queueSupported) throw new ApiError(400, 'Для автосоздания подключите Codex с поддержкой штатной очереди.');
+    if (!validWorkspace(codex, cwd)) throw new ApiError(400, 'Укажите абсолютную локальную рабочую папку операционной системы Codex.');
+  }
+  app.put<{ Params: { id: string } }>('/api/endpoints/:id/access', async request => {
+    const input = object(request.body); fields(input, ['mode', 'allowedSenderIds']);
+    if (input.mode !== 'off' && input.mode !== 'mention' && input.mode !== 'all') throw new ApiError(400, 'Неизвестный режим доступа источника.');
+    const mode = input.mode;
+    const source = sourceEndpoint(request.params.id, mode !== 'off');
+    const { endpoint, channel } = source;
+    const codex = services.codex();
+    const selectedSenders = input.allowedSenderIds === undefined ? store.getSourceAccess(endpoint.id, legacyRule(endpoint)).allowedSenderIds : input.allowedSenderIds;
+    if (!Array.isArray(selectedSenders) || selectedSenders.length > 100 || selectedSenders.some(id => typeof id !== 'string' || !id.trim() || id.length > 200 || /[\x00-\x1f\x7f]/u.test(id))) throw new ApiError(400, 'Некорректный список отправителей источника.');
+    const senders = [...new Set(selectedSenders as string[])];
+    const direct = endpoint.platform === 'slack' ? /^D[A-Z0-9]+$/u.test(endpoint.chatId) : /^\d+$/u.test(endpoint.chatId);
+    const group = endpoint.platform === 'slack' ? /^[CG][A-Z0-9]+$/u.test(endpoint.chatId) : /^-\d+$/u.test(endpoint.chatId);
+    if (mode !== 'off') {
+      if (!direct && !group) throw new ApiError(400, 'Некорректный чат источника. Обновите каталог.');
+      if (endpoint.platform === 'slack') {
+        if (!channel?.listPeople) throw new ApiError(400, 'Каталог участников Slack недоступен.');
+        const page = await channel.listPeople(endpoint.chatId);
+        checkSource(source);
+        rememberPeople(channel, endpoint.accountId, endpoint.chatId, page.items);
+        const people = new Map(store.getEndpoint(endpoint.id)!.people.map(person => [person.id, person]));
+        for (const person of page.items) people.set(person.id, { ...person, isBot: !!person.isBot || !!people.get(person.id)?.isBot });
+        store.upsertEndpoint({ ...store.getEndpoint(endpoint.id)!, people: [...people.values()] });
+      }
+      const people = new Map(store.getEndpoint(endpoint.id)!.people.map(person => [person.id, !!person.isBot]));
+      if (direct && (!senders.length || senders.some(id => !people.has(id) || people.get(id) || endpoint.platform === 'telegram' && id !== endpoint.chatId))) throw new ApiError(400, 'В личном чате выберите только участвующих в нём людей.');
+      checkSource(source);
+      const route = store.getSourceRoute(endpoint.id, legacyRule(endpoint));
+      if (route.mode === 'auto') {
+        if (services.codex() !== codex) throw new ApiError(409, 'Подключение Codex изменилось. Проверьте маршрут источника.');
+        automaticWorkspace(codex, route.cwd ?? '');
+      }
+    }
+    store.setSourceAccess(endpoint.id, mode === 'off' ? { mode, allowedSenderIds: store.getSourceAccess(endpoint.id, legacyRule(endpoint)).allowedSenderIds } : { mode, allowedSenderIds: direct ? senders : [] });
+    return { ok: true };
+  });
+  function recoverableAutoLink(endpoint: Endpoint, id: string) {
+    const intent = store.getAutoLinkIntent(id);
+    if (!intent || intent.endpointId !== endpoint.id) throw new ApiError(404, 'Автосоздание не относится к этому источнику.');
+    if (!['uncertain', 'failed', 'created'].includes(intent.status)) throw new ApiError(409, 'Автосоздание ещё выполняется или уже завершено. Обновите состояние.');
+    if (engine.targetFingerprint() !== intent.targetFingerprint) throw new ApiError(409, 'Подключение Codex отличается от принятого запроса автосоздания.');
+    return intent;
+  }
+  app.put<{ Params: { id: string } }>('/api/endpoints/:id/route', async request => {
+    const input = object(request.body); fields(input, ['threadId', 'autoCreateCwd', 'resolveAutoLinkId']);
+    if (input.resolveAutoLinkId !== undefined && (typeof input.threadId !== 'string' || input.autoCreateCwd !== undefined)) throw new ApiError(400, 'Восстановление автосоздания требует конкретный разговор Codex.');
+    const resolveAutoLinkId = input.resolveAutoLinkId === undefined ? undefined : string(input.resolveAutoLinkId, 'автосоздание', 200);
+    if ((input.threadId === undefined) === (input.autoCreateCwd === undefined)) throw new ApiError(400, 'Выберите разговор Codex, автосоздание или отключение маршрута.');
+    const source = sourceEndpoint(request.params.id, input.threadId !== null);
+    if (input.threadId === null) { store.routeSource(source.endpoint.id, null, undefined, legacyRule(source.endpoint)); return { ok: true }; }
+    const codex = services.codex();
+    if (input.autoCreateCwd !== undefined) {
+      const cwd = string(input.autoCreateCwd, 'рабочая папка');
+      automaticWorkspace(codex, cwd);
+      checkSource(source);
+      store.routeSource(source.endpoint.id, null, cwd, legacyRule(source.endpoint));
+    } else {
+      if (!codex.status().connected) throw new ApiError(400, 'Подключите Codex перед выбором маршрута.');
+      const threadId = string(input.threadId, 'разговор Codex', 200);
+      if (resolveAutoLinkId) recoverableAutoLink(source.endpoint, resolveAutoLinkId);
+      const thread = (await codex.listThreads({ refresh: true })).find(candidate => candidate.id === threadId);
+      if (services.codex() !== codex || !codex.status().connected) throw new ApiError(409, 'Подключение Codex изменилось. Обновите список разговоров.');
+      checkSource(source);
+      if (!thread || thread.archived || !validWorkspace(codex, thread.cwd)) throw new ApiError(400, 'Выберите доступный разговор Codex с локальной рабочей папкой.');
+      if (resolveAutoLinkId) {
+        const intent = recoverableAutoLink(source.endpoint, resolveAutoLinkId);
+        if (intent.threadId && intent.threadId !== thread.id) throw new ApiError(409, 'Выберите известный разговор принятого автосоздания.');
+      }
+      store.routeSourceToThread(source.endpoint.id, { threadId: thread.id, cwd: thread.cwd, name: thread.name || 'Разговор Codex' }, resolveAutoLinkId, legacyRule(source.endpoint));
+    }
+    return { ok: true };
+  });
   app.patch<{ Params: { id: string } }>('/api/endpoints/:id', async request => {
     const input = object(request.body); fields(input, ['title']);
     if (!store.getEndpoint(request.params.id)) throw new ApiError(404, 'Чат не найден.');
@@ -186,7 +290,6 @@ export function createApp(services: AppServices) {
     store.setMeta(`endpoint-alias:${request.params.id}`, title);
     return { ok: true };
   });
-  let configuring = false;
   app.post('/api/codex/connect', async () => {
     if (configuring) throw new ApiError(409, 'Настройки сохраняются. Дождитесь перезапуска подключения Codex.');
     await services.codex().connect(); return { ok: true };
@@ -201,7 +304,8 @@ export function createApp(services: AppServices) {
   async function validateAutoLinkRules(next: AppConfig) {
     const target = (value: AppConfig) => JSON.stringify([value.codex.transport, value.codex.executable, value.codex.endpoint, value.codex.codexHome ?? '']);
     const targetChanged = target(next) !== target(config.config);
-    if (targetChanged && next.autoLinkRules.some(rule => rule.enabled)) throw new ApiError(400, 'Отключите правила автосоздания, затем смените подключение Codex, проверьте рабочие папки и включите правила заново.');
+    const activeAutomaticSource = store.listEndpoints().some(endpoint => store.getSourceRoute(endpoint.id).mode === 'auto' && store.getSourceAccess(endpoint.id).mode !== 'off');
+    if (targetChanged && (next.autoLinkRules.some(rule => rule.enabled) || activeAutomaticSource)) throw new ApiError(400, 'Отключите правила автосоздания и доступ источников с автосозданием, затем смените подключение Codex, проверьте рабочие папки и включите доступ заново.');
     if (targetChanged) return;
     const codex = services.codex();
     for (const rule of next.autoLinkRules) {
@@ -209,11 +313,7 @@ export function createApp(services: AppServices) {
       if (previous && JSON.stringify(previous) === JSON.stringify(rule)) continue;
       // Disabling an existing rule must remain possible while its connector is offline.
       if (previous && !rule.enabled && JSON.stringify({ ...previous, enabled: false }) === JSON.stringify(rule)) continue;
-      const runtime = codex.runtimeInfo?.();
-      const os = runtime?.platformOs ?? (config.config.codex.transport === 'managed' ? process.platform : undefined);
-      const absolute = os === 'windows' || os === 'win32' ? /^[A-Za-z]:[\\/]/u.test(rule.cwd)
-        : os && ['linux', 'macos', 'darwin', 'freebsd', 'openbsd'].includes(os) ? path.posix.isAbsolute(rule.cwd) && !rule.cwd.startsWith('//') : false;
-      if (!codex.status().connected || !absolute) throw new ApiError(400, 'Подключите Codex и укажите абсолютную рабочую папку его операционной системы.');
+      if (!codex.status().connected || !validWorkspace(codex, rule.cwd)) throw new ApiError(400, 'Подключите Codex и укажите абсолютную рабочую папку его операционной системы.');
       const channel = engine.channels[rule.platform];
       if (!next[rule.platform].enabled || !channel?.state.connected || channel.state.accountId !== rule.accountId) throw new ApiError(400, 'Правило должно относиться к текущему подключённому боту.');
       const endpoints = store.listEndpoints().filter(endpoint => endpoint.platform === rule.platform && endpoint.accountId === rule.accountId && endpoint.chatId === rule.chatId && endpoint.available !== false);
@@ -233,6 +333,9 @@ export function createApp(services: AppServices) {
     }
   }
 
+  function guardLegacyBinding(endpointId: string) {
+    if (store.listAutoLinkIntents().some(intent => intent.endpointId === endpointId && intent.status !== 'completed')) throw new ApiError(409, 'Принято автосоздание этого источника. Восстановите его явно через назначение разговора Codex.');
+  }
   function binding(body: unknown, selected?: Platform) {
     const input = object(body);
     fields(input, selected ? ['endpointId', 'allowedSenderIds', 'allowAllSenders', 'requireMention'] : ['platform', 'endpointId', 'allowedSenderIds', 'allowAllSenders', 'requireMention']);
@@ -240,6 +343,7 @@ export function createApp(services: AppServices) {
     const endpointId = string(input.endpointId, 'чат', 200);
     const endpoint = store.getEndpoint(endpointId);
     if (!endpoint || endpoint.platform !== source) throw new ApiError(400, 'Выберите известный чат нужного мессенджера.');
+    guardLegacyBinding(endpointId);
     const accountId = engine.channels[source]?.state.accountId;
     if (accountId && endpoint.accountId !== accountId) throw new ApiError(400, 'Этот чат относится к другому боту. Обновите каталог.');
     if (endpoint.available === false) throw new ApiError(400, 'У бота больше нет доступа к этому чату. Добавьте бота и обновите каталог.');
@@ -323,6 +427,7 @@ export function createApp(services: AppServices) {
   }
   app.put<{ Params: { id: string; bindingId: string } }>('/api/conversations/:id/bindings/:bindingId', async request => {
     const selected = selectedBinding(request.params.id, request.params.bindingId);
+    if (selected.value) guardLegacyBinding(selected.value.endpointId);
     if (!selected.value && selected.conversation.bindings.length >= 100) throw new ApiError(400, 'У связки может быть не более 100 подключений.');
     const value = binding(request.body, selected.value?.platform ?? platform(selected.legacy));
     if (selected.value) store.updateBinding(selected.conversation.id, selected.value.id, value.endpointId, value.allowedSenderIds, value);

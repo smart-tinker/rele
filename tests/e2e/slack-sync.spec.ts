@@ -23,7 +23,8 @@ function stream(extra: Partial<SlackSyncJournal['streams'][number]> = {}): Slack
 
 async function openJournal(page: Page) {
   await openPanel(page);
-  await page.getByRole('button', { name: 'Открыть связку Пример: проект Альфа' }).click();
+  await page.getByRole('tab', { name: 'Slack', exact: true }).click();
+  await page.getByRole('button', { name: 'Настройки источника #alpha-dev', exact: true }).click();
   return page.getByRole('region', { name: 'Журнал контекста Slack' });
 }
 
@@ -156,33 +157,11 @@ test('shows read errors, refreshes explicitly and keeps block-only payloads boun
 test('keeps empty journals out of existing conversation forms', async ({ page }) => {
   const api = await installApi(page);
   await openPanel(page);
-  await page.getByRole('button', { name: 'Открыть связку Пример: проект Альфа' }).click();
+  await page.getByRole('tab', { name: 'Slack', exact: true }).click();
+  await page.getByRole('button', { name: 'Настройки источника #alpha-dev', exact: true }).click();
   await expect.poll(() => api.reads.some(path => path.startsWith('/api/conversations/conversation-0/slack-sync?'))).toBe(true);
   await expect(page.getByRole('heading', { name: 'Журнал контекста Slack' })).toHaveCount(0);
   expect(api.mutations).toEqual([]);
-});
-
-test('keeps other bots selectable for explicit mention-based launches while all messages remain context', async ({ page }) => {
-  const api = await installApi(page, fixtureState(), {
-    people: { 'sl-alpha': [{ items: [{ id: 'BOTOTHER', name: 'Другой агент', isBot: true }] }] },
-  });
-  const bindingId = api.state.conversations[0].bindings.find(binding => binding.endpointId === 'sl-alpha')!.id;
-  await openPanel(page);
-  await page.getByRole('button', { name: 'Открыть связку Пример: проект Альфа' }).click();
-  const slack = page.getByRole('dialog').locator('form').filter({ has: page.getByRole('heading', { name: 'Slack', exact: true }) });
-  await expect(slack).toContainText('Все сообщения обсуждения, включая ботов, передаются как контекст.');
-  await expect(slack).toContainText('Отмеченный бот запускает запрос только по новому упоминанию подключённого агента.');
-  const bot = slack.getByRole('checkbox', { name: 'Другой агент · бот, запуск по упоминанию подключённого агента' });
-  await expect(bot).toBeEnabled();
-  await expect(bot).not.toBeChecked();
-  await bot.check();
-  expect(api.mutations).toEqual([]);
-  await slack.getByRole('button', { name: 'Сохранить Slack', exact: true }).click();
-  await expect(slack).toContainText('Slack подключён. Доступ сохранён.');
-  expect(api.mutations).toEqual([{
-    method: 'PUT', path: `/api/conversations/conversation-0/bindings/${bindingId}`,
-    body: { endpointId: 'sl-alpha', allowedSenderIds: ['person-anna', 'BOTOTHER'] },
-  }]);
 });
 
 test('shows captured detached context without claiming its unfinished history scan is still running', async ({ page }) => {

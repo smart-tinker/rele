@@ -6,23 +6,58 @@ import type { ConfigStore } from './config.js';
 
 interface Instance { pid: number; address: string; version: string }
 
-async function instance(config: ConfigStore): Promise<Instance | null> {
+class InvalidInstanceError extends Error {
+  constructor() { super('Некорректный локальный адрес Rele в instance.json. Перезапустите Rele.'); }
+}
+
+async function instance(config: Pick<ConfigStore, 'directory'>): Promise<Instance | null> {
   let source: string;
   try { source = await readFile(path.join(config.directory, 'instance.json'), 'utf8'); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
   try {
     const value = JSON.parse(source) as Instance;
     const address = new URL(value.address);
-    if (!Number.isSafeInteger(value.pid) || value.pid <= 0 || typeof value.version !== 'string' ||
+    // Node process.kill accepts a signed 32-bit PID; larger JSON integers are not process identities.
+    if (!Number.isSafeInteger(value.pid) || value.pid <= 0 || value.pid > 0x7fffffff || typeof value.version !== 'string' ||
       address.protocol !== 'http:' || !['127.0.0.1', '[::1]'].includes(address.hostname) ||
       address.username || address.password || address.pathname !== '/' || address.search || address.hash) throw new Error();
     return { pid: value.pid, version: value.version, address: address.origin };
-  } catch { throw new Error('Некорректный локальный адрес Rele в instance.json. Перезапустите Rele.'); }
+  } catch { throw new InvalidInstanceError(); }
 }
 
 function alive(pid: number): boolean {
   try { process.kill(pid, 0); return true; }
   catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
+}
+
+interface InstanceDiagnostics {
+  marker: 'absent' | 'valid' | 'invalid' | 'unreadable';
+  pid?: number;
+  processAlive?: boolean;
+  health: 'not-checked' | 'responding' | 'mismatch' | 'unavailable';
+  httpStatus?: number;
+  versionMatch?: boolean;
+}
+
+/** Public health is a limited observation, never authenticated ownership or model readiness. */
+export async function instanceDiagnostics(directory: string, version: string): Promise<InstanceDiagnostics> {
+  let current: Instance | null;
+  try { current = await instance({ directory }); }
+  catch (error) { return { marker: error instanceof InvalidInstanceError ? 'invalid' : 'unreadable', health: 'not-checked' }; }
+  if (!current) return { marker: 'absent', health: 'not-checked' };
+  const report: InstanceDiagnostics = { marker: 'valid', pid: current.pid, processAlive: alive(current.pid), health: 'not-checked' };
+  if (!report.processAlive) return report;
+  try {
+    const response = await fetch(new URL('/api/health', current.address), {
+      method: 'GET', redirect: 'error', signal: AbortSignal.timeout(1500),
+    });
+    report.httpStatus = response.status;
+    if (!response.ok) { report.health = 'unavailable'; return report; }
+    const health = await response.json().catch(() => null) as { ok?: unknown; version?: unknown } | null;
+    report.versionMatch = health?.ok === true && health.version === current.version && current.version === version;
+    report.health = report.versionMatch ? 'responding' : 'mismatch';
+  } catch { report.health = 'unavailable'; }
+  return report;
 }
 
 async function request(config: ConfigStore, current: Instance, endpoint: string, method = 'GET'): Promise<Response> {

@@ -38,7 +38,7 @@ export function AutoLinks({ state, api, refresh }: { state: DashboardState; api:
       <div className="inline-controls"><strong>{chatName(intent.rule)}</strong><Status tone={intent.status === 'uncertain' || intent.status === 'failed' ? 'warning' : intent.status === 'completed' ? 'good' : 'muted'}>{intentNames[intent.status]}</Status></div>
       {intent.error && <Notice tone="warning">{intent.error}</Notice>}
       {intent.threadId && <p className="field-hint">Созданный разговор Codex: <code>{intent.threadId}</code></p>}
-      {(intent.status === 'uncertain' || intent.status === 'failed') && <p className="field-hint">Проверьте список разговоров Codex. Если разговор уже создан, свяжите его с исходным обсуждением через «Связки». Повторное создание автоматически не выполняется.</p>}
+      {(intent.status === 'uncertain' || intent.status === 'failed') && <p className="field-hint">Проверьте список разговоров Codex. Если разговор уже создан, свяжите его с исходным обсуждением через «Связи». Повторное создание автоматически не выполняется.</p>}
     </div>)}</div>}
     {editing && <Drawer title={editing === 'new' ? 'Новое правило автосоздания' : 'Правило автосоздания'} onClose={() => setEditing(null)}>
       <AutoLinkForm key={editing === 'new' ? 'new' : editing.id} rule={editing === 'new' ? undefined : editing} state={state} api={api} refresh={refresh}

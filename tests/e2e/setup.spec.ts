@@ -41,14 +41,14 @@ test('one-time launch links are exchanged once after the URL is cleaned and surv
   ).toBeNull();
   release();
   await expect(
-    page.getByRole('heading', { name: 'Связки', exact: true }),
+    page.getByRole('heading', { name: 'Связи', exact: true }),
   ).toBeVisible();
   expect(
     await page.evaluate(() => sessionStorage.getItem('rele.panelToken')),
   ).toBe(panelToken);
   await page.reload();
   await expect(
-    page.getByRole('heading', { name: 'Связки', exact: true }),
+    page.getByRole('heading', { name: 'Связи', exact: true }),
   ).toBeVisible();
   expect(exchanges).toHaveLength(1);
   expect(
@@ -84,7 +84,7 @@ test('expired launch links offer manual sign-in and are never retried on reload'
   await page.getByLabel('Токен панели').fill(panelToken);
   await page.getByRole('button', { name: 'Открыть Rele', exact: true }).click();
   await expect(
-    page.getByRole('heading', { name: 'Связки', exact: true }),
+    page.getByRole('heading', { name: 'Связи', exact: true }),
   ).toBeVisible();
 });
 
@@ -109,28 +109,6 @@ test('disconnected and failing Codex catalogs never appear as empty and can reco
   expect(api.reads.filter((path) => path.startsWith('/api/threads'))).toEqual(
     [],
   );
-  await page
-    .getByRole('navigation')
-    .getByRole('button', { name: 'Связки', exact: true })
-    .click();
-  await page
-    .getByRole('button', { name: 'Новая связка', exact: true })
-    .first()
-    .click();
-  let dialog = page.getByRole('dialog');
-  await expect(
-    dialog.getByLabel('Разговор Codex', { exact: true }),
-  ).toBeDisabled();
-  await expect(
-    dialog.getByText('Нет свободных разговоров Codex.', { exact: false }),
-  ).toHaveCount(0);
-  await dialog
-    .getByRole('button', { name: 'Настроить Codex', exact: true })
-    .click();
-  await expect(
-    page.getByRole('heading', { name: 'Codex', exact: true }),
-  ).toBeVisible();
-
   state.codex.connected = true;
   state.codex.error = undefined;
   await page.route('**/api/threads?*', (route) => {
@@ -152,34 +130,9 @@ test('disconnected and failing Codex catalogs never appear as empty and can reco
   await expect(
     page.getByText('Список разговоров пока пуст', { exact: true }),
   ).toHaveCount(0);
-  await page
-    .getByRole('navigation')
-    .getByRole('button', { name: 'Связки', exact: true })
-    .click();
-  await page
-    .getByRole('button', { name: 'Новая связка', exact: true })
-    .first()
-    .click();
-  dialog = page.getByRole('dialog');
-  await expect(dialog.getByRole('alert')).toContainText(
-    'список разговоров временно недоступен',
-  );
-  await expect(
-    dialog.getByText('Нет свободных разговоров Codex.', { exact: false }),
-  ).toHaveCount(0);
-  await expect(
-    dialog.getByRole('button', { name: 'Создать связку', exact: true }),
-  ).toBeDisabled();
   await page.unroute('**/api/threads?*');
-  await dialog
-    .getByRole('button', { name: 'Обновить разговоры', exact: true })
-    .click();
-  await dialog
-    .getByLabel('Разговор Codex', { exact: true })
-    .selectOption('thread-new');
-  await expect(
-    dialog.getByRole('button', { name: 'Создать связку', exact: true }),
-  ).toBeEnabled();
+  await page.getByRole('button', { name: 'Обновить разговоры', exact: true }).click();
+  await expect(page.getByRole('table')).toContainText('Пример: новый проект');
 });
 
 test('managed is the default and recommends a usable Desktop executable independently of its external connection', async ({

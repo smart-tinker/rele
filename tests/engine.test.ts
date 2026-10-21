@@ -783,6 +783,43 @@ describe('Engine Slack transcript and authorized task boundary', () => {
     expect(f.codex.enqueue).not.toHaveBeenCalled();
   });
 
+  it('holds an off Slack source until full backfill while another origin in the same conversation proceeds', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture();
+    f.slack.readThreadPage.mockResolvedValueOnce({ messages: [], nextCursor: 'unfinished-history' });
+    const task = slackInbound(f, 'off-before-backfill', '170003.000001', 'Original Slack task');
+    await f.engine.receive(task); await f.engine.settled();
+    const request = f.store.listRequests()[0]; const origin = request.origin;
+    expect(f.codex.enqueue).not.toHaveBeenCalled();
+    f.store.setSourceAccess(f.eps.slack.id, { mode: 'off' });
+    f.slack.readThreadPage.mockClear();
+    vi.setSystemTime(Date.now() + 1501);
+    await f.engine.pump(); await f.engine.settled();
+    expect(f.slack.readThreadPage).not.toHaveBeenCalled();
+    expect(f.codex.enqueue).not.toHaveBeenCalled();
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'queued', origin,
+      error: 'Источник выключен. Включите его для проверки полного контекста или отмените принятый запрос.' });
+    const telegram = await acceptRequest(f, 'telegram', 'later-origin');
+    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, telegram.text, telegram.id);
+    expect(f.store.getRequest(request.id)?.status).toBe('queued');
+    await running(f, telegram);
+    f.codex.complete(telegram.id, 'Telegram finished'); await f.engine.settled();
+    const root = slackInbound(f, 'history-root', f.eps.slack.threadId, 'Previously unverified root').slack!;
+    f.slack.readThreadPage.mockResolvedValueOnce({ messages: [root], nextCursor: 'full-second-page' }).mockResolvedValueOnce({ messages: [] });
+    f.store.setSourceAccess(f.eps.slack.id, { mode: 'all' });
+    vi.setSystemTime(Date.now() + 1501);
+    await f.engine.pump(); await f.engine.settled();
+    expect(f.slack.readThreadPage.mock.calls[0][1]?.oldest).toBeUndefined();
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(Date.now() + 1501);
+    await f.engine.pump(); await f.engine.settled();
+    expect(f.codex.enqueue.mock.calls.filter(([, , id]) => id === request.id)).toEqual([[THREAD, task.text, request.id]]);
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'starting', origin, error: undefined });
+    const contextIndex = f.codex.injectContext.mock.calls.findIndex(([, , text]) => text.includes(root.text));
+    expect(contextIndex).toBeGreaterThanOrEqual(0);
+    expect(f.codex.injectContext.mock.invocationCallOrder[contextIndex]).toBeLessThan(f.codex.enqueue.mock.invocationCallOrder[1]);
+  });
+
   it('projects every history page and the triggering source before enqueueing the authorized task', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     const f = fixture();
@@ -937,6 +974,46 @@ describe('automatic native thread creation', () => {
     expect(f.store.listRequests()).toHaveLength(2);
   });
 
+  it('creates only the explicitly selected source after its access is enabled, without a chat-wide rule', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture(); const endpoint = { ...f.eps.slack, id: 'source-auto', threadId: '170010.000001' };
+    f.store.upsertEndpoint(endpoint); f.config.slack.enabled = true;
+    f.store.routeSource(endpoint.id, null, '/source/project');
+    await f.engine.receive(slackInbound(f, 'off-source', '170010.000002', 'ignored trigger', { endpoint })); await f.engine.settled();
+    expect(f.codex.createThread).not.toHaveBeenCalled();
+    f.store.setSourceAccess(endpoint.id, { mode: 'mention', allowedSenderIds: [] });
+    const sender = { id: 'UAGENT', name: 'Agent', isBot: true };
+    await f.engine.receive(slackInbound(f, 'plain-source', '170010.000003', 'not a trigger', { endpoint, sender })); await f.engine.settled();
+    expect(f.codex.createThread).not.toHaveBeenCalled();
+    await f.engine.receive(slackInbound(f, 'called-source', '170010.000004', 'authorized task', { endpoint, sender, directMention: true })); await f.engine.settled();
+    for (let scan = 0; scan < 4 && !f.codex.enqueue.mock.calls.length; scan++) {
+      vi.setSystemTime(Date.now() + 2000); await f.engine.pump(); await f.engine.settled();
+    }
+    expect(f.codex.createThread).toHaveBeenCalledExactlyOnceWith('/source/project');
+    expect(f.store.listRequests()).toHaveLength(1);
+    const request = f.store.listRequests()[0];
+    expect(request).toMatchObject({ text: 'authorized task', origin: { endpointId: endpoint.id, senderId: sender.id } });
+    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith('auto-created-thread', request.text, request.id);
+    expect(f.config.autoLinkRules).toEqual([]);
+    expect(f.store.getSourceRoute(f.eps.slack.id).mode).toBe('manual');
+  });
+
+  it('keeps approvals and cancellation available for accepted requests after the source is off', async () => {
+    const f = fixture(); const request = await acceptRequest(f, 'telegram');
+    f.store.setSourceAccess(f.eps.telegram.id, { mode: 'off' });
+    const approval = await requestApproval(f, request, true);
+    const delivery = f.store.listDeliveries().find(value => value.approvalId === approval.id)!;
+    await f.engine.receive(f.message('telegram', 'off-approval', { text: 'main', replyToMessageId: delivery.remoteMessageId }));
+    await f.engine.settled();
+    expect(f.codex.respond).toHaveBeenCalledWith(approval.rpcId, { answers: { target: { answers: ['main'] } } });
+    await f.engine.receive(f.message('telegram', 'off-new-task'));
+    await f.engine.receive(f.message('telegram', 'off-cancel', { text: '/rele_cancel' }));
+    await f.engine.settled();
+    expect(f.store.listRequests()).toHaveLength(1);
+    expect(f.codex.enqueue).toHaveBeenCalledOnce();
+    expect(f.codex.interrupt).toHaveBeenCalledWith(THREAD, 'turn-1');
+  });
+
   it('waits for a supported connected runtime before making a durable creation attempt', async () => {
     const f = autoFixture(); f.codex.verifiedVersion = false;
     await f.engine.receive(f.incoming()); await f.engine.settled();
@@ -1068,6 +1145,34 @@ describe('automatic native thread creation', () => {
     expect(f.codex.releaseThread).toHaveBeenCalledWith('auto-created-thread');
     expect(f.codex.createThread).toHaveBeenCalledOnce();
     expect(f.codex.setThreadName).toHaveBeenCalledOnce();
+  });
+
+  it.each(['profile', 'account', 'disabled', 'disconnected', 'unverified'] as const)('keeps explicit recovery pending when the original %s fence changes before promotion', async changed => {
+    const f = autoFixture(); f.codex.createThread.mockRejectedValueOnce(new CodexTransportError('Lost create ACK'));
+    await f.engine.receive(f.incoming()); await f.engine.settled();
+    const intent = f.store.listAutoLinkIntents()[0];
+    expect(intent.status).toBe('uncertain');
+    f.store.routeSourceToThread(f.endpoint.id, { threadId: 'manually-verified-native', cwd: intent.rule.cwd, name: 'Recovered' }, intent.id, intent.rule);
+    const originalConfig = structuredClone(f.config.codex);
+    if (changed === 'profile') f.config.codex.codexHome = '/different-profile';
+    if (changed === 'account') f.telegram.state.accountId = 'different-account';
+    if (changed === 'disabled') f.config.telegram.enabled = false;
+    if (changed === 'disconnected') f.codex.connected = false;
+    if (changed === 'unverified') f.codex.verifiedVersion = false;
+    await f.engine.pump(); await f.engine.settled();
+    expect(f.store.getAutoLinkIntent(intent.id)).toMatchObject({ status: 'uncertain', error: expect.stringContaining('исходное подключение') });
+    expect(f.store.listRequests()).toEqual([]);
+    expect(f.codex.enqueue).not.toHaveBeenCalled();
+    expect(f.codex.createThread).toHaveBeenCalledOnce();
+    f.config.codex = originalConfig; f.telegram.state.accountId = f.endpoint.accountId;
+    f.config.telegram.enabled = true; f.codex.connected = true; f.codex.verifiedVersion = true;
+    await f.engine.pump(); await f.engine.settled();
+    const request = f.store.listRequests()[0];
+    expect(f.store.listRequests()).toHaveLength(1);
+    expect(f.store.getAutoLinkIntent(intent.id)?.status).toBe('completed');
+    expect(request.origin).toMatchObject({ endpointId: f.endpoint.id, accountId: f.endpoint.accountId, threadId: f.endpoint.threadId });
+    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith('manually-verified-native', request.text, request.id);
+    expect(f.codex.createThread).toHaveBeenCalledOnce();
   });
 
   it('prefers a manual binding that appeared while native creation was in flight', async () => {

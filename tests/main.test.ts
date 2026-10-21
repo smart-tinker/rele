@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,6 +10,7 @@ import { Store } from '../src/server/store.js';
 
 const project = fileURLToPath(new URL('../', import.meta.url));
 const directories: string[] = [];
+const healthServers: ReturnType<typeof createServer>[] = [];
 const children: Array<{ child: ChildProcessWithoutNullStreams; done: Promise<{ code: number | null; signal: NodeJS.Signals | null }> }> = [];
 
 async function fixture() {
@@ -62,6 +64,7 @@ async function ready(process: ReturnType<typeof launch>) {
 afterEach(async () => {
   for (const { child } of children) if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
   await Promise.allSettled(children.splice(0).map(process => process.done));
+  for (const server of healthServers.splice(0)) { server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); }
   for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
@@ -204,4 +207,131 @@ describe('CLI lifecycle and durable backup', () => {
     await rm(join(config.directory, 'instance.json'), { recursive: true });
     await ready(launch(config.directory));
   }, 45_000);
+});
+
+
+describe('restricted CLI diagnostics', () => {
+  async function directory() {
+    const value = await mkdtemp(join(tmpdir(), 'Rele diagnostics test '));
+    directories.push(value);
+    return value;
+  }
+  async function healthFixture(options: { status?: number; body?: string; location?: string; silent?: boolean } = {}) {
+    const root = await directory();
+    const version = (JSON.parse(await readFile(join(project, 'package.json'), 'utf8')) as { version: string }).version;
+    const requests: Array<{ method?: string; url?: string; authorization?: string; cookie?: string }> = [];
+    const server = createServer((request, response) => {
+      requests.push({ method: request.method, url: request.url, authorization: request.headers.authorization, cookie: request.headers.cookie });
+      if (options.silent) return;
+      response.writeHead(options.status ?? 200, options.location ? { location: options.location } : {});
+      response.end(options.body ?? JSON.stringify({ ok: true, version, extra: 'PRIVATE_HEALTH_BODY' }));
+    });
+    healthServers.push(server);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const marker = { pid: process.pid, address, version, privatePath: root, secret: 'PRIVATE_MARKER_SECRET' };
+    await writeFile(join(root, 'instance.json'), JSON.stringify(marker));
+    return { root, version, server, address, marker, requests, run: () => result(launch(root, ['diagnostics'])) };
+  }
+
+  it('reports an absent marker without creating a missing data directory or configuration', async () => {
+    const root = await directory(); const missing = join(root, 'nonexistent');
+    const report = await result(launch(missing, ['diagnostics']));
+    expect(report.code, report.errors).toBe(0);
+    expect(JSON.parse(report.output)).toEqual({ version: expect.any(String), platform: process.platform, arch: process.arch,
+      node: process.version, instance: { marker: 'absent', health: 'not-checked' }, desktopVerified: false });
+    await expect(stat(missing)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(report.output + report.errors).not.toContain(missing);
+  });
+
+  it('reads only the marker and unauthenticated public health, preserving config and database bytes and timestamps', async () => {
+    const f = await healthFixture();
+    const config = join(f.root, 'config.json'); const database = join(f.root, 'rele.sqlite');
+    await writeFile(config, 'MALFORMED_CONFIG_MUST_NOT_BE_READ_OR_DECRYPTED');
+    await writeFile(database, 'PRIVATE_DATABASE_MUST_NOT_BE_OPENED');
+    const files = [config, database, join(f.root, 'instance.json')];
+    const before = await Promise.all(files.map(async file => ({ bytes: await readFile(file), modified: (await stat(file)).mtimeMs })));
+    const report = await f.run();
+    expect(report.code, report.errors).toBe(0);
+    expect(JSON.parse(report.output)).toEqual({ version: f.version, platform: process.platform, arch: process.arch, node: process.version,
+      instance: { marker: 'valid', pid: process.pid, processAlive: true, health: 'responding', httpStatus: 200, versionMatch: true }, desktopVerified: false });
+    expect(f.requests).toEqual([{ method: 'GET', url: '/api/health', authorization: undefined, cookie: undefined }]);
+    const after = await Promise.all(files.map(async file => ({ bytes: await readFile(file), modified: (await stat(file)).mtimeMs })));
+    expect(after).toEqual(before);
+    expect(report.output + report.errors).not.toMatch(/PRIVATE_|MALFORMED_|dataDirectory|codexTransport|telegramEnabled|slackEnabled|voiceEnabled/u);
+    expect(report.output + report.errors).not.toContain(f.root);
+    expect(report.output + report.errors).not.toContain(f.address);
+  });
+
+  it.each(['https://example.invalid', 'http://localhost', 'http://user:secret@127.0.0.1:3210',
+    'http://127.0.0.1:3210/redirect', 'http://127.0.0.1:3210/?token=secret', 'http://127.0.0.1:3210/#secret'])('rejects an invalid marker URL before fetching (%s)', async address => {
+    const f = await healthFixture();
+    await writeFile(join(f.root, 'instance.json'), JSON.stringify({ ...f.marker, address }));
+    const report = await f.run();
+    expect(report.code, report.errors).toBe(0);
+    expect(JSON.parse(report.output).instance).toEqual({ marker: 'invalid', health: 'not-checked' });
+    expect(f.requests).toEqual([]);
+    expect(report.output + report.errors).not.toContain(address);
+  });
+
+  it('rejects a PID outside the supported process range before checking health', async () => {
+    const f = await healthFixture();
+    await writeFile(join(f.root, 'instance.json'), JSON.stringify({ ...f.marker, pid: Number.MAX_SAFE_INTEGER }));
+    const report = await f.run();
+    expect(JSON.parse(report.output).instance).toEqual({ marker: 'invalid', health: 'not-checked' });
+    expect(f.requests).toEqual([]);
+  });
+
+  it.each(['malformed', 'invalid-pid', 'unreadable'])('classifies a %s marker without raw fields or errors', async kind => {
+    const root = await directory(); const file = join(root, 'instance.json');
+    if (kind === 'unreadable') await mkdir(file);
+    else await writeFile(file, kind === 'malformed' ? 'PRIVATE_INVALID_JSON' : JSON.stringify({ pid: 0, address: 'http://127.0.0.1:3210', version: 'PRIVATE_VERSION' }));
+    const report = await result(launch(root, ['diagnostics']));
+    expect(report.code, report.errors).toBe(0);
+    expect(JSON.parse(report.output).instance).toEqual({ marker: kind === 'unreadable' ? 'unreadable' : 'invalid', health: 'not-checked' });
+    expect(report.output + report.errors).not.toMatch(/PRIVATE_|instance.json|EISDIR|EPERM/u);
+    expect(report.output + report.errors).not.toContain(root);
+    await expect(stat(join(root, 'config.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it.each([JSON.stringify({ ok: true, version: 'PRIVATE_WRONG_VERSION' }), JSON.stringify({ ok: false }), 'PRIVATE_NON_JSON'])('reports a mismatched health response without exposing its body (%s)', async body => {
+    const f = await healthFixture({ body }); const report = await f.run();
+    expect(JSON.parse(report.output).instance).toMatchObject({ marker: 'valid', health: 'mismatch', httpStatus: 200, versionMatch: false });
+    expect(report.output + report.errors).not.toContain('PRIVATE_');
+  });
+
+  it('compares the marker version as well as the health version', async () => {
+    const f = await healthFixture();
+    await writeFile(join(f.root, 'instance.json'), JSON.stringify({ ...f.marker, version: 'PRIVATE_STALE_MARKER_VERSION' }));
+    const report = await f.run();
+    expect(JSON.parse(report.output).instance).toMatchObject({ health: 'mismatch', versionMatch: false });
+    expect(report.output + report.errors).not.toContain('PRIVATE_');
+  });
+
+  it('does not follow a health redirect or send credentials to its destination', async () => {
+    const target = await healthFixture(); const f = await healthFixture({ status: 302, location: `${target.address}/private-target` });
+    const report = await f.run();
+    expect(JSON.parse(report.output).instance).toEqual({ marker: 'valid', pid: process.pid, processAlive: true, health: 'unavailable' });
+    expect(f.requests).toEqual([{ method: 'GET', url: '/api/health', authorization: undefined, cookie: undefined }]);
+    expect(target.requests).toEqual([]);
+    expect(report.output + report.errors).not.toContain(target.address);
+  });
+
+  it('reports a fixed unavailable category for non-success HTTP status or an offline listener', async () => {
+    const f = await healthFixture({ status: 503, body: 'PRIVATE_SERVER_ERROR' });
+    expect(JSON.parse((await f.run()).output).instance).toMatchObject({ health: 'unavailable', httpStatus: 503 });
+    f.server.closeAllConnections(); await new Promise<void>(resolve => f.server.close(() => resolve()));
+    healthServers.splice(healthServers.indexOf(f.server), 1);
+    const report = await f.run();
+    expect(JSON.parse(report.output).instance).toEqual({ marker: 'valid', pid: process.pid, processAlive: true, health: 'unavailable' });
+    expect(report.output + report.errors).not.toMatch(/PRIVATE_|ECONNREFUSED/u);
+  });
+
+  it('bounds a stalled health request without falling back to another API', async () => {
+    const f = await healthFixture({ silent: true }); const report = await f.run();
+    expect(report.code, report.errors).toBe(0);
+    expect(JSON.parse(report.output).instance).toEqual({ marker: 'valid', pid: process.pid, processAlive: true, health: 'unavailable' });
+    expect(f.requests.map(request => request.url)).toEqual(['/api/health']);
+    expect(report.output + report.errors).not.toMatch(/Timeout|Abort|config.json/u);
+  });
 });

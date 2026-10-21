@@ -374,7 +374,7 @@ describe('Store durability and recovery', () => {
     const check = new DatabaseSync(path);
     try {
       expect(check.prepare('PRAGMA journal_mode').get()?.journal_mode).toBe('wal');
-      expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(5);
+      expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(6);
       expect(check.prepare('PRAGMA quick_check').get()?.quick_check).toBe('ok');
       expect(check.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     } finally { check.close(); }

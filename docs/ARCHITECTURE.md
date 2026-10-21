@@ -1,4 +1,4 @@
-# Архитектура Rele v0.1.0-rc.11
+# Архитектура Rele v0.1.0-rc.12
 
 ## Границы
 
@@ -159,3 +159,18 @@ SQLite v5 сохраняет прежние binding IDs/rowids/ACL и убира
 До `thread/start` durable intent получает `creating`; после валидного ACK сохраняется native ID; `thread/name/set` с названием источника материализует ленивую native историю без модельного хода, затем связка и запросы создаются атомарно. После рестарта `creating` становится `uncertain`: native создание не имеет idempotency key. Полученный ID не теряется при отказе queue probe. Ручная связка того же endpoint может разрешить ожидание, сохранив актуальный ACL. Неопределённость видна в аутентифицированном журнале автосоздания и требует сверки списка Codex, не повторного RPC.
 
 Native history `interrupted` без finite completedAt может быть нормализованным промежуточным снимком. Такой снимок оставляет запрос uncertain до подтверждения. Настоящий terminal abort с completion timestamp завершает запрос; уведомление завершения, пришедшее во время сверки, инициирует повторную сверку.
+
+
+## Маршруты источников и доступ rc.12
+
+UI ориентирован на Endpoint: Telegram/Slack → chat/thread → уникальный native Codex threadId. Conversation остаётся владельцем общей очереди, native context и cwd; несколько Binding ведут в него. SourceAccess хранит off/mention/all отдельно от назначения в meta `source-access:<endpointId>`. SourceRoute в `source-route:<endpointId>` хранит none/manual/auto и cwd для auto. Незнакомый источник по умолчанию off; явное назначение само не выдаёт права.
+
+Для старых Binding и групповых AutoLinkRule применяется прежний ACL, включая выбранных отправителей/allowAllSenders/requireMention. При отвязке legacy ACL сохраняется точным внутренним snapshot, а не превращается в доступ всем. Только явное сохранение нового группового режима заменяет его разрешением всех участников; UI предупреждает об этом. DM всегда требует human allowlist. Повреждённые новые policy snapshots выключают источник.
+
+GET /api/state проецирует sourceAccess/sourceRoutes. Аутентифицированный PUT /api/endpoints/:id/access меняет режим, PUT :id/route назначает существующий проверенный native threadId, null или autoCreateCwd. Проверяются текущий bot/account/availability, runtime OS/cwd, async catalog/config fences. Перемещение Binding и find/create только Rele metadata Conversation атомарны; native create при выборе существующего треда не вызывается. Старые requests/Origin/receipts/Slack ledgers не переписываются.
+
+Обычная смена маршрута не допускается при незавершённых запросах или auto-intents. Восстановление uncertain/failed автосоздания требует отдельного явного resolveAutoLinkId и подтверждения в UI; проверяются профиль, cwd и известный native ID. Без этого принятые auto-события не могут незаметно перейти в новое назначение, включая старые HTTP API связок. Перед переводом событий в очередь повторно проверяются исходные профиль Codex, клиент и включённое подключение того же аккаунта. Per-endpoint auto использует те же durable intents и synthetic rule, не меняя chat-wide правила и соседние источники. Unknown create ACK не повторяется; сохранённый native ID повторно используется.
+
+Off запрещает новые задачи и новый passive capture/backfill конкретного входа. Ранее захваченный контекст остаётся привязанным к прежнему native thread; выключение не удаляет историю. Slack queued request такого источника удерживается с явным пояснением до включения/full backfill либо отмены, не обходя барьер полноты. Другие разрешённые входы продолжают очередь. Выполняющиеся задачи и origin approvals/cancel продолжают обслуживаться. Повторное включение допускает полный backfill истории.
+
+Миграция v6 добавляет только `source-policy-version=1` в meta и повышает user_version; таблицы/идентификаторы/история/ACL не переписываются. Более старый бинарник отклоняет такую базу, чтобы не проигнорировать off/none. Для отката необходима совместимая pre-migration backup.

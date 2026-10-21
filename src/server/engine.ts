@@ -139,8 +139,9 @@ export class Engine extends EventEmitter {
       }
     } else {
       const config = this.options.config();
-      const rule = config.autoLinkRules?.find(rule => rule.enabled && rule.platform === message.endpoint.platform &&
+      const legacyRule = config.autoLinkRules?.find(rule => rule.enabled && rule.platform === message.endpoint.platform &&
         rule.accountId === message.endpoint.accountId && rule.chatId === message.endpoint.chatId);
+      const rule = this.store.getEndpoint(message.endpoint.id) ? this.store.getSourceAutoRule(message.endpoint.id, legacyRule) : legacyRule;
       const channel = this.channels[message.endpoint.platform];
       this.store.ingest(message, rule && config[rule.platform].enabled && channel?.state.accountId === rule.accountId
         ? { rule, targetFingerprint: this.targetFingerprint() } : undefined);
@@ -296,9 +297,17 @@ export class Engine extends EventEmitter {
     await Promise.allSettled(work);
   }
 
-  private targetFingerprint(): string {
+  targetFingerprint(): string {
     const { transport, executable, endpoint, codexHome } = this.options.config().codex;
     return createHash('sha256').update(JSON.stringify([transport, executable, endpoint, codexHome ?? null])).digest('hex');
+  }
+
+  private currentAutoRule(endpointId: string): AutoLinkIntent['rule'] | undefined {
+    const endpoint = this.store.getEndpoint(endpointId);
+    if (!endpoint) return undefined;
+    const legacy = this.options.config().autoLinkRules?.find(rule => rule.enabled && rule.platform === endpoint.platform &&
+      rule.accountId === endpoint.accountId && rule.chatId === endpoint.chatId);
+    return this.store.getSourceAutoRule(endpointId, legacy);
   }
 
   private async provision(intent: AutoLinkIntent): Promise<void> {
@@ -306,20 +315,27 @@ export class Engine extends EventEmitter {
     this.provisioning.add(intent.id);
     const client = this.codex;
     let releasableThreadId: string | undefined;
-    const allowed = () => {
+    const sameTarget = () => {
       const config = this.options.config();
-      const rule = config.autoLinkRules?.find(rule => rule.id === intent.rule.id);
       const account = this.channels[intent.rule.platform]?.state;
       return !this.stopped && !this.suspended && config[intent.rule.platform].enabled && client === this.codex && account?.connected && account.accountId === intent.rule.accountId &&
-        this.targetFingerprint() === intent.targetFingerprint && !!rule && JSON.stringify(rule) === JSON.stringify(intent.rule) && rule.enabled;
+        this.targetFingerprint() === intent.targetFingerprint && client.status().connected && client.isVerifiedVersion();
+    };
+    const allowed = () => {
+      const rule = this.currentAutoRule(intent.endpointId);
+      return sameTarget() && !!rule && JSON.stringify(rule) === JSON.stringify(intent.rule) && rule.enabled;
     };
     try {
       // A manual binding can resolve even a lost native create ACK, using its current ACL.
       const manual = this.store.bindingForEndpoint(intent.endpointId);
       if (manual) {
+        if (!sameTarget()) {
+          const error = 'Подключение автосоздания изменилось или недоступно. Принятые события сохранены; восстановите исходное подключение.';
+          if (intent.error !== error) this.store.updateAutoLinkIntent(intent.id, { error });
+          return;
+        }
         // A manually chosen target abandons the unused auto-created thread, even if still lazy.
-        if (intent.threadId && intent.threadId !== this.store.getConversation(manual.conversationId)!.threadId &&
-            this.targetFingerprint() === intent.targetFingerprint && client.status().connected && client.isVerifiedVersion()) releasableThreadId = intent.threadId;
+        if (intent.threadId && intent.threadId !== this.store.getConversation(manual.conversationId)!.threadId) releasableThreadId = intent.threadId;
         this.store.finalizeAutoLinkIntent(intent.id); return;
       }
       if (intent.status !== 'pending' && intent.status !== 'created') return;
@@ -357,13 +373,21 @@ export class Engine extends EventEmitter {
 
   async settled(): Promise<void> { await this.events; await Promise.allSettled([...this.tasks]); }
 
+  private waitsForSource(request: ReleRequest): boolean {
+    return request.origin.platform === 'slack' && this.store.getSourceAccess(request.origin.endpointId).mode === 'off';
+  }
+
   private async dispatch(conversationId: string): Promise<void> {
     this.dispatching.add(conversationId);
     let request: ReleRequest | undefined;
+    let waiting: ReleRequest | undefined;
     let attempted = false;
     try {
       const conversation = this.store.getConversation(conversationId)!;
-      const waiting = this.store.listPendingRequests().find(row => row.conversationId === conversationId);
+      const queued = this.store.listPendingRequests().filter(row => row.conversationId === conversationId);
+      const blockedReason = 'Источник выключен. Включите его для проверки полного контекста или отмените принятый запрос.';
+      for (const row of queued) if (this.waitsForSource(row) && row.error !== blockedReason) this.store.updateRequest(row.id, { error: blockedReason });
+      waiting = queued.find(row => !this.waitsForSource(row));
       if (this.store.activeRequests().some(row => row.conversationId === conversationId && row.status !== 'queued')) return;
       const client = this.codex;
       const cutoff = waiting ? waiting.origin.platform === 'slack' ? waiting.origin.messageId
@@ -380,8 +404,8 @@ export class Engine extends EventEmitter {
       await client.subscribe(conversation.threadId);
       if (client !== this.codex) { await client.releaseThread(conversation.threadId); return; }
       this.ownedThreads.add(conversationId);
-      if (!this.codex.status().queueSupported || this.stopped || this.suspended || this.store.getRequest(waiting.id)?.status !== 'queued') return;
-      request = this.store.claimNextRequest(conversationId);
+      if (!this.codex.status().queueSupported || this.stopped || this.suspended || this.store.getRequest(waiting.id)?.status !== 'queued' || this.waitsForSource(waiting)) return;
+      request = this.store.claimNextRequest(conversationId, waiting.id);
       if (!request) return;
       if (request.id !== waiting.id) { this.store.updateRequest(request.id, { status: 'queued' }); request = undefined; return; }
       this.retryThreadAfter.delete(conversationId);
@@ -403,16 +427,15 @@ export class Engine extends EventEmitter {
     } catch (error) {
       if (error instanceof CodexThreadBusyError) {
         // Ownership failed before queue/add: the original request and origin stay durable.
-        const waiting = request ?? this.store.listPendingRequests().find(row => row.conversationId === conversationId);
-        if (waiting && !terminal(this.store.getRequest(waiting.id)!.status)) this.store.updateRequest(waiting.id, { status: 'queued', error: this.options.redact(error) });
+        const current = request ?? waiting;
+        if (current && !terminal(this.store.getRequest(current.id)!.status)) this.store.updateRequest(current.id, { status: 'queued', error: this.options.redact(error) });
         this.retryThreadAfter.set(conversationId, Date.now() + 5_000);
       } else if (request && !terminal(this.store.getRequest(request.id)!.status)) {
         if (attempted && !(error instanceof CodexRpcError)) this.store.updateRequest(request.id, { status: 'uncertain', error: this.options.redact(error) });
         else if (this.stopped) this.store.updateRequest(request.id, { status: 'queued' });
         else this.fail(request.id, this.options.redact(error));
       } else if (!request) {
-        const waiting = this.store.listPendingRequests().find(row => row.conversationId === conversationId);
-        if (waiting) this.store.updateRequest(waiting.id, { error: this.options.redact(error) });
+        if (waiting && this.store.getRequest(waiting.id)?.status === 'queued') this.store.updateRequest(waiting.id, { error: this.options.redact(error) });
         this.retryThreadAfter.set(conversationId, Date.now() + 5_000);
       }
     } finally {
