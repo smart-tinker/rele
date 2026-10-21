@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { dirname, posix, resolve, win32 } from 'node:path';
 import { DatabaseSync, backup as backupDatabase, type SQLOutputValue } from 'node:sqlite';
-import type { Approval, AutoLinkIntent, AutoLinkRule, Binding, Conversation, Delivery, Endpoint, InboundMessage, Origin, Platform, ReleRequest, SlackTranscriptMessage } from '../shared/types.js';
+import { isLocalWorkspace } from './config.js';
+import type { Approval, AutoLinkIntent, AutoLinkRule, Binding, Conversation, Delivery, Endpoint, InboundMessage, Origin, Platform, ReleRequest, SlackTranscriptMessage, SourceAccess, SourceRoute } from '../shared/types.js';
 
 type Row = Record<string, SQLOutputValue>;
 type BindingPolicy = Pick<Binding, 'allowAllSenders' | 'requireMention'>;
@@ -140,10 +141,19 @@ const MIGRATIONS = [String.raw`
   CREATE UNIQUE INDEX auto_link_active_endpoint ON auto_link_intents(endpoint_id) WHERE status<>'completed';
   ALTER TABLE inbound_events ADD COLUMN auto_link_intent_id TEXT REFERENCES auto_link_intents(id);
   CREATE INDEX inbound_auto_link ON inbound_events(auto_link_intent_id);
+`, String.raw`
+  INSERT OR IGNORE INTO meta(key,value) VALUES ('source-policy-version','1');
 `];
 
 function required(value: string, label: string): void {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${label} must not be empty`);
+}
+function workingDirectoryKey(value: string): string {
+  const windows = /^[A-Za-z]:[\\/]/u.test(value);
+  const paths = windows ? win32 : posix;
+  let normalized = paths.normalize(value);
+  if (normalized.length > paths.parse(normalized).root.length) normalized = normalized.replace(windows ? /\\+$/u : /\/+$/u, '');
+  return windows ? normalized[0].toUpperCase() + normalized.slice(1) : normalized;
 }
 function allowedPatch(patch: object, fields: readonly string[]): void {
   for (const key of Object.keys(patch)) if (!fields.includes(key)) throw new Error(`Cannot update immutable field: ${key}`);
@@ -333,6 +343,157 @@ export class Store {
     const row = this.db.prepare('SELECT * FROM bindings WHERE endpoint_id=?').get(endpointId);
     return row ? toBinding(row) : undefined;
   }
+  getSourceAccess(endpointId: string, rule?: AutoLinkRule): SourceAccess {
+    const endpoint = this.getEndpoint(endpointId);
+    if (!endpoint) throw new Error('Endpoint not found');
+    const saved = this.getMeta(`source-access:${endpointId}`);
+    if (saved !== undefined) {
+      try {
+        const access = JSON.parse(saved) as SourceAccess & { allowAllSenders?: boolean };
+        if (!['off', 'mention', 'all'].includes(access.mode) || !Array.isArray(access.allowedSenderIds) || access.allowedSenderIds.some(id => typeof id !== 'string' || !id.trim()) ||
+          access.legacy !== undefined && access.legacy !== false && (access.legacy !== true || typeof access.allowAllSenders !== 'boolean' || this.isDirectMessage(endpoint) && access.allowAllSenders)) throw new Error();
+        return { endpointId, mode: access.mode, allowedSenderIds: access.allowedSenderIds, legacy: access.legacy === true };
+      } catch { return { endpointId, mode: 'off', allowedSenderIds: [], legacy: false }; }
+    }
+    const binding = this.bindingForEndpoint(endpointId);
+    if (binding) return { endpointId, mode: binding.requireMention ? 'mention' : 'all', allowedSenderIds: binding.allowedSenderIds, legacy: true };
+    if (this.getMeta(`source-route:${endpointId}`) === undefined && this.matchesSourceRule(endpoint, rule)) {
+      return { endpointId, mode: rule!.requireMention ? 'mention' : 'all', allowedSenderIds: rule!.allowedSenderIds, legacy: true };
+    }
+    return { endpointId, mode: 'off', allowedSenderIds: [], legacy: false };
+  }
+  setSourceAccess(endpointId: string, input: Pick<SourceAccess, 'mode'> & Partial<Pick<SourceAccess, 'allowedSenderIds'>>): SourceAccess {
+    return this.transaction(() => {
+      const endpoint = this.getEndpoint(endpointId);
+      if (!endpoint) throw new Error('Endpoint not found');
+      allowedPatch(input, ['mode', 'allowedSenderIds']);
+      if (!['off', 'mention', 'all'].includes(input.mode)) throw new Error('Unknown source access mode');
+      const allowedSenderIds = input.allowedSenderIds ?? this.getSourceAccess(endpointId).allowedSenderIds;
+      if (!Array.isArray(allowedSenderIds)) throw new Error('Allowed senders must be an array');
+      for (const id of allowedSenderIds) required(id, 'Allowed sender ID');
+      if (input.mode !== 'off' && this.isDirectMessage(endpoint) && (!allowedSenderIds.length || allowedSenderIds.some(id =>
+        !endpoint.people.some(person => person.id === id && !person.isBot) || endpoint.platform === 'telegram' && id !== endpoint.chatId))) {
+        throw new Error('Direct messages require explicitly allowed human senders');
+      }
+      this.setMeta(`source-access:${endpointId}`, JSON.stringify({ mode: input.mode, allowedSenderIds: [...new Set(allowedSenderIds)] }));
+      this.db.prepare(`UPDATE slack_sync_streams SET cursor=NULL,covered_through=NULL,scan_until=NULL,scan_oldest=NULL,
+        state='backfill',error=NULL,retry_at=NULL WHERE endpoint_id=?`).run(endpointId);
+      return this.getSourceAccess(endpointId);
+    });
+  }
+  getSourceRoute(endpointId: string, legacyRule?: AutoLinkRule): SourceRoute {
+    const endpoint = this.getEndpoint(endpointId);
+    if (!endpoint) throw new Error('Endpoint not found');
+    const saved = this.getMeta(`source-route:${endpointId}`);
+    if (saved !== undefined) {
+      try {
+        const route = JSON.parse(saved) as SourceRoute;
+        if (!['none', 'manual', 'auto'].includes(route.mode) || route.mode === 'auto' && (typeof route.cwd !== 'string' || !isLocalWorkspace(route.cwd))) throw new Error();
+        return { endpointId, mode: route.mode, ...(route.mode === 'auto' ? { cwd: route.cwd } : {}) };
+      } catch { return { endpointId, mode: 'none' }; }
+    }
+    if (this.bindingForEndpoint(endpointId)) return { endpointId, mode: 'manual' };
+    return this.matchesSourceRule(endpoint, legacyRule) ? { endpointId, mode: 'auto', cwd: legacyRule!.cwd } : { endpointId, mode: 'none' };
+  }
+  private matchesSourceRule(endpoint: Endpoint, rule?: AutoLinkRule): boolean {
+    return !!rule && rule.enabled === true && rule.platform === endpoint.platform && rule.accountId === endpoint.accountId && rule.chatId === endpoint.chatId && Array.isArray(rule.allowedSenderIds);
+  }
+  private legacySourceAll(endpointId: string, fallback = false): boolean {
+    const saved = this.getMeta(`source-access:${endpointId}`);
+    if (saved !== undefined) {
+      try {
+        const access = JSON.parse(saved) as { legacy?: boolean; allowAllSenders?: boolean };
+        if (access.legacy === true && typeof access.allowAllSenders === 'boolean') return access.allowAllSenders;
+      } catch { /* Invalid snapshots already resolve to off in getSourceAccess. */ }
+    }
+    return fallback;
+  }
+  getSourceAutoRule(endpointId: string, legacyRule?: AutoLinkRule): AutoLinkRule | undefined {
+    const endpoint = this.getEndpoint(endpointId);
+    if (!endpoint) throw new Error('Endpoint not found');
+    const route = this.getSourceRoute(endpointId);
+    const access = this.getSourceAccess(endpointId, legacyRule);
+    if (access.mode === 'off') return undefined;
+    if (route.mode === 'auto') return { id: `source:${endpointId}`, enabled: true, platform: endpoint.platform,
+      accountId: endpoint.accountId, chatId: endpoint.chatId, cwd: route.cwd!, allowedSenderIds: access.allowedSenderIds,
+      requireMention: access.mode === 'mention', allowAllSenders: access.legacy ? this.legacySourceAll(endpointId) : !this.isDirectMessage(endpoint) };
+    if (this.getMeta(`source-route:${endpointId}`) !== undefined || this.bindingForEndpoint(endpointId) || !this.matchesSourceRule(endpoint, legacyRule)) return undefined;
+    return access.legacy ? legacyRule : { ...legacyRule!, allowedSenderIds: access.allowedSenderIds,
+      requireMention: access.mode === 'mention', allowAllSenders: !this.isDirectMessage(endpoint) };
+  }
+  routeSource(endpointId: string, conversationId: string | null, automaticCwd?: string, legacyRule?: AutoLinkRule): SourceRoute {
+    return this.transaction(() => this.routeSourceInside(endpointId, conversationId, automaticCwd, undefined, legacyRule));
+  }
+  routeSourceToThread(endpointId: string, input: { threadId: string; cwd: string; name: string }, recoveryIntentId?: string, legacyRule?: AutoLinkRule): SourceRoute {
+    return this.transaction(() => {
+      required(input.threadId, 'Native Codex thread'); required(input.cwd, 'Working directory');
+      if (recoveryIntentId !== undefined) {
+        const intent = this.getAutoLinkIntent(recoveryIntentId);
+        if (!intent || intent.endpointId !== endpointId || !['uncertain', 'failed', 'created'].includes(intent.status)) {
+          throw Object.assign(new Error('Выберите незавершённое автосоздание этого источника с подтверждённым отказом или неопределённым результатом.'), { statusCode: 409 });
+        }
+        if (intent.threadId && intent.threadId !== input.threadId) throw Object.assign(new Error('Выбранный разговор не совпадает с сохранённым результатом автосоздания.'), { statusCode: 409 });
+        if (!isLocalWorkspace(input.cwd) || workingDirectoryKey(intent.rule.cwd) !== workingDirectoryKey(input.cwd)) {
+          throw Object.assign(new Error('Рабочая папка не совпадает с принятым автосозданием.'), { statusCode: 409 });
+        }
+      }
+      const existing = this.db.prepare('SELECT id FROM conversations WHERE thread_id=?').get(input.threadId);
+      const conversation = existing ? this.getConversation(existing.id as string)! : this.writeConversation(input);
+      if (workingDirectoryKey(conversation.cwd) !== workingDirectoryKey(input.cwd)) throw new Error('Native Codex thread belongs to another working directory');
+      return this.routeSourceInside(endpointId, conversation.id, undefined, recoveryIntentId, legacyRule);
+    });
+  }
+  private routeSourceInside(endpointId: string, conversationId: string | null, automaticCwd?: string, recoveryIntentId?: string, legacyRule?: AutoLinkRule): SourceRoute {
+    const endpoint = this.getEndpoint(endpointId);
+    if (!endpoint) throw new Error('Endpoint not found');
+    if (automaticCwd !== undefined && (conversationId !== null || !isLocalWorkspace(automaticCwd))) throw new Error('Choose an absolute local working directory for automatic creation');
+    if (conversationId !== null && !this.getConversation(conversationId)) throw new Error('Conversation not found');
+    const previous = this.bindingForEndpoint(endpointId);
+    const mode = conversationId !== null ? 'manual' : automaticCwd !== undefined ? 'auto' : 'none';
+    const route = this.getSourceRoute(endpointId);
+    const unchanged = (previous?.conversationId ?? null) === conversationId && route.mode === mode && route.cwd === automaticCwd &&
+      (mode !== 'none' || this.getMeta(`source-route:${endpointId}`) !== undefined);
+    if (!unchanged && this.db.prepare(`SELECT 1 FROM requests WHERE json_extract(origin,'$.endpointId')=?
+      AND status IN ('queued',${BLOCKING_REQUESTS}) LIMIT 1`).get(endpointId)) {
+      throw Object.assign(new Error('Завершите или отмените принятые запросы этого источника перед сменой разговора Codex.'), { statusCode: 409 });
+    }
+    const openIntent = this.db.prepare("SELECT id FROM auto_link_intents WHERE endpoint_id=? AND status<>'completed'").get(endpointId);
+    if (!unchanged && openIntent && openIntent.id !== recoveryIntentId) {
+      throw Object.assign(new Error('Принято автосоздание этого источника. Дождитесь результата или явно восстановите его через журнал автосоздания.'), { statusCode: 409 });
+    }
+    if (this.getMeta(`source-access:${endpointId}`) === undefined) {
+      if (previous && conversationId === null) this.setMeta(`source-access:${endpointId}`, JSON.stringify({
+        mode: previous.requireMention ? 'mention' : 'all', allowedSenderIds: previous.allowedSenderIds,
+        allowAllSenders: !!previous.allowAllSenders, legacy: true,
+      }));
+      else if (!previous) {
+        const access = this.getSourceAccess(endpointId, legacyRule);
+        this.setMeta(`source-access:${endpointId}`, JSON.stringify(access.legacy ? { mode: access.mode,
+          allowedSenderIds: access.allowedSenderIds, allowAllSenders: !!legacyRule?.allowAllSenders, legacy: true,
+        } : { mode: 'off', allowedSenderIds: [] }));
+      }
+    }
+    if (previous && previous.conversationId !== conversationId) {
+      if (conversationId === null) this.db.prepare('DELETE FROM bindings WHERE id=?').run(previous.id);
+      else this.db.prepare('UPDATE bindings SET conversation_id=? WHERE id=?').run(conversationId, previous.id);
+      if (endpoint.platform === 'slack') this.resetSlackSyncStream(previous.conversationId, endpointId);
+      this.db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(new Date().toISOString(), previous.conversationId);
+    } else if (!previous && conversationId !== null) {
+      this.writeBinding(conversationId, endpoint.platform, endpointId, this.getSourceAccess(endpointId).allowedSenderIds);
+    }
+    if (conversationId !== null) {
+      if (endpoint.platform === 'slack' && previous?.conversationId !== conversationId) this.resetSlackSyncStream(conversationId, endpointId);
+      this.db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(new Date().toISOString(), conversationId);
+    }
+    this.setMeta(`source-route:${endpointId}`, JSON.stringify({ mode, ...(automaticCwd !== undefined ? { cwd: automaticCwd } : {}) }));
+    return this.getSourceRoute(endpointId);
+  }
+  private sourceContextEnabled(endpointId: string): boolean { return this.getSourceAccess(endpointId).mode !== 'off'; }
+  private sourceSyncStream(row: Row): SlackSyncStream {
+    const stream = toSlackSyncStream(row);
+    if (stream.active && !this.sourceContextEnabled(stream.endpointId)) stream.active = false;
+    return stream;
+  }
   private writeBinding(conversationId: string, platform: Platform, endpointId: string, allowedSenderIds: string[], bindingId?: string, policy?: BindingPolicy): Binding {
     if (!this.getConversation(conversationId)) throw new Error('Conversation not found');
     const previous = bindingId ? this.getBinding(conversationId, bindingId) : undefined;
@@ -400,6 +561,7 @@ export class Store {
       e.account_id, e.chat_id, e.thread_id FROM bindings b JOIN endpoints e ON e.id=b.endpoint_id
       JOIN conversations c ON c.id=b.conversation_id WHERE b.platform='slack'`).all();
     for (const row of rows) {
+      if (!this.sourceContextEnabled(row.endpoint_id as string)) continue;
       const id = randomUUID();
       const inserted = this.db.prepare(`INSERT OR IGNORE INTO slack_sync_streams
         (id,endpoint_id,conversation_id,codex_thread_id,account_id,chat_id,thread_id) VALUES (?,?,?,?,?,?,?)`)
@@ -423,14 +585,14 @@ export class Store {
       this.ensureSlackSyncStreams();
       return this.db.prepare(`SELECT s.*,c.paused,EXISTS(SELECT 1 FROM bindings b WHERE
         b.platform='slack' AND b.endpoint_id=s.endpoint_id AND b.conversation_id=s.conversation_id) AS active
-        FROM slack_sync_streams s JOIN conversations c ON c.id=s.conversation_id ORDER BY s.rowid`).all().map(toSlackSyncStream);
+        FROM slack_sync_streams s JOIN conversations c ON c.id=s.conversation_id ORDER BY s.rowid`).all().map(row => this.sourceSyncStream(row));
     });
   }
   getSlackSyncStream(id: string): SlackSyncStream | undefined {
     const row = this.db.prepare(`SELECT s.*,c.paused,EXISTS(SELECT 1 FROM bindings b WHERE
       b.platform='slack' AND b.endpoint_id=s.endpoint_id AND b.conversation_id=s.conversation_id) AS active
       FROM slack_sync_streams s JOIN conversations c ON c.id=s.conversation_id WHERE s.id=?`).get(id);
-    return row ? toSlackSyncStream(row) : undefined;
+    return row ? this.sourceSyncStream(row) : undefined;
   }
   updateSlackSyncStream(id: string, patch: Partial<Pick<SlackSyncStream, 'cursor' | 'coveredThrough' | 'scanUntil' | 'scanOldest' | 'state' | 'error' | 'retryAt'>>): SlackSyncStream {
     allowedPatch(patch, ['cursor', 'coveredThrough', 'scanUntil', 'scanOldest', 'state', 'error', 'retryAt']);
@@ -475,7 +637,7 @@ export class Store {
         row = prior;
       }
     }
-    if (!row) return undefined;
+    if (!row || !this.sourceContextEnabled(message.endpointId)) return undefined;
     const matchingRequest = requestId && this.getRequest(requestId)?.conversationId === row.conversation_id ? requestId : undefined;
     return this.writeSlackSyncEntry(row.id as string, message, matchingRequest);
   }
@@ -580,6 +742,15 @@ export class Store {
     return !(this.isBotMessage(message) && !message.directMention) &&
       (!group || !policy.requireMention || message.directMention === true) && allowedSenderIds.includes(message.sender.id);
   }
+  private acceptsSourceRequest(message: InboundMessage, binding: BindingPolicy & { allowedSenderIds: string[] }, rule?: AutoLinkRule): boolean {
+    const access = this.getSourceAccess(message.endpoint.id, rule);
+    if (access.mode === 'off') return false;
+    if (access.legacy) return this.acceptsRequest(message, access.allowedSenderIds, {
+      allowAllSenders: this.legacySourceAll(message.endpoint.id, binding.allowAllSenders), requireMention: access.mode === 'mention',
+    });
+    return (access.mode !== 'mention' || message.directMention === true) && this.acceptsRequest(message, access.allowedSenderIds,
+      { allowAllSenders: !this.isDirectMessage(message.endpoint), requireMention: false });
+  }
   private writeRequest(message: InboundMessage, binding: Binding): ReleRequest {
     const endpoint = message.endpoint;
     const now = new Date().toISOString();
@@ -597,9 +768,10 @@ export class Store {
       const event = this.recordEvent(message);
       if (event.duplicate) return { request: event.requestId ? this.getRequest(event.requestId)! : null, duplicate: true };
       const binding = this.bindingForEndpoint(message.endpoint.id);
-      if (binding) return { request: !this.getConversation(binding.conversationId)!.paused && this.acceptsRequest(message, binding.allowedSenderIds, binding)
+      if (binding) return { request: !this.getConversation(binding.conversationId)!.paused && this.acceptsSourceRequest(message, binding)
         ? this.writeRequest(message, binding) : null, duplicate: false };
-      const intent = auto && this.acceptsAutoLink(message, auto.rule) ? this.recordAutoLink(message, auto) : undefined;
+      const rule = auto && this.getSourceAutoRule(message.endpoint.id, auto.rule);
+      const intent = auto && rule && this.acceptsAutoLink(message, rule) ? this.recordAutoLink(message, { ...auto, rule }) : undefined;
       return { request: null, duplicate: false, ...(intent ? { autoLinkIntent: intent } : {}) };
     });
   }
@@ -609,7 +781,7 @@ export class Store {
     const directMessage = this.isDirectMessage(endpoint);
     return !(directMessage && (rule.allowAllSenders || this.isBotMessage(message) || endpoint.platform === 'telegram' && message.sender.id !== endpoint.chatId)) && rule.enabled === true && !!rule.id?.trim() && !!rule.cwd?.trim() && typeof rule.requireMention === 'boolean' &&
       rule.platform === endpoint.platform && rule.accountId === endpoint.accountId && rule.chatId === endpoint.chatId &&
-      Array.isArray(rule.allowedSenderIds) && this.acceptsRequest(message, rule.allowedSenderIds, rule) &&
+      Array.isArray(rule.allowedSenderIds) && this.acceptsSourceRequest(message, rule, rule) &&
       (!rule.requireMention || directMessage || message.directMention === true) &&
       (!!message.audio || typeof message.text === 'string' && !!message.text.trim()) &&
       !/^(?:rele:cancel|\/rele_cancel(?:@[\w]+)?)(?:\s|$)/iu.test(message.text) &&
@@ -644,6 +816,8 @@ export class Store {
       if (!endpoint || !rule || typeof rule.id !== 'string' || !rule.id.trim() || typeof intent.targetFingerprint !== 'string' || !intent.targetFingerprint.trim()
         || typeof rule.requireMention !== 'boolean' || rule.enabled !== true || typeof rule.cwd !== 'string' || !rule.cwd.trim() || !Array.isArray(rule.allowedSenderIds)
         || rule.platform !== endpoint.platform || rule.accountId !== endpoint.accountId || rule.chatId !== endpoint.chatId) return undefined;
+      const effectiveRule = this.getSourceAutoRule(intent.endpointId, rule);
+      if (!effectiveRule || stableJson(effectiveRule) !== stableJson(rule)) return undefined;
       const changed = this.db.prepare(`UPDATE auto_link_intents SET status='creating',error=NULL,updated_at=?
         WHERE id=? AND status='pending' AND thread_id IS NULL AND NOT EXISTS(SELECT 1 FROM bindings b WHERE b.endpoint_id=auto_link_intents.endpoint_id)`)
         .run(new Date().toISOString(), id);
@@ -674,6 +848,8 @@ export class Store {
       let binding = this.bindingForEndpoint(intent.endpointId);
       if (!binding) {
         if (!intent.threadId || intent.status !== 'created') return undefined;
+        const effectiveRule = this.getSourceAutoRule(intent.endpointId, intent.rule);
+        if (!effectiveRule || stableJson(effectiveRule) !== stableJson(intent.rule)) return undefined;
         const existing = this.db.prepare('SELECT id FROM conversations WHERE thread_id=?').get(intent.threadId);
         const conversation = existing ? this.getConversation(existing.id as string)! : this.writeConversation({
           name: name ?? this.getEndpoint(intent.endpointId)!.title, threadId: intent.threadId, cwd: intent.rule.cwd });
@@ -690,7 +866,7 @@ export class Store {
       let blocked = false;
       for (const event of events) {
         const message = json<InboundMessage>(event.payload);
-        if (!this.acceptsRequest(message, binding.allowedSenderIds, binding)) { blocked = true; continue; }
+        if (!this.acceptsSourceRequest(message, binding)) { blocked = true; continue; }
         this.writeRequest(message, binding);
       }
       const now = new Date().toISOString();
@@ -714,12 +890,12 @@ export class Store {
   activeRequests(): ReleRequest[] {
     return this.db.prepare(`SELECT * FROM requests WHERE status IN ('queued',${BLOCKING_REQUESTS}) ORDER BY rowid`).all().map(toRequest);
   }
-  claimNextRequest(conversationId: string): ReleRequest | undefined {
+  claimNextRequest(conversationId: string, requestId?: string): ReleRequest | undefined {
     return this.transaction(() => {
       const row = this.db.prepare(`SELECT r.id FROM requests r JOIN conversations c ON c.id=r.conversation_id
-        WHERE r.conversation_id=? AND r.status='queued' AND c.paused=0
+        WHERE r.conversation_id=? AND r.status='queued' AND c.paused=0 AND (? IS NULL OR r.id=?)
         AND NOT EXISTS(SELECT 1 FROM requests active WHERE active.conversation_id=r.conversation_id AND active.status IN (${BLOCKING_REQUESTS}))
-        ORDER BY r.rowid LIMIT 1`).get(conversationId);
+        ORDER BY r.rowid LIMIT 1`).get(conversationId, requestId ?? null, requestId ?? null);
       if (!row) return undefined;
       const id = row.id as string;
       this.db.prepare("UPDATE requests SET status='starting',updated_at=? WHERE id=?").run(new Date().toISOString(), id);

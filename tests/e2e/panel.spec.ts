@@ -1,17 +1,5 @@
 import { expect, test } from '@playwright/test';
-import type {
-  CatalogChat,
-  CatalogPage,
-  Endpoint,
-} from '../../src/shared/types';
-import {
-  fixtureEndpoint,
-  fixtureRequest,
-  fixtureState,
-  installApi,
-  openPanel,
-  panelToken,
-} from './fixtures';
+import { fixtureEndpoint, fixtureRequest, fixtureState, installApi, openPanel, panelToken } from './fixtures';
 
 test('fragment authentication is cleaned, survives reload, and is removed at sign-out', async ({
   page,
@@ -24,7 +12,7 @@ test('fragment authentication is cleaned, survives reload, and is removed at sig
   ).toBe(panelToken);
   await page.reload();
   await expect(
-    page.getByRole('heading', { name: 'Связки', exact: true }),
+    page.getByRole('heading', { name: 'Связи', exact: true }),
   ).toBeVisible();
   await page.getByRole('button', { name: 'Выйти', exact: true }).click();
   await expect(
@@ -38,174 +26,6 @@ test('fragment authentication is cleaned, survives reload, and is removed at sig
   await expect(page.getByRole('alert')).toContainText('Токен панели не принят');
 });
 
-test('new binding uses named choices and sends both bindings atomically with explicit people', async ({
-  page,
-}) => {
-  const api = await installApi(page, fixtureState(true));
-  await openPanel(page);
-  await expect(
-    page.getByRole('heading', { name: 'Создайте первую связку' }),
-  ).toBeVisible();
-  await page
-    .getByRole('button', { name: 'Новая связка', exact: true })
-    .first()
-    .click();
-  const dialog = page.getByRole('dialog');
-  await dialog.getByLabel('Название связки').fill('Пример созданной связки');
-  await dialog
-    .getByLabel('Разговор Codex', { exact: true })
-    .selectOption('thread-new');
-  await dialog
-    .getByLabel('Чат Telegram', { exact: true })
-    .selectOption({ label: 'Пример: новый чат' });
-  await dialog
-    .getByLabel('Разговор Telegram', { exact: true })
-    .selectOption('tg-new');
-  await dialog
-    .getByRole('button', { name: 'Создать связку', exact: true })
-    .click();
-  await expect(dialog.getByRole('alert')).toContainText(
-    'разрешите хотя бы одного',
-  );
-  expect(api.mutations).toHaveLength(0);
-  await dialog.getByLabel('Анна (пример)').check();
-  await dialog
-    .getByLabel('Чат Slack', { exact: true })
-    .selectOption('sl-new-chat');
-  await dialog
-    .getByLabel('Разговор Slack', { exact: true })
-    .selectOption('sl-new');
-  await dialog.getByLabel('Михаил (пример)').last().check();
-  await dialog
-    .getByRole('button', { name: 'Создать связку', exact: true })
-    .click();
-  await expect(
-    dialog.getByRole('heading', {
-      name: 'Пример созданной связки',
-      exact: true,
-    }),
-  ).toBeVisible();
-  expect(api.mutations[0]).toMatchObject({
-    path: '/api/conversations',
-    body: {
-      name: 'Пример созданной связки',
-      threadId: 'thread-new',
-      bindings: [
-        {
-          platform: 'telegram',
-          endpointId: 'tg-new',
-          allowedSenderIds: ['person-anna'],
-        },
-        {
-          platform: 'slack',
-          endpointId: 'sl-new',
-          allowedSenderIds: ['person-mikhail'],
-        },
-      ],
-    },
-  });
-  await dialog.getByRole('button', { name: 'Закрыть', exact: true }).click();
-  await expect(page.getByRole('table')).toContainText(
-    'Пример созданной связки',
-  );
-});
-
-test('chat aliases can be saved with Enter and reset without submitting the binding', async ({
-  page,
-}) => {
-  const api = await installApi(page, fixtureState(true));
-  await openPanel(page);
-  await page
-    .getByRole('button', { name: 'Новая связка', exact: true })
-    .first()
-    .click();
-  const dialog = page.getByRole('dialog');
-  await dialog
-    .getByLabel('Разговор Codex', { exact: true })
-    .selectOption('thread-new');
-  await dialog
-    .getByLabel('Чат Telegram', { exact: true })
-    .selectOption({ label: 'Пример: новый чат' });
-  await dialog
-    .getByLabel('Разговор Telegram', { exact: true })
-    .selectOption('tg-new');
-  await dialog.getByLabel('Анна (пример)').check();
-  await dialog
-    .getByRole('button', {
-      name: 'Изменить название разговора Telegram только в Rele',
-      exact: true,
-    })
-    .click();
-  await dialog.getByLabel('Название чата в Rele').fill('Пример: старая тема');
-  await dialog.getByLabel('Название чата в Rele').press('Enter');
-  await expect(
-    dialog.getByLabel('Разговор Telegram', { exact: true }),
-  ).toContainText('Пример: старая тема');
-  expect(api.mutations).toEqual([
-    {
-      method: 'PATCH',
-      path: '/api/endpoints/tg-new',
-      body: { title: 'Пример: старая тема' },
-    },
-  ]);
-  await dialog
-    .getByRole('button', {
-      name: 'Изменить название разговора Telegram только в Rele',
-      exact: true,
-    })
-    .click();
-  await dialog
-    .getByRole('button', { name: 'Имя из мессенджера', exact: true })
-    .click();
-  await expect(
-    dialog.getByLabel('Разговор Telegram', { exact: true }),
-  ).toContainText('Пример: новый чат');
-  expect(api.mutations.at(-1)).toEqual({
-    method: 'PATCH',
-    path: '/api/endpoints/tg-new',
-    body: { title: '' },
-  });
-  expect(api.state.conversations).toEqual([]);
-});
-
-test('search, rename, pause and unlink are real API actions', async ({
-  page,
-}) => {
-  const api = await installApi(page);
-  await openPanel(page);
-  await page.getByLabel('Найти связку или чат').fill('alpha-dev');
-  await expect(page.getByRole('row')).toHaveCount(2);
-  await page
-    .getByRole('button', { name: 'Открыть связку Пример: проект Альфа' })
-    .click();
-  const dialog = page.getByRole('dialog');
-  await dialog.getByLabel('Название связки').fill('Пример: Альфа после правки');
-  await dialog.getByRole('button', { name: 'Сохранить название' }).click();
-  await expect(
-    dialog.getByRole('heading', { name: 'Пример: Альфа после правки' }),
-  ).toBeVisible();
-  await dialog
-    .getByRole('button', { name: 'Приостановить', exact: true })
-    .click();
-  await expect(
-    dialog.getByText('Связка приостановлена', { exact: true }),
-  ).toBeVisible();
-  await dialog
-    .locator('form')
-    .filter({ has: page.getByRole('heading', { name: 'Slack', exact: true }) })
-    .getByRole('button', { name: 'Отвязать', exact: true })
-    .click();
-  await expect(
-    dialog.getByText('Slack отвязан.', { exact: true }),
-  ).toBeVisible();
-  expect(api.mutations.map((item) => item.method)).toEqual([
-    'PATCH',
-    'PATCH',
-    'DELETE',
-  ]);
-  await page.keyboard.press('Escape');
-  await expect(dialog).not.toBeVisible();
-});
 
 test('queue cancels only a selected task, approvals preserve answers, uncertain delivery is not retried', async ({
   page,
@@ -303,6 +123,7 @@ test('queue cancels only a selected task, approvals preserve answers, uncertain 
     .toBe('/api/deliveries/delivery-1/retry');
 });
 
+
 test('uncertain launches can be reconciled and only an existing queued submission can be resumed', async ({
   page,
 }) => {
@@ -354,6 +175,7 @@ test('uncertain launches can be reconciled and only an existing queued submissio
   ]);
 });
 
+
 test('connection forms keep saved secrets write-only and report real API failures', async ({
   page,
 }) => {
@@ -387,533 +209,6 @@ test('connection forms keep saved secrets write-only and report real API failure
   ).toBeVisible();
 });
 
-test('mobile layout has no horizontal page overflow and dialog is keyboard accessible', async ({
-  page,
-}) => {
-  await page.setViewportSize({ width: 390, height: 844 });
-  await installApi(page);
-  await openPanel(page);
-  expect(
-    await page.evaluate(
-      () => document.documentElement.scrollWidth <= window.innerWidth,
-    ),
-  ).toBe(true);
-  await page.getByRole('button', { name: 'Новая связка', exact: true }).click();
-  await expect(page.getByRole('dialog')).toBeVisible();
-  await expect(page.getByLabel('Название связки')).toBeFocused();
-  expect(
-    await page.evaluate(
-      () => document.documentElement.scrollWidth <= window.innerWidth,
-    ),
-  ).toBe(true);
-  await page.keyboard.press('Escape');
-  await expect(page.getByRole('dialog')).not.toBeVisible();
-  await expect(
-    page.getByRole('button', { name: 'Новая связка', exact: true }),
-  ).toBeFocused();
-});
-
-test('Codex catalog searches previews and folders while occupied and archived conversations stay visible but disabled', async ({
-  page,
-}) => {
-  const api = await installApi(page);
-  await openPanel(page);
-  await page.getByRole('button', { name: 'Новая связка', exact: true }).click();
-  const dialog = page.getByRole('dialog');
-  const choice = dialog.getByLabel('Разговор Codex', { exact: true });
-  await dialog.getByLabel('Поиск разговоров Codex').fill('Обсуждение API');
-  await expect(choice.locator('option[value="thread-alpha"]')).toBeDisabled();
-  await expect(choice).toContainText('В связке «Пример: проект Альфа»');
-  await dialog.getByLabel('Поиск разговоров Codex').fill('/work/new');
-  await expect(choice.locator('option[value="thread-new"]')).toBeEnabled();
-  await expect(choice.locator('option[value="thread-alpha"]')).toHaveCount(0);
-  await dialog.getByLabel('Поиск разговоров Codex').fill('Старая идея');
-  await dialog.getByLabel('Показать архивные разговоры').check();
-  await expect(
-    choice.locator('option[value="thread-archived"]'),
-  ).toBeDisabled();
-  await expect(choice).toContainText('Пример: архивный проект');
-  await expect(
-    dialog.getByText(/сначала разархивируйте его в Codex/),
-  ).toBeVisible();
-  await expect(
-    dialog.getByRole('button', { name: 'Создать связку', exact: true }),
-  ).toBeDisabled();
-  expect(api.reads).toContain('/api/threads?archived=true');
-  expect(api.reads.some((url) => url.includes('refresh=true'))).toBe(false);
-  await dialog.getByRole('button', { name: 'Обновить разговоры', exact: true }).click();
-  await expect.poll(() => api.reads).toContain('/api/threads?archived=false&refresh=true');
-  await expect.poll(() => api.reads).toContain('/api/threads?archived=true&refresh=true');
-  await expect(choice.locator('option[value="thread-archived"]')).toBeDisabled();
-  expect(api.mutations).toEqual([]);
-});
-
-test('Slack catalog pages discover a direct chat, threads and explicit people without initial endpoints and can recover a catalog error', async ({
-  page,
-}) => {
-  const state = fixtureState(true);
-  state.endpoints = [];
-  const first = {
-    ...fixtureEndpoint(
-      'sl-catalog-first',
-      'slack',
-      'Пример: прошлое обсуждение',
-      'Личный разговор',
-    ),
-    chatId: 'chat-direct',
-    chatTitle: 'Анна (пример)',
-    people: [],
-  };
-  const target = {
-    ...first,
-    id: 'sl-catalog-target',
-    threadId: 'thread-target',
-    title: 'Пример: план API',
-  };
-  const api = await installApi(page, state, {
-    chats: [
-      {
-        items: [
-          {
-            id: 'chat-general',
-            name: '#example-general',
-            subtitle: 'Общий канал',
-            kind: 'channel',
-          },
-        ],
-        nextCursor: 'chats/page+2',
-      },
-      {
-        items: [
-          {
-            id: 'chat-direct',
-            name: 'Анна (пример)',
-            subtitle: 'Личный разговор',
-            kind: 'direct',
-          },
-        ],
-      },
-    ],
-    threads: {
-      'chat-direct': [
-        { items: [first], nextCursor: 'threads/page+2' },
-        { items: [target] },
-      ],
-    },
-    people: {
-      'sl-catalog-target': [
-        {
-          items: [{ id: 'person-anna', name: 'Анна (пример)' }],
-          nextCursor: 'people/page+2',
-        },
-        { items: [{ id: 'person-mikhail', name: 'Михаил (пример)' }] },
-      ],
-    },
-  });
-  let failThreads = true;
-  await page.route('**/api/catalog/slack/threads?*', async (route) => {
-    if (failThreads) {
-      failThreads = false;
-      await route.fulfill({
-        status: 503,
-        json: { error: 'Пример: каталог временно недоступен' },
-      });
-    } else await route.fallback();
-  });
-  await openPanel(page);
-  await page
-    .getByRole('button', { name: 'Новая связка', exact: true })
-    .first()
-    .click();
-  const dialog = page.getByRole('dialog');
-  await dialog
-    .getByLabel('Название связки', { exact: true })
-    .fill('Пример: связка из каталога');
-  await dialog
-    .getByLabel('Разговор Codex', { exact: true })
-    .selectOption('thread-new');
-  await dialog.getByLabel('Поиск каналов и личных чатов Slack').fill('Анна');
-  await expect(
-    dialog
-      .getByLabel('Чат Slack', { exact: true })
-      .locator('option[value="chat-direct"]'),
-  ).toHaveCount(0);
-  await dialog
-    .getByRole('button', { name: 'Загрузить ещё чаты Slack', exact: true })
-    .click();
-  await dialog
-    .getByLabel('Чат Slack', { exact: true })
-    .selectOption('chat-direct');
-  await expect(dialog.getByRole('alert')).toContainText(
-    'каталог временно недоступен',
-  );
-  await dialog
-    .getByRole('button', { name: 'Обновить треды Slack', exact: true })
-    .click();
-  await expect(
-    dialog.getByLabel('Разговор Slack', { exact: true }),
-  ).toContainText(first.title);
-  await dialog.getByLabel('Поиск тредов Slack').fill('план API');
-  await expect(
-    dialog.getByText('Среди загруженных тредов совпадений нет.', {
-      exact: true,
-    }),
-  ).toBeVisible();
-  await dialog
-    .getByRole('button', { name: 'Загрузить ещё треды Slack', exact: true })
-    .click();
-  await dialog
-    .getByLabel('Разговор Slack', { exact: true })
-    .selectOption(target.id);
-  await expect(
-    dialog.getByLabel('Анна (пример)', { exact: true }),
-  ).not.toBeChecked();
-  await dialog
-    .getByRole('button', { name: 'Создать связку', exact: true })
-    .click();
-  await expect(dialog.getByRole('alert')).toContainText(
-    'разрешите хотя бы одного',
-  );
-  expect(api.mutations).toEqual([]);
-  await dialog
-    .getByRole('button', {
-      name: 'Загрузить ещё участников Slack',
-      exact: true,
-    })
-    .click();
-  await dialog.getByLabel('Поиск участников Slack').fill('Михаил');
-  await dialog.getByLabel('Михаил (пример)', { exact: true }).check();
-  await dialog
-    .getByRole('button', { name: 'Создать связку', exact: true })
-    .click();
-  await expect(
-    dialog.getByRole('heading', {
-      name: 'Пример: связка из каталога',
-      exact: true,
-    }),
-  ).toBeVisible();
-  await expect
-    .poll(() => api.mutations)
-    .toContainEqual({
-      method: 'POST',
-      path: '/api/conversations',
-      body: {
-        name: 'Пример: связка из каталога',
-        threadId: 'thread-new',
-        cwd: '/work/new',
-        bindings: [
-          {
-            platform: 'slack',
-            endpointId: target.id,
-            allowedSenderIds: ['person-mikhail'],
-            allowAllSenders: false,
-            requireMention: false,
-          },
-        ],
-      },
-    });
-});
-
-test('Telegram groups forum topics for the current bot, preserves aliases and discovers a registered topic on refresh', async ({
-  page,
-}) => {
-  const state = fixtureState();
-  const forum: Endpoint = {
-    ...fixtureEndpoint('tg-forum', 'telegram', 'Пример: команда', ''),
-    chatId: 'forum-current',
-    threadId: '',
-    chatTitle: 'Пример: команда',
-    isForum: true,
-  };
-  const occupied = {
-    ...forum,
-    id: 'tg-topic-occupied',
-    threadId: 'topic-occupied',
-    title: 'Пример: занятая тема',
-    topicTitle: 'Занятая тема',
-  };
-  const free = {
-    ...forum,
-    id: 'tg-topic-free',
-    threadId: 'topic-free',
-    title: 'Пример: имя темы в Rele',
-    topicTitle: 'Исходное название темы',
-  };
-  state.endpoints = [
-    forum,
-    occupied,
-    free,
-    {
-      ...forum,
-      id: 'tg-old-account',
-      accountId: 'previous-bot',
-      chatTitle: 'Пример: старый бот',
-      title: 'Пример: старая группа',
-    },
-  ];
-  state.conversations = [
-    {
-      ...state.conversations[0],
-      bindings: [
-        {
-          id: 'binding-topic',
-          conversationId: state.conversations[0].id,
-          platform: 'telegram',
-          endpointId: occupied.id,
-          allowedSenderIds: ['person-anna'],
-        },
-      ],
-    },
-  ];
-  const api = await installApi(page, state);
-  await openPanel(page);
-  await page.getByRole('button', { name: 'Новая связка', exact: true }).click();
-  const dialog = page.getByRole('dialog');
-  await dialog
-    .getByLabel('Разговор Codex', { exact: true })
-    .selectOption('thread-new');
-  await expect(
-    dialog.getByLabel('Чат Telegram', { exact: true }),
-  ).not.toContainText('старый бот');
-  await dialog
-    .getByLabel('Чат Telegram', { exact: true })
-    .selectOption({ label: 'Пример: команда · Группа с темами' });
-  const choice = dialog.getByLabel('Разговор Telegram', { exact: true });
-  await expect(choice.locator('option[value="tg-forum"]')).toHaveCount(0);
-  await expect(
-    choice.locator('option[value="tg-topic-occupied"]'),
-  ).toBeDisabled();
-  await expect(choice).toContainText('В связке «Пример: проект Альфа»');
-  await expect(choice).toContainText('Пример: имя темы в Rele');
-  await expect(
-    dialog.getByRole('link', {
-      name: 'Выбрать группу в Telegram',
-      exact: true,
-    }),
-  ).toHaveAttribute(
-    'href',
-    'https://t.me/example_rele_bot?startgroup=rele_register',
-  );
-  await expect(dialog.getByText('/rele_register [имя]', { exact: true })).toBeVisible();
-  await expect(
-    dialog.getByText('/rele_register@example_rele_bot [имя]', { exact: true }),
-  ).toBeVisible();
-  await expect(dialog.getByText(/Если бот не отвечает в группе/)).toBeVisible();
-  const registered = {
-    ...forum,
-    id: 'tg-topic-registered',
-    threadId: 'topic-registered',
-    title: 'Пример: новая зарегистрированная тема',
-    topicTitle: 'Новая тема',
-  };
-  api.state.endpoints[0] = {
-    ...forum,
-    generalTopic: true,
-    title: 'Пример: команда / Общая тема',
-  };
-  api.state.endpoints.push(registered);
-  await dialog
-    .getByRole('button', {
-      name: 'Обновить обнаруженные чаты Telegram',
-      exact: true,
-    })
-    .click();
-  await expect(choice).toContainText(registered.title);
-  await expect(choice.locator('option[value="tg-forum"]')).toBeEnabled();
-  await choice.selectOption(forum.id);
-  await expect(choice).toHaveValue(forum.id);
-  await expect(choice).toContainText('Пример: команда / Общая тема');
-  expect(api.mutations).toEqual([]);
-  await choice.selectOption(registered.id);
-  await dialog.getByLabel('Анна (пример)', { exact: true }).check();
-  await dialog
-    .getByRole('button', { name: 'Создать связку', exact: true })
-    .click();
-  await expect
-    .poll(() => api.mutations.at(-1)?.body)
-    .toMatchObject({
-      bindings: [
-        {
-          platform: 'telegram',
-          endpointId: registered.id,
-          allowedSenderIds: ['person-anna'],
-        },
-      ],
-    });
-});
-
-test('a late Slack thread page never replaces the currently selected chat or thread', async ({
-  page,
-}) => {
-  const state = fixtureState(true);
-  state.endpoints = [];
-  const oldThread = {
-    ...fixtureEndpoint(
-      'sl-race-old',
-      'slack',
-      'Пример: старый ответ каталога',
-      '',
-    ),
-    chatId: 'chat-old',
-  };
-  const newThread = {
-    ...fixtureEndpoint('sl-race-new', 'slack', 'Пример: текущий тред', ''),
-    chatId: 'chat-new',
-  };
-  let releaseOld!: () => void;
-  let oldStarted = false;
-  const oldGate = new Promise<void>((resolve) => {
-    releaseOld = resolve;
-  });
-  const api = await installApi(page, state, {
-    chats: [
-      {
-        items: [
-          {
-            id: 'chat-old',
-            name: '#example-old',
-            subtitle: '',
-            kind: 'channel',
-          },
-          {
-            id: 'chat-new',
-            name: '#example-new',
-            subtitle: '',
-            kind: 'channel',
-          },
-        ],
-      },
-    ],
-    threads: {
-      'chat-old': [{ items: [oldThread] }],
-      'chat-new': [{ items: [newThread] }],
-    },
-    beforeThreads: async (chatId) => {
-      if (chatId === 'chat-old') {
-        oldStarted = true;
-        await oldGate;
-      }
-    },
-  });
-  await openPanel(page);
-  await page
-    .getByRole('button', { name: 'Новая связка', exact: true })
-    .first()
-    .click();
-  const dialog = page.getByRole('dialog');
-  await dialog
-    .getByLabel('Чат Slack', { exact: true })
-    .selectOption('chat-old');
-  await expect.poll(() => oldStarted).toBe(true);
-  await dialog
-    .getByLabel('Чат Slack', { exact: true })
-    .selectOption('chat-new');
-  await dialog
-    .getByLabel('Разговор Slack', { exact: true })
-    .selectOption(newThread.id);
-  releaseOld();
-  await expect.poll(() => api.completedThreadChats).toContain('chat-old');
-  await expect(dialog.getByLabel('Чат Slack', { exact: true })).toHaveValue(
-    'chat-new',
-  );
-  await expect(
-    dialog.getByLabel('Разговор Slack', { exact: true }),
-  ).toHaveValue(newThread.id);
-  await expect(
-    dialog.getByLabel('Разговор Slack', { exact: true }),
-  ).not.toContainText(oldThread.title);
-  expect(api.mutations).toEqual([]);
-});
-
-test('changing bot accounts resets catalogs and the Telegram picker while an old named binding can still be unlinked', async ({
-  page,
-}) => {
-  const state = fixtureState();
-  const originalSlackBindingId = state.conversations[0].bindings.find(binding => binding.platform === 'slack')!.id;
-  const catalog: {
-    chats: CatalogPage<CatalogChat>[];
-    telegram?: { botUrl?: string; command: string };
-  } = {
-    chats: [
-      {
-        items: [
-          {
-            id: 'old-workspace-chat',
-            name: '#example-old-workspace',
-            subtitle: '',
-            kind: 'channel',
-          },
-        ],
-      },
-    ],
-  };
-  const api = await installApi(page, state, catalog);
-  await openPanel(page);
-  await page
-    .getByRole('button', {
-      name: 'Открыть связку Пример: проект Альфа',
-      exact: true,
-    })
-    .click();
-  const dialog = page.getByRole('dialog');
-  const slack = dialog.getByLabel('Чат Slack', { exact: true });
-  await expect(slack).toContainText('#example-old-workspace');
-  catalog.chats = [
-    {
-      items: [
-        {
-          id: 'new-workspace-chat',
-          name: '#example-new-workspace',
-          subtitle: '',
-          kind: 'channel',
-        },
-      ],
-    },
-  ];
-  catalog.telegram = {
-    botUrl: 'https://t.me/example_new_bot?startgroup=rele_register',
-    command: '/rele_register@example_new_bot',
-  };
-  api.state.connections.slack.accountId = 'slack-new-account';
-  api.state.connections.telegram.accountId = 'telegram-new-account';
-  await dialog
-    .getByRole('button', {
-      name: 'Обновить обнаруженные чаты Telegram',
-      exact: true,
-    })
-    .click();
-  await expect(slack).toContainText('#example-new-workspace');
-  await expect(slack).not.toContainText('#example-old-workspace');
-  await expect(slack).not.toContainText('#alpha-dev');
-  await expect(
-    dialog.getByLabel('Чат Telegram', { exact: true }),
-  ).not.toContainText('Команда Альфа');
-  await expect(
-    dialog.getByRole('link', {
-      name: 'Выбрать группу в Telegram',
-      exact: true,
-    }),
-  ).toHaveAttribute('href', catalog.telegram.botUrl!);
-  await expect(
-    dialog.getByText(
-      /Сохранённый разговор «#alpha-dev» относится к другому подключению/,
-    ),
-  ).toBeVisible();
-  await expect(
-    dialog.getByText(
-      /Сохранённый разговор «Команда Альфа» относится к другому подключению/,
-    ),
-  ).toBeVisible();
-  await dialog
-    .locator('form')
-    .filter({ has: page.getByRole('heading', { name: 'Slack', exact: true }) })
-    .getByRole('button', { name: 'Отвязать', exact: true })
-    .click();
-  await expect
-    .poll(() => api.mutations.at(-1)?.path)
-    .toBe(`/api/conversations/conversation-0/bindings/${originalSlackBindingId}`);
-  expect(api.mutations.at(-1)?.method).toBe('DELETE');
-});
 
 test('network loss keeps last known data visible and can recover', async ({
   page,
@@ -922,11 +217,162 @@ test('network loss keeps last known data visible and can recover', async ({
   await openPanel(page);
   api.setOffline(true);
   await page.getByRole('button', { name: 'Обновить', exact: true }).click();
-  await expect(page.getByRole('alert')).toContainText(
+  await expect(page.getByRole('alert').filter({ hasText: 'Отображаются последние полученные данные' })).toContainText(
     'Отображаются последние полученные данные',
   );
   await expect(page.getByRole('table')).toContainText('Пример: проект Альфа');
   api.setOffline(false);
   await page.getByRole('button', { name: 'Повторить', exact: true }).click();
-  await expect(page.getByRole('alert')).not.toBeVisible();
+  await expect(page.getByRole('alert').filter({ hasText: 'Отображаются последние полученные данные' })).not.toBeVisible();
+  await page.getByRole('button', { name: 'Обновить', exact: true }).click();
+  await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
+test('routes several Telegram and Slack sources into the same Codex without changing access', async ({ page }) => {
+  const state = fixtureState();
+  const api = await installApi(page, state);
+  await openPanel(page);
+  await expect(page).toHaveTitle('Rele — Связи');
+  await expect(page.getByRole('tab', { name: 'Telegram', exact: true })).toHaveAttribute('aria-selected', 'true');
+  const target = page.getByLabel('Разговор Codex для Пример: новый чат', { exact: true });
+  await expect(target).toBeEnabled();
+  await target.selectOption('thread-alpha');
+  await expect.poll(() => state.conversations[0].bindings.some(item => item.endpointId === 'tg-new')).toBe(true);
+  await page.getByRole('tab', { name: 'Slack', exact: true }).click();
+  await page.getByLabel('Разговор Codex для #example-new', { exact: true }).selectOption('thread-alpha');
+  await expect.poll(() => state.conversations[0].bindings.some(item => item.endpointId === 'sl-new')).toBe(true);
+  expect(state.conversations.filter(item => item.threadId === 'thread-alpha')).toHaveLength(1);
+  expect(state.sourceAccess?.filter(item => ['tg-new', 'sl-new'].includes(item.endpointId)).every(item => item.mode === 'off')).toBe(true);
+  expect(api.mutations.every(item => item.method === 'PUT' && item.path.endsWith('/route'))).toBe(true);
+  expect(state.requests).toHaveLength(1);
+});
+
+test('lists unbound and unavailable discovered sources and searches their group and thread names', async ({ page }) => {
+  const state = fixtureState();
+  state.endpoints.push({ ...fixtureEndpoint('tg-inaccessible', 'telegram', 'Старый источник', 'Сохранённый тред'), available: false, accountId: 'previous-account' });
+  await installApi(page, state);
+  await openPanel(page);
+  await expect(page.getByRole('table')).toContainText('Пример: новый чат');
+  await expect(page.getByRole('table')).toContainText('Старый источник');
+  await page.getByLabel('Найти группу или тред', { exact: true }).fill('Документация');
+  await expect(page.getByRole('table')).toContainText('Документация');
+  await expect(page.getByRole('table')).not.toContainText('Команда Альфа');
+  await page.getByLabel('Найти группу или тред', { exact: true }).clear();
+  await page.getByRole('tab', { name: 'Slack', exact: true }).click();
+  await expect(page.getByRole('table')).toContainText('#example-new');
+  await expect(page.getByRole('table')).not.toContainText('Команда Альфа');
+});
+
+test('keeps the previous destination when a route update fails and supports explicit unlink', async ({ page }) => {
+  const state = fixtureState(); const api = await installApi(page, state);
+  await openPanel(page);
+  const select = page.getByLabel('Разговор Codex для Команда Альфа', { exact: true });
+  await expect(select).toHaveValue('thread-alpha');
+  api.setMutationError('Пример: назначение не сохранено');
+  await select.selectOption('thread-docs');
+  await expect(page.getByRole('alert')).toContainText('назначение не сохранено');
+  expect(state.conversations[0].bindings.some(item => item.endpointId === 'tg-alpha')).toBe(true);
+  api.setMutationError('');
+  await select.selectOption('');
+  await expect.poll(() => state.conversations.flatMap(item => item.bindings).some(item => item.endpointId === 'tg-alpha')).toBe(false);
+  expect(state.conversations).toHaveLength(3);
+  expect(state.requests).toHaveLength(1);
+  expect(api.mutations.at(-1)).toMatchObject({ method: 'PUT', path: '/api/endpoints/tg-alpha/route', body: { threadId: null } });
+});
+
+test('protects the route of an accepted task while other rows can still change', async ({ page }) => {
+  await installApi(page);
+  await openPanel(page);
+  await expect(page.getByLabel('Разговор Codex для Поддержка', { exact: true })).toBeDisabled();
+  await expect(page.getByLabel('Разговор Codex для Пример: новый чат', { exact: true })).toBeEnabled();
+});
+
+test('mobile source table and dialogs stay within the viewport and support keyboard dismissal', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await installApi(page); await openPanel(page);
+  await expect(page.getByRole('table')).toContainText('Команда Альфа');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  const trigger = page.getByRole('button', { name: 'Настройки источника Команда Альфа', exact: true });
+  await trigger.click();
+  await expect(page.getByRole('dialog')).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(trigger).toBeFocused();
+});
+
+test('fresh Slack DM discovery pages real endpoints into the table without enabling a route or access', async ({ page }) => {
+  const state = fixtureState(true); state.endpoints = [];
+  const direct = { ...fixtureEndpoint('discovered-dm', 'slack', 'Новая личная задача', 'Тред личного чата'), chatId: 'DANNA', threadId: '1792500000.000001', chatTitle: 'Анна (пример)' };
+  const api = await installApi(page, state, {
+    chats: [{ items: [{ id: 'CPUBLIC', name: '#команда', subtitle: 'Канал', kind: 'channel' }], nextCursor: 'dm-page' }, { items: [{ id: 'DANNA', name: 'Анна (пример)', subtitle: 'Личные сообщения', kind: 'direct' }] }],
+    threads: { DANNA: [{ items: [direct] }] },
+  });
+  await openPanel(page); await page.getByRole('tab', { name: 'Slack', exact: true }).click();
+  await page.getByRole('button', { name: 'Найти источники', exact: true }).first().click();
+  let dialog = page.getByRole('dialog');
+  await dialog.getByRole('button', { name: 'Загрузить ещё чаты Slack', exact: true }).click();
+  await dialog.getByLabel('Чат Slack', { exact: true }).selectOption('DANNA');
+  await dialog.getByLabel('Разговор Slack', { exact: true }).selectOption(direct.id);
+  await expect(page.getByRole('dialog').getByRole('heading', { name: direct.title, exact: true })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('table')).toContainText('Анна (пример)');
+  await expect(page.getByLabel(`Разговор Codex для ${direct.title}`, { exact: true })).toHaveValue('');
+  await expect(page.getByRole('table')).toContainText('Доступ выключен');
+  expect(api.mutations).toEqual([]);
+  expect(api.completedThreadChats).toEqual(['DANNA']);
+});
+
+test('a late Slack discovery page cannot replace the current chat or create a route', async ({ page }) => {
+  const state = fixtureState(true); state.endpoints = [];
+  const slow = { ...fixtureEndpoint('slow-source', 'slack', 'Старый медленный тред', 'Первый канал'), chatId: 'CSLOW' };
+  const fresh = { ...fixtureEndpoint('fresh-source', 'slack', 'Текущий тред', 'Второй канал'), chatId: 'CFRESH' };
+  let release!: () => void; let requested = false;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const api = await installApi(page, state, {
+    chats: [{ items: [{ id: 'CSLOW', name: '#медленный', subtitle: '', kind: 'channel' }, { id: 'CFRESH', name: '#текущий', subtitle: '', kind: 'channel' }] }],
+    threads: { CSLOW: [{ items: [slow] }], CFRESH: [{ items: [fresh] }] },
+    beforeThreads: async chatId => { if (chatId === 'CSLOW') { requested = true; await gate; } },
+  });
+  await openPanel(page); await page.getByRole('tab', { name: 'Slack', exact: true }).click();
+  await page.getByRole('button', { name: 'Найти источники', exact: true }).first().click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByLabel('Чат Slack', { exact: true }).selectOption('CSLOW');
+  await expect.poll(() => requested).toBe(true);
+  await dialog.getByLabel('Чат Slack', { exact: true }).selectOption('CFRESH');
+  await expect(dialog.getByLabel('Разговор Slack', { exact: true }).locator('option')).toContainText(['Не подключать', fresh.title]);
+  release();
+  await expect.poll(() => api.completedThreadChats.includes('CSLOW')).toBe(true);
+  await expect(dialog.getByLabel('Чат Slack', { exact: true })).toHaveValue('CFRESH');
+  await expect(dialog.getByLabel('Разговор Slack', { exact: true }).locator('option')).not.toContainText([slow.title]);
+  expect(api.mutations).toEqual([]);
+});
+
+test('local aliases save on Enter and reset without changing routing or access', async ({ page }) => {
+  const state = fixtureState(); const api = await installApi(page, state);
+  const original = structuredClone(state.conversations);
+  await openPanel(page);
+  await page.getByRole('button', { name: 'Настройки источника Команда Альфа', exact: true }).click();
+  let dialog = page.getByRole('dialog');
+  await dialog.getByRole('button', { name: 'Изменить название разговора Telegram только в Rele', exact: true }).click();
+  await dialog.getByLabel('Название чата в Rele').fill('Моё локальное название');
+  await dialog.getByLabel('Название чата в Rele').press('Enter');
+  await expect(dialog.getByRole('heading', { level: 2 })).toHaveText('Моё локальное название');
+  await dialog.getByRole('button', { name: 'Изменить название разговора Telegram только в Rele', exact: true }).click();
+  await dialog.getByRole('button', { name: 'Имя из мессенджера', exact: true }).click();
+  await expect(dialog.getByRole('heading', { level: 2 })).toHaveText('Команда Альфа');
+  expect(state.conversations).toEqual(original);
+  expect(api.mutations.map(item => item.body)).toEqual([{ title: 'Моё локальное название' }, { title: '' }]);
+});
+
+test('Telegram forum rows distinguish group and topic while a local alias keeps priority', async ({ page }) => {
+  const state = fixtureState(true);
+  state.endpoints = [{ ...fixtureEndpoint('forum-one', 'telegram', 'Команда / Поставки', 'Тема Telegram'), chatId: '-100100', threadId: '17', chatTitle: 'Команда', topicTitle: 'Поставки', isForum: true },
+    { ...fixtureEndpoint('forum-two', 'telegram', 'Особое локальное имя', 'Тема Telegram'), chatId: '-100100', threadId: '18', chatTitle: 'Команда', topicTitle: 'Учёт', isForum: true }];
+  await installApi(page, state); await openPanel(page);
+  const rows = page.getByRole('table').getByRole('row');
+  await expect(rows.nth(1).getByRole('cell').nth(0)).toContainText('Команда');
+  await expect(rows.nth(1).getByRole('cell').nth(1)).toContainText('Поставки');
+  await expect(rows.nth(1).getByRole('cell').nth(1)).not.toContainText('Команда /');
+  await expect(rows.nth(2).getByRole('cell').nth(1)).toContainText('Особое локальное имя');
 });

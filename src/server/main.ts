@@ -11,7 +11,7 @@ import { createApp } from './app.js';
 import { TelegramChannel } from './channels/telegram.js';
 import { SlackChannel } from './channels/slack.js';
 import type { ChannelCallbacks } from './channels/common.js';
-import { openPanel, serverStatus, stopServer } from './lifecycle.js';
+import { instanceDiagnostics, openPanel, serverStatus, stopServer } from './lifecycle.js';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const version = (JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')) as { version: string }).version;
@@ -23,6 +23,11 @@ async function main(): Promise<void> {
     process.stdout.write('Rele — локальный gateway Codex\n\nserve (по умолчанию)  запустить на 127.0.0.1\nopen [--print-url]   открыть панель работающего Rele\nstatus [--wait]      проверить готовность своего Rele\nstop                 штатно остановить свой Rele\ntoken                показать ключ локальной панели\nbackup [каталог]     создать снимок базы и настроек\ndiagnostics          показать состояние без секретов\n\nRELE_DATA_DIR — каталог данных; RELE_PORT — локальный порт (по умолчанию 3210).\n'); return;
   }
   if (!['serve', 'open', 'status', 'stop', 'token', 'backup', 'diagnostics'].includes(command)) throw new Error('Неизвестная команда. Используйте --help.');
+  if (command === 'diagnostics') {
+    const instance = await instanceDiagnostics(defaultDataDirectory(), version);
+    process.stdout.write(JSON.stringify({ version, platform: process.platform, arch: process.arch, node: process.version, instance, desktopVerified: false }, null, 2) + '\n');
+    return;
+  }
   const config = new ConfigStore(defaultDataDirectory());
   await config.load();
   if (command === 'token') { process.stdout.write(`${config.panelToken}\n`); return; }
@@ -43,11 +48,6 @@ async function main(): Promise<void> {
       await writeFile(path.join(destination, 'backup.json'), JSON.stringify({ version, createdAt: new Date().toISOString(), platform: process.platform, note: 'Stop Rele before restore. DPAPI secrets require the same Windows user and machine.' }, null, 2), { mode: 0o600 });
     } finally { store.close(); }
     process.stdout.write(`Резервная копия: ${destination}\n`); return;
-  }
-  if (command === 'diagnostics') {
-    let instance: unknown;
-    try { instance = JSON.parse(await readFile(path.join(config.directory, 'instance.json'), 'utf8')); } catch { instance = null; }
-    process.stdout.write(JSON.stringify({ version, platform: process.platform, arch: process.arch, node: process.version, dataDirectory: config.directory, instance, codexTransport: config.config.codex.transport, telegramEnabled: config.config.telegram.enabled, slackEnabled: config.config.slack.enabled, voiceEnabled: config.config.voice.enabled, desktopVerified: false }, null, 2) + '\n'); return;
   }
 
   const port = Number(process.env.RELE_PORT ?? 3210);

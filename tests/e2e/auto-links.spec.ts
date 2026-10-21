@@ -2,41 +2,6 @@ import { expect, test } from '@playwright/test';
 import type { CatalogChat, CatalogPage, Person } from '../../src/shared/types';
 import { fixtureEndpoint, fixtureState, installApi, openPanel } from './fixtures';
 
-test('several independent origins share one Codex conversation and edit only their own ACL', async ({ page }) => {
-  const state = fixtureState();
-  state.endpoints.push(fixtureEndpoint('tg-extra', 'telegram', 'Дополнительная тема', 'Другая тема'), fixtureEndpoint('sl-extra', 'slack', 'Дополнительный тред', '#extra'));
-  const api = await installApi(page, state);
-  const original = structuredClone(state.conversations[0].bindings);
-  await openPanel(page);
-  await page.getByRole('button', { name: 'Открыть связку Пример: проект Альфа', exact: true }).click();
-  const dialog = page.getByRole('dialog');
-  await dialog.getByRole('button', { name: 'Добавить ещё Telegram', exact: true }).click();
-  const telegram = dialog.getByRole('form', { name: 'Подключение Telegram 2', exact: true });
-  await telegram.getByLabel('Чат Telegram', { exact: true }).selectOption({ label: 'Дополнительная тема' });
-  await telegram.getByLabel('Разговор Telegram', { exact: true }).selectOption('tg-extra');
-  await telegram.getByLabel('Михаил (пример)').check();
-  await telegram.getByRole('button', { name: 'Сохранить Telegram', exact: true }).click();
-  await expect.poll(() => state.conversations[0].bindings.length).toBe(3);
-  await dialog.getByRole('button', { name: 'Добавить ещё Slack', exact: true }).click();
-  const slack = dialog.getByRole('form', { name: 'Подключение Slack 2', exact: true });
-  await slack.getByLabel('Чат Slack', { exact: true }).selectOption('sl-extra-chat');
-  await slack.getByLabel('Разговор Slack', { exact: true }).selectOption('sl-extra');
-  await slack.getByLabel('Анна (пример)').check();
-  await slack.getByRole('button', { name: 'Сохранить Slack', exact: true }).click();
-  await expect.poll(() => state.conversations[0].bindings.length).toBe(4);
-  expect(state.conversations[0].bindings.slice(0, 2)).toEqual(original);
-  await telegram.getByLabel('Анна (пример)').check();
-  await telegram.getByRole('button', { name: 'Сохранить Telegram', exact: true }).click();
-  await expect.poll(() => state.conversations[0].bindings.find(binding => binding.endpointId === 'tg-extra')?.allowedSenderIds).toEqual(['person-mikhail', 'person-anna']);
-  expect(state.conversations[0].bindings.find(binding => binding.endpointId === 'sl-extra')?.allowedSenderIds).toEqual(['person-anna']);
-  await telegram.getByRole('button', { name: 'Отвязать', exact: true }).click();
-  await expect.poll(() => state.conversations[0].bindings.length).toBe(3);
-  expect(state.conversations[0].bindings.some(binding => binding.endpointId === 'sl-extra')).toBe(true);
-  expect(api.mutations.filter(item => item.method === 'DELETE')).toHaveLength(1);
-  await dialog.getByRole('button', { name: 'Закрыть', exact: true }).click();
-  await expect(page.getByRole('table')).toContainText('Дополнительный тред');
-});
-
 test('automatic conversation creation is explicit, named, editable, and leaves existing bindings intact', async ({ page }) => {
   const state = fixtureState();
   const api = await installApi(page, state);
@@ -45,8 +10,8 @@ test('automatic conversation creation is explicit, named, editable, and leaves e
   page.on('pageerror', error => consoleErrors.push(error.message));
   page.on('console', message => { if (['error', 'warning'].includes(message.type())) consoleErrors.push(message.text()); });
   await openPanel(page);
-  await page.getByRole('button', { name: 'Подключения', exact: true }).click();
-  await expect(page).toHaveTitle('Rele — Подключения');
+  await page.getByRole('button', { name: 'Доступ', exact: true }).click();
+  await expect(page).toHaveTitle('Rele — Доступ');
   await expect(page.getByRole('heading', { name: 'Новые разговоры из мессенджера' })).toBeVisible();
   await page.getByRole('button', { name: 'Добавить правило', exact: true }).click();
   const dialog = page.getByRole('dialog');
@@ -80,13 +45,14 @@ test('automatic conversation creation is explicit, named, editable, and leaves e
   await page.screenshot({ path: '/tmp/rele-auto-links-mobile.png', fullPage: false });
 });
 
+
 test('private automatic rules require selected humans and uncertain creation stays visible without retrying', async ({ page }) => {
   const state = fixtureState();
   const direct = { ...fixtureEndpoint('private-people', 'slack', 'Личный чат с Анной', 'Личные сообщения'), chatId: 'DPRIVATE', people: [{ id: 'human', name: 'Анна лично' }, { id: 'agent', name: 'Агент (бот)', isBot: true }] };
   state.endpoints.push(direct);
   const api = await installApi(page, state);
   await openPanel(page);
-  await page.getByRole('button', { name: 'Подключения', exact: true }).click();
+  await page.getByRole('button', { name: 'Доступ', exact: true }).click();
   await page.getByRole('button', { name: 'Добавить правило', exact: true }).click();
   const dialog = page.getByRole('dialog');
   await dialog.getByLabel('Чат для новых разговоров').selectOption('DPRIVATE');
@@ -102,55 +68,15 @@ test('private automatic rules require selected humans and uncertain creation sta
   const rule = state.config.autoLinkRules![0];
   expect(rule).toMatchObject({ allowAllSenders: false, allowedSenderIds: ['human'] });
   state.autoLinks = [{ id: 'uncertain-example', endpointId: direct.id, rule, targetFingerprint: 'synthetic-hash', status: 'uncertain', error: 'Подтверждение создания не получено.', createdAt: '', updatedAt: '' }];
-  await page.getByRole('button', { name: 'Связки', exact: true }).click();
+  await page.getByRole('button', { name: 'Связи', exact: true }).click();
   await page.getByRole('button', { name: 'Обновить', exact: true }).click();
-  await page.getByRole('button', { name: 'Подключения', exact: true }).click();
+  await page.getByRole('button', { name: 'Доступ', exact: true }).click();
   const journal = page.getByLabel('Журнал автосоздания');
   await expect(journal).toContainText('Нужно проверить');
   await expect(journal).toContainText('Повторное создание автоматически не выполняется.');
   expect(api.mutations).toHaveLength(1);
 });
 
-
-test('editing an automatically created group binding preserves visible all-participant and mention policies', async ({ page }) => {
-  const state = fixtureState();
-  const binding = state.conversations[0].bindings.find(item => item.platform === 'slack')!;
-  Object.assign(binding, { allowAllSenders: true, requireMention: true, allowedSenderIds: [] });
-  state.endpoints.find(endpoint => endpoint.id === binding.endpointId)!.chatId = 'CGROUP';
-  const api = await installApi(page, state);
-  await openPanel(page);
-  await page.getByRole('button', { name: 'Открыть связку Пример: проект Альфа', exact: true }).click();
-  const form = page.getByRole('form', { name: 'Подключение Slack 1', exact: true });
-  await expect(form.getByLabel('Разрешить всем участникам группы, включая агентов')).toBeChecked();
-  await expect(form.getByLabel('В группах запускать только при упоминании подключённого агента')).toBeChecked();
-  await expect(form.getByText('Все участники этого канала или группы, включая других агентов, могут отправлять запросы.')).toBeVisible();
-  await form.getByRole('button', { name: 'Сохранить Slack', exact: true }).click();
-  await expect.poll(() => api.mutations.length).toBe(1);
-  expect(api.mutations[0]).toMatchObject({ method: 'PUT', path: `/api/conversations/conversation-0/bindings/${binding.id}`, body: { allowAllSenders: true, requireMention: true, allowedSenderIds: [] } });
-});
-
-
-test('changing an all-participant source explicitly resets both access policies before saving the new group', async ({ page }) => {
-  const state = fixtureState();
-  const binding = state.conversations[0].bindings.find(item => item.platform === 'slack')!;
-  Object.assign(binding, { allowAllSenders: true, requireMention: true, allowedSenderIds: [] });
-  state.endpoints.find(endpoint => endpoint.id === binding.endpointId)!.chatId = 'CORIGINAL';
-  state.endpoints.push({ ...fixtureEndpoint('replacement-group', 'slack', 'Другая группа', 'Другой источник'), chatId: 'CREPLACEMENT' });
-  const api = await installApi(page, state);
-  await openPanel(page);
-  await page.getByRole('button', { name: 'Открыть связку Пример: проект Альфа', exact: true }).click();
-  const form = page.getByRole('form', { name: 'Подключение Slack 1', exact: true });
-  await expect(form.getByLabel('Разрешить всем участникам группы, включая агентов')).toBeChecked();
-  await form.getByLabel('Чат Slack', { exact: true }).selectOption('CREPLACEMENT');
-  await form.getByLabel('Разговор Slack', { exact: true }).selectOption('replacement-group');
-  await expect(form.getByLabel('Разрешить всем участникам группы, включая агентов')).not.toBeChecked();
-  await expect(form.getByLabel('В группах запускать только при упоминании подключённого агента')).not.toBeChecked();
-  await form.getByLabel('Анна (пример)').check();
-  await form.getByRole('button', { name: 'Сохранить Slack', exact: true }).click();
-  await expect.poll(() => api.mutations.length).toBe(1);
-  expect(api.mutations[0]).toMatchObject({ method: 'PUT', body: { endpointId: 'replacement-group', allowedSenderIds: ['person-anna'], allowAllSenders: false, requireMention: false } });
-  expect(binding).toMatchObject({ endpointId: 'replacement-group', allowedSenderIds: ['person-anna'], allowAllSenders: false, requireMention: false });
-});
 
 
 test('fresh partial Slack catalog makes an unavailable cached DM selectable with a human-only rule', async ({ page }) => {
@@ -171,7 +97,7 @@ test('fresh partial Slack catalog makes an unavailable cached DM selectable with
   page.on('pageerror', error => consoleErrors.push(error.message));
   page.on('console', message => { if (['error', 'warning'].includes(message.type())) consoleErrors.push(message.text()); });
   await openPanel(page);
-  await page.getByRole('button', { name: 'Подключения', exact: true }).click();
+  await page.getByRole('button', { name: 'Доступ', exact: true }).click();
   await page.getByRole('button', { name: 'Добавить правило', exact: true }).click();
   const dialog = page.getByRole('dialog');
   const chat = dialog.getByLabel('Чат для новых разговоров');

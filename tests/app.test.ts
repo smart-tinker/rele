@@ -39,6 +39,7 @@ function makeApp() {
   });
   const engine = {
     channels: {} as Partial<Record<'telegram' | 'slack', Channel>>,
+    targetFingerprint: vi.fn().mockReturnValue('synthetic-app-target'),
     cancel: vi.fn().mockResolvedValue(undefined),
     resume: vi.fn().mockResolvedValue(undefined),
     reconcile: vi.fn().mockResolvedValue(undefined),
@@ -961,5 +962,380 @@ describe('automatic rules remain scoped to the selected Codex target', () => {
     expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [rule] } })).statusCode).toBe(400);
     expect(f.config.config.autoLinkRules[0].enabled).toBe(false);
     expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [{ ...rule, cwd: 'C:\\work\\example' }] } })).statusCode).toBe(200);
+  });
+});
+
+
+describe('source access and native thread routing', () => {
+  function attachSource(f: ReturnType<typeof makeApp>, patch: Partial<Endpoint> = {}) {
+    const endpoint: Endpoint = { ...f.endpoint, id: 'source-example', chatId: '-100001', threadId: '42', available: true,
+      people: [{ id: 'UANNA', name: 'Анна' }, { id: 'UAGENT', name: 'Другой агент', isBot: true }], ...patch };
+    f.store.upsertEndpoint(endpoint);
+    const channel = { state: { configured: true, connected: true, accountId: endpoint.accountId },
+      start: vi.fn(), stop: vi.fn(), deliver: vi.fn(), download: vi.fn(),
+      listPeople: vi.fn().mockResolvedValue({ items: endpoint.people }) };
+    f.engine.channels[endpoint.platform] = channel;
+    return { endpoint, channel };
+  }
+  function put(f: ReturnType<typeof makeApp>, endpoint: Endpoint, operation: 'access' | 'route', payload: Record<string, unknown>) {
+    return f.app.inject({ method: 'PUT', url: `/api/endpoints/${endpoint.id}/${operation}`, headers, payload });
+  }
+
+  it('authenticates new setters and leaves unbound discovered sources off without provisioning', async () => {
+    const f = makeApp(); const { endpoint } = attachSource(f);
+    for (const [operation, payload] of [['access', { mode: 'all' }], ['route', { threadId: 'thread-example' }]] as const) {
+      const url = `/api/endpoints/${endpoint.id}/${operation}`;
+      expect((await f.app.inject({ method: 'PUT', url, headers: { host: headers.host }, payload })).statusCode).toBe(401);
+      expect((await f.app.inject({ method: 'PUT', url, headers: { ...headers, origin: 'https://example.invalid' }, payload })).statusCode).toBe(403);
+    }
+    const state = (await f.app.inject({ url: '/api/state', headers })).json();
+    expect(state.sourceAccess.find((item: { endpointId: string }) => item.endpointId === endpoint.id)).toEqual({ endpointId: endpoint.id, mode: 'off', allowedSenderIds: [], legacy: false });
+    expect(state.sourceRoutes.find((item: { endpointId: string }) => item.endpointId === endpoint.id)).toEqual({ endpointId: endpoint.id, mode: 'none' });
+    expect(f.store.listConversations()).toEqual([]);
+    expect(f.store.listRequests()).toEqual([]);
+    expect(f.codex.listThreads).not.toHaveBeenCalled();
+  });
+
+  it('preserves legacy binding ACL until an explicit group mode changes reaction policy', async () => {
+    const f = makeApp(); const { endpoint } = attachSource(f);
+    const conversation = f.store.createConversation({ name: 'Локальное название', threadId: 'thread-example', cwd: '/work/example',
+      bindings: [{ platform: endpoint.platform, endpointId: endpoint.id, allowedSenderIds: ['UANNA'], requireMention: true }] });
+    const binding = structuredClone(conversation.bindings[0]);
+    expect(f.store.getSourceAccess(endpoint.id)).toMatchObject({ mode: 'mention', allowedSenderIds: ['UANNA'], legacy: true });
+    expect((await put(f, endpoint, 'access', { mode: 'off', allowedSenderIds: ['UAGENT'] })).statusCode).toBe(200);
+    expect(f.store.getSourceAccess(endpoint.id)).toMatchObject({ mode: 'off', allowedSenderIds: ['UANNA'] });
+    expect(f.store.getBinding(conversation.id, binding.id)).toEqual(binding);
+    expect((await put(f, endpoint, 'access', { mode: 'all' })).statusCode).toBe(200);
+    expect(f.store.getSourceAccess(endpoint.id)).toEqual({ endpointId: endpoint.id, mode: 'all', allowedSenderIds: [], legacy: false });
+    expect(f.store.getBinding(conversation.id, binding.id)).toEqual(binding);
+    expect((await put(f, endpoint, 'access', { mode: 'off' })).statusCode).toBe(200);
+    expect(f.store.getBinding(conversation.id, binding.id)).toEqual(binding);
+  });
+
+  it.each([{}, { mode: 'unknown' }, { mode: true }, { mode: 'all', arbitrary: true }, { mode: 'all', allowedSenderIds: 'everyone' }, { mode: 'all', allowedSenderIds: [''] }])('rejects malformed access policy: %j', async payload => {
+    const f = makeApp(); const { endpoint } = attachSource(f);
+    expect((await put(f, endpoint, 'access', payload)).statusCode).toBe(400);
+    expect(f.store.getSourceAccess(endpoint.id).mode).toBe('off');
+  });
+
+  it.each(['slack', 'telegram'] as const)('requires selected participating humans in a %s DM', async platform => {
+    const f = makeApp();
+    const humanId = platform === 'slack' ? 'UANNA' : '123456';
+    const { endpoint } = attachSource(f, { platform, chatId: platform === 'slack' ? 'DEXAMPLE' : humanId,
+      people: [{ id: humanId, name: 'Анна' }, { id: 'UAGENT', name: 'Агент', isBot: true }, { id: '999', name: 'Другой человек' }] });
+    for (const allowedSenderIds of [[], ['UAGENT'], ['unknown'], ...(platform === 'telegram' ? [['999']] : [])]) {
+      expect((await put(f, endpoint, 'access', { mode: 'all', allowedSenderIds })).statusCode).toBe(400);
+    }
+    expect((await put(f, endpoint, 'access', { mode: 'all', allowedSenderIds: [humanId, humanId] })).statusCode).toBe(200);
+    expect(f.store.getSourceAccess(endpoint.id)).toEqual({ endpointId: endpoint.id, mode: 'all', allowedSenderIds: [humanId], legacy: false });
+    expect((await put(f, endpoint, 'access', { mode: 'mention' })).statusCode).toBe(200);
+    expect(f.store.getSourceAccess(endpoint.id).allowedSenderIds).toEqual([humanId]);
+  });
+
+  it.each([{ available: false }, { accountId: 'previous-bot' }])('blocks enabling a stale source but permits disabling it offline: %j', async patch => {
+    const f = makeApp(); const { endpoint, channel } = attachSource(f);
+    if (patch.accountId !== undefined) channel.state.accountId = patch.accountId;
+    else f.store.upsertEndpoint({ ...endpoint, ...patch });
+    expect((await put(f, endpoint, 'access', { mode: 'all' })).statusCode).toBe(400);
+    channel.state.connected = false;
+    expect((await put(f, endpoint, 'access', { mode: 'off' })).statusCode).toBe(200);
+    expect(f.store.getSourceAccess(endpoint.id).mode).toBe('off');
+  });
+
+  it('preserves the Telegram forum-topic validation for active access and routing', async () => {
+    const f = makeApp(); const { endpoint } = attachSource(f, { isForum: true, threadId: '', generalTopic: false });
+    expect((await put(f, endpoint, 'access', { mode: 'all' })).statusCode).toBe(400);
+    expect((await put(f, endpoint, 'route', { threadId: 'thread-example' })).statusCode).toBe(400);
+    expect(f.codex.listThreads).not.toHaveBeenCalled();
+    expect((await put(f, endpoint, 'access', { mode: 'off' })).statusCode).toBe(200);
+    expect((await put(f, endpoint, 'route', { threadId: null })).statusCode).toBe(200);
+  });
+
+  it('serializes active access and route changes against configuration saves while keeping off and unlink available', async () => {
+    const f = makeApp(); const { endpoint, channel } = attachSource(f, { platform: 'slack', chatId: 'CGROUP' });
+    let resolvePeople!: (page: { items: Endpoint['people'] }) => void;
+    channel.listPeople.mockImplementationOnce(() => new Promise(resolve => { resolvePeople = resolve; }));
+    const access = put(f, endpoint, 'access', { mode: 'all' }).then(response => response);
+    await vi.waitFor(() => expect(channel.listPeople).toHaveBeenCalledOnce());
+    let completeSave!: () => void;
+    f.configure.mockImplementationOnce(async next => { await new Promise<void>(resolve => { completeSave = resolve; }); f.config.config = next; });
+    const saving = f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { voice: { language: 'en' } } }).then(response => response);
+    await vi.waitFor(() => expect(f.configure).toHaveBeenCalledOnce());
+    try {
+      resolvePeople({ items: endpoint.people });
+      expect((await access).statusCode).toBe(409);
+      expect((await put(f, endpoint, 'access', { mode: 'all' })).statusCode).toBe(409);
+      expect((await put(f, endpoint, 'route', { threadId: 'thread-example' })).statusCode).toBe(409);
+      expect((await put(f, endpoint, 'access', { mode: 'off' })).statusCode).toBe(200);
+      expect((await put(f, endpoint, 'route', { threadId: null })).statusCode).toBe(200);
+    } finally { completeSave(); }
+    expect((await saving).statusCode).toBe(200);
+    expect(f.store.getSourceAccess(endpoint.id).mode).toBe('off');
+    expect(f.store.listConversations()).toEqual([]);
+  });
+
+  it('discards Slack people from a replaced connector before writing source access', async () => {
+    const f = makeApp(); const { endpoint, channel } = attachSource(f, { platform: 'slack', chatId: 'DEXAMPLE' });
+    channel.listPeople.mockImplementationOnce(async () => {
+      f.engine.channels.slack = { ...channel, state: { ...channel.state, accountId: 'other-bot' } };
+      return { items: [{ id: 'UANNA', name: 'Анна' }] };
+    });
+    expect((await put(f, endpoint, 'access', { mode: 'all', allowedSenderIds: ['UANNA'] })).statusCode).toBe(409);
+    expect(f.store.getSourceAccess(endpoint.id).mode).toBe('off');
+  });
+
+  it('routes several sources to the same existing native ID without creating a native thread or duplicate Rele conversation', async () => {
+    const f = makeApp(); const createNative = vi.fn(); Object.assign(f.codex, { createThread: createNative });
+    const original = f.store.createConversation({ name: 'Мой alias', threadId: 'thread-example', cwd: '/work/example' });
+    for (let index = 0; index < 4; index++) {
+      const { endpoint } = attachSource(f, { id: `source-${index}`, platform: index < 2 ? 'telegram' : 'slack', chatId: index < 2 ? `-10000${index}` : `CGROUP${index}` });
+      expect((await put(f, endpoint, 'route', { threadId: 'thread-example' })).statusCode).toBe(200);
+      expect((await put(f, endpoint, 'route', { threadId: 'thread-example' })).statusCode).toBe(200);
+      expect(f.store.getSourceAccess(endpoint.id).mode).toBe('off');
+    }
+    expect(f.store.listConversations()).toHaveLength(1);
+    expect(f.store.getConversation(original.id)).toMatchObject({ name: 'Мой alias', threadId: 'thread-example', cwd: '/work/example' });
+    expect(f.store.getConversation(original.id)?.bindings).toHaveLength(4);
+    expect(f.codex.listThreads).toHaveBeenCalledWith({ refresh: true });
+    expect(createNative).not.toHaveBeenCalled();
+    expect(f.store.listRequests()).toEqual([]);
+  });
+
+  it('creates only Rele metadata for an unbound observed native thread and preserves accepted requests across later reassignment', async () => {
+    const f = makeApp(); const { endpoint } = attachSource(f);
+    expect((await put(f, endpoint, 'route', { threadId: 'thread-example' })).statusCode).toBe(200);
+    expect(f.store.listConversations()).toHaveLength(1);
+    expect(f.store.listConversations()[0]).toMatchObject({ name: 'Пример проекта', threadId: 'thread-example', cwd: '/work/example' });
+    expect((await put(f, endpoint, 'access', { mode: 'all' })).statusCode).toBe(200);
+    const message = { endpoint, eventId: 'accepted-before-move', messageId: 'message-1', sender: { id: '123456', name: 'Участник' }, text: 'Accepted task' };
+    const queued = f.store.ingest(message).request!;
+    expect(queued).not.toBeNull();
+    expect((await put(f, endpoint, 'route', { threadId: 'thread-other' })).statusCode).toBe(409);
+    expect(f.store.listConversations()).toHaveLength(1);
+    expect((await put(f, endpoint, 'route', { threadId: null })).statusCode).toBe(409);
+    f.store.finishRequest(queued.id, { status: 'completed' }, []);
+    const completed = structuredClone(f.store.getRequest(queued.id));
+    const bindingId = f.store.bindingForEndpoint(endpoint.id)!.id;
+    expect((await put(f, endpoint, 'route', { threadId: 'thread-other' })).statusCode).toBe(200);
+    expect(f.store.getRequest(queued.id)).toEqual(completed);
+    expect(f.store.bindingForEndpoint(endpoint.id)?.id).toBe(bindingId);
+    const next = f.store.ingest({ ...message, eventId: 'accepted-after-move', messageId: 'message-2' }).request!;
+    expect(next.conversationId).not.toBe(queued.conversationId);
+    expect(f.store.getConversation(next.conversationId)?.threadId).toBe('thread-other');
+  });
+
+  it.each([{}, { threadId: 'thread-example', autoCreateCwd: '/work' }, { threadId: 'thread-example', cwd: '/work' }, { threadId: 42 }, { autoCreateCwd: 'relative' }, { autoCreateCwd: '\\\\server\\share' }, { autoCreateCwd: 'C:\\work' }])('rejects malformed or wrong-platform routes without local or native creation: %j', async payload => {
+    const f = makeApp(); const { endpoint } = attachSource(f);
+    expect((await put(f, endpoint, 'route', payload)).statusCode).toBe(400);
+    expect(f.store.listConversations()).toEqual([]);
+    expect(f.store.getSourceRoute(endpoint.id).mode).toBe('none');
+  });
+
+  it.each(['missing', 'archived', 'relative'])('rejects a %s native catalog target without a copy or fallback', async kind => {
+    const f = makeApp(); const { endpoint } = attachSource(f);
+    f.codex.listThreads.mockResolvedValue(kind === 'missing' ? [] : [{ id: 'thread-example', name: 'Native thread', cwd: kind === 'relative' ? 'relative' : '/work/example', preview: '', updatedAt: 0, ...(kind === 'archived' ? { archived: true } : {}) }]);
+    expect((await put(f, endpoint, 'route', { threadId: 'thread-example' })).statusCode).toBe(400);
+    expect(f.store.listConversations()).toEqual([]);
+  });
+
+  it.each(['codex', 'channel'] as const)('fences a changed %s while validating the native catalog', async changed => {
+    const f = makeApp(); const { endpoint, channel } = attachSource(f);
+    f.codex.listThreads.mockImplementationOnce(async () => {
+      if (changed === 'codex') f.replaceCodex();
+      else f.engine.channels[endpoint.platform] = { ...channel, state: { ...channel.state, accountId: 'replacement-bot' } };
+      return [{ id: 'thread-example', name: 'Native', cwd: '/work/example', preview: '', updatedAt: 0 }];
+    });
+    expect((await put(f, endpoint, 'route', { threadId: 'thread-example' })).statusCode).toBe(409);
+    expect(f.store.listConversations()).toEqual([]);
+  });
+
+  it('stores per-source automatic routing without a global rule and unlinks while disconnected', async () => {
+    const f = makeApp(); const { endpoint } = attachSource(f);
+    f.codex.runtimeInfo.mockReturnValue({ platformOs: 'windows', platformFamily: 'windows', codexHome: 'C:\\Users\\Example\\.codex', userAgent: 'test' });
+    expect((await put(f, endpoint, 'route', { autoCreateCwd: 'C:\\work\\project' })).statusCode).toBe(200);
+    expect(f.store.getSourceRoute(endpoint.id)).toEqual({ endpointId: endpoint.id, mode: 'auto', cwd: 'C:\\work\\project' });
+    expect(f.store.getSourceAccess(endpoint.id).mode).toBe('off');
+    expect(f.config.config.autoLinkRules).toEqual([]);
+    expect(f.codex.listThreads).not.toHaveBeenCalled();
+    f.engine.channels = {};
+    expect((await put(f, endpoint, 'route', { threadId: null })).statusCode).toBe(200);
+    expect(f.store.getSourceRoute(endpoint.id).mode).toBe('none');
+  });
+
+  function autoIntent(f: ReturnType<typeof makeApp>, endpoint: Endpoint, status: 'pending' | 'creating' | 'uncertain' | 'failed' | 'created' = 'uncertain') {
+    f.store.routeSource(endpoint.id, null, '/work/example');
+    f.store.setSourceAccess(endpoint.id, { mode: 'all', allowedSenderIds: [] });
+    const rule = f.store.getSourceAutoRule(endpoint.id)!;
+    const received = f.store.ingest({ endpoint, eventId: `accepted-${endpoint.id}`, messageId: '100.000001', sender: { id: '123456', name: 'Участник' }, text: 'Previously accepted task' }, { rule, targetFingerprint: f.engine.targetFingerprint() });
+    const intent = received.autoLinkIntent!;
+    expect(intent).toBeDefined();
+    if (status !== 'pending') {
+      expect(f.store.claimAutoLinkIntent(intent.id)?.status).toBe('creating');
+      if (status !== 'creating') f.store.updateAutoLinkIntent(intent.id, { status, ...(status === 'created' ? { threadId: 'thread-example' } : {}) });
+    }
+    return f.store.getAutoLinkIntent(intent.id)!;
+  }
+
+  it('blocks ordinary reassignment of accepted auto-intent events before any local conversation is created', async () => {
+    const f = makeApp(); const { endpoint } = attachSource(f); const intent = autoIntent(f, endpoint, 'pending');
+    expect((await put(f, endpoint, 'route', { threadId: 'thread-other' })).statusCode).toBe(409);
+    expect(f.store.listConversations()).toEqual([]);
+    expect(f.store.listRequests()).toEqual([]);
+    expect(f.store.getAutoLinkIntent(intent.id)).toEqual(intent);
+  });
+
+  it.each(['pending', 'creating', 'uncertain', 'failed', 'created'] as const)('blocks legacy conversation creation for a %s auto-intent without leaving an orphan', async status => {
+    const f = makeApp(); const { endpoint } = attachSource(f); const intent = autoIntent(f, endpoint, status);
+    const response = await f.app.inject({ method: 'POST', url: '/api/conversations', headers, payload: {
+      name: 'Must not recover implicitly', threadId: 'thread-example', cwd: '/work/example',
+      bindings: [{ platform: endpoint.platform, endpointId: endpoint.id, allowedSenderIds: ['UANNA'] }],
+    } });
+    expect(response.statusCode, response.body).toBe(409);
+    expect(f.store.listConversations()).toEqual([]);
+    expect(f.store.bindingForEndpoint(endpoint.id)).toBeUndefined();
+    expect(f.store.listRequests()).toEqual([]);
+    expect(f.store.getAutoLinkIntent(intent.id)).toEqual(intent);
+  });
+
+  it.each(['add', 'legacy-add', 'scoped-target', 'legacy-target', 'scoped-origin', 'legacy-origin'] as const)('blocks legacy binding %s from implicitly resolving or moving an auto-intent', async path => {
+    const f = makeApp(); const { endpoint } = attachSource(f); const intent = autoIntent(f, endpoint);
+    const other = attachSource(f, { id: 'other-source', chatId: '-100002' }).endpoint;
+    const fromIntent = path.endsWith('origin');
+    if (fromIntent) f.store.routeSourceToThread(endpoint.id, { threadId: 'thread-example', cwd: '/work/example', name: 'Explicit recovery' }, intent.id);
+    const conversation = fromIntent
+      ? f.store.listConversations()[0]
+      : f.store.createConversation({ name: 'Existing', threadId: 'thread-example', cwd: '/work/example',
+        bindings: path.endsWith('target') ? [{ platform: other.platform, endpointId: other.id, allowedSenderIds: ['UANNA'] }] : [] });
+    const before = f.store.listConversations();
+    const isAdd = path === 'add';
+    const bindingId = path.startsWith('scoped') ? conversation.bindings[0].id : endpoint.platform;
+    const target = fromIntent ? other : endpoint;
+    const response = await f.app.inject({ method: isAdd ? 'POST' : 'PUT',
+      url: `/api/conversations/${conversation.id}/bindings${isAdd ? '' : `/${bindingId}`}`, headers,
+      payload: { ...(isAdd ? { platform: target.platform } : {}), endpointId: target.id, allowedSenderIds: ['UANNA'] },
+    });
+    expect(response.statusCode, response.body).toBe(409);
+    expect(f.store.listConversations()).toEqual(before);
+    expect(f.store.listRequests()).toEqual([]);
+    expect(f.store.getAutoLinkIntent(intent.id)).toEqual(intent);
+  });
+
+  it.each([{ threadId: null, resolveAutoLinkId: 'intent' }, { autoCreateCwd: '/work', resolveAutoLinkId: 'intent' }, { threadId: 'thread-example', resolveAutoLinkId: true }, { threadId: 'thread-example', resolveAutoLinkId: '' }])('rejects malformed explicit recovery: %j', async payload => {
+    const f = makeApp(); const { endpoint } = attachSource(f);
+    expect((await put(f, endpoint, 'route', payload)).statusCode).toBe(400);
+    expect(f.store.listConversations()).toEqual([]);
+    expect(f.codex.listThreads).not.toHaveBeenCalled();
+  });
+
+  it.each(['pending', 'creating'] as const)('rejects explicit recovery while an auto-intent is %s', async status => {
+    const f = makeApp(); const { endpoint } = attachSource(f); const intent = autoIntent(f, endpoint, status);
+    expect((await put(f, endpoint, 'route', { threadId: 'thread-example', resolveAutoLinkId: intent.id })).statusCode).toBe(409);
+    expect(f.store.listConversations()).toEqual([]);
+  });
+
+  it('rejects a foreign source, stale profile, unknown intent, wrong workspace or different acknowledged native ID during recovery', async () => {
+    const f = makeApp(); const { endpoint } = attachSource(f); const intent = autoIntent(f, endpoint, 'created');
+    const other = attachSource(f, { id: 'other-source', chatId: '-100002' }).endpoint;
+    expect((await put(f, other, 'route', { threadId: 'thread-example', resolveAutoLinkId: intent.id })).statusCode).toBe(404);
+    expect((await put(f, endpoint, 'route', { threadId: 'thread-example', resolveAutoLinkId: 'missing' })).statusCode).toBe(404);
+    f.engine.targetFingerprint.mockReturnValue('changed-profile');
+    expect((await put(f, endpoint, 'route', { threadId: 'thread-example', resolveAutoLinkId: intent.id })).statusCode).toBe(409);
+    f.engine.targetFingerprint.mockReturnValue(intent.targetFingerprint);
+    expect((await put(f, endpoint, 'route', { threadId: 'thread-other', resolveAutoLinkId: intent.id })).statusCode).toBe(409);
+    f.codex.listThreads.mockResolvedValue([{ id: 'different-ack-target', name: 'Та же рабочая папка', cwd: '/work/example', preview: '', updatedAt: 0 }]);
+    expect((await put(f, endpoint, 'route', { threadId: 'different-ack-target', resolveAutoLinkId: intent.id })).statusCode).toBe(409);
+    expect(f.store.listConversations()).toEqual([]);
+    expect(f.store.listRequests()).toEqual([]);
+  });
+
+  it('explicitly resolves an unknown create ACK into a selected existing native thread with the same workspace and no native creation', async () => {
+    const f = makeApp(); const { endpoint } = attachSource(f); const intent = autoIntent(f, endpoint);
+    const createNative = vi.fn(); Object.assign(f.codex, { createThread: createNative });
+    const response = await put(f, endpoint, 'route', { threadId: 'thread-example', resolveAutoLinkId: intent.id });
+    expect(response.statusCode, response.body).toBe(200);
+    expect(f.store.listConversations()).toHaveLength(1);
+    expect(f.store.listConversations()[0]).toMatchObject({ threadId: 'thread-example', cwd: intent.rule.cwd });
+    expect(f.store.bindingForEndpoint(endpoint.id)?.conversationId).toBe(f.store.listConversations()[0].id);
+    expect(createNative).not.toHaveBeenCalled();
+    expect(f.codex.listThreads).toHaveBeenCalledWith({ refresh: true });
+  });
+
+  it('rechecks the original recovery profile after awaiting the native catalog', async () => {
+    const f = makeApp(); const { endpoint } = attachSource(f); const intent = autoIntent(f, endpoint);
+    f.codex.listThreads.mockImplementationOnce(async () => {
+      f.engine.targetFingerprint.mockReturnValue('changed-during-catalog');
+      return [{ id: 'thread-example', name: 'Native', cwd: '/work/example', preview: '', updatedAt: 0 }];
+    });
+    expect((await put(f, endpoint, 'route', { threadId: 'thread-example', resolveAutoLinkId: intent.id })).statusCode).toBe(409);
+    expect(f.store.listConversations()).toEqual([]);
+  });
+
+  it('requires native queue support both when selecting automatic routing and when enabling it later', async () => {
+    const f = makeApp(); const { endpoint } = attachSource(f);
+    const status = f.codex.status();
+    const supported = vi.spyOn(f.codex, 'status').mockReturnValue({ ...status, queueSupported: false });
+    expect((await put(f, endpoint, 'route', { autoCreateCwd: '/work/example' })).statusCode).toBe(400);
+    expect(f.store.getSourceRoute(endpoint.id).mode).toBe('none');
+    supported.mockReturnValue(status);
+    expect((await put(f, endpoint, 'route', { autoCreateCwd: '/work/example' })).statusCode).toBe(200);
+    supported.mockReturnValue({ ...status, queueSupported: false });
+    expect((await put(f, endpoint, 'access', { mode: 'all' })).statusCode).toBe(400);
+    expect(f.store.getSourceAccess(endpoint.id).mode).toBe('off');
+  });
+
+  it('requires explicit auto sources to be disabled before a Codex target change and validates their workspace again on enable', async () => {
+    const f = makeApp(); const { endpoint } = attachSource(f);
+    expect((await put(f, endpoint, 'route', { autoCreateCwd: '/work/example' })).statusCode).toBe(200);
+    expect((await put(f, endpoint, 'access', { mode: 'all' })).statusCode).toBe(200);
+    const codex = { transport: 'websocket', endpoint: 'ws://127.0.0.1:9077' };
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { codex } })).statusCode).toBe(400);
+    expect(f.config.config.codex.transport).toBe('managed');
+    expect((await put(f, endpoint, 'access', { mode: 'off' })).statusCode).toBe(200);
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { codex } })).statusCode).toBe(200);
+    f.codex.runtimeInfo.mockReturnValue({ platformOs: 'windows', platformFamily: 'windows', codexHome: 'C:\\Users\\Example\\.codex', userAgent: 'test' });
+    expect((await put(f, endpoint, 'access', { mode: 'all' })).statusCode).toBe(400);
+    expect(f.store.getSourceAccess(endpoint.id).mode).toBe('off');
+    expect((await put(f, endpoint, 'route', { autoCreateCwd: 'C:\\work\\example' })).statusCode).toBe(200);
+    expect((await put(f, endpoint, 'access', { mode: 'all' })).statusCode).toBe(200);
+  });
+
+  it('preserves config-only legacy ACL when first assigning an existing native conversation', async () => {
+    const f = makeApp(); const { endpoint } = attachSource(f, { people: [{ id: '123456', name: 'Разрешённый человек' }] });
+    const rule = { id: 'legacy-group-before-attach', enabled: true, platform: endpoint.platform, accountId: endpoint.accountId, chatId: endpoint.chatId, cwd: '/legacy/automatic', allowedSenderIds: ['123456'], allowAllSenders: false, requireMention: true };
+    f.config.config.autoLinkRules = [rule];
+    expect((await put(f, endpoint, 'route', { threadId: 'missing-native' })).statusCode).toBe(400);
+    expect(f.store.getSourceAccess(endpoint.id).mode).toBe('off');
+    expect(f.store.getSourceAccess(endpoint.id, rule)).toMatchObject({ mode: 'mention', legacy: true, allowedSenderIds: ['123456'] });
+    expect((await put(f, endpoint, 'route', { threadId: 'thread-example' })).statusCode).toBe(200);
+    expect(f.store.getSourceAccess(endpoint.id)).toEqual({ endpointId: endpoint.id, mode: 'mention', allowedSenderIds: ['123456'], legacy: true });
+    const incoming = { endpoint, eventId: 'unlisted-after-manual-route', messageId: '200', sender: { id: '999999', name: 'Другой участник' }, text: 'Not allowed', directMention: true };
+    expect(f.store.ingest(incoming).request).toBeNull();
+    expect(f.store.ingest({ ...incoming, eventId: 'listed-after-manual-route', messageId: '201', sender: endpoint.people[0] }).request).not.toBeNull();
+    expect(f.config.config.autoLinkRules).toEqual([rule]);
+  });
+
+  it('preserves a config-only legacy DM allowlist when disabling offline and ignores client replacement IDs', async () => {
+    const f = makeApp(); const { endpoint } = attachSource(f, { chatId: '123456', people: [{ id: '123456', name: 'Анна' }, { id: 'UAGENT', name: 'Агент', isBot: true }] });
+    const rule = { id: 'legacy-dm-rule', enabled: true, platform: endpoint.platform, accountId: endpoint.accountId, chatId: endpoint.chatId, cwd: '/work/example', allowedSenderIds: ['123456'], requireMention: true };
+    f.config.config.autoLinkRules = [rule];
+    expect(f.store.getSourceAccess(endpoint.id, rule)).toMatchObject({ mode: 'mention', allowedSenderIds: ['123456'], legacy: true });
+    f.engine.channels = {};
+    expect((await put(f, endpoint, 'access', { mode: 'off', allowedSenderIds: ['UAGENT'] })).statusCode).toBe(200);
+    const state = (await f.app.inject({ url: '/api/state', headers })).json();
+    expect(state.sourceAccess.find((item: { endpointId: string }) => item.endpointId === endpoint.id)).toEqual({ endpointId: endpoint.id, mode: 'off', allowedSenderIds: ['123456'], legacy: false });
+    expect(f.config.config.autoLinkRules).toEqual([rule]);
+    expect(f.store.bindingForEndpoint(endpoint.id)).toBeUndefined();
+  });
+
+  it('shows legacy automatic routing while access is off and an explicit unlink suppresses only this source', async () => {
+    const f = makeApp(); const { endpoint } = attachSource(f);
+    f.config.config.autoLinkRules = [{ id: 'legacy-chat-rule', enabled: true, platform: endpoint.platform, accountId: endpoint.accountId, chatId: endpoint.chatId, cwd: '/work/example', allowedSenderIds: [], allowAllSenders: true, requireMention: true }];
+    const state = async () => (await f.app.inject({ url: '/api/state', headers })).json();
+    expect((await state()).sourceAccess.find((item: { endpointId: string }) => item.endpointId === endpoint.id)).toMatchObject({ mode: 'mention', legacy: true });
+    expect((await put(f, endpoint, 'access', { mode: 'off' })).statusCode).toBe(200);
+    expect((await state()).sourceRoutes.find((item: { endpointId: string }) => item.endpointId === endpoint.id)).toMatchObject({ mode: 'auto', cwd: '/work/example' });
+    expect((await put(f, endpoint, 'route', { threadId: null })).statusCode).toBe(200);
+    expect((await state()).sourceRoutes.find((item: { endpointId: string }) => item.endpointId === endpoint.id)).toMatchObject({ mode: 'none' });
+    expect(f.config.config.autoLinkRules[0].enabled).toBe(true);
   });
 });

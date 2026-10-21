@@ -91,7 +91,7 @@ describe('multiple origin bindings and v5 migration', () => {
     expect(upgraded.getConversation(original.id)?.bindings).toHaveLength(4);
     expect(upgraded.getConversation(original.id)?.threadId).toBe('native-original');
     const check = new DatabaseSync(file);
-    expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(5);
+    expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(6);
     expect(check.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(check.prepare('PRAGMA quick_check').get()?.quick_check).toBe('ok');
     check.close();
@@ -367,4 +367,262 @@ describe('persisted group sender policy', () => {
     expect(store.claimAutoLinkIntent(intent.id)).toBeUndefined();
     expect(store.getAutoLinkIntent(intent.id)?.status).toBe('pending');
   });
+});
+
+
+describe('source access and routing', () => {
+  it('fences older schema-five binaries without rewriting bindings, requests or source policies', () => {
+    const file = path(); const store = open(file); const ep = endpoint(); store.upsertEndpoint(ep);
+    const conversation = store.createConversation({ name: 'Retained', threadId: 'schema-fence', cwd: '/fixture', bindings: [
+      { platform: 'slack', endpointId: ep.id, allowedSenderIds: ['U1'] },
+    ] });
+    const accepted = store.ingest(message(ep, 'before-upgrade')).request!;
+    store.setSourceAccess(ep.id, { mode: 'off' });
+    const access = store.getSourceAccess(ep.id);
+    store.close();
+    const old = new DatabaseSync(file);
+    old.exec("DELETE FROM meta WHERE key='source-policy-version'; PRAGMA user_version=5;"); old.close();
+    const upgraded = open(file);
+    expect(upgraded.getConversation(conversation.id)).toEqual(conversation);
+    expect(upgraded.getRequest(accepted.id)).toEqual(accepted);
+    expect(upgraded.getSourceAccess(ep.id)).toEqual(access);
+    expect(upgraded.getMeta('source-policy-version')).toBe('1');
+    const check = new DatabaseSync(file);
+    expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(6);
+    expect(check.prepare('PRAGMA foreign_key_check').all()).toEqual([]); check.close();
+    expect(upgraded.ingest(message(ep, 'still-off')).request).toBeNull();
+  });
+
+  it('defaults new sources to off and preserves legacy ACL until access is explicitly chosen', () => {
+    const store = open(); const ep = endpoint(); store.upsertEndpoint(ep);
+    expect(store.getSourceAccess(ep.id)).toEqual({ endpointId: ep.id, mode: 'off', allowedSenderIds: [], legacy: false });
+    const conv = store.createConversation({ name: 'Existing', threadId: 'legacy-source', cwd: '/fixture', bindings: [
+      { platform: 'slack', endpointId: ep.id, allowedSenderIds: ['U1'] },
+    ] });
+    const binding = conv.bindings[0];
+    expect(store.getSourceAccess(ep.id)).toMatchObject({ mode: 'all', legacy: true, allowedSenderIds: ['U1'] });
+    expect(store.ingest(message(ep, 'legacy-denied', { sender: { id: 'UNEW', name: 'New member' } })).request).toBeNull();
+    store.setSourceAccess(ep.id, { mode: 'mention', allowedSenderIds: [] });
+    const peer = { id: 'UAGENT', name: 'Agent', isBot: true };
+    expect(store.ingest(message(ep, 'unmentioned-agent', { sender: peer })).request).toBeNull();
+    expect(store.ingest(message(ep, 'mentioned-agent', { sender: peer, directMention: true })).request).toBeTruthy();
+    store.setSourceAccess(ep.id, { mode: 'all' });
+    expect(store.ingest(message(ep, 'all-agent', { sender: peer })).request).toBeTruthy();
+    expect(store.getBinding(conv.id, binding.id)).toEqual(binding);
+  });
+
+  it('stops only the selected source while retaining accepted requests and captured context', () => {
+    const store = open(); const first = endpoint(); const second = endpoint('neighbor');
+    for (const ep of [first, second]) store.upsertEndpoint(ep);
+    const conv = store.createConversation({ name: 'Shared', threadId: 'off-shared', cwd: '/fixture', bindings: [first, second].map(ep =>
+      ({ platform: ep.platform, endpointId: ep.id, allowedSenderIds: ['U1'] })) });
+    const accepted = store.ingest(message(first, 'accepted-before-off')).request!;
+    const stream = store.listSlackSyncStreams().find(stream => stream.endpointId === first.id)!;
+    const captured = store.listSlackSyncEntries(stream.id);
+    store.setSourceAccess(first.id, { mode: 'off' });
+    expect(store.ingest(message(first, 'off-task')).request).toBeNull();
+    expect(store.listSlackSyncEntries(stream.id)).toEqual(captured);
+    expect(store.getSlackSyncStream(stream.id)?.active).toBe(false);
+    expect(store.ingest(message(second, 'neighbor-still-on')).request?.conversationId).toBe(conv.id);
+    expect(store.getRequest(accepted.id)).toEqual(accepted);
+    store.setSourceAccess(first.id, { mode: 'all' });
+    expect(store.ingest(message(first, 'off-task')).request).toBeNull();
+    expect(store.ingest(message(first, 'fresh-after-on')).request).toBeTruthy();
+  });
+
+  it('requires selected humans in direct messages and keeps explicit mention mode separate from legacy DM behavior', () => {
+    const store = open(); const human = { id: 'U1', name: 'Human' }; const bot = { id: 'UBOT', name: 'Bot', isBot: true };
+    const ep = { ...endpoint(), chatId: 'DPRIVATE', people: [human, bot] }; store.upsertEndpoint(ep);
+    const conv = store.createConversation({ name: 'DM', threadId: 'dm-access', cwd: '/fixture' });
+    store.routeSource(ep.id, conv.id);
+    expect(store.getSourceAccess(ep.id).mode).toBe('off');
+    for (const ids of [[], [bot.id], ['UNKNOWN']]) expect(() => store.setSourceAccess(ep.id, { mode: 'all', allowedSenderIds: ids })).toThrow(/human/);
+    store.setSourceAccess(ep.id, { mode: 'all', allowedSenderIds: [human.id] });
+    expect(store.ingest(message(ep, 'human-dm')).request).toBeTruthy();
+    expect(store.ingest(message(ep, 'bot-dm', { sender: bot, directMention: true })).request).toBeNull();
+    store.setSourceAccess(ep.id, { mode: 'mention' });
+    expect(store.ingest(message(ep, 'human-unmentioned')).request).toBeNull();
+    expect(store.ingest(message(ep, 'human-mentioned', { directMention: true })).request).toBeTruthy();
+    store.setSourceAccess(ep.id, { mode: 'off' });
+    expect(store.getSourceAccess(ep.id).mode).toBe('off');
+  });
+
+  it('moves a source atomically after completion while preserving binding identity and old destinations', () => {
+    const store = open(); const ep = endpoint(); store.upsertEndpoint(ep);
+    const original = store.createConversation({ name: 'Original', threadId: 'route-original', cwd: '/fixture', bindings: [
+      { platform: 'slack', endpointId: ep.id, allowedSenderIds: ['U1'] },
+    ] });
+    const target = store.createConversation({ name: 'Target', threadId: 'route-target', cwd: '/fixture' });
+    const binding = original.bindings[0]; const request = store.ingest(message(ep, 'original-task')).request!;
+    const oldStream = store.listSlackSyncStreams()[0];
+    for (const status of ['queued', 'running', 'uncertain'] as const) {
+      store.updateRequest(request.id, { status });
+      expect(() => store.routeSource(ep.id, target.id)).toThrow(/принятые запросы/);
+      expect(() => store.routeSourceToThread(ep.id, { name: 'Must roll back', threadId: `orphan-${status}`, cwd: '/fixture' })).toThrow(/принятые запросы/);
+      expect(store.listConversations()).toHaveLength(2);
+      expect(store.bindingForEndpoint(ep.id)).toEqual(binding);
+    }
+    store.finishRequest(request.id, { status: 'completed' }, []);
+    const accepted = store.getRequest(request.id);
+    expect(store.routeSource(ep.id, target.id)).toEqual({ endpointId: ep.id, mode: 'manual' });
+    expect(store.bindingForEndpoint(ep.id)).toEqual({ ...binding, conversationId: target.id });
+    expect(store.getRequest(request.id)).toEqual(accepted);
+    expect(store.getSlackSyncStream(oldStream.id)).toMatchObject({ active: false, codexThreadId: original.threadId });
+    expect(store.ingest(message(ep, 'new-destination')).request?.conversationId).toBe(target.id);
+  });
+
+  it('retains exact legacy ACL across unbinding, rebinding and automatic routing without widening sender access', () => {
+    const store = open(); const ep = endpoint(); store.upsertEndpoint(ep);
+    const selectedBot = { id: 'UAGENT', name: 'Selected agent', isBot: true }; const outsider = { id: 'UNEW', name: 'New member' };
+    const original = store.createConversation({ name: 'Legacy', threadId: 'legacy-rights', cwd: '/fixture', bindings: [
+      { platform: 'slack', endpointId: ep.id, allowedSenderIds: ['U1', selectedBot.id] },
+    ] });
+    const access = store.getSourceAccess(ep.id);
+    store.routeSource(ep.id, null);
+    expect(store.getSourceAccess(ep.id)).toEqual(access);
+    expect(store.getSourceRoute(ep.id).mode).toBe('none');
+    store.routeSource(ep.id, original.id);
+    expect(store.bindingForEndpoint(ep.id)?.allowedSenderIds).toEqual(['U1', selectedBot.id]);
+    expect(store.ingest(message(ep, 'legacy-outsider', { sender: outsider, directMention: true })).request).toBeNull();
+    expect(store.ingest(message(ep, 'legacy-bot-unmentioned', { sender: selectedBot })).request).toBeNull();
+    const request = store.ingest(message(ep, 'legacy-bot-called', { sender: selectedBot, directMention: true })).request!;
+    expect(request.conversationId).toBe(original.id);
+    store.finishRequest(request.id, { status: 'completed' }, []);
+    store.routeSource(ep.id, null, '/legacy-auto');
+    expect(store.getSourceAccess(ep.id)).toEqual(access);
+    const automatic = store.getSourceAutoRule(ep.id)!;
+    expect(automatic).toMatchObject({ allowAllSenders: false, allowedSenderIds: ['U1', selectedBot.id], requireMention: false });
+    expect(store.ingest(message(ep, 'auto-outsider', { sender: outsider, directMention: true }), auto(automatic)).autoLinkIntent).toBeUndefined();
+    expect(store.ingest(message(ep, 'auto-bot-unmentioned', { sender: selectedBot }), auto(automatic)).autoLinkIntent).toBeUndefined();
+    expect(store.ingest(message(ep, 'auto-bot-called', { sender: selectedBot, directMention: true }), auto(automatic)).autoLinkIntent).toBeTruthy();
+    store.setSourceAccess(ep.id, { mode: 'all', allowedSenderIds: [] });
+    expect(store.getSourceAccess(ep.id)).toMatchObject({ mode: 'all', legacy: false });
+    expect(store.getSourceAutoRule(ep.id)?.allowAllSenders).toBe(true);
+  });
+
+  it('retains legacy all-participant mention policy across automatic routing and fails closed on a corrupt snapshot', () => {
+    const store = open(); const ep = endpoint(); store.upsertEndpoint(ep);
+    store.createConversation({ name: 'Legacy group', threadId: 'legacy-all-rights', cwd: '/fixture', bindings: [
+      { platform: 'slack', endpointId: ep.id, allowedSenderIds: [], allowAllSenders: true, requireMention: true },
+    ] });
+    store.routeSource(ep.id, null, '/legacy-all-auto');
+    expect(store.getSourceAccess(ep.id)).toMatchObject({ mode: 'mention', legacy: true });
+    expect(store.getSourceAutoRule(ep.id)).toMatchObject({ requireMention: true, allowAllSenders: true, allowedSenderIds: [] });
+    store.setMeta(`source-access:${ep.id}`, JSON.stringify({ mode: 'all', allowedSenderIds: ['U1'], legacy: true }));
+    expect(store.getSourceAccess(ep.id)).toMatchObject({ mode: 'off', legacy: false });
+    expect(store.getSourceAutoRule(ep.id)).toBeUndefined();
+    expect(store.ingest(message(ep, 'corrupt-legacy', { directMention: true }), auto(rule(ep))).autoLinkIntent).toBeUndefined();
+  });
+
+  it('keeps an acknowledged native ID without binding or promoting after source access turns off', () => {
+    const store = open(); const ep = endpoint(); store.upsertEndpoint(ep);
+    store.routeSource(ep.id, null, '/source-project'); store.setSourceAccess(ep.id, { mode: 'all', allowedSenderIds: [] });
+    const effective = store.getSourceAutoRule(ep.id)!;
+    const intent = accept(store, message(ep, 'accepted-source-create'), auto(effective));
+    expect(store.claimAutoLinkIntent(intent.id)?.status).toBe('creating');
+    store.updateAutoLinkIntent(intent.id, { status: 'created', threadId: 'keep-acknowledged-native' });
+    store.setSourceAccess(ep.id, { mode: 'off' });
+    expect(store.finalizeAutoLinkIntent(intent.id)).toBeUndefined();
+    expect(store.bindingForEndpoint(ep.id)).toBeUndefined();
+    expect(store.listRequests()).toEqual([]);
+    expect(store.getAutoLinkIntent(intent.id)).toMatchObject({ status: 'created', threadId: 'keep-acknowledged-native' });
+  });
+
+  it('persists endpoint-only auto creation and explicit none independently from legacy chat rules', () => {
+    const file = path(); const store = open(file); const ep = endpoint(); const neighbor = { ...endpoint('same-chat-neighbor'), chatId: ep.chatId };
+    for (const value of [ep, neighbor]) store.upsertEndpoint(value);
+    const legacy = rule(ep);
+    expect(store.getSourceAutoRule(ep.id, legacy)).toEqual(legacy);
+    store.routeSource(ep.id, null, '/source-project');
+    expect(store.getSourceAutoRule(ep.id, legacy)).toBeUndefined();
+    expect(store.getSourceRoute(ep.id)).toEqual({ endpointId: ep.id, mode: 'auto', cwd: '/source-project' });
+    store.setSourceAccess(ep.id, { mode: 'mention', allowedSenderIds: [] });
+    const effective = store.getSourceAutoRule(ep.id)!;
+    expect(effective).toMatchObject({ id: `source:${ep.id}`, cwd: '/source-project', allowedSenderIds: [], allowAllSenders: true, requireMention: true });
+    expect(store.getSourceAutoRule(neighbor.id)).toBeUndefined();
+    expect(store.ingest(message(ep, 'no-mention'), auto(effective)).autoLinkIntent).toBeUndefined();
+    const intent = accept(store, message(ep, 'source-trigger', { directMention: true }), auto(effective));
+    expect(intent.rule).toEqual(effective);
+    expect(() => store.routeSource(ep.id, null)).toThrow(/автосоздание/);
+    store.setSourceAccess(ep.id, { mode: 'off' });
+    expect(store.getSourceAutoRule(ep.id, legacy)).toBeUndefined();
+    expect(store.claimAutoLinkIntent(intent.id)).toBeUndefined();
+    store.routeSource(neighbor.id, null);
+    expect(store.getSourceAutoRule(neighbor.id, legacy)).toBeUndefined();
+    store.close();
+    const reopened = open(file);
+    expect(reopened.getSourceRoute(ep.id, legacy)).toEqual({ endpointId: ep.id, mode: 'auto', cwd: '/source-project' });
+    expect(reopened.getSourceRoute(neighbor.id, legacy)).toEqual({ endpointId: neighbor.id, mode: 'none' });
+    expect(reopened.getSourceAccess(ep.id, legacy)).toMatchObject({ mode: 'off', legacy: false });
+    expect(reopened.getAutoLinkIntent(intent.id)).toEqual(intent);
+  });
+
+  it('preserves config-only legacy ACL on first manual or automatic route without enabling fresh sources', () => {
+    const store = open(); const selectedBot = { id: 'UAGENT', name: 'Agent', isBot: true };
+    const outsider = { id: 'UNEW', name: 'Other member' };
+    for (const mode of ['manual', 'auto', 'none'] as const) {
+      const ep = endpoint(`config-legacy-${mode}`); store.upsertEndpoint(ep);
+      const legacy = rule(ep, { allowedSenderIds: ['U1', selectedBot.id], requireMention: false });
+      const before = store.getSourceAccess(ep.id, legacy);
+      if (mode === 'manual') store.routeSourceToThread(ep.id, { threadId: 'manual-config-legacy', cwd: '/fixture', name: 'Existing' }, undefined, legacy);
+      else store.routeSource(ep.id, null, mode === 'auto' ? '/fixture' : undefined, legacy);
+      expect(store.getSourceAccess(ep.id)).toEqual(before);
+      const effective = store.getSourceAutoRule(ep.id, legacy);
+      expect(store.ingest(message(ep, `outsider-${mode}`, { sender: outsider, directMention: true }), effective && auto(effective)).request).toBeNull();
+      expect(store.ingest(message(ep, `agent-${mode}`, { sender: selectedBot }), effective && auto(effective)).autoLinkIntent).toBeUndefined();
+      if (mode === 'auto') expect(effective).toMatchObject({ allowAllSenders: false, allowedSenderIds: legacy.allowedSenderIds });
+    }
+    const fresh = endpoint('fresh-route'); store.upsertEndpoint(fresh);
+    store.routeSourceToThread(fresh.id, { threadId: 'fresh-native', cwd: '/fixture', name: 'Fresh' });
+    expect(store.getSourceAccess(fresh.id)).toMatchObject({ mode: 'off', legacy: false });
+  });
+
+  it('blocks ordinary rerouting while any accepted auto creation is unresolved and rolls back new metadata', () => {
+    const store = open();
+    for (const status of ['pending', 'creating', 'uncertain', 'failed', 'created'] as const) {
+      const ep = endpoint(`busy-intent-${status}`);
+      const intent = accept(store, message(ep, `accepted-${status}`), auto(rule(ep)));
+      if (status !== 'pending') store.updateAutoLinkIntent(intent.id, { status, ...(status === 'created' ? { threadId: `created-${status}` } : {}) });
+      const before = store.getAutoLinkIntent(intent.id);
+      expect(() => store.routeSource(ep.id, null)).toThrow(/автосоздание/);
+      expect(() => store.routeSource(ep.id, null, '/different')).toThrow(/автосоздание/);
+      expect(() => store.routeSourceToThread(ep.id, { threadId: `must-not-link-${status}`, cwd: '/fixture', name: 'No orphan' })).toThrow(/автосоздание/);
+      expect(store.listConversations()).toEqual([]);
+      expect(store.getAutoLinkIntent(intent.id)).toEqual(before);
+      expect(store.bindingForEndpoint(ep.id)).toBeUndefined();
+    }
+  });
+
+  it('recovers only the matching uncertain, failed or created intent and promotes its events once', () => {
+    const store = open();
+    for (const status of ['uncertain', 'failed', 'created'] as const) {
+      const ep = endpoint(`recover-${status}`); const selected = rule(ep, { cwd: 'c:\\fixture\\project\\' });
+      const intent = accept(store, message(ep, `recover-event-${status}`), auto(selected));
+      store.updateAutoLinkIntent(intent.id, { status, ...(status === 'created' ? { threadId: `native-${status}` } : {}) });
+      const input = { threadId: `native-${status}`, cwd: 'C:/fixture/project', name: 'Recovered' };
+      expect(() => store.routeSourceToThread(ep.id, { ...input, cwd: 'C:/different' }, intent.id)).toThrow(/папка/);
+      if (status === 'created') expect(() => store.routeSourceToThread(ep.id, { ...input, threadId: 'different-native' }, intent.id)).toThrow(/не совпадает/);
+      expect(store.listConversations()).toHaveLength(status === 'uncertain' ? 0 : status === 'failed' ? 1 : 2);
+      store.routeSourceToThread(ep.id, input, intent.id, selected);
+      const binding = store.bindingForEndpoint(ep.id)!;
+      expect(store.getConversation(binding.conversationId)).toMatchObject({ threadId: input.threadId, cwd: input.cwd });
+      expect(store.getAutoLinkIntent(intent.id)?.status).toBe(status);
+      expect(store.finalizeAutoLinkIntent(intent.id)?.id).toBe(binding.conversationId);
+      expect(store.listRequests().filter(request => request.origin.endpointId === ep.id)).toHaveLength(1);
+      expect(store.getAutoLinkIntent(intent.id)?.status).toBe('completed');
+      expect(() => store.routeSourceToThread(ep.id, input, intent.id)).toThrow(/автосоздание/);
+    }
+    const ep = endpoint('bad-recovery'); const intent = accept(store, message(ep), auto(rule(ep)));
+    const other = endpoint('other-recovery'); store.upsertEndpoint(other);
+    const input = { threadId: 'wrong-recovery', cwd: '/fixture', name: 'No orphan' };
+    expect(() => store.routeSourceToThread(ep.id, input, 'missing')).toThrow(/автосоздание/);
+    expect(() => store.routeSourceToThread(other.id, input, intent.id)).toThrow(/автосоздание/);
+    for (const status of ['pending', 'creating'] as const) {
+      store.updateAutoLinkIntent(intent.id, { status });
+      expect(() => store.routeSourceToThread(ep.id, input, intent.id)).toThrow(/автосоздание/);
+    }
+    expect(store.listConversations()).toHaveLength(3);
+    expect(store.bindingForEndpoint(ep.id)).toBeUndefined();
+  });
+
 });

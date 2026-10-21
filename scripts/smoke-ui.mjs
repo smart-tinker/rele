@@ -180,11 +180,11 @@ async function pageFor(address, launch = false) {
     : `${address}#token=${config.panelToken}`;
   await page.goto(loginUrl);
   await expect(
-    page.getByRole('heading', { name: 'Связки', exact: true }),
+    page.getByRole('heading', { name: 'Связи', exact: true }),
   ).toBeVisible();
   await expect(page).toHaveURL(address);
   await expect(
-    page.getByRole('heading', { name: 'Создайте первую связку', exact: true }),
+    page.getByRole('heading', { name: 'Нет источников Telegram', exact: true }),
   ).toBeVisible();
   if (launch) {
     assert.equal(
@@ -200,7 +200,7 @@ async function pageFor(address, launch = false) {
     );
     await page.reload();
     await expect(
-      page.getByRole('heading', { name: 'Связки', exact: true }),
+      page.getByRole('heading', { name: 'Связи', exact: true }),
     ).toBeVisible();
     await expect(page).toHaveURL(address);
     assert.equal(
@@ -233,23 +233,11 @@ async function catalogUnavailable(page, address) {
   ).toHaveCount(0);
   await page
     .getByRole('navigation')
-    .getByRole('button', { name: 'Связки', exact: true })
+    .getByRole('button', { name: 'Связи', exact: true })
     .click();
-  await page
-    .getByRole('button', { name: 'Новая связка', exact: true })
-    .first()
-    .click();
-  const dialog = page.getByRole('dialog');
-  await expect(
-    dialog.getByLabel('Разговор Codex', { exact: true }),
-  ).toBeDisabled();
-  await expect(
-    dialog.getByText('Codex не подключён.', { exact: false }),
-  ).toBeVisible();
-  await expect(
-    dialog.getByText('Нет свободных разговоров Codex.', { exact: false }),
-  ).toHaveCount(0);
-  await dialog.getByRole('button', { name: 'Закрыть', exact: true }).click();
+  await expect(page.getByText('Codex не подключён.', { exact: false })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Нет источников Telegram', exact: true })).toBeVisible();
+  await expect(page.getByRole('tab', { name: 'Telegram', exact: true })).toHaveAttribute('aria-selected', 'true');
 }
 
 try {

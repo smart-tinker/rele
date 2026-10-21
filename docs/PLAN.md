@@ -7,12 +7,12 @@
 | 1. Репозиторий и Codex | Репозиторий, рабочий PR, managed / proxy / WebSocket, точные версии 0.163.0 и 0.163.0-alpha.10.2 | Реальная Windows Desktop приёмка остаётся открытой |
 | 2. Локальное ядро | SQLite inbox/outbox, immutable origin, очередь, backup, recovery | Автоматические тесты и сценарии аварий |
 | 3. Telegram / Slack | Long polling / Socket Mode, имена, ACL, подтверждения, voice attachments | Автотесты плюс разрешённые настоящие тестовые чаты |
-| 4. Панель | Каталог Codex / Slack, обнаруженные чаты Telegram и регистрация тем, связки по названиям, очередь, доставка, настройки | Браузерные и production smoke сценарии |
+| 4. Панель | Каталог Codex / Slack, обнаруженные чаты Telegram и регистрация тем, таблица источников Telegram/Slack с общими Codex-разговорами, отдельный доступ, очередь, доставка, настройки | Браузерные и production smoke сценарии |
 | 5. Надёжность / голос | Корреляция, неопределённые состояния, mixed-turn защита, локальный worker | Автотесты, offline model proof, приёмка на целевых машинах |
 | 6. Установка | Windows Setup / native launcher / пользовательская задача; Debian / systemd; portable runtime; SHA-256; backup / restore | Реальные install → restart → upgrade → uninstall smoke обеих ОС плюс архивы |
 | 7. Выпуск | Автоматическая публикация только явного -rc.N после зелёного CI | Stable после фактического закрытия Desktop / messenger условий |
 
-Рабочий кандидат: **0.1.0-rc.5**. [Изменения rc.5](RC5.md): исправление списка участников Slack, короткая регистрация Telegram и быстрый каталог обычных разговоров Codex. Каталог разговоров: [issue #4](https://github.com/smart-tinker/rele/issues/4), [пользовательский сценарий](CATALOG.md). Установщики и автоматический поиск Codex: [установка](INSTALLATION.md), [issue #8](https://github.com/smart-tinker/rele/issues/8). Точные результаты и сборки доступны в GitHub Actions соответствующего commit. Первоначальные плановые варианты заменены проверенными решениями из [ARCHITECTURE.md](ARCHITECTURE.md).
+Рабочий кандидат: **0.1.0-rc.12**. [Изменения rc.12](RC12.md): таблица всех обнаруженных источников Telegram/Slack, несколько источников на один Codex-тред, отдельный доступ off/mention/all, явное восстановление автосоздания и диагностика без чтения конфигурации. Каталог разговоров: [issue #4](https://github.com/smart-tinker/rele/issues/4), [пользовательский сценарий](CATALOG.md). Установщики и автоматический поиск Codex: [установка](INSTALLATION.md), [issue #8](https://github.com/smart-tinker/rele/issues/8). Точные результаты и сборки доступны в GitHub Actions соответствующего commit. Первоначальные плановые варианты заменены проверенными решениями из [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Принятые ограничения
 
