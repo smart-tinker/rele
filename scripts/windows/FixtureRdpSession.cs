@@ -8,6 +8,23 @@ using System.Security.Principal;
 using System.Threading;
 using System.Windows.Forms;
 
+[ComVisible(true), Guid("336D5562-EFA8-482E-8CB3-C5C0FC7A7DB6"), InterfaceType(ComInterfaceType.InterfaceIsIDispatch)]
+public interface IFixtureRdpEvents
+{
+    [DispId(1)] void OnConnecting(); [DispId(2)] void OnConnected(); [DispId(3)] void OnLoginComplete();
+    [DispId(4)] void OnDisconnected(int reason); [DispId(10)] void OnFatalError(int code); [DispId(22)] void OnLogonError(int code);
+    [DispId(15)] void OnConfirmClose([Out, MarshalAs(UnmanagedType.VariantBool)] out bool allowClose);
+}
+[ComVisible(true), ClassInterface(ClassInterfaceType.None)]
+public sealed class FixtureRdpEvents : IFixtureRdpEvents
+{
+    private readonly Action<int, int> record; private readonly Func<bool> disposing;
+    public FixtureRdpEvents(Action<int, int> record, Func<bool> disposing) { this.record = record; this.disposing = disposing; }
+    public void OnConnecting() { record(1, 0); } public void OnConnected() { record(2, 0); } public void OnLoginComplete() { record(3, 0); }
+    public void OnDisconnected(int code) { record(4, code); } public void OnFatalError(int code) { record(10, code); } public void OnLogonError(int code) { record(22, code); }
+    public void OnConfirmClose(out bool allowClose) { allowClose = disposing(); record(15, allowClose ? 1 : 0); }
+}
+
 // Disposable CI-only loopback client. Credentials never leave this process's memory.
 public sealed class FixtureRdpSession : IDisposable
 {
@@ -15,6 +32,9 @@ public sealed class FixtureRdpSession : IDisposable
     {
         internal RdpHost() : base("8B918B82-7985-4C24-89DF-C33AD2BBFBCD") { }
         internal object Client { get { return GetOcx(); } }
+        private ConnectionPointCookie cookie; private FixtureRdpEvents sink;
+        internal void Observe(Action<int, int> record, Func<bool> disposing) { sink = new FixtureRdpEvents(record, disposing); cookie = new ConnectionPointCookie(Client, sink, typeof(IFixtureRdpEvents)); }
+        protected override void DetachSink() { if (cookie != null) { cookie.Disconnect(); cookie = null; } sink = null; base.DetachSink(); }
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -37,7 +57,15 @@ public sealed class FixtureRdpSession : IDisposable
     private Form form;
     private Exception failure;
     private volatile int connected, extendedReason;
+    private readonly int[] eventCounts = new int[23];
+    private volatile int phase, phaseBeforeClose, disconnectedCode, fatalCode, logonCode, ownWtsCount, ownWtsState = -1, closeStatus = -1, closeError;
+    private volatile bool disposeRequested, closeConfirmed;
     public int SessionId { get; private set; }
+    public Dictionary<string, int> Diagnostics { get { return new Dictionary<string, int> {
+        { "phase", phase }, { "phaseBeforeClose", phaseBeforeClose }, { "connected", connected }, { "extendedReason", extendedReason }, { "connectingCount", eventCounts[1] }, { "connectedCount", eventCounts[2] }, { "loginCompleteCount", eventCounts[3] }, { "loginCompleteSeen", eventCounts[3] == 0 ? 0 : 1 },
+        { "disconnectedCount", eventCounts[4] }, { "disconnectedCode", disconnectedCode }, { "fatalCount", eventCounts[10] }, { "fatalCode", fatalCode }, { "logonCount", eventCounts[22] }, { "logonCode", logonCode },
+        { "ownWtsCount", ownWtsCount }, { "ownWtsState", ownWtsState }, { "confirmCloseCount", eventCounts[15] }, { "closeConfirmed", closeConfirmed ? 1 : 0 }, { "closeStatus", closeStatus }, { "closeErrorHResult", closeError } }; } }
+    private void Record(int id, int code) { phase = id; Interlocked.Increment(ref eventCounts[id]); if (id == 4) disconnectedCode = code; if (id == 10) fatalCode = code; if (id == 22) logonCode = code; if (id == 15 && code == 1) closeConfirmed = true; }
 
     public FixtureRdpSession(string user, string domain, SecureString password, string sid)
     {
@@ -70,6 +98,7 @@ public sealed class FixtureRdpSession : IDisposable
                     try
                     {
                         dynamic client = host.Client;
+                        host.Observe(Record, delegate { return disposeRequested; });
                         client.Server = "127.0.0.1"; client.UserName = user; client.Domain = domain;
                         client.DesktopWidth = 800; client.DesktopHeight = 600;
                         dynamic settings = client.AdvancedSettings9;
@@ -88,13 +117,15 @@ public sealed class FixtureRdpSession : IDisposable
                     try
                     {
                         dynamic client = host.Client; connected = (int)client.Connected; extendedReason = (int)client.ExtendedDisconnectReason;
+                        if (disposeRequested) { if (connected == 0 || closeConfirmed) window.Close(); return; }
+                        int count = 0;
                         foreach (Session session in Sessions())
-                            if (session.State == 0 && Owned(session.Id)) { SessionId = session.Id; ready.Set(); timer.Stop(); break; }
+                            if (Owned(session.Id)) { count++; ownWtsState = session.State; if (session.State == 0) { SessionId = session.Id; ready.Set(); } }
+                        ownWtsCount = count;
                     }
                     catch (Exception error) { failure = error; ready.Set(); window.Close(); }
                 };
                 Application.Run(window);
-                try { dynamic client = host.Client; if ((int)client.Connected != 0) client.Disconnect(); } catch { }
             }
         }
         catch (Exception error) { failure = error; ready.Set(); }
@@ -134,7 +165,11 @@ public sealed class FixtureRdpSession : IDisposable
 
     public void Dispose()
     {
-        try { if (form != null && form.IsHandleCreated) form.BeginInvoke((Action)delegate { form.Close(); }); } catch (InvalidOperationException) { }
+        phaseBeforeClose = phase; disposeRequested = true;
+        try { if (form != null && form.IsHandleCreated) form.BeginInvoke((Action)delegate {
+            try { dynamic client = ((RdpHost)form.Controls[0]).Client; closeStatus = (int)client.RequestClose(); if (closeStatus == 0) form.Close(); }
+            catch (Exception error) { closeError = error.HResult; form.Close(); }
+        }); } catch (InvalidOperationException) { }
         bool hostStopped = !thread.IsAlive || thread.Join(5000);
         foreach (Session session in Sessions())
         {

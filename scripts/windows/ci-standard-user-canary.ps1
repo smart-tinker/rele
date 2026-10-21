@@ -185,11 +185,12 @@ try {
         $stepName = @('child', 'rdp-session', 'rdp-setting', 'service-stop', 'service-startup', 'task', 'user', 'profile', 'fixture')[$cleanupStep++]
         try { & $action } catch { $message = $_.Exception.Message; $cleanupFailures += @{ step = $stepName; hresult = ('0x{0:X8}' -f $_.Exception.HResult); message = $message.Substring(0, [Math]::Min(512, $message.Length)) } }
     }
-    if ($cleanupFailures.Count -ne 0) {
-        $publishedResult = Join-Path $sourceRoot 'windows-standard-user-results.json'
+    $publishedResult = Join-Path $sourceRoot 'windows-standard-user-results.json'
+    if (Test-Path -LiteralPath $publishedResult) {
         $result = Get-Content -LiteralPath $publishedResult -Raw | ConvertFrom-Json
-        $result.result = 'failed'; $result | Add-Member -NotePropertyName cleanupErrors -NotePropertyValue $cleanupFailures
+        if ($rdp) { $result | Add-Member -Force -NotePropertyName rdpDiagnostics -NotePropertyValue $rdp.Diagnostics }
+        if ($cleanupFailures.Count -ne 0) { $result.result = 'failed'; $result | Add-Member -NotePropertyName cleanupErrors -NotePropertyValue $cleanupFailures }
         $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $publishedResult -Encoding UTF8
-        throw 'The isolated Windows canary cleanup did not complete.'
     }
+    if ($cleanupFailures.Count -ne 0) { throw 'The isolated Windows canary cleanup did not complete.' }
 }
