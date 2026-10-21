@@ -26,6 +26,17 @@ async function fixture() {
   return { home, target, socketPath, executable, daemon, run, discovery, discover, env, options: { run, discover, env } };
 }
 
+async function packageFixture(root: string, version = '0.163.0'): Promise<string> {
+  const target = `${process.arch === 'x64' ? 'x86_64' : 'aarch64'}-${process.platform === 'win32' ? 'pc-windows-msvc' : 'unknown-linux-musl'}`;
+  const entrypoint = `bin/${process.platform === 'win32' ? 'codex.exe' : 'codex'}`;
+  const files = [entrypoint, `bin/${process.platform === 'win32' ? 'codex-code-mode-host.exe' : 'codex-code-mode-host'}`,
+    process.platform === 'win32' ? 'codex-path/rg.exe' : 'codex-path/rg',
+    ...(process.platform === 'win32' ? ['codex-resources/codex-command-runner.exe', 'codex-resources/codex-windows-sandbox-setup.exe'] : ['codex-resources/bwrap'])];
+  for (const file of files) { await mkdir(path.dirname(path.join(root, file)), { recursive: true }); await writeFile(path.join(root, file), 'synthetic-package-file', { mode: 0o755 }); }
+  await writeFile(path.join(root, 'codex-package.json'), JSON.stringify({ layoutVersion: 1, version, target, entrypoint }));
+  return path.join(root, entrypoint);
+}
+
 describe('native shared Codex lifecycle', () => {
   it('attaches an existing verified daemon without starting it or inspecting private Desktop owners', async () => {
     const f = await fixture();
@@ -41,15 +52,17 @@ describe('native shared Codex lifecycle', () => {
 
   it.each(['started', 'alreadyRunning'])('starts an absent native singleton with %s and never adds --json', async status => {
     const f = await fixture();
+    f.target.executable = await packageFixture(path.join(f.home, 'source-package'));
     f.run.mockImplementation(async (_command, args) => args.at(-1) === '--version' ? { code: 0, stdout: 'codex-cli 0.163.0\n' }
       : args.at(-1) === 'version' ? { code: 1, stdout: '' } : { code: 0, stdout: JSON.stringify({ ...f.daemon, status }) });
     await ensureSharedCodex(f.target, f.options);
-    expect(f.run.mock.calls.map(([, args]) => args).at(-1)).toEqual([f.target.executable, 'app-server', 'daemon', 'start']);
+    expect(f.run.mock.calls.map(([, args]) => args).at(-1)).toEqual(['app-server', 'daemon', 'start']);
     expect(f.run.mock.calls.some(([, args]) => args.includes('--json'))).toBe(false);
   });
 
   it('lets the native singleton recover its stale socket instead of creating a private server', async () => {
     const f = await fixture();
+    f.target.executable = await packageFixture(path.join(f.home, 'source-package'));
     await writeFile(f.socketPath, 'synthetic-stale-socket');
     f.run.mockImplementation(async (_command, args) => ({ code: args.at(-1) === 'version' ? 1 : 0,
       stdout: args.at(-1) === '--version' ? 'codex-cli 0.163.0' : JSON.stringify({ ...f.daemon, status: 'started' }) }));
@@ -74,6 +87,64 @@ describe('native shared Codex lifecycle', () => {
     f.discovery.issues.push({ code: 'process-owner-unavailable', message: 'Private diagnostic' });
     await expect(ensureSharedCodex(f.target, f.options)).rejects.toMatchObject({ code: 'shared-owner-unknown' });
     expect(f.run.mock.calls.some(([, args]) => args.at(-1) === 'start')).toBe(false);
+  });
+
+  it.each(['0.163.0', '0.163.0-alpha.11'])('selects a complete CLI instead of the preferred incomplete Desktop %s before starting', async desktopVersion => {
+    const f = await fixture();
+    const fullVersion = '0.163.0-alpha.11', full = await packageFixture(path.join(f.home, 'full-cli'), fullVersion);
+    f.discovery.installations.push(
+      { executable: f.target.executable, name: 'Standalone Desktop binary', source: 'desktop-install', version: desktopVersion, running: false },
+      { executable: full, name: 'Complete CLI', source: 'path', version: fullVersion, running: false },
+    );
+    f.run.mockImplementation(async (command, args) => ({ code: args.at(-1) === 'version' ? 1 : 0,
+      stdout: args.at(-1) === '--version' ? `codex-cli ${command === full ? fullVersion : desktopVersion}` : JSON.stringify({ ...f.daemon, status: 'started', managedCodexVersion: fullVersion }) }));
+    const target = { ...f.target, executable: 'codex' };
+    await ensureSharedCodex(target, f.options);
+    expect(f.run.mock.calls.filter(([, args]) => args.at(-1) === 'start').map(([command, args]) => [command, args])).toEqual([[full, ['app-server', 'daemon', 'start']]]);
+    expect(target.executable).toBe('codex');
+  });
+
+  it('does not substitute another complete CLI for an explicit standalone path', async () => {
+    const f = await fixture(), full = await packageFixture(path.join(f.home, 'full-cli'));
+    f.discovery.recommendedManaged = { ...f.target, executable: full, transport: 'managed' };
+    f.discovery.installations.push({ executable: full, name: 'Complete CLI', source: 'path', version: '0.163.0', running: false });
+    f.run.mockResolvedValueOnce({ code: 0, stdout: 'codex-cli 0.163.0' }).mockResolvedValue({ code: 1, stdout: '' });
+    await expect(ensureSharedCodex(f.target, f.options)).rejects.toMatchObject({ code: 'shared-package-incomplete', message: expect.stringContaining('полный пакет CLI') });
+    expect(f.run.mock.calls.some(([command]) => command === full)).toBe(false);
+    expect(f.run.mock.calls.some(([, args]) => args.at(-1) === 'start')).toBe(false);
+  });
+
+  it.each(['0.164.0', '0.163.0'])('rejects an unsupported package manifest even when discovery reports %s', async reportedVersion => {
+    const f = await fixture(), full = await packageFixture(path.join(f.home, 'unsupported-cli'), '0.164.0');
+    f.discovery.installations.push({ executable: full, name: 'Unsupported complete CLI', source: 'path', version: reportedVersion, running: false });
+    f.run.mockResolvedValueOnce({ code: 0, stdout: 'codex-cli 0.163.0' }).mockResolvedValue({ code: 1, stdout: '' });
+    await expect(ensureSharedCodex({ ...f.target, executable: 'codex' }, f.options)).rejects.toMatchObject({ code: 'shared-package-incomplete' });
+    expect(f.run.mock.calls.some(([command]) => command === full)).toBe(false);
+    expect(f.run.mock.calls.some(([, args]) => args.at(-1) === 'start')).toBe(false);
+  });
+
+  it('rejects a manifest-only partial package before native startup', async () => {
+    const f = await fixture();
+    f.target.executable = await packageFixture(path.join(f.home, 'partial-cli'));
+    await rm(path.join(path.dirname(f.target.executable), process.platform === 'win32' ? 'codex-code-mode-host.exe' : 'codex-code-mode-host'));
+    f.run.mockResolvedValueOnce({ code: 0, stdout: 'codex-cli 0.163.0' }).mockResolvedValue({ code: 1, stdout: '' });
+    await expect(ensureSharedCodex(f.target, f.options)).rejects.toMatchObject({ code: 'shared-package-incomplete' });
+    expect(f.run.mock.calls.some(([, args]) => args.at(-1) === 'start')).toBe(false);
+  });
+
+  it('accepts the complete native optional package behind an official npm wrapper without replacing its literal path', async () => {
+    const f = await fixture(), npm = path.join(f.home, 'node_modules', '@openai', 'codex');
+    const target = `${process.arch === 'x64' ? 'x86_64' : 'aarch64'}-${process.platform === 'win32' ? 'pc-windows-msvc' : 'unknown-linux-musl'}`;
+    const optional = path.join(f.home, 'node_modules', '@openai', `codex-${process.platform}-${process.arch}`);
+    await packageFixture(path.join(optional, 'vendor', target));
+    await writeFile(path.join(optional, 'package.json'), JSON.stringify({ name: `@openai/codex-${process.platform}-${process.arch}` }));
+    await mkdir(path.join(npm, 'bin'), { recursive: true });
+    await writeFile(path.join(npm, 'package.json'), JSON.stringify({ name: '@openai/codex' }));
+    f.target.executable = path.join(npm, 'bin', 'codex.js'); await writeFile(f.target.executable, '// synthetic official wrapper');
+    f.run.mockImplementation(async (_command, args) => ({ code: args.at(-1) === 'version' ? 1 : 0,
+      stdout: args.at(-1) === '--version' ? 'codex-cli 0.163.0' : JSON.stringify({ ...f.daemon, status: 'started' }) }));
+    await ensureSharedCodex(f.target, f.options);
+    expect(f.run.mock.calls.filter(([, args]) => args.at(-1) === 'start').map(([, args]) => args)).toEqual([[f.target.executable, 'app-server', 'daemon', 'start']]);
   });
 
   it('resolves automatic CLI discovery only in the selected profile', async () => {
@@ -182,6 +253,7 @@ describe('native shared Codex lifecycle', () => {
 
   it('keeps native startup failures sanitized without fallback to another runtime', async () => {
     const f = await fixture();
+    f.target.executable = await packageFixture(path.join(f.home, 'source-package'));
     f.run.mockResolvedValueOnce({ code: 0, stdout: 'codex-cli 0.163.0' }).mockResolvedValue({ code: 1, stdout: 'synthetic-private-error' });
     const error = await ensureSharedCodex(f.target, f.options).catch(error => error);
     expect(error).toMatchObject({ code: 'shared-daemon-unavailable' });
