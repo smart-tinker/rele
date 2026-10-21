@@ -406,6 +406,7 @@ try {
         $result = Get-Content -LiteralPath $publishedResult -Raw | ConvertFrom-Json
         if ($sharedOutcome) { $result | Add-Member -Force -NotePropertyName sharedPhase -NotePropertyValue $sharedOutcome }
         if ($rdp) { $result | Add-Member -Force -NotePropertyName rdpDiagnostics -NotePropertyValue $rdp.Diagnostics }
+        if ($MstscControl -and $rdp) { $result | Add-Member -NotePropertyName rdpWindows -NotePropertyValue ($rdp.MstscWindows.ToArray()) }
         $result | Add-Member -NotePropertyName rdpClient -NotePropertyValue $(if ($MstscControl) { 'mstsc' } else { 'activex' })
         $result | Add-Member -NotePropertyName rdpTransport -NotePropertyValue $rdpTransport
         $result | Add-Member -NotePropertyName rdpModeBefore -NotePropertyValue $rdpModeBefore

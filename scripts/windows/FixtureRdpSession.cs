@@ -6,6 +6,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Security.Principal;
+using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 using ComTypes = System.Runtime.InteropServices.ComTypes;
@@ -207,11 +208,30 @@ public sealed class FixtureRdpSession : IDisposable
     private static extern bool CredDeleteW(string target, uint type, uint flags);
     [DllImport("advapi32.dll", ExactSpelling = true)]
     private static extern void CredFree(IntPtr credential);
+    private delegate bool WindowCallback(IntPtr window, IntPtr parameter);
+    [DllImport("user32.dll", ExactSpelling = true)]
+    private static extern bool EnumWindows(WindowCallback callback, IntPtr parameter);
+    [DllImport("user32.dll", ExactSpelling = true)]
+    private static extern bool EnumChildWindows(IntPtr parent, WindowCallback callback, IntPtr parameter);
+    [DllImport("user32.dll", ExactSpelling = true)]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+    [DllImport("user32.dll", ExactSpelling = true)]
+    private static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern int GetClassNameW(IntPtr window, StringBuilder name, int capacity);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern int GetWindowTextW(IntPtr window, StringBuilder text, int capacity);
+    [DllImport("user32.dll", ExactSpelling = true)]
+    private static extern int GetDlgCtrlID(IntPtr window);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+    private static extern IntPtr SendMessageTimeoutW(IntPtr window, uint message, UIntPtr capacity, StringBuilder text, uint flags, uint timeout, out UIntPtr result);
     private const string CredentialTarget = "TERMSRV/127.0.0.1";
     private bool mstscControl, credentialOwned;
-    private string credentialComment, mstscFile;
+    private string credentialComment;
     private Process mstsc;
-    private int mstscPid;
+    private int mstscPid, mstscGuiError;
+    private readonly List<Dictionary<string, object>> mstscWindows = new List<Dictionary<string, object>>();
+    public List<Dictionary<string, object>> MstscWindows { get { return mstscWindows; } }
 
     private readonly string user, domain, sid;
     private readonly int parentSession = Process.GetCurrentProcess().SessionId;
@@ -229,7 +249,7 @@ public sealed class FixtureRdpSession : IDisposable
     public Dictionary<string, int> Diagnostics { get { return new Dictionary<string, int> {
         { "phase", phase }, { "phaseBeforeClose", phaseBeforeClose }, { "connected", connected }, { "extendedReason", extendedReason }, { "credentialPromptPolicyStage", credentialPromptPolicyStage }, { "connectingCount", eventCounts[1] }, { "connectedCount", eventCounts[2] }, { "loginCompleteCount", eventCounts[3] }, { "loginCompleteSeen", eventCounts[3] == 0 ? 0 : 1 },
         { "disconnectedCount", eventCounts[4] }, { "disconnectedCode", disconnectedCode }, { "fatalCount", eventCounts[10] }, { "fatalCode", fatalCode }, { "logonCount", eventCounts[22] }, { "logonCode", logonCode },
-        { "ownWtsCount", ownWtsCount }, { "ownWtsState", ownWtsState }, { "confirmCloseCount", eventCounts[15] }, { "closeConfirmed", closeConfirmed ? 1 : 0 }, { "closeStatus", closeStatus }, { "closeErrorHResult", closeError }, { "mstscControl", mstscControl ? 1 : 0 }, { "mstscPid", mstscPid } }; } }
+        { "ownWtsCount", ownWtsCount }, { "ownWtsState", ownWtsState }, { "confirmCloseCount", eventCounts[15] }, { "closeConfirmed", closeConfirmed ? 1 : 0 }, { "closeStatus", closeStatus }, { "closeErrorHResult", closeError }, { "mstscControl", mstscControl ? 1 : 0 }, { "mstscPid", mstscPid }, { "mstscGuiErrorHResult", mstscGuiError } }; } }
     private void Record(int id, int code) { phase = id; Interlocked.Increment(ref eventCounts[id]); if (id == 4) disconnectedCode = code; if (id == 10) fatalCode = code; if (id == 22) logonCode = code; if (id == 15 && code == 1) closeConfirmed = true; }
 
     public FixtureRdpSession(string user, string domain, SecureString password, string sid)
@@ -273,14 +293,7 @@ public sealed class FixtureRdpSession : IDisposable
             credentialOwned = true;
         }
         finally { Marshal.ZeroFreeGlobalAllocUnicode(secret); password.Dispose(); password = null; }
-        string path = Path.Combine(root, "mstsc-" + nonce + ".rdp");
-        using (var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-        {
-            mstscFile = path;
-            using (var writer = new StreamWriter(stream, System.Text.Encoding.Unicode))
-                writer.Write("full address:s:127.0.0.1\r\nusername:s:" + domain + "\\" + user + "\r\nauthentication level:i:0\r\nenablecredsspsupport:i:1\r\n");
-        }
-        mstsc = Process.Start(new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "mstsc.exe"), "\"" + path + "\"") { UseShellExecute = false, WorkingDirectory = root });
+        mstsc = Process.Start(new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "mstsc.exe"), "/v:127.0.0.1") { UseShellExecute = false, WorkingDirectory = root });
         mstscPid = mstsc.Id;
         while (DateTime.UtcNow < deadline)
         {
@@ -292,7 +305,42 @@ public sealed class FixtureRdpSession : IDisposable
             if (mstsc.HasExited) throw new InvalidOperationException("The owned mstsc client exited before the isolated RDP session was active; exitCode=" + mstsc.ExitCode + ".");
             Thread.Sleep(200);
         }
+        CaptureMstscWindows();
         throw new InvalidOperationException("The mstsc control did not create the isolated user's active RDP session.");
+    }
+
+    private void CaptureMstscWindows()
+    {
+        // Only the exact process started above; read no Edit/custom-control text and send no input.
+        DateTime deadline = DateTime.UtcNow.AddSeconds(3); int childCount = 0;
+        try
+        {
+            EnumWindows(delegate(IntPtr window, IntPtr unused)
+            {
+                if (mstscWindows.Count >= 4 || DateTime.UtcNow >= deadline) return false;
+                uint owner; GetWindowThreadProcessId(window, out owner); if (owner != mstscPid || !IsWindowVisible(window)) return true;
+                var name = new StringBuilder(80); GetClassNameW(window, name, name.Capacity);
+                var title = new StringBuilder(161);
+                if (name.Length != 0 && name.ToString().IndexOf("edit", StringComparison.OrdinalIgnoreCase) < 0) GetWindowTextW(window, title, title.Capacity);
+                var children = new List<Dictionary<string, object>>();
+                mstscWindows.Add(new Dictionary<string, object> { { "class", name.ToString() }, { "title", title.ToString() }, { "children", children } });
+                EnumChildWindows(window, delegate(IntPtr child, IntPtr ignored)
+                {
+                    if (childCount >= 24 || DateTime.UtcNow >= deadline) return false;
+                    uint childOwner; GetWindowThreadProcessId(child, out childOwner); if (childOwner != mstscPid) return true;
+                    childCount++; var childClass = new StringBuilder(80); GetClassNameW(child, childClass, childClass.Capacity);
+                    var record = new Dictionary<string, object> { { "class", childClass.ToString() }, { "id", GetDlgCtrlID(child) } }; children.Add(record);
+                    if (childClass.ToString() == "Static" || childClass.ToString() == "Button")
+                    {
+                        var text = new StringBuilder(161); UIntPtr copied;
+                        if (SendMessageTimeoutW(child, 0x000D, new UIntPtr((uint)text.Capacity), text, 0x0003, 100, out copied) != IntPtr.Zero) record["text"] = text.ToString();
+                    }
+                    return true;
+                }, IntPtr.Zero);
+                return true;
+            }, IntPtr.Zero);
+        }
+        catch (Exception error) { mstscGuiError = error.HResult; }
     }
 
     private void DeleteMstscCredential()
@@ -408,11 +456,7 @@ public sealed class FixtureRdpSession : IDisposable
                 finally
                 {
                     try { DeleteMstscCredential(); }
-                    finally
-                    {
-                        try { if (mstscFile != null) File.Delete(mstscFile); }
-                        finally { if (password != null) { password.Dispose(); password = null; } ready.Dispose(); }
-                    }
+                    finally { if (password != null) { password.Dispose(); password = null; } ready.Dispose(); }
                 }
             }
             return;
