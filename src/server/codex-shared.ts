@@ -197,7 +197,7 @@ export async function ensureSharedCodex(target: CodexConnectionTarget, options: 
   const found = await (options.discover ?? discoverCodex)({ env, ...(target.codexHome ? { codexHome: target.codexHome } : {}), processesOnly: true });
   const ownerIssue = found.issues.find(issue => ['windows-discovery-unavailable', 'process-discovery-unavailable', 'process-owner-unavailable'].includes(issue.code));
   if (!socketPresent && ownerIssue) {
-    const trace = found.issues.find(issue => /^windows-probe-(?:timeout|unavailable|output-limit|exit|json|failed)-(?:startup|process-module|process-query|process-parse|owner-query|parent-query|packages|json-module|json|done)$/u.test(issue.code))?.code;
+    const trace = found.issues.find(issue => /^windows-probe-(?:timeout|unavailable|output-limit|exit|json|failed)-(?:startup|process-provider|process-query|process-parse|owner-query|parent-query|packages|json-provider|json|done)$/u.test(issue.code))?.code;
     throw new SharedCodexError(`Не удалось проверить существующий сервер Desktop (${ownerIssue.code}${trace ? `; ${trace}` : ''}). Проверьте доступ Rele к процессам текущего пользователя; новый сервер не запущен.`, 'shared-owner-unknown');
   }
   if (!socketPresent && found.installations.some(item => item.running)) throw new SharedCodexError('Codex Desktop уже использует отдельный сервер. Один раз полностью закройте Desktop и запустите его через Rele.Codex; затем повторите подключение. Rele не завершает чужие процессы.', 'shared-desktop-conflict');

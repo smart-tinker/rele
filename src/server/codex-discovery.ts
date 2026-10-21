@@ -9,24 +9,53 @@ import { codexEnvironment, environmentValue, fileExists, isDesktopLauncher, reso
 
 // Command lines are inspected inside this fixed script and never returned. No auth,
 // history, environment, or Codex configuration files are read during discovery.
-export const WINDOWS_CODEX_CIM_IMPORT_SCRIPT = String.raw`Import-Module "$PSHOME\Modules\CimCmdlets\CimCmdlets.psd1" -ErrorAction Stop`;
+export const WINDOWS_CODEX_PROCESS_PROVIDER_SCRIPT = String.raw`
+[void][Reflection.Assembly]::Load('System.Management, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a')
+function Close-ReleProcessQuery($query) {
+  try { foreach ($row in $query.objects) { $row.Dispose() } }
+  finally { try { if ($query.collection) { $query.collection.Dispose() } } finally { $query.searcher.Dispose() } }
+}
+function Get-ReleProcessQuery([string]$filter, [bool]$parentOnly = $false) {
+  $fields = if ($parentOnly) { 'Name,ExecutablePath,ParentProcessId' } else { 'Name,ExecutablePath,CommandLine,ProcessId,ParentProcessId' }
+  $query = @{ searcher = [Management.ManagementObjectSearcher]::new('root\CIMV2', "SELECT $fields FROM Win32_Process WHERE $filter"); collection = $null; objects = [Collections.Generic.List[object]]::new() }
+  try {
+    $query.collection = $query.searcher.Get()
+    foreach ($row in $query.collection) { $query.objects.Add($row) }
+    return $query
+  } catch { Close-ReleProcessQuery $query; throw }
+}
+function Get-ReleProcessOwner($process) {
+  $owner = $null
+  try {
+    $owner = $process.InvokeMethod('GetOwnerSid', $null, $null)
+    return @{ ReturnValue = $owner.ReturnValue; Sid = $owner.Sid }
+  } finally { if ($owner) { $owner.Dispose() } }
+}
+`;
 export const WINDOWS_CODEX_METADATA_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 [Console]::Error.WriteLine('rele-discovery:startup')
-$processes = @()
-$packages = @()
+$processes = [Collections.Generic.List[object]]::new()
+$packages = [Collections.Generic.List[object]]::new()
 $issues = @()
 $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+function Add-ReleJsonRecord([Collections.Generic.List[object]]$records, [hashtable]$values) {
+  $record = [Collections.Generic.Dictionary[string,object]]::new()
+  foreach ($key in $values.Keys) { $record.Add([string]$key, $values[$key]) }
+  $records.Add($record)
+}
+$query = $null
 try {
-  [Console]::Error.WriteLine('rele-discovery:process-module')
-  ${WINDOWS_CODEX_CIM_IMPORT_SCRIPT}
+  [Console]::Error.WriteLine('rele-discovery:process-provider')
+  ${WINDOWS_CODEX_PROCESS_PROVIDER_SCRIPT}
   [Console]::Error.WriteLine('rele-discovery:process-query')
-  foreach ($process in @(CimCmdlets\Get-CimInstance Win32_Process -Filter "Name = 'codex.exe'")) {
+  $query = Get-ReleProcessQuery "Name = 'codex.exe'"
+  foreach ($process in $query.objects) {
     try {
       [Console]::Error.WriteLine('rele-discovery:owner-query')
-      $owner = CimCmdlets\Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid
+      $owner = Get-ReleProcessOwner $process
       if ($owner.ReturnValue -ne 0 -or -not $owner.Sid) { $issues += 'process-owner-unavailable'; continue }
       if ($owner.Sid -ne $sid) { continue }
     } catch { $issues += 'process-owner-unavailable'; continue }
@@ -39,13 +68,17 @@ try {
     $parentId = $process.ParentProcessId
     for ($depth = 0; -not $desktop -and $parentId -gt 0 -and $depth -lt 4; $depth++) {
       [Console]::Error.WriteLine('rele-discovery:parent-query')
-      $parent = CimCmdlets\Get-CimInstance Win32_Process -Filter "ProcessId = $parentId" -Property Name,ExecutablePath,ParentProcessId -ErrorAction SilentlyContinue
-      if (-not $parent) { break }
-      if ($parent.Name -match '^(?i:Codex|ChatGPT)\.exe$' -and $parent.ExecutablePath) {
-        $parentRoot = [IO.Path]::GetDirectoryName($parent.ExecutablePath)
-        $desktop = (Test-Path -LiteralPath (Join-Path $parentRoot 'resources\app.asar')) -or (Test-Path -LiteralPath (Join-Path $parentRoot 'resources\codex.exe'))
-      }
-      $parentId = $parent.ParentProcessId
+      $parents = $null
+      try {
+        $parents = Get-ReleProcessQuery "ProcessId = $parentId" $true
+        if ($parents.objects.Count -eq 0) { break }
+        $parent = $parents.objects[0]
+        if ($parent.Name -match '^(?i:Codex|ChatGPT)\.exe$' -and $parent.ExecutablePath) {
+          $parentRoot = [IO.Path]::GetDirectoryName($parent.ExecutablePath)
+          $desktop = [IO.File]::Exists([IO.Path]::Combine($parentRoot, 'resources\app.asar')) -or [IO.File]::Exists([IO.Path]::Combine($parentRoot, 'resources\codex.exe'))
+        }
+        $parentId = $parent.ParentProcessId
+      } finally { if ($parents) { Close-ReleProcessQuery $parents } }
     }
     if (-not $desktop) { continue }
     $listen = $null
@@ -81,17 +114,32 @@ try {
         else { $socketInvalid = $true }
       }
     }
-    $processes += [pscustomobject]@{ executable = $process.ExecutablePath; processId = [int]$process.ProcessId; listenKind = $listenKind; listen = $listen; socket = $socket; socketDefault = $socketDefault; socketInvalid = $socketInvalid }
+    Add-ReleJsonRecord $processes @{ executable = [string]$process.ExecutablePath; processId = [int]$process.ProcessId; listenKind = $listenKind; listen = $listen; socket = $socket; socketDefault = $socketDefault; socketInvalid = $socketInvalid }
   }
-} catch { $issues += 'process-discovery-unavailable' }
+} catch { $issues += 'process-discovery-unavailable' } finally { if ($query) { Close-ReleProcessQuery $query } }
 if (-not $releProcessesOnly) { try {
   [Console]::Error.WriteLine('rele-discovery:packages')
-  $packages = @(Get-AppxPackage -Name 'OpenAI.*' | Where-Object { $_.Name -in @('OpenAI.Codex', 'OpenAI.ChatGPT') -and $_.InstallLocation } | ForEach-Object { [pscustomobject]@{ location = $_.InstallLocation; name = $_.Name } })
+  foreach ($package in @(Get-AppxPackage -Name 'OpenAI.*')) {
+    if ($package.Name -in @('OpenAI.Codex', 'OpenAI.ChatGPT') -and $package.InstallLocation) { Add-ReleJsonRecord $packages @{ location = [string]$package.InstallLocation; name = [string]$package.Name } }
+  }
 } catch { $issues += 'package-discovery-unavailable' } }
-[Console]::Error.WriteLine('rele-discovery:json-module')
-Import-Module "$PSHOME\Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1" -ErrorAction Stop
+[Console]::Error.WriteLine('rele-discovery:json-provider')
+[void][Reflection.Assembly]::Load('System.Runtime.Serialization, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089')
 [Console]::Error.WriteLine('rele-discovery:json')
-[pscustomobject]@{ processes = @($processes); packages = @($packages); issues = @($issues | Microsoft.PowerShell.Utility\Select-Object -Unique) } | Microsoft.PowerShell.Utility\ConvertTo-Json -Depth 5 -Compress
+$uniqueIssues = @()
+foreach ($issue in $issues) { if ($uniqueIssues -notcontains $issue) { $uniqueIssues += [string]$issue } }
+$result = [Collections.Generic.Dictionary[string,object]]::new()
+$result.Add('processes', $processes.ToArray())
+$result.Add('packages', $packages.ToArray())
+$result.Add('issues', [object[]]@($uniqueIssues))
+$settings = [Runtime.Serialization.Json.DataContractJsonSerializerSettings]::new()
+$settings.UseSimpleDictionaryFormat = $true
+$settings.EmitTypeInformation = [Runtime.Serialization.EmitTypeInformation]::Never
+$settings.KnownTypes = [type[]]@([Collections.Generic.Dictionary[string,object]], [object[]])
+$serializer = [Runtime.Serialization.Json.DataContractJsonSerializer]::new([Collections.Generic.Dictionary[string,object]], $settings)
+$stream = [IO.MemoryStream]::new()
+try { $serializer.WriteObject($stream, $result); [Console]::Out.Write([Text.Encoding]::UTF8.GetString($stream.ToArray())) }
+finally { $stream.Dispose() }
 [Console]::Error.WriteLine('rele-discovery:done')
 `;
 export const WINDOWS_CODEX_PROCESS_METADATA_SCRIPT = '$releProcessesOnly = $true\n' + WINDOWS_CODEX_METADATA_SCRIPT;
@@ -110,7 +158,7 @@ export interface CodexDiscoveryOptions {
 }
 
 function probeStage(value: unknown): string | undefined {
-  return typeof value === 'string' && ['startup', 'process-module', 'process-query', 'process-parse', 'owner-query', 'parent-query', 'packages', 'json-module', 'json', 'done'].includes(value) ? value : undefined;
+  return typeof value === 'string' && ['startup', 'process-provider', 'process-query', 'process-parse', 'owner-query', 'parent-query', 'packages', 'json-provider', 'json', 'done'].includes(value) ? value : undefined;
 }
 interface WindowsProcess {
   executable: string;

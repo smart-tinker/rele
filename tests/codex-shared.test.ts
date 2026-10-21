@@ -89,7 +89,7 @@ describe('native shared Codex lifecycle', () => {
     expect(f.run.mock.calls.some(([, args]) => args.at(-1) === 'start')).toBe(false);
   });
 
-  it.each(['process-module', 'owner-query', 'json-module'])('keeps %s failure diagnostics fixed and never starts on a failed process-only scan', async stage => {
+  it.each(['process-provider', 'owner-query', 'json-provider'])('keeps %s failure diagnostics fixed and never starts on a failed process-only scan', async stage => {
     const f = await fixture();
     f.run.mockResolvedValueOnce({ code: 0, stdout: 'codex-cli 0.163.0' }).mockResolvedValueOnce({ code: 1, stdout: '' });
     f.discovery.issues.push({ code: 'windows-discovery-unavailable', message: 'synthetic-secret' },
