@@ -315,15 +315,19 @@ public sealed class FixtureRdpSession : IDisposable
             catch (Exception error) { closeError = error.HResult; form.Close(); }
         }); } catch (InvalidOperationException) { }
         bool hostStopped = !thread.IsAlive || thread.Join(5000);
+        var loggingOff = new HashSet<int>();
         foreach (Session session in Sessions())
         {
             if (!Owned(session.Id)) continue;
             // Revalidate the SID, RDP protocol, and baseline immediately before logging off.
             if (!Owned(session.Id)) continue;
             if (!WTSLogoffSession(IntPtr.Zero, session.Id, false)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            loggingOff.Add(session.Id);
         }
         DateTime deadline = DateTime.UtcNow.AddSeconds(10);
-        while (Sessions().Exists(delegate(Session session) { return Owned(session.Id); }))
+        // A logging-off session can clear its username before it has terminated.
+        // Wait for the exact sessions we logged off, independently of their changing owner metadata.
+        while (Sessions().Exists(delegate(Session session) { return loggingOff.Contains(session.Id); }))
         {
             if (DateTime.UtcNow >= deadline) throw new InvalidOperationException("The isolated RDP fixture session did not log off.");
             Thread.Sleep(100);
