@@ -1,11 +1,28 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { glob, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { glob, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
-import { CodexClient } from '../dist/server/codex.js';
+
+// A single budget avoids fs.rm's recursive retry budget multiplying at every directory level.
+export async function removeInstallerFixture(directory, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try { await rm(directory, { recursive: true, force: true, maxRetries: 0 }); return; }
+    catch (error) {
+      if (['EBUSY', 'EMFILE', 'ENFILE', 'ENOTEMPTY', 'EPERM'].includes(error.code) && Date.now() < deadline) { await delay(200); continue; }
+      const code = typeof error.code === 'string' && /^[A-Z_]{1,32}$/u.test(error.code) ? error.code : 'UNKNOWN';
+      const relative = typeof error.path === 'string' ? path.relative(directory, path.resolve(error.path)) : '';
+      const safePath = relative && relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative) && relative.length <= 240 && !/[\x00-\x1f\x7f]/u.test(relative) ? relative : undefined;
+      const failure = new Error(`Installer fixture cleanup failed (${code}${safePath ? `, ${safePath}` : ''}).`);
+      failure.code = code;
+      if (safePath) failure.relativePath = safePath;
+      throw failure;
+    }
+  }
+}
 
 // Only disposable installer CI calls this; it never uses a user profile or sends a model request.
 export async function installerCodex(home) {
@@ -25,6 +42,7 @@ export async function installerCodex(home) {
 }
 
 export async function sharedBackendPid(target, expectedPid) {
+  const { CodexClient } = await import('../dist/server/codex.js');
   const deadline = Date.now() + 45_000;
   let failure = 'no-connection';
   do {

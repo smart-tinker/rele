@@ -388,6 +388,7 @@ try {
     $credential = $null; if ($password) { $password.Dispose() }
     $cleanupFailures = @()
     $profileCleanupFacts = @{}
+    $installerProgress = [Collections.Generic.List[string]]::new()
     $cleanupStep = 0
     foreach ($action in @(
         { if ($child) { if (-not $child.HasExited) { Stop-Process -Id $child.Id -Force }; if (-not $child.WaitForExit(5000)) { throw 'The owned fixture child did not exit.' }; $child.Dispose() } },
@@ -400,7 +401,14 @@ try {
         { if ($user) { Remove-Canary $user.SID.Value } },
         { if ($user) { Remove-FixtureProfile $user.SID.Value $profileCleanupFacts } },
         { if ($user) { Remove-LocalUser -SID $user.SID } },
-        { if ($RunGates) { foreach ($name in @('installer-results.json', 'installer-failure-results.json', 'shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json')) { $report = Join-Path $FixtureRoot ('reports\' + $name); if (Test-Path -LiteralPath $report) { Copy-Item -LiteralPath $report -Destination (Join-Path $sourceRoot $name) } } } },
+        { if ($RunGates) {
+            foreach ($name in @('installer-results.json', 'installer-failure-results.json', 'shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json')) { $report = Join-Path $FixtureRoot ('reports\' + $name); if (Test-Path -LiteralPath $report) { Copy-Item -LiteralPath $report -Destination (Join-Path $sourceRoot $name) } }
+            $stdout = Join-Path $FixtureRoot 'stdout.log'
+            if (Test-Path -LiteralPath $stdout) {
+                $allowed = @('Windows installer smoke: an unknown startup script is preserved', 'Windows installer smoke: a previous portable process is not killed', 'Windows installer smoke: foreign Desktop settings are preserved without blocking installation', 'Windows installer smoke: the Codex wrapper preserves argv, profile, data and raw bytes', 'Windows installer smoke: launcher restart', 'Windows installer smoke: same-version upgrade with backup', 'Windows installer smoke: owned Desktop settings restore and later foreign changes survive uninstall', 'Windows installer smoke: uninstall preserves data', 'Windows installer cleanup: desktop-environment', 'Windows installer cleanup: held-adapter', 'Windows installer cleanup: native-daemon', 'Windows installer cleanup: files', 'Windows installer cleanup: complete')
+                Get-Content -LiteralPath $stdout -Tail 64 | Where-Object { $_ -in $allowed } | Select-Object -Last 32 | ForEach-Object { $installerProgress.Add([string]$_) }
+            }
+        } },
         { Remove-Item -LiteralPath $FixtureRoot -Recurse -Force }
     )) {
         $stepName = @('child', 'rdp-session', 'rdp-setting', 'redirector-stop', 'redirector-startup', 'service-stop', 'service-startup', 'task', 'profile', 'user', 'reports', 'fixture')[$cleanupStep++]
@@ -417,6 +425,7 @@ try {
         $result | Add-Member -NotePropertyName rdpModeBefore -NotePropertyValue $rdpModeBefore
         $result | Add-Member -NotePropertyName rdpModeAfter -NotePropertyValue $rdpModeAfter
         if ($profileCleanupFacts.Count -ne 0) { $result | Add-Member -NotePropertyName profileCleanup -NotePropertyValue $profileCleanupFacts }
+        if ($installerProgress.Count -ne 0) { $result | Add-Member -NotePropertyName installerProgress -NotePropertyValue ($installerProgress.ToArray()) }
         if ($cleanupFailures.Count -ne 0) { $result.result = 'failed'; $result | Add-Member -NotePropertyName cleanupErrors -NotePropertyValue $cleanupFailures }
         $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $publishedResult -Encoding UTF8
     }

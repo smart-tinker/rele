@@ -9,7 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { ConfigStore, mergeConfig } from '../dist/server/config.js';
 import { findCSharpCompiler } from './build-process-host.mjs';
-import { installerCodex, sharedBackendPid, stopInstallerCodex, openInstallerAdapter } from './installer-codex-fixture.mjs';
+import { installerCodex, sharedBackendPid, stopInstallerCodex, openInstallerAdapter, removeInstallerFixture } from './installer-codex-fixture.mjs';
 
 if (process.platform !== 'win32' || process.env.CI !== 'true') throw new Error('The installer smoke test runs only on an isolated Windows CI runner.');
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -372,9 +372,25 @@ try {
     const contents = await readFile(path.join(temporary, file), 'utf8').catch(() => '');
     if (contents && !uninstalled) console.error(`${file}:\n${contents.slice(-7000)}`);
   }
+  console.log('Windows installer cleanup: desktop-environment');
   if (originalDesktopEnvironment) desktopEnvironment(originalDesktopEnvironment);
+  console.log('Windows installer cleanup: held-adapter');
   if (heldAdapter) await heldAdapter.close();
+  console.log('Windows installer cleanup: native-daemon');
   stopInstallerCodex(codexFixture);
-  if (!failed) await rm(temporary, { recursive: true, force: true, maxRetries: 20, retryDelay: 200 });
+  console.log('Windows installer cleanup: files');
+  if (!failed) {
+    const reportPath = path.join(reportDirectory, 'installer-results.json');
+    const report = JSON.parse(await readFile(reportPath, 'utf8'));
+    try { await removeInstallerFixture(temporary); }
+    catch (error) {
+      report.cleanup = { result: 'failed', code: error.code, ...(error.relativePath ? { relativePath: error.relativePath } : {}) };
+      await writeFile(reportPath, JSON.stringify(report, null, 2) + '\n');
+      throw error;
+    }
+    report.cleanup = { result: 'passed' };
+    await writeFile(reportPath, JSON.stringify(report, null, 2) + '\n');
+  }
   else console.error(`Failed fixture files retained until runner disposal: ${temporary}`);
+  console.log('Windows installer cleanup: complete');
 }

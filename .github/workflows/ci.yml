@@ -6,6 +6,10 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      windows_cleanup_probe:
+        description: 'Check the bounded fixture cleanup with a real Windows executable lock'
+        type: boolean
+        default: false
       windows_mstsc_probe:
         description: 'Compare the stock loopback RDP client in the disposable session probe'
         type: boolean
@@ -23,13 +27,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: rele-${{ github.workflow }}-${{ github.ref }}-${{ inputs.windows_session_probe == true && 'session' || inputs.windows_installer_probe == true && 'installer' || 'full' }}
+  group: rele-${{ github.workflow }}-${{ github.ref }}-${{ inputs.windows_cleanup_probe == true && 'cleanup' || inputs.windows_session_probe == true && 'session' || inputs.windows_installer_probe == true && 'installer' || 'full' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   windows-session-probe:
-    name: Diagnose Windows session or installer
-    if: github.event_name == 'workflow_dispatch' && (inputs.windows_session_probe == true || inputs.windows_installer_probe == true)
+    name: Diagnose Windows primitive or installer
+    if: github.event_name == 'workflow_dispatch' && (inputs.windows_cleanup_probe == true || inputs.windows_session_probe == true || inputs.windows_installer_probe == true)
     runs-on: windows-2025
     timeout-minutes: ${{ inputs.windows_installer_probe == true && 30 || 8 }}
     steps:
@@ -37,10 +41,14 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        if: inputs.windows_installer_probe == true
+        if: inputs.windows_installer_probe == true || inputs.windows_cleanup_probe == true
         with:
           node-version: 24.19.0
-          cache: npm
+          cache: ${{ inputs.windows_installer_probe == true && 'npm' || '' }}
+      - name: Check bounded cleanup with an actual Windows file lock
+        if: inputs.windows_cleanup_probe == true
+        shell: pwsh
+        run: node scripts/probe-installer-cleanup.mjs
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         if: inputs.windows_installer_probe == true
         with:
@@ -57,6 +65,7 @@ jobs:
           done
           npm run package
       - name: Check isolated RDP session and requested gate
+        if: inputs.windows_session_probe == true || inputs.windows_installer_probe == true
         shell: pwsh
         env:
           RELE_INSTALLER_PROBE: ${{ inputs.windows_installer_probe }}
@@ -76,13 +85,14 @@ jobs:
           name: windows-session-probe
           path: |
             windows-standard-user-results.json
+            installer-cleanup-probe-results.json
             installer-results.json
             installer-failure-results.json
           if-no-files-found: error
           retention-days: 14
 
   verify:
-    if: github.event_name != 'workflow_dispatch' || (inputs.windows_session_probe != true && inputs.windows_installer_probe != true)
+    if: github.event_name != 'workflow_dispatch' || (inputs.windows_cleanup_probe != true && inputs.windows_session_probe != true && inputs.windows_installer_probe != true)
     name: Verify and package (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
