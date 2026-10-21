@@ -31,7 +31,7 @@ function Remove-Canary([string]$Sid) {
     try { $task.Stop(0) } catch { }
     $folder.DeleteTask($name, 0)
 }
-function Remove-FixtureProfile([string]$Sid) {
+function Remove-FixtureProfile([string]$Sid, [hashtable]$Facts) {
     $deadline = [DateTime]::UtcNow.AddSeconds(20); $lastError = $null
     do {
         $profile = Get-CimInstance Win32_UserProfile -Filter ("SID='$Sid'")
@@ -43,6 +43,21 @@ function Remove-FixtureProfile([string]$Sid) {
         }
         Start-Sleep -Milliseconds 250
     } while ([DateTime]::UtcNow -lt $deadline)
+    $Facts.cimLoaded = [bool]$profile.Loaded
+    $hive = $null; $profileKey = $null
+    try {
+        $hive = [Microsoft.Win32.Registry]::Users.OpenSubKey($Sid)
+        $Facts.hivePresent = $null -ne $hive
+        $profileKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\' + $Sid)
+        $Facts.profileListPresent = $null -ne $profileKey
+        if ($profileKey) {
+            foreach ($name in @('State', 'Flags', 'RefCount')) {
+                $value = $profileKey.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                if ($value -is [int] -or $value -is [long]) { $Facts[$name] = $value }
+            }
+        }
+    } catch { $Facts.registryErrorHResult = ('0x{0:X8}' -f $_.Exception.HResult) }
+    finally { if ($profileKey) { $profileKey.Dispose() }; if ($hive) { $hive.Dispose() } }
     $detail = if ($lastError) { $lastError.Message } else { 'The fixture profile is still loaded.' }
     throw ('Fixture profile cleanup timed out; Loaded=' + $profile.Loaded + '; refCount=' + $profile.refCount + '; ' + $detail)
 }
@@ -363,6 +378,7 @@ try {
     }
     $credential = $null; if ($password) { $password.Dispose() }
     $cleanupFailures = @()
+    $profileCleanupFacts = @{}
     $cleanupStep = 0
     foreach ($action in @(
         { if ($child) { if (-not $child.HasExited) { Stop-Process -Id $child.Id -Force }; if (-not $child.WaitForExit(5000)) { throw 'The owned fixture child did not exit.' }; $child.Dispose() } },
@@ -373,7 +389,7 @@ try {
         { if ($serviceStarted) { Stop-Service -Name TermService } },
         { if ($serviceStartupChanged) { Set-Service -Name TermService -StartupType $priorServiceStartup } },
         { if ($user) { Remove-Canary $user.SID.Value } },
-        { if ($user) { Remove-FixtureProfile $user.SID.Value } },
+        { if ($user) { Remove-FixtureProfile $user.SID.Value $profileCleanupFacts } },
         { if ($user) { Remove-LocalUser -SID $user.SID } },
         { if ($RunGates) { foreach ($name in @('installer-results.json', 'installer-failure-results.json', 'shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json')) { $report = Join-Path $FixtureRoot ('reports\' + $name); if (Test-Path -LiteralPath $report) { Copy-Item -LiteralPath $report -Destination (Join-Path $sourceRoot $name) } } } },
         { Remove-Item -LiteralPath $FixtureRoot -Recurse -Force }
@@ -389,6 +405,7 @@ try {
         $result | Add-Member -NotePropertyName rdpTransport -NotePropertyValue $rdpTransport
         $result | Add-Member -NotePropertyName rdpModeBefore -NotePropertyValue $rdpModeBefore
         $result | Add-Member -NotePropertyName rdpModeAfter -NotePropertyValue $rdpModeAfter
+        if ($profileCleanupFacts.Count -ne 0) { $result | Add-Member -NotePropertyName profileCleanup -NotePropertyValue $profileCleanupFacts }
         if ($cleanupFailures.Count -ne 0) { $result.result = 'failed'; $result | Add-Member -NotePropertyName cleanupErrors -NotePropertyValue $cleanupFailures }
         $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $publishedResult -Encoding UTF8
     }
