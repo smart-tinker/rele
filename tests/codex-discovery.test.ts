@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { discoverCodex, runCodexProbe, WINDOWS_CODEX_METADATA_SCRIPT, type CodexDiscoveryOptions } from '../src/server/codex-discovery.js';
+import { discoverCodex, runCodexProbe, WINDOWS_CODEX_METADATA_SCRIPT, WINDOWS_CODEX_PROCESS_METADATA_SCRIPT, type CodexDiscoveryOptions } from '../src/server/codex-discovery.js';
 import { codexEnvironment, resolveCodexLaunch } from '../src/server/codex-launch.js';
 
 const win = path.win32;
@@ -33,6 +33,24 @@ function windowsFixture(metadata: object = { processes: [], packages: [], issues
 }
 
 describe('Codex installation and existing Desktop discovery', () => {
+  it('uses a separate process-only ownership scan while ordinary discovery retains packages', async () => {
+    const f = windowsFixture();
+    f.run.mockImplementation(async (_command, args) => ({ stdout: JSON.stringify({ processes: [], packages: [], issues: [] }), code: 0 }));
+    await discoverCodex({ ...f.options, processesOnly: true });
+    expect(f.run.mock.calls[0][1]).toContain(WINDOWS_CODEX_PROCESS_METADATA_SCRIPT);
+    expect(f.run.mock.calls[0][2]).toBe(8_000);
+    await discoverCodex(f.options);
+    expect(f.run.mock.calls[1][1]).toContain(WINDOWS_CODEX_METADATA_SCRIPT);
+  });
+
+  it('reports only a fixed failed probe stage and reason', async () => {
+    const f = windowsFixture();
+    f.run.mockRejectedValue(Object.assign(new Error('probe-timeout'), { stage: 'owner-query', sensitive: 'synthetic-secret' }));
+    const result = await discoverCodex({ ...f.options, processesOnly: true });
+    expect(result.issues.map(issue => issue.code)).toContain('windows-probe-timeout-owner-query');
+    expect(JSON.stringify(result)).not.toContain('synthetic-secret');
+  });
+
   it('prefers an existing Desktop WebSocket and only returns filtered process metadata', async () => {
     const f = windowsFixture({
       processes: [{ executable: desktop, processId: 1234, listenKind: 'websocket', listen: 'ws://127.0.0.1:45678', commandLine: 'synthetic-private-arguments', auth: 'synthetic-secret' }],
@@ -234,8 +252,22 @@ describe('Codex installation and existing Desktop discovery', () => {
     await expect(runCodexProbe(process.execPath, ['-e', 'require("node:fs").writeSync(1, "x".repeat(200000))'], 4_000)).rejects.toThrow('probe-output-limit');
   });
 
-  it.skipIf(process.platform !== 'win32')('parses real PowerShell fixture command lines and emits only allowed same-user metadata', async () => {
+  it('captures fixed probe stages without publishing other child stderr', async () => {
+    const error = await runCodexProbe(process.execPath, ['-e', 'process.stderr.write("synthetic-secret\\nrele-discovery:owner-query\\nrele-discovery:synthetic-secret\\n"); setInterval(() => {}, 1000)'], 250).catch(error => error);
+    expect(error).toMatchObject({ message: 'probe-timeout', stage: 'owner-query' });
+    expect(JSON.stringify(error)).not.toContain('synthetic-secret');
+  });
+
+  it.skipIf(process.platform !== 'win32')('completes a process-only scan without calling optional Appx discovery', async () => {
+    const fixtures = "function Get-CimInstance { [pscustomobject]@{ ProcessId = 1; ExecutablePath = $null; CommandLine = $null } }; function Invoke-CimMethod { [pscustomobject]@{ ReturnValue = 0; Sid = 'another-user' } }; function Get-AppxPackage { throw 'Appx must not run' }; ";
+    const result = await runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', fixtures + WINDOWS_CODEX_PROCESS_METADATA_SCRIPT], 25_000);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({ processes: [], packages: [], issues: [] });
+  }, 35_000);
+
+  it.skipIf(process.platform !== 'win32').each(['owner', 'fields'])('parses same-user metadata and fails closed on unreadable %s', async unavailable => {
     const fixtures = String.raw`
+$releFixtureMissingFields = ${unavailable === 'fields' ? '$true' : '$false'}
 function Get-CimInstance {
   [CmdletBinding()] param([string]$ClassName, [string]$Filter, [string[]]$Property)
   @(
@@ -247,11 +279,13 @@ function Get-CimInstance {
     [pscustomobject]@{ ProcessId = 106; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\Codex.exe'; CommandLine = 'Codex.exe --synthetic-gui-argument' },
     [pscustomobject]@{ ProcessId = 107; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\resources\codex.exe'; CommandLine = 'codex.exe app-server proxy' },
     [pscustomobject]@{ ProcessId = 108; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\resources\codex.exe'; CommandLine = 'codex.exe app-server --listen "unix://C:\Example User\custom.sock"' },
-    [pscustomobject]@{ ProcessId = 109; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\resources\codex.exe'; CommandLine = 'codex.exe app-server --listen=unix://' }
+    [pscustomobject]@{ ProcessId = 109; ParentProcessId = 1; ExecutablePath = 'C:\Program Files\Codex\resources\codex.exe'; CommandLine = 'codex.exe app-server --listen=unix://' },
+    [pscustomobject]@{ ProcessId = 110; ParentProcessId = 1; ExecutablePath = $(if (-not $releFixtureMissingFields) { 'C:\Program Files\Codex\resources\codex.exe' }); CommandLine = $(if (-not $releFixtureMissingFields) { 'codex.exe app-server --listen=stdio://' }) }
   )
 }
 function Invoke-CimMethod {
   [CmdletBinding()] param($InputObject, [string]$MethodName)
+  if ($InputObject.ProcessId -eq 110 -and -not $releFixtureMissingFields) { return [pscustomobject]@{ ReturnValue = 2; Sid = $null } }
   [pscustomobject]@{ ReturnValue = 0; Sid = $(if ($InputObject.ProcessId -eq 105) { 'another-user' } else { [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }) }
 }
 function Get-AppxPackage { [CmdletBinding()] param([string]$Name); @() }
@@ -261,7 +295,7 @@ function Get-AppxPackage { [CmdletBinding()] param([string]$Name); @() }
     const result = await runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', fixtures + WINDOWS_CODEX_METADATA_SCRIPT], 25_000);
     expect(result.code).toBe(0);
     const parsed = JSON.parse(result.stdout);
-    expect(parsed.issues).toEqual([]);
+    expect(parsed.issues).toEqual(['process-owner-unavailable']);
     expect(parsed.processes.map((item: { processId: number }) => item.processId)).toEqual([101, 102, 103, 104, 108, 109]);
     expect(parsed.processes[0]).toMatchObject({ listenKind: 'websocket', listen: 'ws://127.0.0.1:45678/' });
     expect(parsed.processes[1]).toMatchObject({ listenKind: 'stdio', listen: null });

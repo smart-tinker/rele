@@ -89,6 +89,30 @@ describe('native shared Codex lifecycle', () => {
     expect(f.run.mock.calls.some(([, args]) => args.at(-1) === 'start')).toBe(false);
   });
 
+  it('keeps ownership failure diagnostics fixed and never starts on a failed process-only scan', async () => {
+    const f = await fixture();
+    f.run.mockResolvedValueOnce({ code: 0, stdout: 'codex-cli 0.163.0' }).mockResolvedValueOnce({ code: 1, stdout: '' });
+    f.discovery.issues.push({ code: 'windows-discovery-unavailable', message: 'synthetic-secret' },
+      { code: 'windows-probe-timeout-owner-query', message: 'synthetic-secret' });
+    const error = await ensureSharedCodex(f.target, f.options).catch(error => error);
+    expect(error).toMatchObject({ code: 'shared-owner-unknown', message: expect.stringContaining('windows-probe-timeout-owner-query') });
+    expect(error.message).not.toContain('synthetic-secret');
+    expect(f.discover).toHaveBeenCalledWith(expect.objectContaining({ processesOnly: true }));
+    expect(f.run.mock.calls.some(([, args]) => args.at(-1) === 'start')).toBe(false);
+  });
+
+  it('uses successful process-only proof even when optional package discovery failed', async () => {
+    const f = await fixture(), executable = await packageFixture(path.join(f.home, 'full-cli'));
+    f.discovery.recommendedManaged = { ...f.target, executable, transport: 'managed' };
+    f.discovery.issues.push({ code: 'windows-discovery-unavailable', message: 'Optional package timeout' });
+    f.discover.mockImplementation(async options => options.processesOnly ? { installations: [], issues: [] } : f.discovery);
+    f.run.mockImplementation(async (_command, args) => ({ code: args.at(-1) === 'version' ? 1 : 0,
+      stdout: args.at(-1) === '--version' ? 'codex-cli 0.163.0' : JSON.stringify({ ...f.daemon, status: 'started' }) }));
+    await ensureSharedCodex({ ...f.target, executable: 'codex' }, f.options);
+    expect(f.discover.mock.calls.map(([options]) => options.processesOnly ?? false)).toEqual([false, true]);
+    expect(f.run.mock.calls.filter(([, args]) => args.at(-1) === 'start')).toHaveLength(1);
+  });
+
   it.each(['0.163.0', '0.163.0-alpha.11'])('selects a complete CLI instead of the preferred incomplete Desktop %s before starting', async desktopVersion => {
     const f = await fixture();
     const fullVersion = '0.163.0-alpha.11', full = await packageFixture(path.join(f.home, 'full-cli'), fullVersion);
