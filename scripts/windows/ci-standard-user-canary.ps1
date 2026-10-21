@@ -45,7 +45,8 @@ if ($Mode -eq 'Child') {
     $env:USERPROFILE = $profile; $env:LOCALAPPDATA = Join-Path $profile 'AppData\Local'; $env:APPDATA = Join-Path $profile 'AppData\Roaming'
     $env:TEMP = Join-Path $FixtureRoot 'tmp'; $env:TMP = $env:TEMP
     New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
-    $evidence = @{ result = 'failed'; selfElevated = $null; taskElevated = $null; stage = 'token' }
+    $evidence = @{ result = 'failed'; selfElevated = $null; taskElevated = $null; stage = 'token'; selfSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId }
+    $task = $null; $running = $null
     try {
         $compiler = Join-Path $windows 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
         & $compiler /nologo /target:exe /platform:x64 /codepage:65001 ('/out:' + (Join-Path $FixtureRoot 'FixtureElevation.exe')) (Join-Path $PSScriptRoot 'FixtureElevation.cs')
@@ -60,7 +61,8 @@ if ($Mode -eq 'Child') {
         $action = $definition.Actions.Create(0); $action.Path = $shell; $action.WorkingDirectory = $FixtureRoot
         $action.Arguments = '-NoProfile -NonInteractive -File ' + (Quote $PSCommandPath) + ' -Mode Canary -FixtureRoot ' + (Quote $FixtureRoot) + ' -Nonce ' + $Nonce
         $task = $folder.RegisterTaskDefinition(('Rele-CI-Canary-' + $Nonce), $definition, 2, $sid, $null, 3, $null)
-        $task.Run($null) | Out-Null
+        $running = $task.Run($null)
+        $evidence.runReturned = $true
         $deadline = [DateTime]::UtcNow.AddSeconds(20); $receiptPath = Join-Path $FixtureRoot 'canary.json'
         while ([DateTime]::UtcNow -lt $deadline -and (-not (Test-Path -LiteralPath $receiptPath) -or $task.LastTaskResult -ne 0)) { Start-Sleep -Milliseconds 100 }
         $evidence.lastTaskResult = ('0x{0:X8}' -f $task.LastTaskResult)
@@ -68,9 +70,24 @@ if ($Mode -eq 'Child') {
         $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
         if ($receipt.nonce -ne $Nonce -or $receipt.sid -ne $sid -or $receipt.elevated -ne $false) { throw 'Invalid InteractiveToken canary receipt.' }
         $evidence.taskElevated = $receipt.elevated; $evidence.result = 'passed'; $evidence.stage = 'complete'
-    } catch { $evidence.error = $_.Exception.Message }
+    } catch {
+        $evidence.error = $_.Exception.Message
+        $evidence.errorHResult = ('0x{0:X8}' -f $_.Exception.HResult)
+        if ($_.Exception.InnerException) { $evidence.innerErrorHResult = ('0x{0:X8}' -f $_.Exception.InnerException.HResult) }
+    }
     finally {
-        Remove-Canary $sid
+        try {
+            if ($task) {
+                $fresh = $folder.GetTask('Rele-CI-Canary-' + $Nonce)
+                $settings = $fresh.Definition.Settings
+                $evidence.registeredTask = @{ state = [int]$fresh.State; lastTaskResult = ('0x{0:X8}' -f $fresh.LastTaskResult); lastRunTime = $fresh.LastRunTime.ToUniversalTime().ToString('o'); enabled = [bool]$settings.Enabled; allowDemandStart = [bool]$settings.AllowDemandStart; runOnlyIfIdle = [bool]$settings.RunOnlyIfIdle; runOnlyIfNetworkAvailable = [bool]$settings.RunOnlyIfNetworkAvailable }
+            }
+            if ($running) {
+                $running.Refresh()
+                $evidence.runningTask = @{ state = [int]$running.State; enginePid = [int]$running.EnginePID; currentAction = [string]$running.CurrentAction }
+            }
+        } catch { $evidence.taskEvidenceError = $_.Exception.Message }
+        try { Remove-Canary $sid } catch { $evidence.cleanupError = $_.Exception.Message; $evidence.result = 'failed' }
         $evidence | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $FixtureRoot 'windows-standard-user-results.json') -Encoding UTF8
     }
     if ($evidence.result -ne 'passed') { throw $evidence.error }
@@ -79,6 +96,9 @@ if ($Mode -eq 'Child') {
 
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:CI -ne 'true' -or $env:RUNNER_OS -ne 'Windows') { throw 'Run this canary only on a disposable GitHub Windows runner.' }
 $Nonce = [Guid]::NewGuid().ToString('N'); $account = 'ReleCi' + $Nonce.Substring(0, 8)
+$operationalLog = 'Microsoft-Windows-TaskScheduler/Operational'
+& (Join-Path ([Environment]::GetFolderPath('System')) 'wevtutil.exe') sl $operationalLog /e:true
+if ($LASTEXITCODE -ne 0) { throw 'Cannot enable the disposable runner Task Scheduler diagnostic channel.' }
 $FixtureRoot = Join-Path ([IO.Path]::GetPathRoot($env:RUNNER_TEMP)) ('rc-' + $Nonce.Substring(0, 8))
 if (Test-Path -LiteralPath $FixtureRoot) { throw 'Fixture directory already exists.' }
 New-Item -ItemType Directory -Path $FixtureRoot | Out-Null
@@ -101,7 +121,25 @@ try {
     $credential = $null; $password.Dispose(); $password = $null
     if (-not $child.WaitForExit(60000)) { throw 'Standard-user canary child timed out.' }
     $resultPath = Join-Path $FixtureRoot 'windows-standard-user-results.json'
-    if (Test-Path -LiteralPath $resultPath) { Get-Content -LiteralPath $resultPath -Raw | Write-Output; Copy-Item -LiteralPath $resultPath -Destination (Join-Path $sourceRoot 'windows-standard-user-results.json') }
+    if (Test-Path -LiteralPath $resultPath) {
+        $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+        $ownEvents = @()
+        try {
+            $ownTaskXPath = "*[EventData[Data[@Name='TaskName']='\Rele-CI-Canary-$Nonce']]"
+            foreach ($event in @(Get-WinEvent -LogName $operationalLog -FilterXPath $ownTaskXPath -MaxEvents 32 -ErrorAction Stop)) {
+                $record = @{ eventId = [int]$event.Id }
+                $xml = [xml]$event.ToXml()
+                foreach ($datum in @($xml.Event.EventData.Data)) {
+                    if ([string]$datum.Name -in @('ErrorValue', 'ResultCode', 'HRESULT')) { $record[[string]$datum.Name] = [string]$datum.InnerText }
+                }
+                $ownEvents += $record
+            }
+        } catch { $result | Add-Member -NotePropertyName taskEventsErrorHResult -NotePropertyValue ('0x{0:X8}' -f $_.Exception.HResult) }
+        $result | Add-Member -NotePropertyName taskEvents -NotePropertyValue $ownEvents
+        $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $resultPath -Encoding UTF8
+        Get-Content -LiteralPath $resultPath -Raw | Write-Output
+        Copy-Item -LiteralPath $resultPath -Destination (Join-Path $sourceRoot 'windows-standard-user-results.json')
+    }
     if ($child.ExitCode -ne 0) { foreach ($log in @('stdout.log', 'stderr.log')) { Get-Content -LiteralPath (Join-Path $FixtureRoot $log) -Tail 30 | Write-Output }; throw 'Standard-user InteractiveToken canary failed; native gates must not run in this environment.' }
 } finally {
     $credential = $null; if ($password) { $password.Dispose() }
