@@ -140,7 +140,8 @@ public sealed class FixtureRdpSession : IDisposable
         {
             if (!Owned(session.Id)) continue;
             // Revalidate the SID, RDP protocol, and baseline immediately before logging off.
-            if (!Owned(session.Id) || !WTSLogoffSession(IntPtr.Zero, session.Id, false)) throw new InvalidOperationException("Cannot log off the isolated RDP fixture session.");
+            if (!Owned(session.Id)) continue;
+            if (!WTSLogoffSession(IntPtr.Zero, session.Id, false)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
         }
         DateTime deadline = DateTime.UtcNow.AddSeconds(10);
         while (Sessions().Exists(delegate(Session session) { return Owned(session.Id); }))

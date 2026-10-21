@@ -1,4 +1,4 @@
-param([ValidateSet('Parent', 'Child', 'Canary')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce)
+param([ValidateSet('Parent', 'Child')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce)
 $ErrorActionPreference = 'Stop'
 $sourceRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $shell = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'PowerShell\7\pwsh.exe'
@@ -17,21 +17,10 @@ function Remove-Canary([string]$Sid) {
     $definition = $task.Definition
     $owner = [string]$definition.Principal.UserId
     if ($owner -notmatch '^S-1-') { $owner = (New-Object Security.Principal.NTAccount $owner).Translate([Security.Principal.SecurityIdentifier]).Value }
-    if ($owner -ne $Sid -or $definition.Actions.Count -ne 1 -or $definition.Actions.Item(1).Path -ne $shell -or -not $definition.Actions.Item(1).Arguments.Contains($Nonce)) { throw 'Refusing to remove a foreign canary task.' }
+    $arguments = '--canary ' + (Quote $FixtureRoot) + ' ' + $Nonce + ' ' + $Sid
+    if ($owner -ne $Sid -or $definition.Actions.Count -ne 1 -or $definition.Actions.Item(1).Path -ne (Join-Path $FixtureRoot 'FixtureElevation.exe') -or $definition.Actions.Item(1).Arguments -ne $arguments) { throw 'Refusing to remove a foreign canary task.' }
     try { $task.Stop(0) } catch { }
     $folder.DeleteTask($name, 0)
-}
-
-if ($Mode -eq 'Canary') {
-    $marker = Get-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Raw | ConvertFrom-Json
-    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    if ($marker.nonce -ne $Nonce -or $marker.sid -ne $sid) { throw 'Canary fixture identity mismatch.' }
-    $elevated = Token-Elevated
-    if ($elevated) { throw 'InteractiveToken canary ran elevated.' }
-    $receipt = @{ nonce = $Nonce; sid = $sid; elevated = $elevated } | ConvertTo-Json -Compress
-    $file = [IO.File]::Open((Join-Path $FixtureRoot 'canary.json'), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-    try { $bytes = [Text.Encoding]::UTF8.GetBytes($receipt); $file.Write($bytes, 0, $bytes.Length) } finally { $file.Dispose() }
-    exit 0
 }
 
 if ($Mode -eq 'Child') {
@@ -58,8 +47,8 @@ if ($Mode -eq 'Child') {
         $definition = $scheduler.NewTask(0)
         $definition.Principal.UserId = $sid; $definition.Principal.LogonType = 3; $definition.Principal.RunLevel = 0
         $definition.Settings.ExecutionTimeLimit = 'PT30S'; $definition.Settings.DisallowStartIfOnBatteries = $false; $definition.Settings.StopIfGoingOnBatteries = $false
-        $action = $definition.Actions.Create(0); $action.Path = $shell; $action.WorkingDirectory = $FixtureRoot
-        $action.Arguments = '-NoProfile -NonInteractive -File ' + (Quote $PSCommandPath) + ' -Mode Canary -FixtureRoot ' + (Quote $FixtureRoot) + ' -Nonce ' + $Nonce
+        $action = $definition.Actions.Create(0); $action.Path = Join-Path $FixtureRoot 'FixtureElevation.exe'; $action.WorkingDirectory = $FixtureRoot
+        $action.Arguments = '--canary ' + (Quote $FixtureRoot) + ' ' + $Nonce + ' ' + $sid
         $task = $folder.RegisterTaskDefinition(('Rele-CI-Canary-' + $Nonce), $definition, 2, $sid, $null, 3, $null)
         $evidence.runMode = 'registered-user'
         $running = $task.Run($null)
@@ -69,8 +58,8 @@ if ($Mode -eq 'Child') {
         $evidence.lastTaskResult = ('0x{0:X8}' -f $task.LastTaskResult)
         if (-not (Test-Path -LiteralPath $receiptPath) -or $task.LastTaskResult -ne 0) { throw ('InteractiveToken canary did not complete; LastTaskResult=' + $evidence.lastTaskResult) }
         $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
-        if ($receipt.nonce -ne $Nonce -or $receipt.sid -ne $sid -or $receipt.elevated -ne $false) { throw 'Invalid InteractiveToken canary receipt.' }
-        $evidence.taskElevated = $receipt.elevated; $evidence.result = 'passed'; $evidence.stage = 'complete'
+        if ($receipt.nonce -ne $Nonce -or $receipt.sid -ne $sid -or $receipt.elevated -ne $false -or $receipt.sessionId -ne $marker.rdpSessionId) { throw 'Invalid InteractiveToken canary receipt.' }
+        $evidence.taskElevated = $receipt.elevated; $evidence.taskSessionId = $receipt.sessionId; $evidence.result = 'passed'; $evidence.stage = 'complete'
     } catch {
         $evidence.error = $_.Exception.Message
         $evidence.errorHResult = ('0x{0:X8}' -f $_.Exception.HResult)
@@ -88,6 +77,8 @@ if ($Mode -eq 'Child') {
                 $evidence.runningTask = @{ state = [int]$running.State; enginePid = [int]$running.EnginePID; currentAction = [string]$running.CurrentAction }
             }
         } catch { $evidence.taskEvidenceError = $_.Exception.Message }
+        $canaryError = Join-Path $FixtureRoot 'canary-error.json'
+        if (Test-Path -LiteralPath $canaryError) { $evidence.canaryError = Get-Content -LiteralPath $canaryError -Raw | ConvertFrom-Json }
         try { Remove-Canary $sid } catch { $evidence.cleanupError = $_.Exception.Message; $evidence.result = 'failed' }
         $evidence | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $FixtureRoot 'windows-standard-user-results.json') -Encoding UTF8
     }
@@ -138,6 +129,7 @@ try {
     }
     $rdp = [FixtureRdpSession]::new($account, $env:COMPUTERNAME, $password, $sid)
     $rdp.Connect()
+    @{ nonce = $Nonce; sid = $sid; rdpSessionId = $rdp.SessionId } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8
     $credential = New-Object System.Management.Automation.PSCredential ($env:COMPUTERNAME + '\' + $account), $password
     $arguments = '-NoProfile -NonInteractive -File ' + (Quote $PSCommandPath) + ' -Mode Child -FixtureRoot ' + (Quote $FixtureRoot) + ' -Nonce ' + $Nonce
     $child = Start-Process -FilePath $shell -ArgumentList $arguments -Credential $credential -LoadUserProfile -UseNewEnvironment -WorkingDirectory $FixtureRoot -RedirectStandardOutput (Join-Path $FixtureRoot 'stdout.log') -RedirectStandardError (Join-Path $FixtureRoot 'stderr.log') -PassThru
@@ -178,6 +170,7 @@ try {
 } finally {
     $credential = $null; if ($password) { $password.Dispose() }
     $cleanupFailures = @()
+    $cleanupStep = 0
     foreach ($action in @(
         { if ($child -and -not $child.HasExited) { Stop-Process -Id $child.Id -Force } },
         { if ($rdp) { $rdp.Dispose() } },
@@ -188,11 +181,14 @@ try {
         { if ($user) { Remove-LocalUser -SID $user.SID } },
         { if ($user) { Get-CimInstance Win32_UserProfile | Where-Object { $_.SID -eq $user.SID.Value } | Remove-CimInstance } },
         { Remove-Item -LiteralPath $FixtureRoot -Recurse -Force }
-    )) { try { & $action } catch { $cleanupFailures += ('0x{0:X8}' -f $_.Exception.HResult) } }
+    )) {
+        $stepName = @('child', 'rdp-session', 'rdp-setting', 'service-stop', 'service-startup', 'task', 'user', 'profile', 'fixture')[$cleanupStep++]
+        try { & $action } catch { $message = $_.Exception.Message; $cleanupFailures += @{ step = $stepName; hresult = ('0x{0:X8}' -f $_.Exception.HResult); message = $message.Substring(0, [Math]::Min(512, $message.Length)) } }
+    }
     if ($cleanupFailures.Count -ne 0) {
         $publishedResult = Join-Path $sourceRoot 'windows-standard-user-results.json'
         $result = Get-Content -LiteralPath $publishedResult -Raw | ConvertFrom-Json
-        $result.result = 'failed'; $result | Add-Member -NotePropertyName cleanupErrorHResults -NotePropertyValue $cleanupFailures
+        $result.result = 'failed'; $result | Add-Member -NotePropertyName cleanupErrors -NotePropertyValue $cleanupFailures
         $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $publishedResult -Encoding UTF8
         throw 'The isolated Windows canary cleanup did not complete.'
     }
