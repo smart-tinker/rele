@@ -1,4 +1,6 @@
 import path from 'node:path';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
 import { discoverCodex, runCodexProbe, WINDOWS_CODEX_METADATA_SCRIPT, WINDOWS_CODEX_PROCESS_METADATA_SCRIPT, type CodexDiscoveryOptions } from '../src/server/codex-discovery.js';
 import { codexEnvironment, resolveCodexLaunch } from '../src/server/codex-launch.js';
@@ -12,9 +14,18 @@ const npmPackage = win.join(npmRoot, 'node_modules', '@openai', 'codex');
 const npmEntry = win.join(npmPackage, 'bin', 'codex.js');
 const socket = 'C:\\Users\\Example User\\.codex\\app-server-control\\app-server-control.sock';
 
-function windowsMetadataFixture(cim: string, script: string, appx = 'function Get-AppxPackage { [CmdletBinding()] param([string]$Name); @() }') {
-  const prefix = `New-Module -Name CimCmdlets -ScriptBlock {\n${cim}\nExport-ModuleMember -Function Get-CimInstance, Invoke-CimMethod\n} | Import-Module -Global;\n`;
-  return runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', prefix + appx + '\n' + script], 25_000);
+async function windowsMetadataFixture(cim: string, script: string, appx = 'function Get-AppxPackage { [CmdletBinding()] param([string]$Name); @() }') {
+  const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'rele-cim-fixture-')));
+  try {
+    const module = path.join(directory, 'CimCmdlets');
+    await mkdir(module);
+    const entry = path.join(module, 'CimCmdlets.psm1');
+    await writeFile(entry, cim + '\nExport-ModuleMember -Function Get-CimInstance, Invoke-CimMethod\n');
+    const literal = (value: string) => `'${value.replace(/'/gu, "''")}'`;
+    const verify = `if ((Get-Module -Name CimCmdlets).Path -ne ${literal(entry)}) { throw 'The fixture CimCmdlets module was not selected' };\n`;
+    const prefix = `$ErrorActionPreference='Stop'; $env:PSModulePath = ${literal(directory)} + [IO.Path]::PathSeparator + $env:PSModulePath;\nImport-Module CimCmdlets -ErrorAction Stop;\n` + verify;
+    return await runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', prefix + appx + '\n' + script + '\n' + verify], 25_000);
+  } finally { await rm(directory, { recursive: true, force: true }); }
 }
 
 function windowsFixture(metadata: object = { processes: [], packages: [], issues: [] }, extra: string[] = []) {
@@ -267,6 +278,7 @@ describe('Codex installation and existing Desktop discovery', () => {
     const fixtures = "function Get-CimInstance { [pscustomobject]@{ ProcessId = 1; ExecutablePath = $null; CommandLine = $null } }; function Invoke-CimMethod { [pscustomobject]@{ ReturnValue = 0; Sid = 'another-user' } }; ";
     const result = await windowsMetadataFixture(fixtures, WINDOWS_CODEX_PROCESS_METADATA_SCRIPT, "function Get-AppxPackage { throw 'Appx must not run' }");
     expect(result.code).toBe(0);
+    expect(result.stage).toBe('done');
     expect(JSON.parse(result.stdout)).toEqual({ processes: [], packages: [], issues: [] });
   }, 35_000);
 
@@ -298,6 +310,7 @@ function Invoke-CimMethod {
     // Its deadline is separate from production probe budgets and the limit test above.
     const result = await windowsMetadataFixture(fixtures, WINDOWS_CODEX_METADATA_SCRIPT);
     expect(result.code).toBe(0);
+    expect(result.stage).toBe('done');
     const parsed = JSON.parse(result.stdout);
     expect(parsed.issues).toEqual(['process-owner-unavailable']);
     expect(parsed.processes.map((item: { processId: number }) => item.processId)).toEqual([101, 102, 103, 104, 108, 109]);
