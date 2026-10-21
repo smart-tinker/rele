@@ -20,6 +20,8 @@ import {
   publicConfig,
 } from '../src/server/config.js';
 
+vi.mock('node:child_process', { spy: true });
+
 const syntheticSecrets = {
   codex: 'synthetic-codex-secret',
   telegram: '123456:synthetic_telegram_secret_123456',
@@ -278,7 +280,7 @@ describe('configuration storage and panel credentials', () => {
   it.runIf(process.platform === 'win32')(
     'round-trips Windows DPAPI without module autoload or plaintext secrets',
     async () => {
-      const nativeSpawn = childProcess.spawn;
+      const nativeSpawn = (await vi.importActual<typeof import('node:child_process')>('node:child_process')).spawn;
       const spawn = vi.spyOn(childProcess, 'spawn').mockImplementation(((command: string, args: readonly string[], options: childProcess.SpawnOptions) => {
         return nativeSpawn(command, [...args.slice(0, -1), `$ErrorActionPreference='Stop'; $PSModuleAutoLoadingPreference='None'; ${args.at(-1)}`], options);
       }) as typeof childProcess.spawn);
