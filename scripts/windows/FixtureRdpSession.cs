@@ -29,6 +29,68 @@ public sealed class FixtureRdpEvents : IFixtureRdpEvents
 // Disposable CI-only loopback client. Credentials never leave this process's memory.
 public sealed class FixtureRdpSession : IDisposable
 {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PolicyAttributes { internal uint Length; internal IntPtr RootDirectory, ObjectName; internal uint Attributes; internal IntPtr SecurityDescriptor, SecurityQualityOfService; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PolicyString { internal ushort Length, MaximumLength; internal IntPtr Buffer; }
+    [DllImport("advapi32.dll", ExactSpelling = true)]
+    private static extern uint LsaOpenPolicy(IntPtr system, ref PolicyAttributes attributes, uint access, out IntPtr policy);
+    [DllImport("advapi32.dll", ExactSpelling = true)]
+    private static extern uint LsaEnumerateAccountRights(IntPtr policy, [In] byte[] sid, out IntPtr rights, out uint count);
+    [DllImport("advapi32.dll", ExactSpelling = true)]
+    private static extern uint LsaFreeMemory(IntPtr memory);
+    [DllImport("advapi32.dll", ExactSpelling = true)]
+    private static extern uint LsaClose(IntPtr policy);
+
+    public static Dictionary<string, object> ReadRemoteLogonRights(string freshSid)
+    {
+        var identity = new SecurityIdentifier(freshSid);
+        if (!identity.IsAccountSid() || identity.Equals(WindowsIdentity.GetCurrent().User)) throw new InvalidOperationException("Expected the isolated fixture account SID.");
+        // Fixed principals: 0=fresh user, 1=Users, 2=RDP Users, 3=Everyone,
+        // 4=Authenticated Users, 5=Local Account, 6=Interactive, 7=Remote Interactive.
+        // Direct assignment facts only; this is not an effective-access calculation.
+        string[] principals = { freshSid, "S-1-5-32-545", "S-1-5-32-555", "S-1-1-0", "S-1-5-11", "S-1-5-113", "S-1-5-4", "S-1-5-14" };
+        var facts = new List<Dictionary<string, object>>();
+        var result = new Dictionary<string, object> { { "principals", facts } };
+        var attributes = new PolicyAttributes { Length = (uint)Marshal.SizeOf(typeof(PolicyAttributes)) };
+        IntPtr policy = IntPtr.Zero; uint opened = LsaOpenPolicy(IntPtr.Zero, ref attributes, 0x800, out policy); // POLICY_LOOKUP_NAMES only.
+        result["policyStatus"] = opened;
+        try
+        {
+            if (opened != 0) return result;
+            int size = Marshal.SizeOf(typeof(PolicyString));
+            for (int index = 0; index < principals.Length; index++)
+            {
+                var principal = new SecurityIdentifier(principals[index]); byte[] binary = new byte[principal.BinaryLength]; principal.GetBinaryForm(binary, 0);
+                IntPtr rights = IntPtr.Zero; uint count;
+                var record = new Dictionary<string, object> { { "principal", index }, { "allowAssigned", null }, { "denyAssigned", null } }; facts.Add(record);
+                try
+                {
+                    uint status = LsaEnumerateAccountRights(policy, binary, out rights, out count);
+                    record["queryStatus"] = status;
+                    // No LSA account object means no directly assigned rights; other failures remain unknown.
+                    if (status == 0xC0000034) { record["rightsCount"] = 0; record["noAssignments"] = true; record["allowAssigned"] = false; record["denyAssigned"] = false; continue; }
+                    if (status != 0) continue;
+                    if (count > 256 || (count != 0 && rights == IntPtr.Zero)) throw new InvalidOperationException("Invalid LSA rights array.");
+                    record["rightsCount"] = count;
+                    bool allow = false, deny = false;
+                    for (int item = 0; item < count; item++)
+                    {
+                        var right = (PolicyString)Marshal.PtrToStructure(IntPtr.Add(rights, item * size), typeof(PolicyString));
+                        if (right.Length > 1024 || right.Length % 2 != 0 || right.Length > right.MaximumLength || (right.Length != 0 && right.Buffer == IntPtr.Zero)) throw new InvalidOperationException("Invalid LSA right string.");
+                        string name = right.Length == 0 ? "" : Marshal.PtrToStringUni(right.Buffer, right.Length / 2);
+                        if (name == "SeRemoteInteractiveLogonRight") allow = true;
+                        if (name == "SeDenyRemoteInteractiveLogonRight") deny = true;
+                    }
+                    record["allowAssigned"] = allow; record["denyAssigned"] = deny;
+                }
+                finally { if (rights != IntPtr.Zero) { uint status = LsaFreeMemory(rights); if (status != 0) record["freeStatus"] = status; } }
+            }
+            return result;
+        }
+        finally { if (opened == 0 && policy != IntPtr.Zero) { uint status = LsaClose(policy); if (status != 0) result["closeStatus"] = status; } }
+    }
+
     [ComImport, Guid("4F6996D5-D7B1-412C-B0FF-063718566907"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     private interface RdpNonScriptable5
     {

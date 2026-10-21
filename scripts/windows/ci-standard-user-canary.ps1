@@ -194,6 +194,8 @@ try {
     }
     $rdpModeAfter = Read-RdpMode
     $rdp = [FixtureRdpSession]::new($account, $env:COMPUTERNAME, $password, $sid)
+    try { $rdpTransport.logonRights = [FixtureRdpSession]::ReadRemoteLogonRights($sid) }
+    catch { $rdpTransport.logonRightsErrorHResult = ('0x{0:X8}' -f $_.Exception.HResult) }
     $rdpStartedAt = [DateTime]::UtcNow
     $rdp.Connect()
     $marker.rdpSessionId = $rdp.SessionId; $marker | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8
