@@ -6,6 +6,11 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      windows_probe_shell:
+        description: 'Parent RDP host for the temporary primitive comparison'
+        type: choice
+        options: [pwsh, powershell]
+        default: pwsh
       windows_probe_image:
         description: 'Hosted Windows image for the temporary primitive comparison'
         type: choice
@@ -58,7 +63,7 @@ jobs:
           done
           npm run package
       - name: Check isolated RDP session and requested gate
-        shell: pwsh
+        shell: ${{ inputs.windows_probe_shell == 'powershell' && inputs.windows_installer_probe != true && 'powershell' || 'pwsh' }}
         env:
           RELE_INSTALLER_PROBE: ${{ inputs.windows_installer_probe }}
         run: |
