@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: rele-${{ github.workflow }}-${{ github.ref }}
+  group: rele-${{ github.workflow }}-${{ github.ref }}-${{ inputs.windows_session_probe == true && 'session' || inputs.windows_installer_probe == true && 'installer' || 'full' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
