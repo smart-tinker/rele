@@ -7,19 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       windows_cleanup_probe:
-        description: 'Check the bounded fixture cleanup with a real Windows executable lock'
-        type: boolean
-        default: false
-      windows_mstsc_probe:
-        description: 'Compare the stock loopback RDP client in the disposable session probe'
+        description: 'Check real Windows executable and current-directory locks'
         type: boolean
         default: false
       windows_session_probe:
-        description: 'Run only the disposable Windows RDP and InteractiveToken canary'
-        type: boolean
-        default: false
-      windows_installer_probe:
-        description: 'Run only the packaged Windows installer gate after the session canary'
+        description: 'Check the final standard-user session and ordinary task path'
         type: boolean
         default: false
 
@@ -27,58 +19,32 @@ permissions:
   contents: read
 
 concurrency:
-  group: rele-${{ github.workflow }}-${{ github.ref }}-${{ inputs.windows_cleanup_probe == true && 'cleanup' || inputs.windows_session_probe == true && 'session' || inputs.windows_installer_probe == true && 'installer' || 'full' }}
+  group: rele-${{ github.workflow }}-${{ github.ref }}-${{ inputs.windows_cleanup_probe == true && 'cleanup' || inputs.windows_session_probe == true && 'session' || 'full' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   windows-session-probe:
-    name: Diagnose Windows primitive or installer
-    if: github.event_name == 'workflow_dispatch' && (inputs.windows_cleanup_probe == true || inputs.windows_session_probe == true || inputs.windows_installer_probe == true)
+    name: Diagnose Windows primitive or session
+    if: github.event_name == 'workflow_dispatch' && (inputs.windows_cleanup_probe == true || inputs.windows_session_probe == true)
     runs-on: windows-2025
-    timeout-minutes: ${{ inputs.windows_installer_probe == true && 30 || 8 }}
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        if: inputs.windows_installer_probe == true || inputs.windows_cleanup_probe == true
+        if: inputs.windows_cleanup_probe == true
         with:
           node-version: 24.19.0
-          cache: ${{ inputs.windows_installer_probe == true && 'npm' || '' }}
-      - name: Check bounded cleanup with an actual Windows file lock
+      - name: Check bounded cleanup with actual Windows locks
         if: inputs.windows_cleanup_probe == true
         shell: pwsh
         run: node scripts/probe-installer-cleanup.mjs
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        if: inputs.windows_installer_probe == true
-        with:
-          python-version: '3.13'
-      - name: Prepare only the Windows installer and local protocol fixture
-        if: inputs.windows_installer_probe == true
-        shell: bash
-        run: |
-          npm ci
-          npm run build
-          python -m pip install -r scripts/protocol-requirements.txt
-          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11; do
-            npm install --prefix "$RUNNER_TEMP/codex-probe-$version" --ignore-scripts --no-audit --no-fund --no-package-lock "@openai/codex@$version"
-          done
-          npm run package
-      - name: Check isolated RDP session and requested gate
-        if: inputs.windows_session_probe == true || inputs.windows_installer_probe == true
+      - name: Check the final standard-user session and ordinary task
+        if: inputs.windows_session_probe == true
         shell: pwsh
-        env:
-          RELE_INSTALLER_PROBE: ${{ inputs.windows_installer_probe }}
-          RELE_MSTSC_PROBE: ${{ inputs.windows_mstsc_probe }}
-        run: |
-          if ($env:RELE_INSTALLER_PROBE -eq 'true') {
-            .\scripts\windows\ci-standard-user-canary.ps1 -RunGates -InstallerOnly -MstscControl:($env:RELE_MSTSC_PROBE -eq 'true')
-          } elseif ($env:RELE_MSTSC_PROBE -eq 'true') {
-            .\scripts\windows\ci-standard-user-canary.ps1 -MstscControl
-          } else {
-            .\scripts\windows\ci-standard-user-canary.ps1
-          }
-      - name: Keep bounded session evidence
+        run: .\scripts\windows\ci-standard-user-canary.ps1
+      - name: Keep bounded preflight evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -86,13 +52,11 @@ jobs:
           path: |
             windows-standard-user-results.json
             installer-cleanup-probe-results.json
-            installer-results.json
-            installer-failure-results.json
           if-no-files-found: error
           retention-days: 14
 
   verify:
-    if: github.event_name != 'workflow_dispatch' || (inputs.windows_cleanup_probe != true && inputs.windows_session_probe != true && inputs.windows_installer_probe != true)
+    if: github.event_name != 'workflow_dispatch' || (inputs.windows_cleanup_probe != true && inputs.windows_session_probe != true)
     name: Verify and package (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -128,6 +92,9 @@ jobs:
         run: |
           npm run package
           node scripts/smoke-package.mjs
+      - name: Verify bounded Windows fixture cleanup with a real file lock
+        if: runner.os == 'Windows'
+        run: node scripts/probe-installer-cleanup.mjs
       - name: Verify Windows installer and native shared gates as a standard user
         if: runner.os == 'Windows'
         shell: pwsh
@@ -183,6 +150,7 @@ jobs:
             installer-results.json
             installer-failure-results.json
             windows-standard-user-results.json
+            installer-cleanup-probe-results.json
             playwright-report/
             test-results/
           if-no-files-found: ignore
