@@ -204,6 +204,26 @@ try {
                 $rdpTransport.events += $record
             }
         } catch { $rdpTransport.eventsErrorHResult = ('0x{0:X8}' -f $_.Exception.HResult) }
+        try {
+            $observed = @($rdpTransport.events | ForEach-Object { $_.eventId })
+            $rdpTransport.eventTemplates = @((Get-WinEvent -ListProvider 'Microsoft-Windows-TerminalServices-ClientActiveXCore').Events | Where-Object { $_.Id -in @(1024, 1028, 1029, 1102, 1103) -and $_.Id -in $observed } | Sort-Object Id -Unique | Select-Object -First 5 | ForEach-Object { $description = [string]$_.Description; @{ eventId = [int]$_.Id; description = $description.Substring(0, [Math]::Min(512, $description.Length)) } })
+        } catch { $rdpTransport.templateErrorHResult = ('0x{0:X8}' -f $_.Exception.HResult) }
+        $rdpTransport.logonEvents = @()
+        try {
+            $xpath = "*[System[(EventID=4624 or EventID=4625) and TimeCreated[@SystemTime>='$since']] and EventData[Data[@Name='TargetUserSid']='$sid' or Data[@Name='TargetUserName']='$account']]"
+            foreach ($event in @(Get-WinEvent -LogName Security -FilterXPath $xpath -MaxEvents 32 -ErrorAction Stop)) {
+                $values = @{}; $xml = [xml]$event.ToXml()
+                foreach ($datum in @($xml.Event.EventData.Data)) { $values[[string]$datum.Name] = [string]$datum.InnerText }
+                if ($values.TargetUserSid -ne $sid -and ($values.TargetUserName -ne $account -or $values.TargetDomainName -notin @([Environment]::MachineName, '.'))) { continue }
+                $record = @{ eventId = [int]$event.Id }
+                foreach ($name in @('LogonType', 'Status', 'SubStatus')) { if ($values[$name] -match '^(0[xX][0-9a-fA-F]{1,8}|[0-9]{1,10})$') { $record[$name] = $values[$name] } }
+                if ($values.AuthenticationPackageName -in @('NTLM', 'Kerberos', 'Negotiate')) { $record.authenticationPackage = $values.AuthenticationPackageName }
+                $rdpTransport.logonEvents += $record
+            }
+        } catch {
+            if ($_.FullyQualifiedErrorId -eq 'NoMatchingEventsFound,Microsoft.PowerShell.Commands.GetWinEventCommand') { $rdpTransport.logonNoMatchingEvents = $true }
+            else { $rdpTransport.logonEventsErrorHResult = ('0x{0:X8}' -f $_.Exception.HResult) }
+        }
     }
     $credential = $null; if ($password) { $password.Dispose() }
     $cleanupFailures = @()
