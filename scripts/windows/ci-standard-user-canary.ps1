@@ -144,6 +144,7 @@ if (Test-Path -LiteralPath $FixtureRoot) { throw 'Fixture directory already exis
 New-Item -ItemType Directory -Path $FixtureRoot | Out-Null
 $user = $null; $child = $null; $credential = $null; $password = $null; $rdp = $null; $sharedOutcome = $null; $gatesDeadline = $null; $parentStage = 'setup'
 $rdpSettingsChanged = $false; $serviceStartupChanged = $false; $serviceStarted = $false
+$redirectorStartupChanged = $false; $redirectorStarted = $false
 $rdpStartedAt = $null; $rdpModeBefore = $null; $rdpModeAfter = $null; $rdpTransport = @{}
 $rdpClientLog = 'Microsoft-Windows-TerminalServices-RDPClient/Operational'
 $terminalPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
@@ -210,9 +211,17 @@ try {
     $priorDeny = (Get-Item -LiteralPath $terminalPath).GetValue('fDenyTSConnections', $null)
     if ($null -eq $priorDeny -or $priorDeny -ne 0) { Set-ItemProperty -LiteralPath $terminalPath -Name fDenyTSConnections -Value 0; $rdpSettingsChanged = $true }
     $service = Get-Service -Name TermService
+    $redirector = Get-Service -Name UmRdpService
+    $rdpTransport.servicesBefore = @{ TermService = [string]$service.Status; UmRdpService = [string]$redirector.Status }
     $priorServiceStartup = $service.StartType
+    $priorRedirectorStartup = $redirector.StartType
     if ($priorServiceStartup -eq 'Disabled') { Set-Service -Name TermService -StartupType Manual; $serviceStartupChanged = $true }
     if ($service.Status -ne 'Running') { Start-Service -Name TermService; $serviceStarted = $true }
+    if ($priorRedirectorStartup -eq 'Disabled') { Set-Service -Name UmRdpService -StartupType Manual; $redirectorStartupChanged = $true }
+    if ($redirector.Status -ne 'Running') { $redirectorStarted = $true; $redirector.Refresh(); if ($redirector.Status -eq 'Stopped') { $redirector.Start() } }
+    $redirector.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(10))
+    $service.Refresh(); $redirector.Refresh()
+    $rdpTransport.servicesAfter = @{ TermService = [string]$service.Status; UmRdpService = [string]$redirector.Status }
     $listenerDeadline = [DateTime]::UtcNow.AddSeconds(10)
     while (-not (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)) {
         if ([DateTime]::UtcNow -ge $listenerDeadline) { throw 'The disposable runner RDP listener did not become ready.' }
@@ -353,6 +362,8 @@ try {
         { if ($child) { if (-not $child.HasExited) { Stop-Process -Id $child.Id -Force }; if (-not $child.WaitForExit(5000)) { throw 'The owned fixture child did not exit.' }; $child.Dispose() } },
         { if ($rdp) { $rdp.Dispose() } },
         { if ($rdpSettingsChanged) { if ($null -eq $priorDeny) { Remove-ItemProperty -LiteralPath $terminalPath -Name fDenyTSConnections } else { Set-ItemProperty -LiteralPath $terminalPath -Name fDenyTSConnections -Value $priorDeny } } },
+        { if ($redirectorStarted) { Stop-Service -Name UmRdpService } },
+        { if ($redirectorStartupChanged) { Set-Service -Name UmRdpService -StartupType $priorRedirectorStartup } },
         { if ($serviceStarted) { Stop-Service -Name TermService } },
         { if ($serviceStartupChanged) { Set-Service -Name TermService -StartupType $priorServiceStartup } },
         { if ($user) { Remove-Canary $user.SID.Value } },
@@ -361,7 +372,7 @@ try {
         { if ($RunGates) { foreach ($name in @('installer-results.json', 'installer-failure-results.json', 'shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json')) { $report = Join-Path $FixtureRoot ('reports\' + $name); if (Test-Path -LiteralPath $report) { Copy-Item -LiteralPath $report -Destination (Join-Path $sourceRoot $name) } } } },
         { Remove-Item -LiteralPath $FixtureRoot -Recurse -Force }
     )) {
-        $stepName = @('child', 'rdp-session', 'rdp-setting', 'service-stop', 'service-startup', 'task', 'profile', 'user', 'reports', 'fixture')[$cleanupStep++]
+        $stepName = @('child', 'rdp-session', 'rdp-setting', 'redirector-stop', 'redirector-startup', 'service-stop', 'service-startup', 'task', 'profile', 'user', 'reports', 'fixture')[$cleanupStep++]
         try { & $action } catch { $message = $_.Exception.Message; $cleanupFailures += @{ step = $stepName; hresult = ('0x{0:X8}' -f $_.Exception.HResult); message = $message.Substring(0, [Math]::Min(512, $message.Length)) } }
     }
     $publishedResult = Join-Path $sourceRoot 'windows-standard-user-results.json'
