@@ -6,6 +6,11 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      windows_probe_image:
+        description: 'Hosted Windows image for the temporary primitive comparison'
+        type: choice
+        options: [windows-2025, windows-2022]
+        default: windows-2025
       windows_session_probe:
         description: 'Run only the disposable Windows RDP and InteractiveToken canary'
         type: boolean
@@ -26,7 +31,7 @@ jobs:
   windows-session-probe:
     name: Diagnose Windows session or installer
     if: github.event_name == 'workflow_dispatch' && (inputs.windows_session_probe == true || inputs.windows_installer_probe == true)
-    runs-on: windows-2025
+    runs-on: ${{ inputs.windows_probe_image == 'windows-2022' && 'windows-2022' || 'windows-2025' }}
     timeout-minutes: ${{ inputs.windows_installer_probe == true && 30 || 8 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
