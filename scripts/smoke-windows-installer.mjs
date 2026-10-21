@@ -13,6 +13,7 @@ import { installerCodex, sharedBackendPid, stopInstallerCodex, openInstallerAdap
 
 if (process.platform !== 'win32' || process.env.CI !== 'true') throw new Error('The installer smoke test runs only on an isolated Windows CI runner.');
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const reportDirectory = path.resolve(process.env.RELE_TEST_REPORT_DIR || root);
 const metadata = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
 const installer = path.resolve(process.argv[2] || path.join(root, 'release', `rele-${metadata.version}-windows-x64-setup.exe`));
 const hash = createHash('sha256');
@@ -299,7 +300,7 @@ try {
   assert.equal(await readFile(path.join(data, 'config.json'), 'utf8'), configured);
   assert.equal(await readFile(path.join(data, 'preserve-me.txt'), 'utf8'), 'installer smoke data\n');
   const report = { platform: 'windows', version: metadata.version, installer: path.basename(installer), result: 'passed', perUser: true, interactiveToken: true, nativeLauncher: true, legacyStartupMigrated: true, foreignProcessPreserved: true, codexConsoleWrapper: true, immutableOpenAdapterPreservedAcrossUpgradeRemove: true, desktopEnvironmentOwnership: true, nativeBackendPreservedAcrossRestartUpgradeRemove: true, health: true, restart: true, upgradeBackup: true, uninstall: true, dataPreserved: true };
-  await writeFile(path.join(root, 'installer-results.json'), JSON.stringify(report, null, 2) + '\n');
+  await writeFile(path.join(reportDirectory, 'installer-results.json'), JSON.stringify(report, null, 2) + '\n');
   console.log(JSON.stringify(report));
 } catch (error) {
   failed = true;
@@ -341,7 +342,7 @@ try {
       evidence.native[operation] = { code: control.status, error: control.error?.code, stdout: sanitize(control.stdout?.slice(-4000)), stderr: sanitize(control.stderr?.slice(-4000)) };
     }
   }
-  await writeFile(path.join(root, 'installer-failure-results.json'), JSON.stringify(evidence, null, 2) + '\n');
+  await writeFile(path.join(reportDirectory, 'installer-failure-results.json'), JSON.stringify(evidence, null, 2) + '\n');
   console.error(JSON.stringify(evidence));
   throw error;
 } finally {

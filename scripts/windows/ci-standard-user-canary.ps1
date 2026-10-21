@@ -1,4 +1,4 @@
-param([ValidateSet('Parent', 'Child')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce)
+param([ValidateSet('Parent', 'Child')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce, [switch]$RunGates)
 $ErrorActionPreference = 'Stop'
 $sourceRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $shell = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'PowerShell\7\pwsh.exe'
@@ -30,11 +30,26 @@ function Remove-Canary([string]$Sid) {
     try { $task.Stop(0) } catch { }
     $folder.DeleteTask($name, 0)
 }
+function Remove-FixtureProfile([string]$Sid) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(20); $lastError = $null
+    do {
+        $profile = Get-CimInstance Win32_UserProfile -Filter ("SID='$Sid'")
+        if (-not $profile) { return }
+        if ($profile.Special) { throw 'Refusing to remove a special user profile.' }
+        if (-not $profile.Loaded) {
+            try { $profile | Remove-CimInstance; $lastError = $null } catch { $lastError = $_.Exception }
+            if (-not (Get-CimInstance Win32_UserProfile -Filter ("SID='$Sid'"))) { return }
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    $detail = if ($lastError) { $lastError.Message } else { 'The fixture profile is still loaded.' }
+    throw ('Fixture profile cleanup timed out; Loaded=' + $profile.Loaded + '; refCount=' + $profile.refCount + '; ' + $detail)
+}
 
 if ($Mode -eq 'Child') {
     $marker = Get-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Raw | ConvertFrom-Json
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    if ($marker.nonce -ne $Nonce -or $marker.sid -ne $sid) { throw 'Standard-user fixture identity mismatch.' }
+    if ($marker.nonce -ne $Nonce -or $marker.sid -ne $sid -or [bool]$marker.runGates -ne $RunGates.IsPresent) { throw 'Standard-user fixture identity mismatch.' }
     $profile = [Environment]::GetFolderPath('UserProfile')
     $system = [Environment]::GetFolderPath('System'); $windows = [IO.Directory]::GetParent($system).FullName
     foreach ($entry in @(Get-ChildItem Env:)) { Remove-Item -LiteralPath ('Env:' + $entry.Name) }
@@ -67,7 +82,26 @@ if ($Mode -eq 'Child') {
         if (-not (Test-Path -LiteralPath $receiptPath) -or $task.LastTaskResult -ne 0) { throw ('InteractiveToken canary did not complete; LastTaskResult=' + $evidence.lastTaskResult) }
         $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
         if ($receipt.nonce -ne $Nonce -or $receipt.sid -ne $sid -or $receipt.elevated -ne $false -or $receipt.sessionId -ne $marker.rdpSessionId) { throw 'Invalid InteractiveToken canary receipt.' }
-        $evidence.taskElevated = $receipt.elevated; $evidence.taskSessionId = $receipt.sessionId; $evidence.result = 'passed'; $evidence.stage = 'complete'
+        $evidence.taskElevated = $receipt.elevated; $evidence.taskSessionId = $receipt.sessionId; $evidence.canary = 'passed'
+        if ($RunGates) {
+            $env:CI = 'true'; $env:RUNNER_OS = 'Windows'; $env:RUNNER_TEMP = $env:TEMP
+            $env:PATH = @((Split-Path $marker.node), (Split-Path $marker.python), (Join-Path (Split-Path $marker.python) 'Scripts'), $system, (Join-Path $system 'WindowsPowerShell\v1.0')) -join ';'
+            $env:PYTHONNOUSERSITE = '1'; $env:PYTHONDONTWRITEBYTECODE = '1'
+            $env:RELE_TEST_REPORT_DIR = Join-Path $FixtureRoot 'reports'; New-Item -ItemType Directory -Path $env:RELE_TEST_REPORT_DIR | Out-Null
+            $env:RELE_TEST_CODEX_PREFIX = $marker.prefixes[0]; $env:RELE_TEST_CODEX_VERSION = '0.163.0'
+            $evidence.gates = @(); $evidence.stage = 'installer'
+            & $marker.node (Join-Path $sourceRoot 'scripts\smoke-windows-installer.mjs')
+            if ($LASTEXITCODE -ne 0) { throw 'The standard-user Windows installer lifecycle gate failed.' }
+            $evidence.gates += 'installer'
+            $versions = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11')
+            for ($index = 0; $index -lt $versions.Count; $index++) {
+                $version = $versions[$index]; $evidence.stage = 'shared-' + $version
+                & $marker.python (Join-Path $sourceRoot 'scripts\shared-protocol-probe.py') --codex-prefix $marker.prefixes[$index] --expected-version $version --report (Join-Path $env:RELE_TEST_REPORT_DIR ('shared-results-' + $version + '.json'))
+                if ($LASTEXITCODE -ne 0) { throw ('The standard-user native shared gate failed for ' + $version + '.') }
+                $evidence.gates += 'shared-' + $version
+            }
+        }
+        $evidence.result = 'passed'; $evidence.stage = 'complete'
     } catch {
         $evidence.error = $_.Exception.Message
         $evidence.errorHResult = ('0x{0:X8}' -f $_.Exception.HResult)
@@ -119,7 +153,18 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant fixture source read access.' }
     & icacls.exe $FixtureRoot /grant ('*' + $sid + ':(OI)(CI)(M)') /T /C | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant fixture write access.' }
-    @{ nonce = $Nonce; sid = $sid } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8
+    $marker = @{ nonce = $Nonce; sid = $sid; runGates = $RunGates.IsPresent }
+    if ($RunGates) {
+        $marker.node = (Get-Command node.exe -CommandType Application).Source
+        $marker.python = (Get-Command python.exe -CommandType Application).Source
+        $marker.prefixes = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11') | ForEach-Object { Join-Path $env:RUNNER_TEMP ('codex-probe-' + $_) }
+        foreach ($path in (@((Split-Path $marker.node), (Split-Path $marker.python)) + $marker.prefixes)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Container) -or -not [IO.Path]::IsPathRooted($path)) { throw 'An isolated gate runtime or native package is unavailable.' }
+            & icacls.exe $path /grant ('*' + $sid + ':(OI)(CI)(RX)') /T /C | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot grant fixture gate runtime read access.' }
+        }
+    }
+    $marker | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8
     $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
     $rdpAssembly = Join-Path $FixtureRoot 'FixtureRdpSession.dll'
     & $compiler /nologo /target:library /platform:x64 /codepage:65001 /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:Microsoft.CSharp.dll ('/out:' + $rdpAssembly) (Join-Path $PSScriptRoot 'FixtureRdpSession.cs')
@@ -148,12 +193,14 @@ try {
     $rdp = [FixtureRdpSession]::new($account, $env:COMPUTERNAME, $password, $sid)
     $rdpStartedAt = [DateTime]::UtcNow
     $rdp.Connect()
-    @{ nonce = $Nonce; sid = $sid; rdpSessionId = $rdp.SessionId } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8
+    $marker.rdpSessionId = $rdp.SessionId; $marker | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8
     $credential = New-Object System.Management.Automation.PSCredential ($env:COMPUTERNAME + '\' + $account), $password
     $arguments = '-NoProfile -NonInteractive -File ' + (Quote $PSCommandPath) + ' -Mode Child -FixtureRoot ' + (Quote $FixtureRoot) + ' -Nonce ' + $Nonce
+    if ($RunGates) { $arguments += ' -RunGates' }
     $child = Start-Process -FilePath $shell -ArgumentList $arguments -Credential $credential -LoadUserProfile -UseNewEnvironment -WorkingDirectory $FixtureRoot -RedirectStandardOutput (Join-Path $FixtureRoot 'stdout.log') -RedirectStandardError (Join-Path $FixtureRoot 'stderr.log') -PassThru
     $credential = $null; $password.Dispose(); $password = $null
-    if (-not $child.WaitForExit(60000)) { throw 'Standard-user canary child timed out.' }
+    $childDeadline = if ($RunGates) { 1200000 } else { 60000 }
+    if (-not $child.WaitForExit($childDeadline)) { throw 'Standard-user fixture child timed out.' }
     $resultPath = Join-Path $FixtureRoot 'windows-standard-user-results.json'
     if (Test-Path -LiteralPath $resultPath) {
         $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
@@ -181,10 +228,13 @@ try {
         Get-Content -LiteralPath $resultPath -Raw | Write-Output
         Copy-Item -LiteralPath $resultPath -Destination (Join-Path $sourceRoot 'windows-standard-user-results.json')
     }
-    if ($child.ExitCode -ne 0) { foreach ($log in @('stdout.log', 'stderr.log')) { Get-Content -LiteralPath (Join-Path $FixtureRoot $log) -Tail 30 | Write-Output }; throw 'Standard-user InteractiveToken canary failed; native gates must not run in this environment.' }
+    if ($child.ExitCode -ne 0) { foreach ($log in @('stdout.log', 'stderr.log')) { Get-Content -LiteralPath (Join-Path $FixtureRoot $log) -Tail 30 | Write-Output }; throw 'The standard-user canary or native gate failed; see the bounded fixture reports.' }
 } catch {
     $publishedResult = Join-Path $sourceRoot 'windows-standard-user-results.json'
-    if (-not (Test-Path -LiteralPath $publishedResult)) { @{ result = 'failed'; stage = 'rdp-session'; error = $_.Exception.Message; errorHResult = ('0x{0:X8}' -f $_.Exception.HResult) } | ConvertTo-Json | Set-Content -LiteralPath $publishedResult -Encoding UTF8 }
+    if (-not (Test-Path -LiteralPath $publishedResult)) {
+        $failedStage = if ($rdp -and $rdp.SessionId -ge 0) { 'standard-user-child' } else { 'rdp-session' }
+        @{ result = 'failed'; stage = $failedStage; error = $_.Exception.Message; errorHResult = ('0x{0:X8}' -f $_.Exception.HResult) } | ConvertTo-Json | Set-Content -LiteralPath $publishedResult -Encoding UTF8
+    }
     throw
 } finally {
     if ($rdpStartedAt) {
@@ -229,17 +279,18 @@ try {
     $cleanupFailures = @()
     $cleanupStep = 0
     foreach ($action in @(
-        { if ($child -and -not $child.HasExited) { Stop-Process -Id $child.Id -Force } },
+        { if ($child) { if (-not $child.HasExited) { Stop-Process -Id $child.Id -Force }; if (-not $child.WaitForExit(5000)) { throw 'The owned fixture child did not exit.' }; $child.Dispose() } },
         { if ($rdp) { $rdp.Dispose() } },
         { if ($rdpSettingsChanged) { if ($null -eq $priorDeny) { Remove-ItemProperty -LiteralPath $terminalPath -Name fDenyTSConnections } else { Set-ItemProperty -LiteralPath $terminalPath -Name fDenyTSConnections -Value $priorDeny } } },
         { if ($serviceStarted) { Stop-Service -Name TermService } },
         { if ($serviceStartupChanged) { Set-Service -Name TermService -StartupType $priorServiceStartup } },
         { if ($user) { Remove-Canary $user.SID.Value } },
+        { if ($user) { Remove-FixtureProfile $user.SID.Value } },
         { if ($user) { Remove-LocalUser -SID $user.SID } },
-        { if ($user) { Get-CimInstance Win32_UserProfile | Where-Object { $_.SID -eq $user.SID.Value } | Remove-CimInstance } },
+        { if ($RunGates) { foreach ($name in @('installer-results.json', 'installer-failure-results.json', 'shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json')) { $report = Join-Path $FixtureRoot ('reports\' + $name); if (Test-Path -LiteralPath $report) { Copy-Item -LiteralPath $report -Destination (Join-Path $sourceRoot $name) } } } },
         { Remove-Item -LiteralPath $FixtureRoot -Recurse -Force }
     )) {
-        $stepName = @('child', 'rdp-session', 'rdp-setting', 'service-stop', 'service-startup', 'task', 'user', 'profile', 'fixture')[$cleanupStep++]
+        $stepName = @('child', 'rdp-session', 'rdp-setting', 'service-stop', 'service-startup', 'task', 'profile', 'user', 'reports', 'fixture')[$cleanupStep++]
         try { & $action } catch { $message = $_.Exception.Message; $cleanupFailures += @{ step = $stepName; hresult = ('0x{0:X8}' -f $_.Exception.HResult); message = $message.Substring(0, [Math]::Min(512, $message.Length)) } }
     }
     $publishedResult = Join-Path $sourceRoot 'windows-standard-user-results.json'
