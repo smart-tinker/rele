@@ -5,52 +5,16 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      windows_native_cleanup_probe:
-        description: Run only the isolated standard-user native stop/workdir probe
-        type: boolean
-        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: rele-${{ github.workflow }}-${{ github.ref }}-${{ inputs.windows_native_cleanup_probe == true && 'native-cleanup' || 'full' }}
+  group: rele-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  windows-native-cleanup-probe:
-    name: Diagnose native stop and workdir release (Windows)
-    if: github.event_name == 'workflow_dispatch' && inputs.windows_native_cleanup_probe == true
-    runs-on: windows-2025
-    timeout-minutes: 8
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        with:
-          node-version: 24.19.0
-          package-manager-cache: false
-      - name: Install only the exact native package
-        shell: bash
-        run: npm install --prefix "$RUNNER_TEMP/codex-probe-0.163.0" --ignore-scripts --no-audit --no-fund --no-package-lock @openai/codex@0.163.0
-      - name: Verify real native stop and workdir cleanup as a standard user
-        shell: pwsh
-        run: .\scripts\windows\ci-standard-user-canary.ps1 -RunGates -Phase NativeCleanup
-      - name: Keep native cleanup diagnostic reports
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: windows-native-cleanup-probe
-          path: |
-            windows-standard-user-results.json
-            installer-native-cleanup-results.json
-          if-no-files-found: ignore
-          retention-days: 14
-
   verify:
-    if: github.event_name != 'workflow_dispatch' || inputs.windows_native_cleanup_probe != true
     name: Verify and package (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
