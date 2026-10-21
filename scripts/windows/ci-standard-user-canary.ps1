@@ -1,5 +1,6 @@
-param([ValidateSet('Parent', 'Child')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce, [switch]$RunGates, [ValidateSet('Shared', 'Installer')][string]$Phase = 'Installer')
+param([ValidateSet('Parent', 'Child')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce, [switch]$RunGates, [switch]$InstallerOnly, [ValidateSet('Shared', 'Installer')][string]$Phase = 'Installer')
 $ErrorActionPreference = 'Stop'
+if ($InstallerOnly -and (-not $RunGates -or $Phase -eq 'Shared')) { throw 'InstallerOnly requires RunGates and the Installer phase.' }
 $sourceRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $shell = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'PowerShell\7\pwsh.exe'
 if (-not (Test-Path -LiteralPath $shell) -or [Diagnostics.FileVersionInfo]::GetVersionInfo($shell).FileMajorPart -ne 7) { throw 'The trusted PowerShell 7 installation is required for this CI canary.' }
@@ -49,7 +50,7 @@ function Remove-FixtureProfile([string]$Sid) {
 if ($Mode -eq 'Child') {
     $marker = Get-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Raw | ConvertFrom-Json
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    if ($marker.nonce -ne $Nonce -or $marker.sid -ne $sid -or $marker.phase -ne $Phase -or [bool]$marker.runGates -ne $RunGates.IsPresent -or ($Phase -eq 'Shared' -and -not $RunGates)) { throw 'Standard-user fixture identity mismatch.' }
+    if ($marker.nonce -ne $Nonce -or $marker.sid -ne $sid -or $marker.phase -ne $Phase -or [bool]$marker.runGates -ne $RunGates.IsPresent -or [bool]$marker.installerOnly -ne $InstallerOnly.IsPresent -or ($Phase -eq 'Shared' -and -not $RunGates)) { throw 'Standard-user fixture identity mismatch.' }
     $profile = [Environment]::GetFolderPath('UserProfile')
     $system = [Environment]::GetFolderPath('System'); $windows = [IO.Directory]::GetParent($system).FullName
     foreach ($entry in @(Get-ChildItem Env:)) { Remove-Item -LiteralPath ('Env:' + $entry.Name) }
@@ -57,7 +58,7 @@ if ($Mode -eq 'Child') {
     $env:USERPROFILE = $profile; $env:LOCALAPPDATA = Join-Path $profile 'AppData\Local'; $env:APPDATA = Join-Path $profile 'AppData\Roaming'
     $env:TEMP = Join-Path $FixtureRoot 'tmp'; $env:TMP = $env:TEMP
     New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
-    $evidence = @{ nonce = $Nonce; sid = $sid; phase = $Phase; result = 'failed'; selfElevated = $null; taskElevated = $null; stage = 'token'; selfSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId }
+    $evidence = @{ nonce = $Nonce; sid = $sid; phase = $Phase; installerOnly = $InstallerOnly.IsPresent; result = 'failed'; selfElevated = $null; taskElevated = $null; stage = 'token'; selfSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId }
     $task = $null; $running = $null
     try {
         $compiler = Join-Path $windows 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
@@ -160,7 +161,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant fixture source read access.' }
     & icacls.exe $FixtureRoot /grant ('*' + $sid + ':(OI)(CI)(M)') /T /C | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant fixture write access.' }
-    $marker = @{ nonce = $Nonce; sid = $sid; phase = 'Installer'; runGates = $RunGates.IsPresent }
+    $marker = @{ nonce = $Nonce; sid = $sid; phase = 'Installer'; runGates = $RunGates.IsPresent; installerOnly = $InstallerOnly.IsPresent }
     if ($RunGates) {
         $marker.node = (Get-Command node.exe -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
         $marker.python = (Get-Command python.exe -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
@@ -176,9 +177,9 @@ try {
     }
     $credential = New-Object System.Management.Automation.PSCredential ($env:COMPUTERNAME + '\' + $account), $password
     $resultPath = Join-Path $FixtureRoot 'windows-standard-user-results.json'
-    if ($RunGates) {
+    if ($RunGates) { $gatesDeadline = [DateTime]::UtcNow.AddMinutes(20) }
+    if ($RunGates -and -not $InstallerOnly) {
         $parentStage = 'shared'
-        $gatesDeadline = [DateTime]::UtcNow.AddMinutes(20)
         $marker.phase = 'Shared'; $marker | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8
         $arguments = '-NoProfile -NonInteractive -File ' + (Quote $PSCommandPath) + ' -Mode Child -FixtureRoot ' + (Quote $FixtureRoot) + ' -Nonce ' + $Nonce + ' -RunGates -Phase Shared'
         $child = Start-Process -FilePath $shell -ArgumentList $arguments -Credential $credential -LoadUserProfile -UseNewEnvironment -WorkingDirectory $FixtureRoot -RedirectStandardOutput (Join-Path $FixtureRoot 'stdout.log') -RedirectStandardError (Join-Path $FixtureRoot 'stderr.log') -PassThru
@@ -186,7 +187,7 @@ try {
         if (-not $child.WaitForExit($remaining)) { throw 'The standard-user shared phase timed out.' }
         if (-not (Test-Path -LiteralPath $resultPath)) { throw 'The standard-user shared phase did not produce a receipt.' }
         $receipt = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
-        if ($receipt.nonce -ne $Nonce -or $receipt.sid -ne $sid -or $receipt.phase -ne 'Shared') { throw 'Invalid standard-user shared phase receipt.' }
+        if ($receipt.nonce -ne $Nonce -or $receipt.sid -ne $sid -or $receipt.phase -ne 'Shared' -or [bool]$receipt.installerOnly -ne $InstallerOnly.IsPresent) { throw 'Invalid standard-user shared phase receipt.' }
         $receipt.PSObject.Properties.Remove('nonce'); $receipt.PSObject.Properties.Remove('sid'); $sharedOutcome = $receipt
         if ($child.ExitCode -ne 0 -or $receipt.result -ne 'passed' -or $receipt.selfElevated -ne $false) { foreach ($log in @('stdout.log', 'stderr.log')) { Get-Content -LiteralPath (Join-Path $FixtureRoot $log) -Tail 30 | Write-Output }; throw 'The standard-user native shared phase failed.' }
         $child.Dispose(); $child = $null
@@ -238,6 +239,7 @@ try {
     $marker.rdpSessionId = $rdp.SessionId; $marker | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8
     $arguments = '-NoProfile -NonInteractive -File ' + (Quote $PSCommandPath) + ' -Mode Child -FixtureRoot ' + (Quote $FixtureRoot) + ' -Nonce ' + $Nonce
     if ($RunGates) { $arguments += ' -RunGates' }
+    if ($InstallerOnly) { $arguments += ' -InstallerOnly' }
     $childDeadline = if ($RunGates) { [Math]::Max(0, [int](($gatesDeadline - [DateTime]::UtcNow).TotalMilliseconds)) } else { 60000 }
     if ($childDeadline -le 0) { throw 'The standard-user native gates exceeded their common deadline.' }
     $child = Start-Process -FilePath $shell -ArgumentList $arguments -Credential $credential -LoadUserProfile -UseNewEnvironment -WorkingDirectory $FixtureRoot -RedirectStandardOutput (Join-Path $FixtureRoot 'stdout.log') -RedirectStandardError (Join-Path $FixtureRoot 'stderr.log') -PassThru
@@ -247,7 +249,7 @@ try {
     if (-not $child.WaitForExit($childDeadline)) { throw 'Standard-user fixture child timed out.' }
     if (Test-Path -LiteralPath $resultPath) {
         $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
-        if ($result.nonce -ne $Nonce -or $result.sid -ne $sid -or $result.phase -ne 'Installer') { throw 'Invalid standard-user installer phase receipt.' }
+        if ($result.nonce -ne $Nonce -or $result.sid -ne $sid -or $result.phase -ne 'Installer' -or [bool]$result.installerOnly -ne $InstallerOnly.IsPresent) { throw 'Invalid standard-user installer phase receipt.' }
         $result.PSObject.Properties.Remove('nonce'); $result.PSObject.Properties.Remove('sid')
         if ($child.ExitCode -ne 0 -or $result.selfElevated -ne $false) { $result.result = 'failed' }
         $result | Add-Member -NotePropertyName verifiedRdpSessionId -NotePropertyValue $rdp.SessionId
@@ -278,7 +280,7 @@ try {
 } catch {
     $publishedResult = Join-Path $sourceRoot 'windows-standard-user-results.json'
     if (-not (Test-Path -LiteralPath $publishedResult)) {
-        @{ result = 'failed'; stage = $parentStage; error = $_.Exception.Message; errorHResult = ('0x{0:X8}' -f $_.Exception.HResult) } | ConvertTo-Json | Set-Content -LiteralPath $publishedResult -Encoding UTF8
+        @{ result = 'failed'; installerOnly = $InstallerOnly.IsPresent; stage = $parentStage; error = $_.Exception.Message; errorHResult = ('0x{0:X8}' -f $_.Exception.HResult) } | ConvertTo-Json | Set-Content -LiteralPath $publishedResult -Encoding UTF8
     }
     throw
 } finally {
