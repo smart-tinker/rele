@@ -9,6 +9,7 @@ import { codexEnvironment, environmentValue, fileExists, isDesktopLauncher, reso
 
 // Command lines are inspected inside this fixed script and never returned. No auth,
 // history, environment, or Codex configuration files are read during discovery.
+export const WINDOWS_CODEX_CIM_IMPORT_SCRIPT = String.raw`Import-Module "$PSHOME\Modules\CimCmdlets\CimCmdlets.psd1" -ErrorAction Stop`;
 export const WINDOWS_CODEX_METADATA_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -20,7 +21,7 @@ $issues = @()
 $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 try {
   [Console]::Error.WriteLine('rele-discovery:process-module')
-  Import-Module CimCmdlets -ErrorAction Stop
+  ${WINDOWS_CODEX_CIM_IMPORT_SCRIPT}
   [Console]::Error.WriteLine('rele-discovery:process-query')
   foreach ($process in @(CimCmdlets\Get-CimInstance Win32_Process -Filter "Name = 'codex.exe'")) {
     try {
@@ -87,6 +88,8 @@ if (-not $releProcessesOnly) { try {
   [Console]::Error.WriteLine('rele-discovery:packages')
   $packages = @(Get-AppxPackage -Name 'OpenAI.*' | Where-Object { $_.Name -in @('OpenAI.Codex', 'OpenAI.ChatGPT') -and $_.InstallLocation } | ForEach-Object { [pscustomobject]@{ location = $_.InstallLocation; name = $_.Name } })
 } catch { $issues += 'package-discovery-unavailable' } }
+[Console]::Error.WriteLine('rele-discovery:json-module')
+Import-Module "$PSHOME\Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1" -ErrorAction Stop
 [Console]::Error.WriteLine('rele-discovery:json')
 [pscustomobject]@{ processes = @($processes); packages = @($packages); issues = @($issues | Microsoft.PowerShell.Utility\Select-Object -Unique) } | Microsoft.PowerShell.Utility\ConvertTo-Json -Depth 5 -Compress
 [Console]::Error.WriteLine('rele-discovery:done')
@@ -107,7 +110,7 @@ export interface CodexDiscoveryOptions {
 }
 
 function probeStage(value: unknown): string | undefined {
-  return typeof value === 'string' && ['startup', 'process-module', 'process-query', 'process-parse', 'owner-query', 'parent-query', 'packages', 'json', 'done'].includes(value) ? value : undefined;
+  return typeof value === 'string' && ['startup', 'process-module', 'process-query', 'process-parse', 'owner-query', 'parent-query', 'packages', 'json-module', 'json', 'done'].includes(value) ? value : undefined;
 }
 interface WindowsProcess {
   executable: string;

@@ -2,7 +2,7 @@ import path from 'node:path';
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
-import { discoverCodex, runCodexProbe, WINDOWS_CODEX_METADATA_SCRIPT, WINDOWS_CODEX_PROCESS_METADATA_SCRIPT, type CodexDiscoveryOptions } from '../src/server/codex-discovery.js';
+import { discoverCodex, runCodexProbe, WINDOWS_CODEX_CIM_IMPORT_SCRIPT, WINDOWS_CODEX_METADATA_SCRIPT, WINDOWS_CODEX_PROCESS_METADATA_SCRIPT, type CodexDiscoveryOptions } from '../src/server/codex-discovery.js';
 import { codexEnvironment, resolveCodexLaunch } from '../src/server/codex-launch.js';
 
 const win = path.win32;
@@ -23,8 +23,11 @@ async function windowsMetadataFixture(cim: string, script: string, appx = 'funct
     await writeFile(entry, cim + '\nExport-ModuleMember -Function Get-CimInstance, Invoke-CimMethod\n');
     const literal = (value: string) => `'${value.replace(/'/gu, "''")}'`;
     const verify = `if ((Get-Module -Name CimCmdlets).Path -ne ${literal(entry)}) { throw 'The fixture CimCmdlets module was not selected' };\n`;
-    const prefix = `$ErrorActionPreference='Stop'; $env:PSModulePath = ${literal(directory)} + [IO.Path]::PathSeparator + $env:PSModulePath;\nImport-Module CimCmdlets -ErrorAction Stop;\n` + verify;
-    return await runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', prefix + appx + '\n' + script + '\n' + verify], 25_000);
+    const importFixture = `Import-Module ${literal(entry)} -ErrorAction Stop`;
+    expect(script.split(WINDOWS_CODEX_CIM_IMPORT_SCRIPT)).toHaveLength(2);
+    const fixtureScript = script.replace(WINDOWS_CODEX_CIM_IMPORT_SCRIPT, importFixture);
+    const prefix = `$ErrorActionPreference='Stop'; ${importFixture};\n` + verify;
+    return await runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', prefix + appx + '\n' + fixtureScript + '\n' + verify], 25_000);
   } finally { await rm(directory, { recursive: true, force: true }); }
 }
 
@@ -268,7 +271,7 @@ describe('Codex installation and existing Desktop discovery', () => {
     await expect(runCodexProbe(process.execPath, ['-e', 'require("node:fs").writeSync(1, "x".repeat(200000))'], 4_000)).rejects.toThrow('probe-output-limit');
   });
 
-  it.each(['process-module', 'owner-query'])('captures fixed %s stage without publishing other child stderr', async stage => {
+  it.each(['process-module', 'owner-query', 'json-module'])('captures fixed %s stage without publishing other child stderr', async stage => {
     const error = await runCodexProbe(process.execPath, ['-e', `process.stderr.write("synthetic-secret\\nrele-discovery:${stage}\\nrele-discovery:synthetic-secret\\n"); setInterval(() => {}, 1000)`], 250).catch(error => error);
     expect(error).toMatchObject({ message: 'probe-timeout', stage });
     expect(JSON.stringify(error)).not.toContain('synthetic-secret');
