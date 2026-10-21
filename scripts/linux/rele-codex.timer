@@ -1,0 +1,12 @@
+[Unit]
+Description=Recover the Codex shared daemon independently of Rele
+ConditionPathExists=/etc/rele/service.json
+
+[Timer]
+OnBootSec=1s
+OnUnitInactiveSec=5s
+AccuracySec=1s
+Unit=rele-codex.service
+
+[Install]
+WantedBy=timers.target

@@ -16,10 +16,11 @@ await rm(packageRoot, { recursive: true, force: true });
 for (const directory of ['DEBIAN', 'opt', 'usr/bin', 'usr/lib/systemd/system']) await mkdir(path.join(packageRoot, directory), { recursive: true });
 await cp(stage, path.join(packageRoot, 'opt/rele'), { recursive: true });
 await copyFile(path.join(root, 'scripts/linux-service.mjs'), path.join(packageRoot, 'opt/rele/scripts/linux-service.mjs'));
-for (const file of ['rele', 'rele.service', 'postinst', 'prerm', 'postrm']) {
-  const destination = file === 'rele' ? 'usr/bin/rele' : file === 'rele.service' ? 'usr/lib/systemd/system/rele.service' : `DEBIAN/${file}`;
+for (const file of ['rele', 'rele-codex', 'rele.service', 'rele-codex.service', 'rele-codex.timer', 'postinst', 'prerm', 'postrm']) {
+  const unit = /\.(service|timer)$/u.test(file);
+  const destination = file.startsWith('rele') ? (unit ? `usr/lib/systemd/system/${file}` : `usr/bin/${file}`) : `DEBIAN/${file}`;
   await copyFile(path.join(root, 'scripts/linux', file), path.join(packageRoot, destination));
-  await chmod(path.join(packageRoot, destination), file === 'rele.service' ? 0o644 : 0o755);
+  await chmod(path.join(packageRoot, destination), unit ? 0o644 : 0o755);
 }
 const size = spawnSync('du', ['-sk', path.join(packageRoot, 'opt')], { encoding: 'utf8' });
 if (size.status !== 0) throw new Error('Cannot calculate Debian installed size.');

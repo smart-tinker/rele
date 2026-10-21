@@ -62,6 +62,8 @@ await writeFile(path.join(stage, 'start-rele.sh'), '#!/bin/sh\nset -eu\ncd -- "$
 await writeFile(path.join(stage, 'start-rele.cmd'), '@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\n"%~dp0runtime\\node.exe" "%~dp0dist\\server\\main.js" %*\r\n');
 await writeFile(path.join(stage, 'install-user-service.sh'), '#!/bin/sh\nset -eu\ncd -- "$(dirname -- "$0")"\nexec ./runtime/node ./scripts/install-user-service.mjs "$@"\n', { mode: 0o755 });
 await writeFile(path.join(stage, 'install-autostart.cmd'), '@echo off\r\nsetlocal\r\n"%~dp0runtime\\node.exe" "%~dp0scripts\\install-autostart.mjs" %*\r\n');
+await writeFile(path.join(stage, 'start-codex.sh'), '#!/bin/sh\nset -eu\ncd -- "$(dirname -- "$0")"\nexec ./runtime/node ./dist/server/codex-cli.js --rele-cli "$@"\n', { mode: 0o755 });
+await writeFile(path.join(stage, 'start-codex.cmd'), '@echo off\r\nsetlocal\r\ncd /d "%~dp0"\r\n"%~dp0runtime\\node.exe" "%~dp0dist\\server\\codex-cli.js" --rele-cli %*\r\n');
 const git = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', windowsHide: true });
 const commit = process.env.GITHUB_SHA || (git.status === 0 ? git.stdout.trim() : null);
 await writeFile(path.join(stage, 'manifest.json'), JSON.stringify({

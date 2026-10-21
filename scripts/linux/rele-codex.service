@@ -1,0 +1,14 @@
+[Unit]
+Description=Ensure the Codex shared daemon for the Rele owner
+After=network.target
+ConditionPathExists=/etc/rele/service.json
+
+[Service]
+Type=oneshot
+User=nobody
+WorkingDirectory=~
+ExecStart=/opt/rele/runtime/node /opt/rele/dist/server/codex-cli.js --rele-daemon-start
+# Native Codex owns its detached daemon; stopping this starter must preserve it.
+KillMode=process
+TimeoutStartSec=45
+UMask=0077

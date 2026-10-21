@@ -212,7 +212,7 @@ export interface ConnectionState {
   accountId?: string;
 }
 
-export type CodexTransport = 'managed' | 'proxy' | 'websocket';
+export type CodexTransport = 'shared' | 'managed' | 'proxy' | 'websocket';
 
 export interface CodexConnectionTarget {
   executable: string;

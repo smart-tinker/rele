@@ -48,8 +48,8 @@ function configured() {
 }
 
 describe('configuration validation and public projection', () => {
-  it('defaults to a managed server while inheriting the native Codex home', () => {
-    expect(defaultConfig.codex).toEqual({ transport: 'managed', executable: 'codex', endpoint: '' });
+  it('defaults to the shared native server while inheriting the Codex home', () => {
+    expect(defaultConfig.codex).toEqual({ transport: 'shared', executable: 'codex', endpoint: '' });
     const selected = mergeConfig(defaultConfig, { codex: { codexHome: resolve('synthetic-codex-home') } });
     expect(publicConfig(selected).codex.codexHome).toBe(resolve('synthetic-codex-home'));
     expect(mergeConfig(selected, { codex: { codexHome: '' } }).codex).not.toHaveProperty('codexHome');
@@ -57,12 +57,12 @@ describe('configuration validation and public projection', () => {
     expect(defaultConfig.codex).not.toHaveProperty('codexHome');
   });
 
-  it('clears the old address only when explicitly switching to a managed server', () => {
+  it.each(['shared', 'managed'] as const)('clears the old address only when explicitly switching to %s', transport => {
     const current = mergeConfig(defaultConfig, { codex: { transport: 'websocket', endpoint: 'ws://127.0.0.1:4500', codexHome: resolve('native-home') } });
-    expect(mergeConfig(current, { codex: { transport: 'managed' } }).codex).toMatchObject({ transport: 'managed', endpoint: '', codexHome: current.codex.codexHome });
+    expect(mergeConfig(current, { codex: { transport } }).codex).toMatchObject({ transport, endpoint: '', codexHome: current.codex.codexHome });
     expect(mergeConfig(current, { telegram: { enabled: false } }).codex).toEqual(current.codex);
     expect(() => mergeConfig(defaultConfig, { codex: { endpoint: 'ws://127.0.0.1:4500' } })).toThrow('endpoint');
-    expect(() => mergeConfig(current, { codex: { transport: 'managed', endpoint: 'ws://127.0.0.1:4501' } })).toThrow('endpoint');
+    expect(() => mergeConfig(current, { codex: { transport, endpoint: 'ws://127.0.0.1:4501' } })).toThrow('endpoint');
   });
 
   it('accepts only an absolute local Codex home for the native platform', () => {

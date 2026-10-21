@@ -5,6 +5,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Security.Principal;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -19,6 +20,12 @@ internal static class Rele
         public string TaskName { get; set; }
         public int Port { get; set; }
         public string CodexHome { get; set; }
+        public string OwnerSid { get; set; }
+        public bool DesktopIntegrationOwned { get; set; }
+        public string PreviousCodexCliPath { get; set; }
+        public string PreviousForceCli { get; set; }
+        public string DesktopIntegrationWarning { get; set; }
+        public string DesktopCliPath { get; set; }
     }
 
     private sealed class LegacyStartup
@@ -42,8 +49,8 @@ internal static class Rele
         {
             for (int i = 1; i < args.Length; i++)
             {
-                if (args[i] == "--quiet" || args[i] == "--backup") options.Add(args[i], "true");
-                else if (Array.IndexOf(new[] { "--app-dir", "--data-dir", "--task-name", "--port", "--codex-home", "--error-file" }, args[i]) >= 0 && i + 1 < args.Length)
+                if (args[i] == "--quiet" || args[i] == "--backup" || args[i] == "--desktop-integration") options.Add(args[i], "true");
+                else if (Array.IndexOf(new[] { "--app-dir", "--data-dir", "--task-name", "--port", "--codex-home", "--error-file", "--warning-file", "--path-file" }, args[i]) >= 0 && i + 1 < args.Length)
                     options.Add(args[i], args[++i]);
                 else throw new InvalidOperationException("Неизвестный параметр Rele.");
             }
@@ -63,6 +70,9 @@ internal static class Rele
                 ((!SamePath(Value(options, "--data-dir", Config.DataDirectory), Config.DataDirectory)) ||
                  Value(options, "--task-name", Config.TaskName) != Config.TaskName))
                 throw new InvalidOperationException("Обновление должно использовать прежние каталог данных и фоновую задачу Rele.");
+            if (!String.IsNullOrEmpty(Config.OwnerSid) && Config.OwnerSid != currentUser.Value)
+                throw new InvalidOperationException("Эта установка Rele принадлежит другой учётной записи Windows.");
+            Config.OwnerSid = currentUser.Value;
             Config.DataDirectory = Path.GetFullPath(Value(options, "--data-dir", Config.DataDirectory));
             Config.TaskName = Value(options, "--task-name", Config.TaskName);
             Config.CodexHome = Value(options, "--codex-home", Config.CodexHome);
@@ -73,6 +83,30 @@ internal static class Rele
                 throw new InvalidOperationException("Каталог данных должен находиться вне каталога программы, чтобы удаление Rele сохранило данные.");
 
             if (command == "serve") return RunNode("serve", true);
+            if (command == "codex-desktop")
+            {
+                ValidateDesktopIntegration();
+                if (String.IsNullOrEmpty(Config.DesktopCliPath) || !OwnedDesktopAdapter(Config.DesktopCliPath) || !File.Exists(Config.DesktopCliPath)) PrepareDesktopAdapter();
+                File.WriteAllText(settingsPath, Json.Serialize(Config), new UTF8Encoding(false));
+                return RunNode("--rele-desktop", false, true);
+            }
+            if (command == "adapter-path")
+            {
+                LegacyStartup legacy = ReadLegacyStartup();
+                if (!File.Exists(settingsPath) && !options.ContainsKey("--codex-home") && legacy != null && legacy.CodexHome != null) Config.CodexHome = legacy.CodexHome;
+                PrepareDesktopAdapter();
+                File.WriteAllText(settingsPath, Json.Serialize(Config), new UTF8Encoding(false));
+                if (!options.ContainsKey("--path-file")) throw new InvalidOperationException("Укажите файл результата adapter-path.");
+                File.WriteAllText(options["--path-file"], Config.DesktopCliPath, new UTF8Encoding(false));
+                return 0;
+            }
+            if (command == "desktop-integrate" || command == "desktop-unintegrate")
+            {
+                if (!File.Exists(settingsPath)) throw new InvalidOperationException("Сначала установите Rele.");
+                if (command == "desktop-integrate") InstallDesktopIntegration(); else RemoveDesktopIntegration();
+                File.WriteAllText(settingsPath, Json.Serialize(Config), new UTF8Encoding(false));
+                return 0;
+            }
             if (command == "prepare-update")
             {
                 ReadLegacyStartup();
@@ -87,8 +121,22 @@ internal static class Rele
                 if (!File.Exists(settingsPath) && !options.ContainsKey("--codex-home") && legacy != null && legacy.CodexHome != null)
                     Config.CodexHome = legacy.CodexHome;
                 Directory.CreateDirectory(AppDirectory);
+                PrepareDesktopAdapter();
                 File.WriteAllText(settingsPath, Json.Serialize(Config), new UTF8Encoding(false));
                 if (options.ContainsKey("--backup")) Backup();
+                Config.DesktopIntegrationWarning = null;
+                if (options.ContainsKey("--desktop-integration"))
+                {
+                    try { InstallDesktopIntegration(); }
+                    catch (Exception error)
+                    {
+                        Config.DesktopIntegrationWarning = error.Message;
+                        Log("Desktop integration skipped: " + error.Message);
+                        if (options.ContainsKey("--warning-file")) File.WriteAllText(options["--warning-file"], error.Message, new UTF8Encoding(false));
+                    }
+                }
+                else RemoveDesktopIntegration();
+                File.WriteAllText(settingsPath, Json.Serialize(Config), new UTF8Encoding(false));
                 RegisterTask();
                 Start();
                 MigrateLegacyStartup(legacy);
@@ -99,6 +147,7 @@ internal static class Rele
                 Stop(true);
                 dynamic folder = TaskFolder();
                 if (OwnedTask(folder) != null) folder.DeleteTask(Config.TaskName, 0);
+                RemoveDesktopIntegration();
                 return 0;
             }
             if (command == "stop") { Stop(false); return 0; }
@@ -344,15 +393,154 @@ internal static class Rele
         File.Delete(legacy.File);
     }
 
-    private static int RunNode(string command, bool background)
+    private static bool OwnedDesktopAdapter(string value)
     {
-        var start = new ProcessStartInfo(Path.Combine(AppDirectory, "runtime", "node.exe"), "\"" + Path.Combine(AppDirectory, "dist", "server", "main.js") + "\" " + command)
+        if (SamePath(value, Path.Combine(AppDirectory, "Rele.Codex.exe"))) return true;
+        string directory = Path.GetDirectoryName(Path.GetFullPath(value));
+        string cache = Path.Combine(Config.DataDirectory, "codex-adapters");
+        if (!String.Equals(Path.GetFileName(value), "Rele.Codex.exe", StringComparison.OrdinalIgnoreCase) ||
+            !Regex.IsMatch(Path.GetFileName(directory), "^[a-f0-9]{64}$") || !SamePath(Path.GetDirectoryName(directory), cache)) return false;
+        try
+        {
+            var marker = Json.Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(directory, "rele-install.json")));
+            return Convert.ToInt32(marker["DesktopAdapterVersion"]) == 1 && (string)marker["OwnerSid"] == Config.OwnerSid && SamePath((string)marker["DataDirectory"], Config.DataDirectory);
+        }
+        catch { return false; }
+    }
+
+    private static void PrepareDesktopAdapter()
+    {
+        var files = new SortedDictionary<string, string>(StringComparer.Ordinal);
+        foreach (string file in new[] { "Rele.Codex.exe", "runtime\\node.exe", "package.json" }) files.Add(file, Path.Combine(AppDirectory, file));
+        foreach (string tree in new[] { "dist\\server", "dist\\shared", "node_modules\\ws" })
+            foreach (string file in Directory.GetFiles(Path.Combine(AppDirectory, tree), "*", SearchOption.AllDirectories))
+                files.Add(file.Substring(AppDirectory.TrimEnd('\\').Length + 1), file);
+        string marker = Json.Serialize(new Dictionary<string, object> {
+            { "DesktopAdapterVersion", 1 }, { "OwnerSid", Config.OwnerSid }, { "DataDirectory", Config.DataDirectory }, { "CodexHome", Config.CodexHome }
+        });
+        var identity = new StringBuilder(marker);
+        using (var hash = SHA256.Create())
+            foreach (KeyValuePair<string, string> file in files)
+                using (var input = File.OpenRead(file.Value)) identity.Append('\n').Append(file.Key).Append(':').Append(BitConverter.ToString(hash.ComputeHash(input)));
+        string name;
+        using (var hash = SHA256.Create()) name = BitConverter.ToString(hash.ComputeHash(Encoding.UTF8.GetBytes(identity.ToString()))).Replace("-", "").ToLowerInvariant();
+        string cache = Path.Combine(Config.DataDirectory, "codex-adapters");
+        string directory = Path.Combine(cache, name);
+        if (!Directory.Exists(directory))
+        {
+            Directory.CreateDirectory(cache);
+            string temporary = Path.Combine(cache, ".prepare-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(temporary);
+            try
+            {
+                foreach (KeyValuePair<string, string> file in files)
+                {
+                    string destination = Path.Combine(temporary, file.Key);
+                    Directory.CreateDirectory(Path.GetDirectoryName(destination));
+                    File.Copy(file.Value, destination, false);
+                }
+                File.WriteAllText(Path.Combine(temporary, "rele-install.json"), marker, new UTF8Encoding(false));
+                try { Directory.Move(temporary, directory); }
+                catch (IOException) { if (!Directory.Exists(directory)) throw; }
+            }
+            finally { if (Directory.Exists(temporary)) Directory.Delete(temporary, true); }
+        }
+        if (File.ReadAllText(Path.Combine(directory, "rele-install.json")) != marker || !File.Exists(Path.Combine(directory, "Rele.Codex.exe")))
+            throw new InvalidOperationException("Сохранённый адаптер Codex повреждён. Установка не заменяет его работающие файлы.");
+        Config.DesktopCliPath = Path.Combine(directory, "Rele.Codex.exe");
+    }
+
+    private static string UserEnvironment(string name)
+    {
+        return Environment.GetEnvironmentVariable(name, EnvironmentVariableTarget.User);
+    }
+
+    private static void ValidateDesktopIntegration()
+    {
+        foreach (EnvironmentVariableTarget scope in new[] { EnvironmentVariableTarget.Process, EnvironmentVariableTarget.User, EnvironmentVariableTarget.Machine })
+        {
+            if (!String.IsNullOrEmpty(Environment.GetEnvironmentVariable("CODEX_APP_SERVER_WS_URL", scope)))
+                throw new InvalidOperationException("Подключение Desktop не изменено: задан CODEX_APP_SERVER_WS_URL. Удалите прежнее подключение вручную и повторите подключение Desktop в Rele.");
+            string cli = Environment.GetEnvironmentVariable("CODEX_CLI_PATH", scope);
+            if (!String.IsNullOrEmpty(cli) && !OwnedDesktopAdapter(cli))
+                throw new InvalidOperationException("Подключение Desktop не изменено: CODEX_CLI_PATH принадлежит другой программе. Проверьте его вручную перед подключением Desktop в Rele.");
+            string force = Environment.GetEnvironmentVariable("CODEX_APP_SERVER_FORCE_CLI", scope);
+            if (!String.IsNullOrEmpty(force) && force != "1")
+                throw new InvalidOperationException("Подключение Desktop не изменено: CODEX_APP_SERVER_FORCE_CLI уже настроен иначе. Проверьте его вручную.");
+        }
+    }
+
+    private static void InstallDesktopIntegration()
+    {
+        ValidateDesktopIntegration();
+        PrepareDesktopAdapter();
+        string cli = UserEnvironment("CODEX_CLI_PATH"), force = UserEnvironment("CODEX_APP_SERVER_FORCE_CLI");
+        if (!Config.DesktopIntegrationOwned)
+        {
+            Config.PreviousCodexCliPath = cli;
+            Config.PreviousForceCli = force;
+        }
+        try
+        {
+            SetUserEnvironment("CODEX_CLI_PATH", Config.DesktopCliPath);
+            SetUserEnvironment("CODEX_APP_SERVER_FORCE_CLI", "1");
+            Config.DesktopIntegrationOwned = true;
+            Config.DesktopIntegrationWarning = null;
+        }
+        catch
+        {
+            SetUserEnvironment("CODEX_CLI_PATH", cli);
+            SetUserEnvironment("CODEX_APP_SERVER_FORCE_CLI", force);
+            throw;
+        }
+        BroadcastEnvironment();
+    }
+
+    private static void RemoveDesktopIntegration()
+    {
+        if (!Config.DesktopIntegrationOwned) return;
+        string cli = UserEnvironment("CODEX_CLI_PATH");
+        if (!String.IsNullOrEmpty(cli) && OwnedDesktopAdapter(cli))
+        {
+            SetUserEnvironment("CODEX_CLI_PATH", Config.PreviousCodexCliPath);
+            if (UserEnvironment("CODEX_APP_SERVER_FORCE_CLI") == "1") SetUserEnvironment("CODEX_APP_SERVER_FORCE_CLI", Config.PreviousForceCli);
+        }
+        Config.DesktopIntegrationOwned = false;
+        Config.DesktopIntegrationWarning = null;
+        BroadcastEnvironment();
+    }
+
+    private static void SetUserEnvironment(string name, string value)
+    {
+        Environment.SetEnvironmentVariable(name, value, EnvironmentVariableTarget.User);
+        Environment.SetEnvironmentVariable(name, value, EnvironmentVariableTarget.Process);
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr SendMessageTimeout(IntPtr window, uint message, UIntPtr parameter, string value, uint flags, uint milliseconds, out UIntPtr result);
+
+    private static void BroadcastEnvironment()
+    {
+        UIntPtr result;
+        SendMessageTimeout(new IntPtr(0xffff), 0x001a, UIntPtr.Zero, "Environment", 2, 1000, out result);
+    }
+
+    private static int RunNode(string command, bool background, bool codex = false)
+    {
+        var start = new ProcessStartInfo(Path.Combine(AppDirectory, "runtime", "node.exe"), "\"" + Path.Combine(AppDirectory, "dist", "server", codex ? "codex-cli.js" : "main.js") + "\" " + command)
         {
             WorkingDirectory = AppDirectory, UseShellExecute = false, CreateNoWindow = true,
             RedirectStandardOutput = true, RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8
         };
         start.EnvironmentVariables["RELE_DATA_DIR"] = Config.DataDirectory;
         start.EnvironmentVariables["RELE_PORT"] = Config.Port.ToString();
+        if (codex)
+        {
+            ValidateDesktopIntegration();
+            start.EnvironmentVariables["CODEX_CLI_PATH"] = Config.DesktopCliPath;
+            start.EnvironmentVariables["RELE_DESKTOP_CLI"] = Config.DesktopCliPath;
+            start.EnvironmentVariables["CODEX_APP_SERVER_FORCE_CLI"] = "1";
+        }
         if (!String.IsNullOrEmpty(Config.CodexHome)) start.EnvironmentVariables["CODEX_HOME"] = Config.CodexHome;
         var errors = new StringBuilder();
         using (var process = new Process { StartInfo = start })
@@ -432,7 +620,8 @@ internal static class Rele
         public ChildJob(Process process)
         {
             handle = CreateJobObject(IntPtr.Zero, null);
-            var limits = new Limits(); limits.Basic.Flags = 0x2000;
+            // Native Codex explicitly breaks away into its own installed daemon; owned stdio stays in its nested Job.
+            var limits = new Limits(); limits.Basic.Flags = 0x2000 | 0x800;
             if (handle == IntPtr.Zero || !SetInformationJobObject(handle, 9, ref limits, (uint)Marshal.SizeOf(typeof(Limits))) || !AssignProcessToJobObject(handle, process.Handle))
             {
                 try { if (!process.HasExited) process.Kill(); } catch { }

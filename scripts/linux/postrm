@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 if [ "$1" = purge ]; then
-  rm -f /etc/rele/service.json /etc/systemd/system/rele.service.d/rele-user.conf /var/lib/rele/restart.json
-  rmdir /etc/rele /etc/systemd/system/rele.service.d /var/lib/rele 2>/dev/null || true
+  rm -f /etc/rele/service.json /etc/systemd/system/rele.service.d/rele-user.conf /etc/systemd/system/rele-codex.service.d/rele-user.conf /var/lib/rele/restart.json
+  rmdir /etc/rele /etc/systemd/system/rele.service.d /etc/systemd/system/rele-codex.service.d /var/lib/rele 2>/dev/null || true
 fi
 if [ -d /run/systemd/system ]; then
   systemctl daemon-reload

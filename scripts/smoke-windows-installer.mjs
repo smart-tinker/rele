@@ -7,6 +7,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { ConfigStore, mergeConfig } from '../dist/server/config.js';
+import { installerCodex, sharedBackendPid, stopInstallerCodex, openInstallerAdapter } from './installer-codex-fixture.mjs';
 
 if (process.platform !== 'win32' || process.env.CI !== 'true') throw new Error('The installer smoke test runs only on an isolated Windows CI runner.');
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -15,20 +17,25 @@ const installer = path.resolve(process.argv[2] || path.join(root, 'release', `re
 const hash = createHash('sha256');
 for await (const chunk of createReadStream(installer)) hash.update(chunk);
 assert.equal(hash.digest('hex'), (await readFile(`${installer}.sha256`, 'utf8')).split(/\s/u)[0], 'Installer checksum mismatch');
-const temporary = await mkdtemp(path.join(tmpdir(), 'Rele installer smoke '));
+const temporary = await mkdtemp(path.join(process.env.RUNNER_TEMP || tmpdir(), 'ri-'));
 const application = path.join(temporary, 'Installed Rele');
 const data = path.join(temporary, 'User Data');
 const codexHome = path.join(temporary, 'Isolated Codex');
 const task = `Rele-Smoke-${randomUUID()}`;
 const uninstallKey = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{3F09F239-2927-4ED8-9431-A74CCED1D5EB}_is1';
 const env = { ...process.env, RELE_SMOKE_APP: application, RELE_SMOKE_TASK: task, RELE_SMOKE_REGISTRY: uninstallKey, RELE_DATA_DIR: data, RELE_PORT: '0', CODEX_HOME: codexHome };
-for (const key of ['OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN']) delete env[key];
+for (const key of ['OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN', 'CODEX_CLI_PATH', 'CODEX_APP_SERVER_FORCE_CLI', 'CODEX_APP_SERVER_WS_URL']) delete env[key];
 let instance;
 let installationAttempted = false;
 let uninstalled = false;
 let legacyStartup;
 let legacyContents;
 let legacyProcess;
+let originalDesktopEnvironment;
+let codexFixture;
+let sharedPid;
+let heldAdapter;
+let heldAdapterPath;
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { encoding: 'utf8', env, windowsHide: true, timeout: 120_000, maxBuffer: 1024 * 1024, ...options });
@@ -39,6 +46,20 @@ function run(command, args, options = {}) {
 function powershell(code, options) {
   return run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `$ErrorActionPreference = 'Stop'; ${code}`], options);
 }
+function desktopEnvironment(values) {
+  if (values) {
+    powershell(`$values = $env:RELE_SMOKE_DESKTOP_ENV | ConvertFrom-Json;
+      foreach ($name in @('CODEX_CLI_PATH', 'CODEX_APP_SERVER_FORCE_CLI', 'CODEX_APP_SERVER_WS_URL')) {
+        [Environment]::SetEnvironmentVariable($name, $values.$name, 'User');
+      }`, { env: { ...env, RELE_SMOKE_DESKTOP_ENV: JSON.stringify(values) } });
+    return;
+  }
+  return JSON.parse(powershell(`$values = @{};
+    foreach ($name in @('CODEX_CLI_PATH', 'CODEX_APP_SERVER_FORCE_CLI', 'CODEX_APP_SERVER_WS_URL')) {
+      $values[$name] = [Environment]::GetEnvironmentVariable($name, 'User');
+    }; $values | ConvertTo-Json -Compress`));
+}
+const emptyDesktopEnvironment = { CODEX_CLI_PATH: null, CODEX_APP_SERVER_FORCE_CLI: null, CODEX_APP_SERVER_WS_URL: null };
 async function exists(file) {
   try { await access(file); return true; } catch { return false; }
 }
@@ -72,13 +93,18 @@ async function stopped(address) {
 }
 
 const installArguments = ['/SP-', '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART',
-  `/DIR=${application}`, `/RELEDATADIR=${data}`, `/RELETASKNAME=${task}`, '/RELEPORT=0', `/RELECODEXHOME=${codexHome}`];
+  '/TASKS=desktop', `/DIR=${application}`, `/RELEDATADIR=${data}`, `/RELETASKNAME=${task}`, '/RELEPORT=0', `/RELECODEXHOME=${codexHome}`];
 try {
   // A fixed AppId is deliberate; refuse to disturb any existing installation on a reused runner.
   assert.equal(powershell('Test-Path -LiteralPath $env:RELE_SMOKE_REGISTRY'), 'False', 'The CI user already has Rele installed.');
   assert.equal(powershell('(@(Get-ScheduledTask -TaskName $env:RELE_SMOKE_TASK -ErrorAction SilentlyContinue)).Count'), '0');
+  originalDesktopEnvironment = desktopEnvironment();
+  desktopEnvironment(emptyDesktopEnvironment);
   await mkdir(data, { recursive: true });
-  await mkdir(codexHome, { recursive: true });
+  codexFixture = await installerCodex(codexHome);
+  const nativeConfig = new ConfigStore(data);
+  await nativeConfig.load();
+  await nativeConfig.save(mergeConfig(nativeConfig.config, { codex: codexFixture }));
   await writeFile(path.join(data, 'preserve-me.txt'), 'installer smoke data\n');
 
   legacyStartup = path.join(powershell("[Environment]::GetFolderPath([Environment+SpecialFolder]::Startup, [Environment+SpecialFolderOption]::DoNotVerify)"), 'Rele.cmd');
@@ -124,7 +150,9 @@ try {
   legacyProcess = undefined;
   await rm(path.join(data, 'instance.json'));
 
-  console.log('Windows installer smoke: silent per-user install');
+  console.log('Windows installer smoke: foreign Desktop settings are preserved without blocking installation');
+  const foreignDesktopEnvironment = { CODEX_CLI_PATH: 'C:\\Foreign Codex\\codex.exe', CODEX_APP_SERVER_FORCE_CLI: '0', CODEX_APP_SERVER_WS_URL: 'ws://127.0.0.1:59999' };
+  desktopEnvironment(foreignDesktopEnvironment);
   run(installer, [...installArguments, `/LOG=${path.join(temporary, 'install.log')}`]);
   const launcher = path.join(application, 'Rele.exe');
   const runtime = path.join(application, 'runtime', 'node.exe');
@@ -134,10 +162,46 @@ try {
   assert.equal(run(runtime, [main, '--version']), metadata.version);
   instance = await ready();
   const initialPid = instance.pid;
+  sharedPid = await sharedBackendPid(codexFixture);
   const settings = JSON.parse(await readFile(path.join(application, 'rele-install.json'), 'utf8'));
   await assertSamePath(settings.DataDirectory, data);
   assert.equal(settings.TaskName, task);
   await assertSamePath(settings.CodexHome, codexHome);
+  assert.equal(settings.DesktopIntegrationOwned, false);
+  assert.ok(settings.DesktopIntegrationWarning);
+  assert.deepEqual(desktopEnvironment(), foreignDesktopEnvironment);
+  const refused = spawnSync(launcher, ['desktop-integrate', '--quiet'], { env, windowsHide: true, timeout: 60_000 });
+  assert.equal(refused.status, 1);
+  assert.deepEqual(desktopEnvironment(), foreignDesktopEnvironment);
+  desktopEnvironment(emptyDesktopEnvironment);
+  run(launcher, ['desktop-integrate', '--quiet']);
+  const integratedEnvironment = desktopEnvironment();
+  await assertSamePath(integratedEnvironment.CODEX_CLI_PATH, JSON.parse(await readFile(path.join(application, 'rele-install.json'), 'utf8')).DesktopCliPath);
+  assert.ok(integratedEnvironment.CODEX_CLI_PATH.startsWith(path.join(data, 'codex-adapters') + path.sep));
+  assert.equal(integratedEnvironment.CODEX_APP_SERVER_FORCE_CLI, '1');
+  assert.equal(integratedEnvironment.CODEX_APP_SERVER_WS_URL, null);
+  console.log('Windows installer smoke: the Codex wrapper preserves argv, profile, data and raw bytes');
+  const shim = path.join(application, 'dist', 'server', 'codex-cli.js');
+  const originalShim = await readFile(shim);
+  try {
+    await writeFile(shim, `process.stdout.write(JSON.stringify({ args: process.argv.slice(2), data: process.env.RELE_DATA_DIR, profile: process.env.CODEX_HOME }) + '\\n'); process.stdin.pipe(process.stdout);`);
+    const argv = ['app-server', 'two words', 'a"quote', 'C:\\space folder\\', 'Кодекс 🙂'];
+    const payload = Buffer.from([0, 1, 0xff, 13, 10, 0x5c]);
+    const wrapped = spawnSync(path.join(application, 'Rele.Codex.exe'), argv, { env, input: payload, windowsHide: true, timeout: 60_000 });
+    assert.equal(wrapped.status, 0, wrapped.stderr?.toString());
+    const newline = wrapped.stdout.indexOf(10);
+    assert.deepEqual(JSON.parse(wrapped.stdout.subarray(0, newline).toString('utf8')), { args: argv, data, profile: codexHome });
+    assert.deepEqual(wrapped.stdout.subarray(newline + 1), payload);
+  } finally { await writeFile(shim, originalShim); }
+  // A content change creates a fresh immutable bundle even when the app version stays the same.
+  const packageFile = path.join(application, 'package.json');
+  const packageMetadata = JSON.parse(await readFile(packageFile, 'utf8'));
+  await writeFile(packageFile, JSON.stringify({ ...packageMetadata, installerSnapshotFixture: randomUUID() }));
+  run(launcher, ['desktop-integrate', '--quiet']);
+  heldAdapterPath = desktopEnvironment().CODEX_CLI_PATH;
+  assert.notEqual(heldAdapterPath, integratedEnvironment.CODEX_CLI_PATH);
+  heldAdapter = await openInstallerAdapter(heldAdapterPath, env);
+  assert.equal((await heldAdapter.call('server/diagnostics')).process.id, sharedPid);
   assert.equal(await exists(legacyStartup), false, 'The known old startup script must be migrated after readiness.');
   const legacyBackup = (await readdir(path.join(data, 'backups'))).find(name => name.startsWith('legacy-startup-'));
   assert.ok(legacyBackup);
@@ -189,11 +253,19 @@ try {
   run(launcher, ['restart', '--quiet']);
   instance = await ready(initialPid);
   assert.equal(await readFile(path.join(data, 'config.json'), 'utf8'), configured);
+  await sharedBackendPid(codexFixture, sharedPid);
+  assert.equal((await heldAdapter.call('server/diagnostics')).process.id, sharedPid);
 
   console.log('Windows installer smoke: same-version upgrade with backup');
   const beforeUpgradePid = instance.pid;
   run(installer, [...installArguments, `/LOG=${path.join(temporary, 'upgrade.log')}`]);
   instance = await ready(beforeUpgradePid);
+  await sharedBackendPid(codexFixture, sharedPid);
+  assert.equal((await heldAdapter.call('server/diagnostics')).process.id, sharedPid);
+  process.kill(heldAdapter.child.pid, 0);
+  const upgradedSettings = JSON.parse(await readFile(path.join(application, 'rele-install.json'), 'utf8'));
+  assert.notEqual(upgradedSettings.DesktopCliPath, heldAdapterPath);
+  assert.equal(await exists(heldAdapterPath), true);
   assert.equal(await readFile(path.join(data, 'preserve-me.txt'), 'utf8'), 'installer smoke data\n');
   assert.equal(await readFile(path.join(data, 'config.json'), 'utf8'), configured);
   const backups = (await readdir(path.join(data, 'backups'))).filter(name => !name.startsWith('legacy-startup-'));
@@ -201,17 +273,28 @@ try {
   assert.equal(await exists(path.join(data, 'backups', backups[0], 'rele.sqlite')), true);
   assert.equal(await readFile(path.join(data, 'backups', backups[0], 'config.json'), 'utf8'), configured);
 
+  console.log('Windows installer smoke: owned Desktop settings restore and later foreign changes survive uninstall');
+  run(launcher, ['desktop-unintegrate', '--quiet']);
+  assert.deepEqual(desktopEnvironment(), emptyDesktopEnvironment);
+  run(launcher, ['desktop-integrate', '--quiet']);
+  const changedDesktopEnvironment = { ...desktopEnvironment(), CODEX_CLI_PATH: foreignDesktopEnvironment.CODEX_CLI_PATH };
+  desktopEnvironment(changedDesktopEnvironment);
   console.log('Windows installer smoke: uninstall preserves data');
   run(path.join(application, 'unins000.exe'), ['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', `/LOG=${path.join(temporary, 'uninstall.log')}`]);
   uninstalled = true;
   await stopped(instance.address);
+  await sharedBackendPid(codexFixture, sharedPid);
+  assert.equal((await heldAdapter.call('server/diagnostics')).process.id, sharedPid);
+  process.kill(heldAdapter.child.pid, 0);
+  assert.equal(await exists(heldAdapterPath), true);
   assert.equal(powershell('(@(Get-ScheduledTask -TaskName $env:RELE_SMOKE_TASK -ErrorAction SilentlyContinue)).Count'), '0');
   assert.equal(powershell('Test-Path -LiteralPath $env:RELE_SMOKE_REGISTRY'), 'False');
   assert.equal(await exists(launcher), false);
+  assert.deepEqual(desktopEnvironment(), { ...emptyDesktopEnvironment, CODEX_CLI_PATH: foreignDesktopEnvironment.CODEX_CLI_PATH, CODEX_APP_SERVER_FORCE_CLI: '1' });
   assert.equal(await exists(path.join(data, 'rele.sqlite')), true);
   assert.equal(await readFile(path.join(data, 'config.json'), 'utf8'), configured);
   assert.equal(await readFile(path.join(data, 'preserve-me.txt'), 'utf8'), 'installer smoke data\n');
-  const report = { platform: 'windows', version: metadata.version, installer: path.basename(installer), result: 'passed', perUser: true, interactiveToken: true, nativeLauncher: true, legacyStartupMigrated: true, foreignProcessPreserved: true, health: true, restart: true, upgradeBackup: true, uninstall: true, dataPreserved: true };
+  const report = { platform: 'windows', version: metadata.version, installer: path.basename(installer), result: 'passed', perUser: true, interactiveToken: true, nativeLauncher: true, legacyStartupMigrated: true, foreignProcessPreserved: true, codexConsoleWrapper: true, immutableOpenAdapterPreservedAcrossUpgradeRemove: true, desktopEnvironmentOwnership: true, nativeBackendPreservedAcrossRestartUpgradeRemove: true, health: true, restart: true, upgradeBackup: true, uninstall: true, dataPreserved: true };
   await writeFile(path.join(root, 'installer-results.json'), JSON.stringify(report, null, 2) + '\n');
   console.log(JSON.stringify(report));
 } finally {
@@ -241,5 +324,8 @@ try {
     const contents = await readFile(path.join(temporary, file), 'utf8').catch(() => '');
     if (contents && !uninstalled) console.error(`${file}:\n${contents.slice(-7000)}`);
   }
+  if (originalDesktopEnvironment) desktopEnvironment(originalDesktopEnvironment);
+  if (heldAdapter) await heldAdapter.close();
+  stopInstallerCodex(codexFixture);
   await rm(temporary, { recursive: true, force: true, maxRetries: 20, retryDelay: 200 });
 }

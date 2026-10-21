@@ -40,31 +40,42 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      - name: Install the isolated protocol fixture
+        run: |
+          python -m pip install -r scripts/protocol-requirements.txt
+          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11; do
+            npm install --prefix "$RUNNER_TEMP/codex-probe-$version" --ignore-scripts --no-audit --no-fund --no-package-lock "@openai/codex@$version"
+          done
       - name: Build installers and portable runtime, verify the extracted archive
         run: |
           npm run package
           node scripts/smoke-package.mjs
       - name: Verify the real Windows installer lifecycle
         if: runner.os == 'Windows'
+        env:
+          RELE_TEST_CODEX_PREFIX: ${{ runner.temp }}/codex-probe-0.163.0
+          RELE_TEST_CODEX_VERSION: 0.163.0
         run: node scripts/smoke-windows-installer.mjs
       - name: Verify the real Debian package and systemd lifecycle
         if: runner.os == 'Linux'
+        env:
+          RELE_TEST_CODEX_PREFIX: ${{ runner.temp }}/codex-probe-0.163.0
+          RELE_TEST_CODEX_VERSION: 0.163.0
         run: node scripts/smoke-linux-installer.mjs
-      - name: Install the isolated protocol fixture
-        run: |
-          python -m pip install -r scripts/protocol-requirements.txt
-          for version in 0.163.0 0.163.0-alpha.10.2; do
-            npm install --prefix "$RUNNER_TEMP/codex-probe-$version" --ignore-scripts --no-audit --no-fund --no-package-lock "@openai/codex@$version"
-          done
       - name: Verify the actual Codex protocol without credentials or a real model
         run: |
-          for version in 0.163.0 0.163.0-alpha.10.2; do
+          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11; do
             python scripts/protocol-probe.py --codex-prefix "$RUNNER_TEMP/codex-probe-$version" --expected-version "$version" --report "protocol-results-$version.json"
           done
       - name: Verify managed Rele, shared history, ownership and origin delivery
         run: |
-          for version in 0.163.0 0.163.0-alpha.10.2; do
+          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11; do
             python scripts/managed-protocol-probe.py --codex-prefix "$RUNNER_TEMP/codex-probe-$version" --expected-version "$version" --report "managed-results-$version.json"
+          done
+      - name: Verify native shared daemon, Desktop stdio shim and Rele recovery
+        run: |
+          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11; do
+            python scripts/shared-protocol-probe.py --codex-prefix "$RUNNER_TEMP/codex-probe-$version" --expected-version "$version" --report "shared-results-$version.json"
           done
       - name: Install the pinned local speech environment and public fixture
         run: |
@@ -90,6 +101,7 @@ jobs:
           path: |
             protocol-results-*.json
             managed-results-*.json
+            shared-results-*.json
             voice-results.json
             installer-results.json
             playwright-report/
@@ -165,7 +177,9 @@ jobs:
 
           Both installers include Node.js 24.19.0 and production dependencies. Codex discovery checks Desktop backend locations, versioned Windows CLI directories, running process metadata, and local CLI installations. Opening the installed application uses an expiring single-use login link. Existing chat bindings and saved tokens survive upgrades. Portable ZIP/TAR packages remain available.
 
-          New in rc.12: Source-first Telegram/Slack tabs map discovered chats and threads to named Codex conversations. Separate per-source off/mention/all access defaults new sources to off, preserves legacy restrictions until an explicit change, and requires human-only DM allowlists. Per-source automatic creation and explicit recovery protect already accepted messages. SQLite migrates v5 to v6; back up before upgrading and use a compatible pre-v6 backup for rollback. Limited diagnostics runs before config loading and reads only the instance marker and public loopback health, without config/DPAPI/database/history access. Real Windows/Defender and messenger acceptance remain open. See docs/RC12.md.
+          New in rc.13: Recommended native shared Codex policy attaches to or starts one daemon in the original profile, discovers its private control socket again after restart, and preserves original conversation IDs and uncertain request UUIDs. Windows supplies immutable Desktop/interactive CLI adapters and owner-checked optional Desktop integration; Ubuntu uses an independent systemd starter/timer without a Desktop or user D-Bus session. Installer gates keep the actual native PID and an open Windows adapter connection through Rele restart/upgrade/uninstall. Exact Codex 0.163.0, alpha.10.2 and alpha.11 run raw, managed and shared native probes. Existing explicit targets require a deliberate shared-mode transition and one Quit/relaunch of a private Desktop. codex exec does not support the shared remote transport in these versions. Real Desktop GUI and phone/messenger acceptance remain open. See docs/RC13.md.
+
+          Previously in rc.12: Source-first Telegram/Slack tabs map discovered chats and threads to named Codex conversations. Separate per-source off/mention/all access defaults new sources to off, preserves legacy restrictions until an explicit change, and requires human-only DM allowlists. Per-source automatic creation and explicit recovery protect already accepted messages. SQLite migrates v5 to v6; back up before upgrading and use a compatible pre-v6 backup for rollback. Limited diagnostics runs before config loading and reads only the instance marker and public loopback health, without config/DPAPI/database/history access. Real Windows/Defender and messenger acceptance remain open. See docs/RC12.md.
 
           Previously in rc.11: Slack conversation discovery uses form-encoded types and cursor, filters conversation types by granted bot read scopes, and reports partial catalogs without blocking available direct messages. Membership validation stays authoritative; accessible DM entries recover their availability. See docs/RC11.md.
 

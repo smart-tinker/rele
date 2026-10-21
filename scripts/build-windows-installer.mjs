@@ -44,6 +44,9 @@ try {
   run(compiler, ['/nologo', '/target:winexe', '/platform:x64', '/optimize+', '/codepage:65001',
     '/r:System.Windows.Forms.dll', '/r:System.Web.Extensions.dll', '/r:Microsoft.CSharp.dll',
     `/out:${path.join(stage, 'Rele.exe')}`, path.join(root, 'scripts', 'windows', 'Rele.cs'), assembly]);
+  run(compiler, ['/nologo', '/target:exe', '/platform:x64', '/optimize+', '/codepage:65001',
+    '/r:System.Web.Extensions.dll', `/out:${path.join(stage, 'Rele.Codex.exe')}`,
+    path.join(root, 'scripts', 'windows', 'Codex.cs'), assembly]);
   const setupScript = path.join(temporary, 'rele.iss');
   await writeFile(setupScript, '\uFEFF' + await readFile(path.join(root, 'scripts', 'windows', 'rele.iss'), 'utf8'));
   run(inno, ['/Qp', `/DStageDir=${stage}`, `/DAppVersion=${metadata.version}`, `/DNativeVersion=${nativeVersion}`,

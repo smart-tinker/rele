@@ -8,6 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { ConfigStore, mergeConfig } from '../dist/server/config.js';
 import { Store } from '../dist/server/store.js';
+import { installerCodex, sharedBackendPid, stopInstallerCodex } from './installer-codex-fixture.mjs';
 
 // This test installs a real OS package and unit only on a disposable CI runner.
 if (process.platform !== 'linux' || process.env.CI !== 'true' || !existsSync('/run/systemd/system')) throw new Error('Run the installer smoke only on a disposable Linux CI runner with systemd.');
@@ -46,14 +47,24 @@ async function healthy(previousPid) {
   throw new Error('Installed systemd service never became healthy.');
 }
 await config.load();
-await config.save(mergeConfig(config.config, { codex: { executable: path.join(work, 'missing-codex') } }));
+const codexFixture = await installerCodex(path.join(work, 'codex'));
+await config.save(mergeConfig(config.config, { codex: codexFixture }));
 assert.notEqual(run('/usr/bin/dpkg-query', ['-W', '-f=${db:Status-Status}', 'rele'], true).stdout.trim(), 'installed', 'Runner must not already have Rele installed.');
 try {
   sudo(['/usr/bin/env', `SUDO_USER=${owner}`, `RELE_INSTALL_DATA_DIR=${config.directory}`, `RELE_INSTALL_CODEX_HOME=${path.join(work, 'codex')}`, 'RELE_INSTALL_PORT=0', '/usr/bin/dpkg', '-i', artifact]);
   assert.equal(ctl('show', 'rele.service', '--property=User', '--value').stdout.trim(), owner);
   assert.equal(ctl('is-enabled', 'rele.service').stdout.trim(), 'enabled');
   assert.ok(ctl('show', 'rele.service', '--property=Environment', '--value').stdout.includes('PATH=/opt/rele/runtime:'), 'npm-installed Codex must be able to resolve bundled Node even when no system Node exists.');
+  assert.equal(ctl('is-enabled', 'rele-codex.timer').stdout.trim(), 'enabled');
+  assert.equal(ctl('show', 'rele-codex.service', '--property=User', '--value').stdout.trim(), owner);
+  assert.equal(ctl('show', 'rele-codex.service', '--property=KillMode', '--value').stdout.trim(), 'process');
+  assert.ok(ctl('show', 'rele.service', '--property=Environment', '--value').stdout.includes('RELE_CODEX_DAEMON_EXTERNAL=1'));
   const installed = await healthy();
+  const sharedPid = await sharedBackendPid(codexFixture);
+  const backendCgroup = await readFile(`/proc/${sharedPid}/cgroup`, 'utf8');
+  assert.ok(backendCgroup.includes('rele-codex.service'), 'Native daemon must start in its independent sidecar cgroup.');
+  assert.ok(!backendCgroup.includes('/rele.service'), 'Native daemon must not belong to the Rele gateway cgroup.');
+  assert.ok(existsSync('/usr/bin/rele-codex'));
   const store = new Store(path.join(config.directory, 'rele.sqlite'));
   try { store.setMeta('installer:preserve', 'Bindings and delivery data survive package changes.'); } finally { store.close(); }
   assert.equal(run('/usr/bin/rele', ['token']).stdout.trim(), config.panelToken);
@@ -64,17 +75,19 @@ try {
   report.passed.push('install, same-user service, autostart, health, one-time panel link');
   sudo(['/usr/bin/rele', 'service', 'restart']);
   const restarted = await healthy(installed.pid);
+  await sharedBackendPid(codexFixture, sharedPid);
   preserved();
   report.passed.push('restart and durable data');
   sudo(['/usr/bin/dpkg', '-i', artifact]);
   await healthy(restarted.pid);
+  await sharedBackendPid(codexFixture, sharedPid);
   preserved();
   assert.equal(run('/usr/bin/rele', ['token']).stdout.trim(), config.panelToken);
   const backups = await readdir(path.join(config.directory, 'backups'));
   assert.ok(backups.length > 0, 'An upgrade must back up the previous data before replacement.');
   const backup = new Store(path.join(config.directory, 'backups', backups.at(-1), 'rele.sqlite'));
   try { assert.equal(backup.getMeta('installer:preserve'), 'Bindings and delivery data survive package changes.'); } finally { backup.close(); }
-  report.passed.push('upgrade, pre-upgrade SQLite backup, preserved panel key');
+  report.passed.push('upgrade, pre-upgrade SQLite backup, preserved panel key, native shared daemon PID outside Rele cgroup survives restart and upgrade');
   const settings = JSON.parse(await readFile('/etc/rele/service.json', 'utf8'));
   const goodSettings = path.join(work, 'service-good.json');
   const missingOwner = path.join(work, 'service-missing-owner.json');
@@ -85,6 +98,8 @@ try {
   assert.ok(!existsSync('/usr/bin/rele'));
   assert.notEqual(run('/usr/bin/systemctl', ['is-active', 'rele.service'], true).status, 0);
   preserved();
+  await sharedBackendPid(codexFixture, sharedPid);
+  assert.notEqual(run('/usr/bin/systemctl', ['is-active', 'rele-codex.timer'], true).status, 0);
   assert.ok(existsSync(path.join(config.directory, 'config.json')));
   report.passed.push('uninstall removes application and service, preserves user data');
   sudo(['/usr/bin/install', '-m', '644', goodSettings, '/etc/rele/service.json']);
@@ -98,6 +113,8 @@ try {
   sudo(['/usr/bin/dpkg', '--purge', 'rele']);
   assert.ok(!existsSync('/etc/rele/service.json'));
   assert.ok(!existsSync('/etc/systemd/system/rele.service.d/rele-user.conf'));
+  assert.ok(!existsSync('/etc/systemd/system/rele-codex.service.d/rele-user.conf'));
+  await sharedBackendPid(codexFixture, sharedPid);
   preserved();
   report.passed.push('reinstall resumes saved configuration; remove/purge work with missing owner or damaged service settings and retain user data');
   await writeFile(path.join(root, 'installer-results.json'), JSON.stringify(report, null, 2) + '\n');
@@ -107,5 +124,6 @@ try {
   throw error;
 } finally {
   run('/usr/bin/sudo', ['-n', '/usr/bin/dpkg', '--purge', 'rele'], true);
+  stopInstallerCodex(codexFixture);
   await rm(work, { recursive: true, force: true });
 }

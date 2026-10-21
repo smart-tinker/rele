@@ -415,7 +415,8 @@ export function CodexSettings({
   const [codexHome, setCodexHome] = useState(state.config.codex.codexHome ?? '');
   const [token, setToken] = useState('');
   const [selection, setSelection] = useState(
-    codexTargetKey(state.config.codex) === codexTargetKey(automaticCodex)
+    ['shared', 'managed'].includes(state.config.codex.transport) &&
+    codexTargetKey(state.config.codex) === codexTargetKey({ ...automaticCodex, transport: state.config.codex.transport })
       ? 'auto'
       : 'manual',
   );
@@ -432,8 +433,8 @@ export function CodexSettings({
     setTransport(mode);
     setEndpoint('');
     setToken('');
-    setSelection(mode === 'managed' ? 'auto' : 'manual');
-    if (mode === 'managed') setExecutable(automaticCodex.executable);
+    setSelection(['shared', 'managed'].includes(mode) ? 'auto' : 'manual');
+    if (['shared', 'managed'].includes(mode)) setExecutable(automaticCodex.executable);
   };
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -442,11 +443,11 @@ export function CodexSettings({
         api.request('/api/config', 'PUT', {
           codex: {
             ...(selection === 'auto'
-              ? automaticCodex
+              ? { ...automaticCodex, transport }
               : {
                   transport,
                   executable: executable.trim(),
-                  endpoint: transport === 'managed' ? '' : endpoint.trim(),
+                  endpoint: ['shared', 'managed'].includes(transport) ? '' : endpoint.trim(),
                 }),
             codexHome: codexHome.trim(),
             ...(selection === 'manual' &&
@@ -527,7 +528,9 @@ export function CodexSettings({
           <dt>Подключение</dt>
           <dd>
             {state.codex.transport
-              ? state.codex.transport === 'managed'
+              ? state.codex.transport === 'shared'
+                ? 'Общий Codex'
+                : state.codex.transport === 'managed'
                 ? 'Сервер Rele'
                 : state.codex.transport === 'websocket'
                   ? 'WebSocket'
@@ -556,14 +559,20 @@ export function CodexSettings({
                 chooseMode(event.target.value as CodexTransport)
               }
             >
-              <option value="managed">Сервер Rele</option>
+              <option value="shared">Общий Codex (рекомендуется)</option>
               <optgroup label="Дополнительно">
+                <option value="managed">Сервер Rele</option>
                 <option value="proxy">Существующий локальный сервер</option>
                 <option value="websocket">WebSocket</option>
               </optgroup>
             </select>
           </Field>
-          {transport === 'managed' ? (
+          {transport === 'shared' ? (
+            <div className="codex-mode-copy">
+              <p>Rele подключается к общему Codex или запускает его. Сервер восстанавливается после перезапусков и работает без открытого Desktop.</p>
+              <p className="field-hint">Для совместной работы запускайте Desktop через установленный адаптер Rele. После первого подключения полностью выйдите из Desktop и откройте его снова. Существующие разговоры и профиль сохраняются.</p>
+            </div>
+          ) : transport === 'managed' ? (
             <div className="codex-mode-copy">
               <p>
                 Rele самостоятельно запускает Codex. Codex Desktop можно
@@ -580,12 +589,12 @@ export function CodexSettings({
               {transport === 'proxy'
                 ? 'Rele подключается к уже запущенному локальному серверу Codex.'
                 : 'Rele подключается к уже запущенному серверу Codex по указанному адресу.'}
-              <p>Для самостоятельного запуска Codex перейдите на сервер Rele.</p>
+              <p>Для автоматического подключения и запуска выберите общий Codex.</p>
               <Button
                 disabled={action.busy}
-                onClick={() => chooseMode('managed')}
+                onClick={() => chooseMode('shared')}
               >
-                Перейти на сервер Rele
+                Перейти на общий Codex
               </Button>
             </Notice>
           )}
@@ -596,14 +605,15 @@ export function CodexSettings({
             refreshKey={discoveryRevision}
             disabled={action.busy}
             onChange={(choice) => {
-              if (choice === 'auto') chooseMode('managed');
+              if (choice === 'auto') chooseMode(transport === 'managed' ? 'managed' : 'shared');
               else if (choice === 'manual') setSelection(choice);
+              else if (choice.transport === 'shared' && codexTargetKey(choice) === codexTargetKey(automaticCodex)) chooseMode('shared');
               else {
                 setSelection(codexTargetKey(choice));
                 setTransport(choice.transport);
                 setExecutable(choice.executable);
                 setEndpoint(
-                  choice.transport === 'managed' ? '' : choice.endpoint,
+                  ['shared', 'managed'].includes(choice.transport) ? '' : choice.endpoint,
                 );
                 if (choice.codexHome !== undefined)
                   setCodexHome(choice.codexHome);
