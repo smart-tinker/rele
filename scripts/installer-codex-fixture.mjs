@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { glob, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, glob, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import { once } from 'node:events';
@@ -45,9 +45,18 @@ export async function installerCodex(home) {
   const metadata = JSON.parse(await readFile(path.join(path.dirname(executable), '..', 'codex-package.json'), 'utf8'));
   assert.equal(metadata.version, '0.163.0');
   assert.equal(metadata.entrypoint, `bin/${binary}`);
+  const settings = path.join(home, 'app-server-daemon');
+  await assert.rejects(access(settings), { code: 'ENOENT' });
+  await assert.rejects(access(path.join(home, 'app-server-control', 'app-server-control.sock')), { code: 'ENOENT' });
   await mkdir(home, { recursive: true });
   await writeFile(path.join(home, 'config.toml'), 'model = "installer-fixture"\nmodel_provider = "installer-fixture"\n[model_providers.installer-fixture]\nname = "Offline installer fixture"\nbase_url = "http://127.0.0.1:9/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n', { flag: 'wx' });
-  return { executable, transport: 'shared', endpoint: '', codexHome: home };
+  const target = { executable, transport: 'shared', endpoint: '', codexHome: home };
+  // Native stop initializes its owner-private Windows DACL without starting a backend.
+  if (process.platform === 'win32') assert.equal(stopInstallerCodex(target).status, 'notRunning');
+  else await mkdir(settings, { mode: 0o700 });
+  // Offline fixture policy only: the separate optional updater is not stopped by daemon stop.
+  await writeFile(path.join(settings, 'settings.json'), JSON.stringify({ updater: { autoUpdateEnabled: false } }), { flag: 'wx' });
+  return target;
 }
 
 export async function sharedBackendPid(target, expectedPid) {
@@ -78,7 +87,9 @@ export function stopInstallerCodex(target) {
   for (const key of ['OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN']) delete env[key];
   const result = spawnSync(target.executable, ['app-server', 'daemon', 'stop'], { env, encoding: 'utf8', timeout: 30_000, windowsHide: true });
   assert.equal(result.status, 0, 'The isolated fixture daemon must stop before its profile is removed.');
-  assert.ok(['stopped', 'notRunning'].includes(JSON.parse(result.stdout).status));
+  const output = JSON.parse(result.stdout);
+  assert.ok(['stopped', 'notRunning'].includes(output.status));
+  return output;
 }
 
 // Keep the installed immutable adapter open as Desktop would, including its executable/file locks.

@@ -5,16 +5,52 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      windows_native_cleanup_probe:
+        description: Run only the isolated standard-user native stop/workdir probe
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: rele-${{ github.workflow }}-${{ github.ref }}
+  group: rele-${{ github.workflow }}-${{ github.ref }}-${{ inputs.windows_native_cleanup_probe == true && 'native-cleanup' || 'full' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  windows-native-cleanup-probe:
+    name: Diagnose native stop and workdir release (Windows)
+    if: github.event_name == 'workflow_dispatch' && inputs.windows_native_cleanup_probe == true
+    runs-on: windows-2025
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24.19.0
+          package-manager-cache: false
+      - name: Install only the exact native package
+        shell: bash
+        run: npm install --prefix "$RUNNER_TEMP/codex-probe-0.163.0" --ignore-scripts --no-audit --no-fund --no-package-lock @openai/codex@0.163.0
+      - name: Verify real native stop and workdir cleanup as a standard user
+        shell: pwsh
+        run: .\scripts\windows\ci-standard-user-canary.ps1 -RunGates -Phase NativeCleanup
+      - name: Keep native cleanup diagnostic reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: windows-native-cleanup-probe
+          path: |
+            windows-standard-user-results.json
+            installer-native-cleanup-results.json
+          if-no-files-found: ignore
+          retention-days: 14
+
   verify:
+    if: github.event_name != 'workflow_dispatch' || inputs.windows_native_cleanup_probe != true
     name: Verify and package (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -109,6 +145,7 @@ jobs:
             installer-failure-results.json
             windows-standard-user-results.json
             installer-cleanup-probe-results.json
+            installer-native-cleanup-results.json
             playwright-report/
             test-results/
           if-no-files-found: ignore
@@ -182,7 +219,7 @@ jobs:
 
           Both installers include Node.js 24.19.0 and production dependencies. Codex discovery checks Desktop backend locations, versioned Windows CLI directories, running process metadata, and local CLI installations. Opening the installed application uses an expiring single-use login link. Existing chat bindings and saved tokens survive upgrades. Portable ZIP/TAR packages remain available.
 
-          New in rc.13: Recommended native shared Codex policy attaches to or starts one daemon in the original profile, discovers its private control socket again after restart, and preserves original conversation IDs and uncertain request UUIDs. Windows supplies immutable Desktop/interactive CLI adapters and owner-checked optional Desktop integration; Ubuntu uses an independent systemd starter/timer without a Desktop or user D-Bus session. Installer gates keep the actual native PID and an open Windows adapter connection through Rele restart/upgrade/uninstall. Exact Codex 0.163.0, alpha.10.2 and alpha.11 run raw, managed and shared native probes. Existing explicit targets require a deliberate shared-mode transition and one Quit/relaunch of a private Desktop. codex exec does not support the shared remote transport in these versions. Real Desktop GUI and phone/messenger acceptance remain open. See docs/RC13.md.
+          New in rc.13: Recommended native shared Codex policy attaches to or starts one daemon in the original profile, discovers its private control socket again after restart, and preserves original conversation IDs and uncertain request UUIDs. Windows supplies immutable Desktop/interactive CLI adapters and owner-checked optional Desktop integration; Ubuntu uses an independent systemd starter/timer without a Desktop or user D-Bus session. Installer gates keep the actual native PID and an open Windows adapter connection through Rele restart/upgrade/uninstall. Exact Codex 0.163.0, alpha.10.2 and alpha.11 run raw, managed and shared native probes. Initial daemon setup requires a complete supported local Codex package. Rele does not change Codex's native updater policy; an unverified updated version blocks shared access while keeping accepted requests. Existing explicit targets require a deliberate shared-mode transition and one Quit/relaunch of a private Desktop. codex exec does not support the shared remote transport in these versions. Real Desktop GUI and phone/messenger acceptance remain open. See docs/RC13.md.
 
           Previously in rc.12: Source-first Telegram/Slack tabs map discovered chats and threads to named Codex conversations. Separate per-source off/mention/all access defaults new sources to off, preserves legacy restrictions until an explicit change, and requires human-only DM allowlists. Per-source automatic creation and explicit recovery protect already accepted messages. SQLite migrates v5 to v6; back up before upgrading and use a compatible pre-v6 backup for rollback. Limited diagnostics runs before config loading and reads only the instance marker and public loopback health, without config/DPAPI/database/history access. Real Windows/Defender and messenger acceptance remain open. See docs/RC12.md.
 

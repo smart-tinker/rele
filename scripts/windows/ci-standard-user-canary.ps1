@@ -1,5 +1,6 @@
-param([ValidateSet('Parent', 'Child')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce, [switch]$RunGates, [ValidateSet('Shared', 'Installer')][string]$Phase = 'Installer')
+param([ValidateSet('Parent', 'Child')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce, [switch]$RunGates, [ValidateSet('Shared', 'Installer', 'NativeCleanup')][string]$Phase = 'Installer')
 $ErrorActionPreference = 'Stop'
+if ($Phase -eq 'NativeCleanup' -and -not $RunGates) { throw 'NativeCleanup requires RunGates.' }
 $sourceRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $shell = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'PowerShell\7\pwsh.exe'
 if (-not (Test-Path -LiteralPath $shell) -or [Diagnostics.FileVersionInfo]::GetVersionInfo($shell).FileMajorPart -ne 7) { throw 'The trusted PowerShell 7 installation is required for this CI canary.' }
@@ -87,11 +88,18 @@ if ($Mode -eq 'Child') {
         if ($evidence.selfElevated) { throw 'Standard-user child ran elevated.' }
         if ($RunGates) {
             $env:CI = 'true'; $env:RUNNER_OS = 'Windows'; $env:RUNNER_TEMP = $env:TEMP
-            $env:PATH = @((Split-Path $marker.node), (Split-Path $marker.python), (Join-Path (Split-Path $marker.python) 'Scripts'), $system, (Join-Path $system 'WindowsPowerShell\v1.0')) -join ';'
+            if ($Phase -eq 'NativeCleanup') { $env:PATH = @((Split-Path $marker.node), $system, (Join-Path $system 'WindowsPowerShell\v1.0')) -join ';' }
+            else { $env:PATH = @((Split-Path $marker.node), (Split-Path $marker.python), (Join-Path (Split-Path $marker.python) 'Scripts'), $system, (Join-Path $system 'WindowsPowerShell\v1.0')) -join ';' }
             $env:PYTHONNOUSERSITE = '1'; $env:PYTHONDONTWRITEBYTECODE = '1'
             $env:RELE_TEST_REPORT_DIR = Join-Path $FixtureRoot 'reports'; New-Item -ItemType Directory -Path $env:RELE_TEST_REPORT_DIR -Force | Out-Null
             $env:RELE_TEST_CODEX_PREFIX = $marker.prefixes[0]; $env:RELE_TEST_CODEX_VERSION = '0.163.0'
             $evidence.gates = @()
+        }
+        if ($Phase -in @('Shared', 'NativeCleanup')) {
+            $evidence.stage = 'native-cleanup'
+            & $marker.node (Join-Path $sourceRoot 'scripts\probe-installer-cleanup.mjs') --native
+            if ($LASTEXITCODE -ne 0) { throw 'The standard-user native stop/workdir cleanup gate failed.' }
+            $evidence.gates += 'native-cleanup'
         }
         if ($Phase -eq 'Shared') {
             $versions = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11')
@@ -101,7 +109,7 @@ if ($Mode -eq 'Child') {
                 if ($LASTEXITCODE -ne 0) { throw ('The standard-user native shared gate failed for ' + $version + '.') }
                 $evidence.gates += 'shared-' + $version
             }
-        } else {
+        } elseif ($Phase -eq 'Installer') {
             $evidence.stage = 'interactive-token'
             $scheduler = New-Object -ComObject 'Schedule.Service'; $scheduler.Connect(); $folder = $scheduler.GetFolder('\')
             $definition = $scheduler.NewTask(0)
@@ -183,12 +191,14 @@ try {
     $marker = @{ nonce = $Nonce; sid = $sid; phase = 'Installer'; runGates = $RunGates.IsPresent }
     if ($RunGates) {
         $marker.node = (Get-Command node.exe -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
-        $marker.python = (Get-Command python.exe -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
-        foreach ($executable in @($marker.node, $marker.python)) {
+        $executables = @($marker.node)
+        if ($Phase -ne 'NativeCleanup') { $marker.python = (Get-Command python.exe -CommandType Application -TotalCount 1 -ErrorAction Stop).Source; $executables += $marker.python }
+        foreach ($executable in $executables) {
             if ($executable -isnot [string] -or -not [IO.Path]::IsPathFullyQualified($executable) -or [IO.Path]::GetExtension($executable) -ne '.exe' -or -not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw 'An isolated gate runtime must resolve to one fully qualified executable.' }
         }
-        $marker.prefixes = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11') | ForEach-Object { Join-Path $env:RUNNER_TEMP ('codex-probe-' + $_) }
-        foreach ($path in (@((Split-Path $marker.node), (Split-Path $marker.python)) + $marker.prefixes)) {
+        $versions = if ($Phase -eq 'NativeCleanup') { @('0.163.0') } else { @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11') }
+        $marker.prefixes = @($versions | ForEach-Object { Join-Path $env:RUNNER_TEMP ('codex-probe-' + $_) })
+        foreach ($path in (@($executables | ForEach-Object { Split-Path $_ }) + $marker.prefixes)) {
             if (-not (Test-Path -LiteralPath $path -PathType Container) -or -not [IO.Path]::IsPathRooted($path)) { throw 'An isolated gate runtime or native package is unavailable.' }
             & icacls.exe $path /grant ('*' + $sid + ':(OI)(CI)(RX)') /T /C | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'Cannot grant fixture gate runtime read access.' }
@@ -196,21 +206,25 @@ try {
     }
     $credential = New-Object System.Management.Automation.PSCredential ($env:COMPUTERNAME + '\' + $account), $password
     $resultPath = Join-Path $FixtureRoot 'windows-standard-user-results.json'
-    if ($RunGates) { $gatesDeadline = [DateTime]::UtcNow.AddMinutes(20) }
+    if ($RunGates) { $gatesDeadline = [DateTime]::UtcNow.AddMinutes($(if ($Phase -eq 'NativeCleanup') { 3 } else { 20 })) }
     if ($RunGates) {
-        $parentStage = 'shared'
-        $marker.phase = 'Shared'; $marker | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8
-        $arguments = '-NoProfile -NonInteractive -File ' + (Quote $PSCommandPath) + ' -Mode Child -FixtureRoot ' + (Quote $FixtureRoot) + ' -Nonce ' + $Nonce + ' -RunGates -Phase Shared'
+        $nativePhase = if ($Phase -eq 'NativeCleanup') { 'NativeCleanup' } else { 'Shared' }
+        $parentStage = $nativePhase.ToLowerInvariant()
+        $marker.phase = $nativePhase; $marker | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8
+        $arguments = '-NoProfile -NonInteractive -File ' + (Quote $PSCommandPath) + ' -Mode Child -FixtureRoot ' + (Quote $FixtureRoot) + ' -Nonce ' + $Nonce + ' -RunGates -Phase ' + $nativePhase
         $child = Start-Process -FilePath $shell -ArgumentList $arguments -Credential $credential -LoadUserProfile -UseNewEnvironment -WorkingDirectory $FixtureRoot -RedirectStandardOutput (Join-Path $FixtureRoot 'stdout.log') -RedirectStandardError (Join-Path $FixtureRoot 'stderr.log') -PassThru
         $remaining = [Math]::Max(0, [int](($gatesDeadline - [DateTime]::UtcNow).TotalMilliseconds))
         if (-not $child.WaitForExit($remaining)) { throw 'The standard-user shared phase timed out.' }
         if (-not (Test-Path -LiteralPath $resultPath)) { throw 'The standard-user shared phase did not produce a receipt.' }
         $receipt = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
-        if ($receipt.nonce -ne $Nonce -or $receipt.sid -ne $sid -or $receipt.phase -ne 'Shared') { throw 'Invalid standard-user shared phase receipt.' }
-        $receipt.PSObject.Properties.Remove('nonce'); $receipt.PSObject.Properties.Remove('sid'); $sharedOutcome = $receipt
+        if ($receipt.nonce -ne $Nonce -or $receipt.sid -ne $sid -or $receipt.phase -ne $nativePhase) { throw 'Invalid standard-user native phase receipt.' }
+        $receipt.PSObject.Properties.Remove('nonce'); $receipt.PSObject.Properties.Remove('sid')
+        if ($Phase -eq 'NativeCleanup') { $receipt | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $sourceRoot 'windows-standard-user-results.json') -Encoding UTF8 }
+        else { $sharedOutcome = $receipt }
         if ($child.ExitCode -ne 0 -or $receipt.result -ne 'passed' -or $receipt.selfElevated -ne $false) { foreach ($log in @('stdout.log', 'stderr.log')) { Get-Content -LiteralPath (Join-Path $FixtureRoot $log) -Tail 30 | Write-Output }; throw 'The standard-user native shared phase failed.' }
         $child.Dispose(); $child = $null
         Remove-Item -LiteralPath $resultPath
+        if ($Phase -eq 'NativeCleanup') { return }
         $marker.phase = 'Installer'
     }
     $parentStage = 'rdp-session'
@@ -399,7 +413,7 @@ try {
         { if ($user) { Remove-FixtureProfile $user.SID.Value $profileCleanupFacts } },
         { if ($user) { Remove-LocalUser -SID $user.SID } },
         { if ($RunGates) {
-            foreach ($name in @('installer-results.json', 'installer-failure-results.json', 'shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json')) { $report = Join-Path $FixtureRoot ('reports\' + $name); if (Test-Path -LiteralPath $report) { Copy-Item -LiteralPath $report -Destination (Join-Path $sourceRoot $name) } }
+            foreach ($name in @('installer-results.json', 'installer-failure-results.json', 'installer-native-cleanup-results.json', 'shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json')) { $report = Join-Path $FixtureRoot ('reports\' + $name); if (Test-Path -LiteralPath $report) { Copy-Item -LiteralPath $report -Destination (Join-Path $sourceRoot $name) } }
             $stdout = Join-Path $FixtureRoot 'stdout.log'
             if (Test-Path -LiteralPath $stdout) {
                 $allowed = @('Windows installer smoke: an unknown startup script is preserved', 'Windows installer smoke: a previous portable process is not killed', 'Windows installer smoke: foreign Desktop settings are preserved without blocking installation', 'Windows installer smoke: the Codex wrapper preserves argv, profile, data and raw bytes', 'Windows installer smoke: launcher restart', 'Windows installer smoke: same-version upgrade with backup', 'Windows installer smoke: owned Desktop settings restore and later foreign changes survive uninstall', 'Windows installer smoke: uninstall preserves data', 'Windows installer cleanup: desktop-environment', 'Windows installer cleanup: held-adapter', 'Windows installer cleanup: native-daemon', 'Windows installer cleanup: files', 'Windows installer cleanup: complete')
@@ -417,7 +431,7 @@ try {
         if ($sharedOutcome) { $result | Add-Member -Force -NotePropertyName sharedPhase -NotePropertyValue $sharedOutcome }
         if ($rdp) { $result | Add-Member -Force -NotePropertyName rdpDiagnostics -NotePropertyValue $rdp.Diagnostics }
         if ($rdp) { $result | Add-Member -NotePropertyName rdpWindows -NotePropertyValue ($rdp.MstscWindows.ToArray()) }
-        $result | Add-Member -NotePropertyName rdpClient -NotePropertyValue 'mstsc'
+        if ($rdp) { $result | Add-Member -NotePropertyName rdpClient -NotePropertyValue 'mstsc' }
         $result | Add-Member -NotePropertyName rdpTransport -NotePropertyValue $rdpTransport
         $result | Add-Member -NotePropertyName rdpModeBefore -NotePropertyValue $rdpModeBefore
         $result | Add-Member -NotePropertyName rdpModeAfter -NotePropertyValue $rdpModeAfter
