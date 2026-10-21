@@ -19,6 +19,7 @@ function Get-ReleProcessQuery([string]$filter, [bool]$parentOnly = $false) {
   $fields = if ($parentOnly) { 'Name,ExecutablePath,ParentProcessId' } else { 'Name,ExecutablePath,CommandLine,ProcessId,ParentProcessId' }
   $query = @{ searcher = [Management.ManagementObjectSearcher]::new('root\CIMV2', "SELECT $fields FROM Win32_Process WHERE $filter"); collection = $null; objects = [Collections.Generic.List[object]]::new() }
   try {
+    $query.searcher.Options.EnsureLocatable = $true
     $query.collection = $query.searcher.Get()
     foreach ($row in $query.collection) { $query.objects.Add($row) }
     return $query
@@ -128,18 +129,25 @@ if (-not $releProcessesOnly) { try {
 [Console]::Error.WriteLine('rele-discovery:json')
 $uniqueIssues = @()
 foreach ($issue in $issues) { if ($uniqueIssues -notcontains $issue) { $uniqueIssues += [string]$issue } }
-$result = [Collections.Generic.Dictionary[string,object]]::new()
-$result.Add('processes', $processes.ToArray())
-$result.Add('packages', $packages.ToArray())
-$result.Add('issues', [object[]]@($uniqueIssues))
 $settings = [Runtime.Serialization.Json.DataContractJsonSerializerSettings]::new()
 $settings.UseSimpleDictionaryFormat = $true
 $settings.EmitTypeInformation = [Runtime.Serialization.EmitTypeInformation]::Never
-$settings.KnownTypes = [type[]]@([Collections.Generic.Dictionary[string,object]], [object[]])
-$serializer = [Runtime.Serialization.Json.DataContractJsonSerializer]::new([Collections.Generic.Dictionary[string,object]], $settings)
-$stream = [IO.MemoryStream]::new()
-try { $serializer.WriteObject($stream, $result); [Console]::Out.Write([Text.Encoding]::UTF8.GetString($stream.ToArray())) }
-finally { $stream.Dispose() }
+# Keep dictionary records in a declared dictionary-array contract. A dictionary
+# nested under Object is otherwise serialized as enumerable Key/Value entries.
+$recordArrayType = [Collections.Generic.Dictionary[string,object][]]
+$fields = @(
+  @{ name = 'processes'; type = $recordArrayType; value = [Collections.Generic.Dictionary[string,object][]]$processes.ToArray() },
+  @{ name = 'packages'; type = $recordArrayType; value = [Collections.Generic.Dictionary[string,object][]]$packages.ToArray() },
+  @{ name = 'issues'; type = [string[]]; value = [string[]]$uniqueIssues }
+)
+$jsonFields = [Collections.Generic.List[string]]::new()
+foreach ($field in $fields) {
+  $serializer = [Runtime.Serialization.Json.DataContractJsonSerializer]::new($field.type, $settings)
+  $stream = [IO.MemoryStream]::new()
+  try { $serializer.WriteObject($stream, $field.value); $jsonFields.Add('"' + $field.name + '":' + [Text.Encoding]::UTF8.GetString($stream.ToArray())) }
+  finally { $stream.Dispose() }
+}
+[Console]::Out.Write('{' + [string]::Join(',', $jsonFields.ToArray()) + '}')
 [Console]::Error.WriteLine('rele-discovery:done')
 `;
 export const WINDOWS_CODEX_PROCESS_METADATA_SCRIPT = '$releProcessesOnly = $true\n' + WINDOWS_CODEX_METADATA_SCRIPT;

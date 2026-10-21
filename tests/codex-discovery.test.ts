@@ -269,14 +269,30 @@ describe('Codex installation and existing Desktop discovery', () => {
   it.skipIf(process.platform !== 'win32')('verifies the real current-user WMI owner and closes its query resources', async () => {
     const script = String.raw`
 $ErrorActionPreference = 'Stop'
-${WINDOWS_CODEX_PROCESS_PROVIDER_SCRIPT}
+$stage = 'provider-load'
 $query = $null
 try {
-  $query = Get-ReleProcessQuery "ProcessId = $PID"
-  if ($query.objects.Count -ne 1) { throw 'Current process query did not return one row' }
-  $owner = Get-ReleProcessOwner ($query.objects[0])
-  if ($owner.ReturnValue -ne 0 -or $owner.Sid -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) { throw 'Current process owner was not confirmed' }
-} finally { if ($query) { Close-ReleProcessQuery $query } }
+  ${WINDOWS_CODEX_PROCESS_PROVIDER_SCRIPT}
+  try {
+    $stage = 'process-query'
+    $query = Get-ReleProcessQuery "ProcessId = $PID"
+    $stage = 'row-count'
+    if ($query.objects.Count -ne 1) { throw 'Current process query did not return one row' }
+    $stage = 'row-path'
+    if (-not $query.objects[0].psbase.Path.RelativePath) { throw 'Current process query did not return a locatable row' }
+    $stage = 'owner-query'
+    $owner = Get-ReleProcessOwner ($query.objects[0])
+    $stage = 'owner-check'
+    if ($owner.ReturnValue -ne 0 -or $owner.Sid -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) { throw 'Current process owner was not confirmed' }
+  } finally {
+    if ($query) { $beforeClose = $stage; $stage = 'query-close'; Close-ReleProcessQuery $query; $stage = $beforeClose }
+  }
+} catch {
+  $exception = $_.Exception
+  while ($exception.InnerException) { $exception = $exception.InnerException }
+  [Console]::Out.Write('provider-failed:' + $stage + ':' + $exception.GetType().FullName + ':0x' + $exception.HResult.ToString('X8'))
+  exit 1
+}
 [Console]::Out.Write('provider-current-user-ok')
 `;
     const result = await runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], 8_000);
@@ -339,7 +355,7 @@ function Get-ReleProcessOwner {
     expect(result.stage).toBe('done');
     const parsed = JSON.parse(result.stdout);
     expect(parsed.issues).toEqual(['process-owner-unavailable']);
-    expect(parsed.processes.map((item: { processId: number }) => item.processId)).toEqual([101, 102, 103, 104, 108, 109]);
+    expect(parsed.processes.map((item: { processId: number }) => item.processId), `Synthetic fixture JSON: ${result.stdout}`).toEqual([101, 102, 103, 104, 108, 109]);
     expect(parsed.processes[0]).toMatchObject({ listenKind: 'websocket', listen: 'ws://127.0.0.1:45678/' });
     expect(parsed.processes[1]).toMatchObject({ listenKind: 'stdio', listen: null });
     expect(parsed.processes[2]).toMatchObject({ listenKind: 'unsupported', listen: null });
