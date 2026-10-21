@@ -61,7 +61,8 @@ if ($Mode -eq 'Child') {
         $action = $definition.Actions.Create(0); $action.Path = $shell; $action.WorkingDirectory = $FixtureRoot
         $action.Arguments = '-NoProfile -NonInteractive -File ' + (Quote $PSCommandPath) + ' -Mode Canary -FixtureRoot ' + (Quote $FixtureRoot) + ' -Nonce ' + $Nonce
         $task = $folder.RegisterTaskDefinition(('Rele-CI-Canary-' + $Nonce), $definition, 2, $sid, $null, 3, $null)
-        $running = $task.Run($null)
+        $evidence.runMode = 'as-self'
+        $running = $task.RunEx($null, 1, 0, $null)
         $evidence.runReturned = $true
         $deadline = [DateTime]::UtcNow.AddSeconds(20); $receiptPath = Join-Path $FixtureRoot 'canary.json'
         while ([DateTime]::UtcNow -lt $deadline -and (-not (Test-Path -LiteralPath $receiptPath) -or $task.LastTaskResult -ne 0)) { Start-Sleep -Milliseconds 100 }
@@ -136,6 +137,12 @@ try {
             }
         } catch { $result | Add-Member -NotePropertyName taskEventsErrorHResult -NotePropertyValue ('0x{0:X8}' -f $_.Exception.HResult) }
         $result | Add-Member -NotePropertyName taskEvents -NotePropertyValue $ownEvents
+        if (@($ownEvents | Where-Object { $_.eventId -eq 332 }).Count -ne 0) {
+            try {
+                $template = [string]((Get-WinEvent -ListProvider 'Microsoft-Windows-TaskScheduler').Events | Where-Object { $_.Id -eq 332 } | Select-Object -First 1 -ExpandProperty Description)
+                $result | Add-Member -NotePropertyName event332Template -NotePropertyValue $template.Substring(0, [Math]::Min(1024, $template.Length))
+            } catch { $result | Add-Member -NotePropertyName event332TemplateErrorHResult -NotePropertyValue ('0x{0:X8}' -f $_.Exception.HResult) }
+        }
         $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $resultPath -Encoding UTF8
         Get-Content -LiteralPath $resultPath -Raw | Write-Output
         Copy-Item -LiteralPath $resultPath -Destination (Join-Path $sourceRoot 'windows-standard-user-results.json')
