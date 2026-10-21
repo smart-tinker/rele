@@ -272,20 +272,27 @@ $ErrorActionPreference = 'Stop'
 $stage = 'provider-load'
 $query = $null
 try {
+  [Console]::Error.WriteLine('rele-discovery:process-provider')
   ${WINDOWS_CODEX_PROCESS_PROVIDER_SCRIPT}
   try {
     $stage = 'process-query'
+    [Console]::Error.WriteLine('rele-discovery:process-query')
     $query = Get-ReleProcessQuery "ProcessId = $PID"
     $stage = 'row-count'
     if ($query.objects.Count -ne 1) { throw 'Current process query did not return one row' }
     $stage = 'row-path'
     if (-not $query.objects[0].psbase.Path.RelativePath) { throw 'Current process query did not return a locatable row' }
     $stage = 'owner-query'
+    [Console]::Error.WriteLine('rele-discovery:owner-query')
     $owner = Get-ReleProcessOwner ($query.objects[0])
     $stage = 'owner-check'
     if ($owner.ReturnValue -ne 0 -or $owner.Sid -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) { throw 'Current process owner was not confirmed' }
   } finally {
-    if ($query) { $beforeClose = $stage; $stage = 'query-close'; Close-ReleProcessQuery $query; $stage = $beforeClose }
+    if ($query) {
+      $beforeClose = $stage; $stage = 'query-close'
+      [Console]::Error.WriteLine('rele-discovery:done')
+      Close-ReleProcessQuery $query; $stage = $beforeClose
+    }
   }
 } catch {
   $exception = $_.Exception
@@ -295,8 +302,12 @@ try {
 }
 [Console]::Out.Write('provider-current-user-ok')
 `;
-    const result = await runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], 8_000);
-    expect(result).toEqual({ code: 0, stdout: 'provider-current-user-ok' });
+    const result = await runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], 8_000).catch(error => ({
+      error: ['probe-timeout', 'probe-output-limit', 'probe-unavailable'].includes(error?.message) ? error.message : 'probe-error',
+      // Reuse a whitelisted marker so this diagnostic leaves the product probe unchanged.
+      stage: error?.stage === 'done' ? 'query-close' : error?.stage,
+    }));
+    expect(result).toEqual({ code: 0, stdout: 'provider-current-user-ok', stage: 'done' });
   }, 10_000);
 
   it.skipIf(process.platform !== 'win32')('completes a process-only scan without calling optional Appx discovery', async () => {
