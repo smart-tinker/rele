@@ -189,7 +189,7 @@ try {
 } finally {
     if ($rdpStartedAt) {
         try {
-            $connections = @(Get-NetTCPConnection -OwningProcess $PID -RemoteAddress '127.0.0.1' -RemotePort 3389 -ErrorAction SilentlyContinue)
+            $connections = @(Get-CimInstance -Namespace 'root/StandardCimv2' -ClassName MSFT_NetTCPConnection -Filter ("OwningProcess = $PID AND RemoteAddress = '127.0.0.1' AND RemotePort = 3389") -Property State -ErrorAction Stop)
             $rdpTransport.loopbackConnectionCount = $connections.Count; $rdpTransport.tcpStates = @($connections | ForEach-Object { [int]$_.State })
         } catch { $rdpTransport.tcpErrorHResult = ('0x{0:X8}' -f $_.Exception.HResult) }
         $rdpTransport.events = @()
