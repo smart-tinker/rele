@@ -261,6 +261,41 @@ try {
             $observed = @($rdpTransport.events | ForEach-Object { $_.eventId })
             $rdpTransport.eventTemplates = @((Get-WinEvent -ListProvider 'Microsoft-Windows-TerminalServices-ClientActiveXCore').Events | Where-Object { $_.Id -in @(1024, 1028, 1029, 1102, 1103) -and $_.Id -in $observed } | Sort-Object Id -Unique | Select-Object -First 5 | ForEach-Object { $description = [string]$_.Description; @{ eventId = [int]$_.Id; description = $description.Substring(0, [Math]::Min(512, $description.Length)) } })
         } catch { $rdpTransport.templateErrorHResult = ('0x{0:X8}' -f $_.Exception.HResult) }
+        $rdpTransport.serverEvents = @()
+        foreach ($server in @(
+            @{ provider = 'Microsoft-Windows-TerminalServices-RemoteConnectionManager'; eventId = 1149; fields = @('Param1', 'Param2') },
+            @{ provider = 'Microsoft-Windows-TerminalServices-LocalSessionManager'; eventId = 21; fields = @('User', 'SessionID') }
+        )) {
+            $record = @{ eventId = $server.eventId; events = @(); schemaVerified = 0 }
+            $rdpTransport.serverEvents += $record
+            try {
+                $log = $server.provider + '/Operational'; $provider = Get-WinEvent -ListProvider $server.provider
+                $metadata = @($provider.Events | Where-Object { $_.Id -eq $server.eventId } | Select-Object -First 1)
+                if (@($provider.LogLinks | Where-Object { $_.LogName -eq $log }).Count -ne 1 -or $metadata.Count -ne 1 -or $metadata[0].LogLink.LogName -ne $log) { throw 'The fixed RDP server event channel is unavailable.' }
+                $template = [xml]$metadata[0].Template
+                foreach ($field in $server.fields) {
+                    $type = if ($field -eq 'SessionID') { 'win:UInt32' } else { 'win:UnicodeString' }
+                    if (-not $template.SelectSingleNode("//*[local-name()='data' and @name='$field' and @inType='$type']")) { throw 'The inbox RDP server event schema is unsupported.' }
+                }
+                $record.schemaVerified = 1; $record.logEnabled = [int](Get-WinEvent -ListLog $log).IsEnabled
+                if (-not $record.logEnabled) { continue }
+                $identity = [Environment]::MachineName + '\' + $account
+                $owner = if ($server.eventId -eq 1149) { "Param1='$account' and (Param2='$([Environment]::MachineName)' or Param2='.')" } else { "User='$identity'" }
+                $xpath = "*[System[EventID=$($server.eventId) and TimeCreated[@SystemTime>='$since']] and UserData[EventXML[$owner]]]"
+                foreach ($event in @(Get-WinEvent -LogName $log -FilterXPath $xpath -MaxEvents 16 -ErrorAction Stop)) {
+                    $xml = [xml]$event.ToXml(); $data = $xml.SelectSingleNode("//*[local-name()='UserData']/*[local-name()='EventXML']")
+                    foreach ($field in $server.fields) { if (-not $data -or -not $data.SelectSingleNode("*[local-name()='$field']")) { throw 'The RDP server event payload is unsupported.' } }
+                    if ($server.eventId -eq 1149) { if ([string]$data.Param1 -ne $account -or [string]$data.Param2 -notin @([Environment]::MachineName, '.')) { continue } }
+                    elseif ([string]$data.User -ne $identity) { continue }
+                    $item = @{ eventId = [int]$event.Id }
+                    if ($server.eventId -eq 21 -and [string]$data.SessionID -match '^[0-9]{1,10}$') { $item.sessionId = [long][string]$data.SessionID }
+                    $record.events += $item
+                }
+            } catch {
+                if ($_.FullyQualifiedErrorId -eq 'NoMatchingEventsFound,Microsoft.PowerShell.Commands.GetWinEventCommand') { $record.noMatchingEvents = 1 }
+                else { $record.errorHResult = ('0x{0:X8}' -f $_.Exception.HResult) }
+            }
+        }
         $rdpTransport.logonEvents = @()
         try {
             $xpath = "*[System[(EventID=4624 or EventID=4625) and TimeCreated[@SystemTime>='$since']] and EventData[Data[@Name='TargetUserSid']='$sid' or Data[@Name='TargetUserName']='$account']]"
