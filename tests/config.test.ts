@@ -8,7 +8,8 @@ import {
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import * as childProcess from 'node:child_process';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ConfigStore,
   defaultConfig,
@@ -275,23 +276,31 @@ describe('configuration storage and panel credentials', () => {
   });
 
   it.runIf(process.platform === 'win32')(
-    'round-trips Windows DPAPI for the current user without storing plaintext secrets',
+    'round-trips Windows DPAPI without module autoload or plaintext secrets',
     async () => {
-      const root = await directory();
-      const first = new ConfigStore(root);
-      await first.load();
-      await first.save(configured());
-      const raw = await readFile(join(root, 'config.json'), 'utf8');
-      expect(JSON.parse(raw).encoding).toBe('dpapi');
-      for (const secret of [
-        first.panelToken,
-        ...Object.values(syntheticSecrets),
-      ])
-        expect(raw).not.toContain(secret);
-      const restored = new ConfigStore(root);
-      await restored.load();
-      expect(restored.config).toEqual(first.config);
-      expect(restored.authorized(`Bearer ${first.panelToken}`)).toBe(true);
+      const nativeSpawn = childProcess.spawn;
+      const spawn = vi.spyOn(childProcess, 'spawn').mockImplementation(((command: string, args: readonly string[], options: childProcess.SpawnOptions) => {
+        return nativeSpawn(command, [...args.slice(0, -1), `$ErrorActionPreference='Stop'; $PSModuleAutoLoadingPreference='None'; ${args.at(-1)}`], options);
+      }) as typeof childProcess.spawn);
+      try {
+        const root = await directory();
+        const first = new ConfigStore(root);
+        await first.load();
+        await first.save(configured());
+        const raw = await readFile(join(root, 'config.json'), 'utf8');
+        expect(JSON.parse(raw).encoding).toBe('dpapi');
+        for (const secret of [
+          first.panelToken,
+          ...Object.values(syntheticSecrets),
+        ])
+          expect(raw).not.toContain(secret);
+        const restored = new ConfigStore(root);
+        await restored.load();
+        expect(restored.config).toEqual(first.config);
+        expect(restored.authorized(`Bearer ${first.panelToken}`)).toBe(true);
+      } finally {
+        spawn.mockRestore();
+      }
     },
   );
 });

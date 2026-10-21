@@ -239,7 +239,7 @@ stream_max_retries=0
         # report only fixed stages from a synthetic CurrentUser roundtrip.
         script = '''$ErrorActionPreference='Stop'; try {
 [Console]::Error.WriteLine('dpapi:started');
-Add-Type -AssemblyName System.Security;
+[void][Reflection.Assembly]::Load('System.Security, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a');
 [Console]::Error.WriteLine('dpapi:assembly-ready');
 $s=[Console]::In.ReadToEnd();
 [Console]::Error.WriteLine('dpapi:input-read');
