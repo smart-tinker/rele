@@ -1,7 +1,8 @@
 param([ValidateSet('Parent', 'Child', 'Canary')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce)
 $ErrorActionPreference = 'Stop'
 $sourceRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
-$shell = Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell\v1.0\powershell.exe'
+$shell = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'PowerShell\7\pwsh.exe'
+if (-not (Test-Path -LiteralPath $shell) -or [Diagnostics.FileVersionInfo]::GetVersionInfo($shell).FileMajorPart -ne 7) { throw 'The trusted PowerShell 7 installation is required for this CI canary.' }
 function Quote([string]$Value) { if ($Value.Contains('"')) { throw 'Invalid fixture argument.' }; return '"' + $Value + '"' }
 function Token-Elevated {
     $helper = Join-Path $FixtureRoot 'FixtureElevation.exe'
@@ -101,7 +102,7 @@ try {
     if (-not $child.WaitForExit(60000)) { throw 'Standard-user canary child timed out.' }
     $resultPath = Join-Path $FixtureRoot 'windows-standard-user-results.json'
     if (Test-Path -LiteralPath $resultPath) { Get-Content -LiteralPath $resultPath -Raw | Write-Output; Copy-Item -LiteralPath $resultPath -Destination (Join-Path $sourceRoot 'windows-standard-user-results.json') }
-    if ($child.ExitCode -ne 0) { Get-Content -LiteralPath (Join-Path $FixtureRoot 'stderr.log') -Tail 30 | Write-Output; throw 'Standard-user InteractiveToken canary failed; native gates must not run in this environment.' }
+    if ($child.ExitCode -ne 0) { foreach ($log in @('stdout.log', 'stderr.log')) { Get-Content -LiteralPath (Join-Path $FixtureRoot $log) -Tail 30 | Write-Output }; throw 'Standard-user InteractiveToken canary failed; native gates must not run in this environment.' }
 } finally {
     $credential = $null; if ($password) { $password.Dispose() }
     if ($child -and -not $child.HasExited) { Stop-Process -Id $child.Id -Force }
