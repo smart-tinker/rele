@@ -172,7 +172,7 @@ public sealed class FixtureRdpSession : IDisposable
             using (var timer = new System.Windows.Forms.Timer())
             {
                 form = window; window.ShowInTaskbar = false; window.StartPosition = FormStartPosition.Manual;
-                window.Location = new Point(-32000, -32000); window.Size = new Size(800, 600);
+                window.Location = Screen.PrimaryScreen.WorkingArea.Location; window.Size = new Size(800, 600);
                 host.Dock = DockStyle.Fill; window.Controls.Add(host); timer.Interval = 200;
                 window.Shown += delegate
                 {
