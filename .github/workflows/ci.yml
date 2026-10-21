@@ -104,6 +104,7 @@ jobs:
             shared-results-*.json
             voice-results.json
             installer-results.json
+            installer-failure-results.json
             playwright-report/
             test-results/
           if-no-files-found: ignore

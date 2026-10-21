@@ -26,6 +26,7 @@ export async function installerCodex(home) {
 
 export async function sharedBackendPid(target, expectedPid) {
   const deadline = Date.now() + 45_000;
+  let failure = 'no-connection';
   do {
     const client = new CodexClient({ ...target, transport: 'proxy', endpoint: path.join(target.codexHome, 'app-server-control', 'app-server-control.sock') });
     try {
@@ -37,10 +38,11 @@ export async function sharedBackendPid(target, expectedPid) {
       return pid;
     } catch (error) {
       if (error.code === 'ERR_ASSERTION') throw error;
+      failure = typeof error.code === 'string' ? error.code : error.name;
     } finally { await client.close(); }
     await delay(250);
   } while (Date.now() < deadline);
-  throw new Error('The installer did not establish the native shared Codex backend.');
+  throw new Error(`The installer did not establish the native shared Codex backend (${failure}).`);
 }
 
 export function stopInstallerCodex(target) {

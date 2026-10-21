@@ -8,6 +8,7 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { ConfigStore, mergeConfig } from '../dist/server/config.js';
+import { findCSharpCompiler } from './build-process-host.mjs';
 import { installerCodex, sharedBackendPid, stopInstallerCodex, openInstallerAdapter } from './installer-codex-fixture.mjs';
 
 if (process.platform !== 'win32' || process.env.CI !== 'true') throw new Error('The installer smoke test runs only on an isolated Windows CI runner.');
@@ -36,6 +37,8 @@ let codexFixture;
 let sharedPid;
 let heldAdapter;
 let heldAdapterPath;
+let fixturePanelToken;
+let failed = false;
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { encoding: 'utf8', env, windowsHide: true, timeout: 120_000, maxBuffer: 1024 * 1024, ...options });
@@ -104,6 +107,7 @@ try {
   codexFixture = await installerCodex(codexHome);
   const nativeConfig = new ConfigStore(data);
   await nativeConfig.load();
+  fixturePanelToken = nativeConfig.panelToken;
   await nativeConfig.save(mergeConfig(nativeConfig.config, { codex: codexFixture }));
   await writeFile(path.join(data, 'preserve-me.txt'), 'installer smoke data\n');
 
@@ -297,6 +301,49 @@ try {
   const report = { platform: 'windows', version: metadata.version, installer: path.basename(installer), result: 'passed', perUser: true, interactiveToken: true, nativeLauncher: true, legacyStartupMigrated: true, foreignProcessPreserved: true, codexConsoleWrapper: true, immutableOpenAdapterPreservedAcrossUpgradeRemove: true, desktopEnvironmentOwnership: true, nativeBackendPreservedAcrossRestartUpgradeRemove: true, health: true, restart: true, upgradeBackup: true, uninstall: true, dataPreserved: true };
   await writeFile(path.join(root, 'installer-results.json'), JSON.stringify(report, null, 2) + '\n');
   console.log(JSON.stringify(report));
+} catch (error) {
+  failed = true;
+  // This profile contains only an offline fixture; capture startup evidence before teardown.
+  const sanitize = value => {
+    let text = String(value || '');
+    if (fixturePanelToken) text = text.split(fixturePanelToken).join('[fixture-panel-key]');
+    return text.replace(/#rele-launch=[A-Za-z0-9_-]+/gu, '#rele-launch=[redacted]');
+  };
+  const serviceLog = await readFile(path.join(data, 'logs', 'service.log'), 'utf8').catch(() => 'No fixture service log.');
+  const evidence = { platform: 'windows', result: 'failed', error: sanitize(error.message), serviceLog: sanitize(serviceLog.slice(-12_000)), native: {} };
+  if (instance) {
+    try {
+      const address = new URL(instance.address);
+      if (address.protocol !== 'http:' || address.hostname !== '127.0.0.1' || address.username || address.password) throw new Error('Invalid fixture address.');
+      const response = await fetch(new URL('/api/state', address), { headers: { Authorization: `Bearer ${fixturePanelToken}` }, redirect: 'error', signal: AbortSignal.timeout(3000) });
+      if (!response.ok) throw new Error(`Fixture state HTTP ${response.status}.`);
+      const state = await response.json();
+      evidence.codex = {};
+      for (const key of ['connected', 'error', 'errorCode', 'transport', 'executable', 'endpoint', 'codexHome', 'queueSupported']) {
+        const value = state.codex?.[key];
+        if (typeof value === 'string' || typeof value === 'boolean') evidence.codex[key] = typeof value === 'string' ? sanitize(value) : value;
+      }
+    } catch (stateError) { evidence.fixtureStateError = sanitize(stateError.message); }
+    try {
+      const compiler = await findCSharpCompiler();
+      const helper = path.join(temporary, 'FixtureElevation.exe');
+      const compiled = spawnSync(compiler, ['/nologo', '/target:exe', '/platform:x64', '/codepage:65001', `/out:${helper}`, path.join(root, 'scripts/windows/FixtureElevation.cs')], { encoding: 'utf8', windowsHide: true, timeout: 30_000 });
+      if (compiled.status !== 0) throw new Error('Fixture elevation helper compilation failed.');
+      const queried = spawnSync(helper, [String(instance.pid), path.join(application, 'runtime/node.exe')], { encoding: 'utf8', windowsHide: true, timeout: 10_000 });
+      if (queried.status !== 0) throw new Error('Fixture process identity or token elevation could not be verified.');
+      evidence.taskProcessToken = JSON.parse(queried.stdout);
+    } catch (tokenError) { evidence.fixtureTokenError = sanitize(tokenError.message); }
+  }
+  if (codexFixture) {
+    // Diagnostic start runs only after this test has already failed; it can never satisfy the lifecycle assertion.
+    for (const operation of ['version', 'start']) {
+      const control = spawnSync(codexFixture.executable, ['app-server', 'daemon', operation], { env, encoding: 'utf8', windowsHide: true, timeout: 20_000 });
+      evidence.native[operation] = { code: control.status, error: control.error?.code, stdout: sanitize(control.stdout?.slice(-4000)), stderr: sanitize(control.stderr?.slice(-4000)) };
+    }
+  }
+  await writeFile(path.join(root, 'installer-failure-results.json'), JSON.stringify(evidence, null, 2) + '\n');
+  console.error(JSON.stringify(evidence));
+  throw error;
 } finally {
   if (legacyProcess && legacyProcess.exitCode === null && legacyProcess.signalCode === null) {
     legacyProcess.kill();
@@ -327,5 +374,6 @@ try {
   if (originalDesktopEnvironment) desktopEnvironment(originalDesktopEnvironment);
   if (heldAdapter) await heldAdapter.close();
   stopInstallerCodex(codexFixture);
-  await rm(temporary, { recursive: true, force: true, maxRetries: 20, retryDelay: 200 });
+  if (!failed) await rm(temporary, { recursive: true, force: true, maxRetries: 20, retryDelay: 200 });
+  else console.error(`Failed fixture files retained until runner disposal: ${temporary}`);
 }
