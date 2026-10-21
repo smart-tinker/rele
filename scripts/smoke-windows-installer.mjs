@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { once } from 'node:events';
 import { createReadStream } from 'node:fs';
 import { access, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -9,7 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { ConfigStore, mergeConfig } from '../dist/server/config.js';
 import { findCSharpCompiler } from './build-process-host.mjs';
-import { installerCodex, sharedBackendPid, stopInstallerCodex, openInstallerAdapter, removeInstallerFixture } from './installer-codex-fixture.mjs';
+import { installerCodex, sharedBackendPid, stopInstallerCodex, openInstallerAdapter, removeInstallerFixture, closeInstallerChild } from './installer-codex-fixture.mjs';
 
 if (process.platform !== 'win32' || process.env.CI !== 'true') throw new Error('The installer smoke test runs only on an isolated Windows CI runner.');
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -33,6 +34,7 @@ let uninstalled = false;
 let legacyStartup;
 let legacyContents;
 let legacyProcess;
+let legacyClosed;
 let originalDesktopEnvironment;
 let codexFixture;
 let sharedPid;
@@ -132,14 +134,18 @@ try {
   await mkdir(path.join(legacyRoot, 'runtime'), { recursive: true });
   await mkdir(path.join(legacyRoot, 'dist', 'server'), { recursive: true });
   await copyFile(process.execPath, path.join(legacyRoot, 'runtime', 'node.exe'));
-  await writeFile(path.join(legacyRoot, 'dist', 'server', 'main.js'), 'setInterval(() => {}, 1000);\n');
+  const legacyOwner = randomUUID();
+  // Explorer may observe this real Startup fixture; only our explicitly owned child may persist.
+  await writeFile(path.join(legacyRoot, 'dist', 'server', 'main.js'), `if (process.env.RELE_SMOKE_LEGACY_OWNER === ${JSON.stringify(legacyOwner)}) setInterval(() => {}, 1000);\n`);
   await writeFile(path.join(legacyRoot, 'package.json'), JSON.stringify({ name: 'rele', version: '0.1.0-rc.2' }));
   const literal = value => value.replaceAll('%', '%%');
   legacyContents = ['@echo off', 'chcp 65001 >nul', 'setlocal DisableDelayedExpansion',
     `set "CODEX_HOME=${literal(codexHome)}"`, `set "RELE_DATA_DIR=${literal(data)}"`, `cd /d "${literal(legacyRoot)}"`,
     `start "Rele" /min "${literal(path.join(legacyRoot, 'runtime', 'node.exe'))}" "${literal(path.join(legacyRoot, 'dist', 'server', 'main.js'))}"`, ''].join('\r\n');
   await writeFile(legacyStartup, legacyContents);
-  legacyProcess = spawn(path.join(legacyRoot, 'runtime', 'node.exe'), [path.join(legacyRoot, 'dist', 'server', 'main.js')], { env, windowsHide: true, stdio: 'ignore' });
+  legacyProcess = spawn(path.join(legacyRoot, 'runtime', 'node.exe'), [path.join(legacyRoot, 'dist', 'server', 'main.js')], { env: { ...env, RELE_SMOKE_LEGACY_OWNER: legacyOwner }, cwd: temporary, windowsHide: true, stdio: 'ignore' });
+  legacyClosed = once(legacyProcess, 'close');
+  void legacyClosed.catch(() => {});
   await new Promise((resolve, reject) => { legacyProcess.once('spawn', resolve); legacyProcess.once('error', reject); });
   await writeFile(path.join(data, 'instance.json'), JSON.stringify({ pid: legacyProcess.pid, address: 'http://127.0.0.1:1', version: '0.1.0-rc.2' }));
   const blocked = spawnSync(installer, [...installArguments, `/LOG=${path.join(temporary, 'blocked-legacy.log')}`], { env, windowsHide: true, timeout: 60_000 });
@@ -150,9 +156,9 @@ try {
   process.kill(legacyProcess.pid, 0);
   assert.equal(await readFile(legacyStartup, 'utf8'), legacyContents);
   assert.equal(await exists(path.join(application, 'runtime', 'node.exe')), false);
-  legacyProcess.kill();
-  await new Promise(resolve => legacyProcess.once('exit', resolve));
+  await closeInstallerChild(legacyProcess, legacyClosed);
   legacyProcess = undefined;
+  legacyClosed = undefined;
   await rm(path.join(data, 'instance.json'));
 
   console.log('Windows installer smoke: foreign Desktop settings are preserved without blocking installation');
@@ -346,10 +352,7 @@ try {
   console.error(JSON.stringify(evidence));
   throw error;
 } finally {
-  if (legacyProcess && legacyProcess.exitCode === null && legacyProcess.signalCode === null) {
-    legacyProcess.kill();
-    await new Promise(resolve => legacyProcess.once('exit', resolve));
-  }
+  if (legacyProcess) await closeInstallerChild(legacyProcess, legacyClosed);
   if (installationAttempted && !uninstalled) {
     const uninstaller = path.join(application, 'unins000.exe');
     if (await exists(uninstaller)) {

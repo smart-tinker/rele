@@ -24,6 +24,15 @@ export async function removeInstallerFixture(directory, timeoutMs = 10_000) {
   }
 }
 
+// The close promise is attached at spawn so process exit cannot race teardown's listener.
+export async function closeInstallerChild(child, closed) {
+  if (!child) return;
+  if (child.exitCode === null && child.signalCode === null) child.kill();
+  let timeout;
+  try { await Promise.race([closed, new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('The owned installer fixture process did not close.')), 5000); })]); }
+  finally { clearTimeout(timeout); }
+}
+
 // Only disposable installer CI calls this; it never uses a user profile or sends a model request.
 export async function installerCodex(home) {
   assert.ok(process.env.RELE_TEST_CODEX_PREFIX, 'Installer smoke requires an isolated full native Codex package.');
