@@ -23,6 +23,15 @@ REPO = Path(__file__).resolve().parent.parent
 NODE = shutil.which('node')
 DRIVER = REPO / 'scripts/probe-shared-codex.ts'
 SHIM = REPO / 'dist/server/codex-cli.js'
+WINDOWS_NATIVE_CONTROL_SCRIPT = '''import { spawn } from 'node:child_process';
+const child = spawn(process.argv[1], process.argv.slice(2), {
+  windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+});
+child.stdout.pipe(process.stdout);
+child.stderr.pipe(process.stderr);
+child.once('error', () => { console.error('native-control-spawn-failed'); process.exitCode = 1; });
+child.once('close', code => { process.exitCode = code ?? 1; });
+'''
 
 
 def arguments():
@@ -268,7 +277,12 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
         report['checks']['windowsDpapi'] = True
 
     async def native(env, operation):
-        process = await spawn([str(args.cli), 'app-server', 'daemon', operation], env, root)
+        command = [str(args.cli), 'app-server', 'daemon', operation]
+        if os.name == 'nt':
+            # Match Rele's Node launcher: libuv owns a breakaway-capable child
+            # Job. Native Codex still performs its own detached-launch preflight.
+            command = [NODE, '--input-type=module', '-e', WINDOWS_NATIVE_CONTROL_SCRIPT, *command]
+        process = await spawn(command, env, root)
         output = await output_and_exit(process, 20)
         assert process.returncode == 0, (operation, errors[-10:])
         return json.loads(output)
