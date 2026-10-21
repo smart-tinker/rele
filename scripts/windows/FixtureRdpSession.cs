@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Security.Principal;
@@ -191,6 +192,27 @@ public sealed class FixtureRdpSession : IDisposable
     [DllImport("wtsapi32.dll", SetLastError = true)]
     private static extern bool WTSLogoffSession(IntPtr server, int session, bool wait);
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct SavedCredential
+    {
+        internal uint Flags, Type; internal string TargetName, Comment; internal ComTypes.FILETIME LastWritten;
+        internal uint CredentialBlobSize; internal IntPtr CredentialBlob; internal uint Persist, AttributeCount;
+        internal IntPtr Attributes; internal string TargetAlias, UserName;
+    }
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+    private static extern bool CredReadW(string target, uint type, uint flags, out IntPtr credential);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+    private static extern bool CredWriteW([In] ref SavedCredential credential, uint flags);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+    private static extern bool CredDeleteW(string target, uint type, uint flags);
+    [DllImport("advapi32.dll", ExactSpelling = true)]
+    private static extern void CredFree(IntPtr credential);
+    private const string CredentialTarget = "TERMSRV/127.0.0.1";
+    private bool mstscControl, credentialOwned;
+    private string credentialComment, mstscFile;
+    private Process mstsc;
+    private int mstscPid;
+
     private readonly string user, domain, sid;
     private readonly int parentSession = Process.GetCurrentProcess().SessionId;
     private readonly HashSet<int> baseline = new HashSet<int>();
@@ -207,7 +229,7 @@ public sealed class FixtureRdpSession : IDisposable
     public Dictionary<string, int> Diagnostics { get { return new Dictionary<string, int> {
         { "phase", phase }, { "phaseBeforeClose", phaseBeforeClose }, { "connected", connected }, { "extendedReason", extendedReason }, { "credentialPromptPolicyStage", credentialPromptPolicyStage }, { "connectingCount", eventCounts[1] }, { "connectedCount", eventCounts[2] }, { "loginCompleteCount", eventCounts[3] }, { "loginCompleteSeen", eventCounts[3] == 0 ? 0 : 1 },
         { "disconnectedCount", eventCounts[4] }, { "disconnectedCode", disconnectedCode }, { "fatalCount", eventCounts[10] }, { "fatalCode", fatalCode }, { "logonCount", eventCounts[22] }, { "logonCode", logonCode },
-        { "ownWtsCount", ownWtsCount }, { "ownWtsState", ownWtsState }, { "confirmCloseCount", eventCounts[15] }, { "closeConfirmed", closeConfirmed ? 1 : 0 }, { "closeStatus", closeStatus }, { "closeErrorHResult", closeError } }; } }
+        { "ownWtsCount", ownWtsCount }, { "ownWtsState", ownWtsState }, { "confirmCloseCount", eventCounts[15] }, { "closeConfirmed", closeConfirmed ? 1 : 0 }, { "closeStatus", closeStatus }, { "closeErrorHResult", closeError }, { "mstscControl", mstscControl ? 1 : 0 }, { "mstscPid", mstscPid } }; } }
     private void Record(int id, int code) { phase = id; Interlocked.Increment(ref eventCounts[id]); if (id == 4) disconnectedCode = code; if (id == 10) fatalCode = code; if (id == 22) logonCode = code; if (id == 15 && code == 1) closeConfirmed = true; }
 
     public FixtureRdpSession(string user, string domain, SecureString password, string sid)
@@ -223,6 +245,70 @@ public sealed class FixtureRdpSession : IDisposable
         thread.Start();
         if (!ready.WaitOne(60000)) throw new InvalidOperationException("Loopback RDP did not create the isolated user's active session; connected=" + connected + "; extendedReason=" + extendedReason + ".");
         if (failure != null) throw new InvalidOperationException("Loopback RDP initialization failed; HRESULT=0x" + failure.HResult.ToString("X8") + ".");
+    }
+
+    public void ConnectMstsc(string fixtureRoot, string nonce)
+    {
+        DateTime deadline = DateTime.UtcNow.AddSeconds(60);
+        mstscControl = true;
+        Guid parsed; string root = Path.GetFullPath(fixtureRoot), drive = Path.GetPathRoot(root);
+        if (!Guid.TryParseExact(nonce, "N", out parsed) || drive.Length != 3 || drive[1] != ':' ||
+            root != Path.Combine(drive, "rc-" + nonce.Substring(0, 8)) || user != "ReleCi" + nonce.Substring(0, 8) || !string.Equals(domain, Environment.MachineName, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Invalid isolated mstsc fixture.");
+        if (IntPtr.Size != 8 || Marshal.SizeOf(typeof(SavedCredential)) != 80) throw new InvalidOperationException("Unexpected Windows credential ABI.");
+        credentialComment = "Rele-CI-" + nonce;
+        // Refuse both password credential types; never overwrite a pre-existing loopback entry.
+        foreach (uint type in new uint[] { 1, 2 })
+        {
+            IntPtr existing;
+            if (CredReadW(CredentialTarget, type, 0, out existing)) { CredFree(existing); throw new InvalidOperationException("A loopback RDP credential already exists."); }
+            int error = Marshal.GetLastWin32Error(); if (error != 1168) throw new System.ComponentModel.Win32Exception(error);
+        }
+        IntPtr secret = Marshal.SecureStringToGlobalAllocUnicode(password);
+        try
+        {
+            var credential = new SavedCredential { Type = 1, TargetName = CredentialTarget, Comment = credentialComment,
+                UserName = domain + "\\" + user, Persist = 1, CredentialBlob = secret, CredentialBlobSize = checked((uint)password.Length * 2) };
+            if (!CredWriteW(ref credential, 0)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            credentialOwned = true;
+        }
+        finally { Marshal.ZeroFreeGlobalAllocUnicode(secret); password.Dispose(); password = null; }
+        string path = Path.Combine(root, "mstsc-" + nonce + ".rdp");
+        using (var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        {
+            mstscFile = path;
+            using (var writer = new StreamWriter(stream, System.Text.Encoding.Unicode))
+                writer.Write("full address:s:127.0.0.1\r\nusername:s:" + domain + "\\" + user + "\r\nauthentication level:i:0\r\nenablecredsspsupport:i:1\r\n");
+        }
+        mstsc = Process.Start(new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "mstsc.exe"), "\"" + path + "\"") { UseShellExecute = false, WorkingDirectory = root });
+        mstscPid = mstsc.Id;
+        while (DateTime.UtcNow < deadline)
+        {
+            int count = 0;
+            foreach (Session session in Sessions())
+                if (Owned(session.Id)) { count++; ownWtsState = session.State; if (session.State == 0) SessionId = session.Id; }
+            ownWtsCount = count;
+            if (SessionId >= 0) return;
+            if (mstsc.HasExited) throw new InvalidOperationException("The owned mstsc client exited before the isolated RDP session was active; exitCode=" + mstsc.ExitCode + ".");
+            Thread.Sleep(200);
+        }
+        throw new InvalidOperationException("The mstsc control did not create the isolated user's active RDP session.");
+    }
+
+    private void DeleteMstscCredential()
+    {
+        if (!credentialOwned) return;
+        IntPtr value;
+        if (!CredReadW(CredentialTarget, 1, 0, out value)) { int error = Marshal.GetLastWin32Error(); if (error == 1168) return; throw new System.ComponentModel.Win32Exception(error); }
+        try
+        {
+            var credential = (SavedCredential)Marshal.PtrToStructure(value, typeof(SavedCredential));
+            if (credential.Type != 1 || !string.Equals(credential.TargetName, CredentialTarget, StringComparison.OrdinalIgnoreCase) || credential.Comment != credentialComment || credential.UserName != domain + "\\" + user)
+                throw new InvalidOperationException("Refusing to remove a foreign loopback RDP credential.");
+            if (!CredDeleteW(CredentialTarget, 1, 0)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            credentialOwned = false;
+        }
+        finally { CredFree(value); }
     }
 
     private void Run()
@@ -309,12 +395,41 @@ public sealed class FixtureRdpSession : IDisposable
 
     public void Dispose()
     {
+        if (mstscControl)
+        {
+            try
+            {
+                try { if (mstsc != null) { if (!mstsc.HasExited) mstsc.Kill(); if (!mstsc.WaitForExit(5000)) throw new InvalidOperationException("The owned mstsc client did not exit."); } }
+                finally { if (mstsc != null) { mstsc.Dispose(); mstsc = null; } }
+            }
+            finally
+            {
+                try { LogOffOwnedSessions(); }
+                finally
+                {
+                    try { DeleteMstscCredential(); }
+                    finally
+                    {
+                        try { if (mstscFile != null) File.Delete(mstscFile); }
+                        finally { if (password != null) { password.Dispose(); password = null; } ready.Dispose(); }
+                    }
+                }
+            }
+            return;
+        }
         phaseBeforeClose = phase; disposeRequested = true;
         try { if (form != null && form.IsHandleCreated) form.BeginInvoke((Action)delegate {
             try { dynamic client = ((RdpHost)form.Controls[0]).Client; closeStatus = (int)client.RequestClose(); if (closeStatus == 0) form.Close(); }
             catch (Exception error) { closeError = error.HResult; form.Close(); }
         }); } catch (InvalidOperationException) { }
         bool hostStopped = !thread.IsAlive || thread.Join(5000);
+        LogOffOwnedSessions();
+        if (!hostStopped) throw new InvalidOperationException("The loopback RDP host did not close.");
+        ready.Dispose();
+    }
+
+    private void LogOffOwnedSessions()
+    {
         var loggingOff = new HashSet<int>();
         foreach (Session session in Sessions())
         {
@@ -332,7 +447,5 @@ public sealed class FixtureRdpSession : IDisposable
             if (DateTime.UtcNow >= deadline) throw new InvalidOperationException("The isolated RDP fixture session did not log off.");
             Thread.Sleep(100);
         }
-        if (!hostStopped) throw new InvalidOperationException("The loopback RDP host did not close.");
-        ready.Dispose();
     }
 }

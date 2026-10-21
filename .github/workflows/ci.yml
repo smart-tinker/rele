@@ -6,16 +6,10 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
-      windows_probe_shell:
-        description: 'Parent RDP host for the temporary primitive comparison'
-        type: choice
-        options: [pwsh, powershell]
-        default: pwsh
-      windows_probe_image:
-        description: 'Hosted Windows image for the temporary primitive comparison'
-        type: choice
-        options: [windows-2025, windows-2022]
-        default: windows-2025
+      windows_mstsc_probe:
+        description: 'Compare the stock loopback RDP client in the disposable session probe'
+        type: boolean
+        default: false
       windows_session_probe:
         description: 'Run only the disposable Windows RDP and InteractiveToken canary'
         type: boolean
@@ -36,7 +30,7 @@ jobs:
   windows-session-probe:
     name: Diagnose Windows session or installer
     if: github.event_name == 'workflow_dispatch' && (inputs.windows_session_probe == true || inputs.windows_installer_probe == true)
-    runs-on: ${{ inputs.windows_probe_image == 'windows-2022' && 'windows-2022' || 'windows-2025' }}
+    runs-on: windows-2025
     timeout-minutes: ${{ inputs.windows_installer_probe == true && 30 || 8 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -62,18 +56,16 @@ jobs:
             npm install --prefix "$RUNNER_TEMP/codex-probe-$version" --ignore-scripts --no-audit --no-fund --no-package-lock "@openai/codex@$version"
           done
           npm run package
-      - name: Check isolated RDP session with the Framework parent host
-        if: inputs.windows_probe_shell == 'powershell' && inputs.windows_installer_probe != true
-        shell: powershell
-        run: .\scripts\windows\ci-standard-user-canary.ps1
       - name: Check isolated RDP session and requested gate
-        if: inputs.windows_probe_shell != 'powershell' || inputs.windows_installer_probe == true
         shell: pwsh
         env:
           RELE_INSTALLER_PROBE: ${{ inputs.windows_installer_probe }}
+          RELE_MSTSC_PROBE: ${{ inputs.windows_mstsc_probe }}
         run: |
           if ($env:RELE_INSTALLER_PROBE -eq 'true') {
             .\scripts\windows\ci-standard-user-canary.ps1 -RunGates -InstallerOnly
+          } elseif ($env:RELE_MSTSC_PROBE -eq 'true') {
+            .\scripts\windows\ci-standard-user-canary.ps1 -MstscControl
           } else {
             .\scripts\windows\ci-standard-user-canary.ps1
           }

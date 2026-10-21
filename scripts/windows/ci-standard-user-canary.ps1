@@ -1,6 +1,7 @@
-param([ValidateSet('Parent', 'Child')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce, [switch]$RunGates, [switch]$InstallerOnly, [ValidateSet('Shared', 'Installer')][string]$Phase = 'Installer')
+param([ValidateSet('Parent', 'Child')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce, [switch]$RunGates, [switch]$InstallerOnly, [switch]$MstscControl, [ValidateSet('Shared', 'Installer')][string]$Phase = 'Installer')
 $ErrorActionPreference = 'Stop'
 if ($InstallerOnly -and (-not $RunGates -or $Phase -eq 'Shared')) { throw 'InstallerOnly requires RunGates and the Installer phase.' }
+if ($MstscControl -and ($Mode -ne 'Parent' -or $RunGates)) { throw 'MstscControl is a parent-only session probe.' }
 $sourceRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $shell = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'PowerShell\7\pwsh.exe'
 if (-not (Test-Path -LiteralPath $shell) -or [Diagnostics.FileVersionInfo]::GetVersionInfo($shell).FileMajorPart -ne 7) { throw 'The trusted PowerShell 7 installation is required for this CI canary.' }
@@ -249,7 +250,7 @@ try {
     catch { $rdpTransport.logonRightsErrorHResult = ('0x{0:X8}' -f $_.Exception.HResult) }
     if ($RunGates -and ($gatesDeadline - [DateTime]::UtcNow).TotalSeconds -lt 60) { throw 'The common native gate deadline has insufficient time for the unchanged RDP timeout.' }
     $rdpStartedAt = [DateTime]::UtcNow
-    $rdp.Connect()
+    if ($MstscControl) { $rdp.ConnectMstsc($FixtureRoot, $Nonce) } else { $rdp.Connect() }
     $parentStage = 'installer'
     $marker.rdpSessionId = $rdp.SessionId; $marker | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8
     $arguments = '-NoProfile -NonInteractive -File ' + (Quote $PSCommandPath) + ' -Mode Child -FixtureRoot ' + (Quote $FixtureRoot) + ' -Nonce ' + $Nonce
@@ -304,14 +305,17 @@ try {
     throw
 } finally {
     if ($rdpStartedAt) {
+        $rdpClientPid = if ($MstscControl) { [int]$rdp.Diagnostics['mstscPid'] } else { $PID }
         try {
-            $connections = @(Get-CimInstance -Namespace 'root/StandardCimv2' -ClassName MSFT_NetTCPConnection -Filter ("OwningProcess = $PID AND RemoteAddress = '127.0.0.1' AND RemotePort = 3389") -Property State -ErrorAction Stop)
+            if ($rdpClientPid -le 0) { throw 'The owned RDP client process did not start.' }
+            $connections = @(Get-CimInstance -Namespace 'root/StandardCimv2' -ClassName MSFT_NetTCPConnection -Filter ("OwningProcess = $rdpClientPid AND RemoteAddress = '127.0.0.1' AND RemotePort = 3389") -Property State -ErrorAction Stop)
             $rdpTransport.loopbackConnectionCount = $connections.Count; $rdpTransport.tcpStates = @($connections | ForEach-Object { [int]$_.State })
         } catch { $rdpTransport.tcpErrorHResult = ('0x{0:X8}' -f $_.Exception.HResult) }
         $rdpTransport.events = @()
         try {
             $since = $rdpStartedAt.ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')
-            $xpath = "*[System[Execution[@ProcessID='$PID'] and TimeCreated[@SystemTime>='$since']]]"
+            if ($rdpClientPid -le 0) { throw 'The owned RDP client process did not start.' }
+            $xpath = "*[System[Execution[@ProcessID='$rdpClientPid'] and TimeCreated[@SystemTime>='$since']]]"
             foreach ($event in @(Get-WinEvent -LogName $rdpClientLog -FilterXPath $xpath -MaxEvents 32 -ErrorAction Stop)) {
                 $record = @{ eventId = [int]$event.Id }; $xml = [xml]$event.ToXml()
                 foreach ($datum in @($xml.Event.EventData.Data)) {
@@ -402,6 +406,7 @@ try {
         $result = Get-Content -LiteralPath $publishedResult -Raw | ConvertFrom-Json
         if ($sharedOutcome) { $result | Add-Member -Force -NotePropertyName sharedPhase -NotePropertyValue $sharedOutcome }
         if ($rdp) { $result | Add-Member -Force -NotePropertyName rdpDiagnostics -NotePropertyValue $rdp.Diagnostics }
+        $result | Add-Member -NotePropertyName rdpClient -NotePropertyValue $(if ($MstscControl) { 'mstsc' } else { 'activex' })
         $result | Add-Member -NotePropertyName rdpTransport -NotePropertyValue $rdpTransport
         $result | Add-Member -NotePropertyName rdpModeBefore -NotePropertyValue $rdpModeBefore
         $result | Add-Member -NotePropertyName rdpModeAfter -NotePropertyValue $rdpModeAfter
