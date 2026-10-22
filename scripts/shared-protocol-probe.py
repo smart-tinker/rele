@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Native shared daemon + real Rele adapter/Engine + Desktop NDJSON shim gate.
 
-Only isolated profiles, complete npm vendor packages, fake Responses provider and
-synthetic messenger channels are used. This does not test the actual Desktop GUI.
+Only isolated profiles, complete npm vendor packages or signed Desktop payloads,
+a fake Responses provider and synthetic messenger channels are used. The optional
+Desktop mode tests real backend bytes and production bootstrap, never the GUI.
 """
 import argparse
 import asyncio
@@ -36,22 +37,41 @@ child.once('close', code => { process.exitCode = code ?? 1; });
 
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--codex-prefix', type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument('--codex-prefix', type=Path)
+    source.add_argument('--desktop-bundle', type=Path)
+    parser.add_argument('--desktop-inventory', type=Path)
     parser.add_argument('--expected-version', choices=VERSIONS, required=True)
     parser.add_argument('--report', type=Path, required=True)
     args = parser.parse_args()
     binary = 'codex.exe' if os.name == 'nt' else 'codex'
-    candidates = list(args.codex_prefix.glob(f'node_modules/@openai/codex-*/vendor/*/bin/{binary}'))
-    if len(candidates) != 1:
-        parser.error('Expected exactly one native CLI in the isolated npm prefix.')
-    args.cli = candidates[0].resolve()
-    args.package = args.cli.parent.parent
-    manifest = args.package / 'codex-package.json'
-    if not manifest.is_file():
-        parser.error('Native shared gate requires a complete npm vendor package with codex-package.json.')
-    metadata = json.loads(manifest.read_text())
-    if metadata.get('entrypoint') != f'bin/{binary}' or metadata.get('version') != args.expected_version:
-        parser.error('Native vendor package manifest does not match the selected version and executable.')
+    args.inventory = None
+    if args.desktop_bundle:
+        if os.name != 'nt' or not args.desktop_inventory:
+            parser.error('Actual Desktop mode requires Windows and the signed package inventory.')
+        args.desktop_bundle = args.desktop_bundle.resolve(strict=True)
+        args.inventory = json.loads(args.desktop_inventory.read_text(encoding='utf-8-sig'))
+        evidence = args.inventory
+        if (evidence.get('result') != 'passed' or not evidence.get('nativeGatePrepared')
+                or evidence.get('backendVersion') != args.expected_version
+                or evidence.get('package', {}).get('signature', {}).get('status') != 'Valid'
+                or evidence.get('package', {}).get('identity', {}).get('name') not in ('OpenAI.Codex', 'OpenAI.ChatGPT')
+                or evidence['package']['identity'].get('architecture') != 'x64'):
+            parser.error('Expected a trusted x64 Desktop inventory with the exact measured backend version.')
+        args.cli = args.desktop_bundle / 'app/resources/codex.exe'
+        args.package = None
+    else:
+        candidates = list(args.codex_prefix.glob(f'node_modules/@openai/codex-*/vendor/*/bin/{binary}'))
+        if len(candidates) != 1:
+            parser.error('Expected exactly one native CLI in the isolated npm prefix.')
+        args.cli = candidates[0].resolve()
+        args.package = args.cli.parent.parent
+        manifest = args.package / 'codex-package.json'
+        if not manifest.is_file():
+            parser.error('Native shared gate requires a complete npm vendor package with codex-package.json.')
+        metadata = json.loads(manifest.read_text())
+        if metadata.get('entrypoint') != f'bin/{binary}' or metadata.get('version') != args.expected_version:
+            parser.error('Native vendor package manifest does not match the selected version and executable.')
     if not NODE or not SHIM.is_file():
         parser.error('Build Rele including dist/server/codex-cli.js before the shared gate.')
     return args
@@ -151,9 +171,11 @@ def frame(event):
 
 
 async def gate(args, root):
-    report = {'codexVersion': args.expected_version, 'platform': os.name, 'actualDesktopTested': False,
+    report = {'codexVersion': args.expected_version, 'platform': os.name, 'actualDesktopTested': False, 'actualDesktopGui': False,
+              'actualDesktopBundle': bool(args.desktop_bundle), 'actualDesktopBackendExecuted': False,
               'realModelRequests': 0, 'realMessengerRequests': 0, 'checks': {}}
     records, actions, holds, errors, drainers, processes = [], [], [], [], [], []
+    native_executables = {}
 
     async def provider(request):
         if request.method != 'POST' or not request.path.endswith('/responses'):
@@ -219,6 +241,24 @@ stream_max_retries=0
     base_env.update({'NO_PROXY': '127.0.0.1,localhost', 'no_proxy': '127.0.0.1,localhost',
                      'HTTP_PROXY': 'http://127.0.0.1:9', 'HTTPS_PROXY': 'http://127.0.0.1:9',
                      'ALL_PROXY': 'http://127.0.0.1:9'})
+    if args.desktop_bundle:
+        # Use an ordinary supported install root, not injected discovery results or a
+        # prepared CLI package. Every selected file remains the real signed ZIP entry.
+        local = root / 'desktop-user/AppData/Local'
+        install = local / 'Programs/ChatGPT'
+        shutil.copytree(args.desktop_bundle, install)
+        for row in args.inventory['inventory']:
+            source = install / row['path']
+            assert source.is_file() and source.stat().st_size == row['size'], row['path']
+            with source.open('rb') as stream:
+                assert row['sha256'] and hashlib.file_digest(stream, 'sha256').hexdigest() == row['sha256'], row['path']
+        assert not list(install.rglob('codex-package.json'))
+        base_env.update({'LOCALAPPDATA': str(local), 'APPDATA': str(local.parent / 'Roaming')})
+        assert shutil.which('codex', path=base_env.get('PATH')) is None, 'Actual Desktop gate must not find an npm/manual CLI on PATH'
+        args.cli = install / 'app/resources/codex.exe'
+        report['desktopPackage'] = args.inventory['package']
+        report['checks']['actual_signed_desktop_files_without_npm_or_native_manifest'] = True
+
 
     async def drain(process):
         while line := await process.stderr.readline():
@@ -277,7 +317,7 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
         report['checks']['windowsDpapi'] = True
 
     async def native(env, operation):
-        command = [str(args.cli), 'app-server', 'daemon', operation]
+        command = [str(native_executables.get(env['CODEX_HOME'], args.cli)), 'app-server', 'daemon', operation]
         if os.name == 'nt':
             # Match Rele's Node launcher: libuv owns a breakaway-capable child
             # Job. Native Codex still performs its own detached-launch preflight.
@@ -287,14 +327,16 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
         assert process.returncode == 0, (operation, errors[-10:])
         return json.loads(output)
 
-    async def driver(env, workspace, prepare=False, thread=None, profile_socket=None):
+    async def driver(env, workspace, prepare=False, thread=None, profile_socket=None, expected_error=None):
         command = [NODE, str(REPO / 'node_modules/tsx/dist/cli.mjs'), str(DRIVER),
-                   '--executable', str(args.cli), '--home', env['CODEX_HOME'], '--directory', str(workspace)]
-        if prepare or profile_socket:
-            process = await spawn([*command, *(['--profile-socket', str(profile_socket)] if profile_socket else ['--prepare'])], env, REPO)
+                   '--executable', 'codex' if args.desktop_bundle else str(args.cli), '--home', env['CODEX_HOME'], '--directory', str(workspace)]
+        if prepare or profile_socket or expected_error:
+            option = ['--expect-error', expected_error] if expected_error else ['--profile-socket', str(profile_socket)] if profile_socket else ['--prepare']
+            process = await spawn([*command, *option], env, REPO)
             output = await output_and_exit(process, 30)
             assert process.returncode == 0, errors[-10:]
-            assert json.loads(output)['profileRejected' if profile_socket else 'prepared']
+            result = json.loads(output)
+            assert result['expectedError'] == expected_error if expected_error else result['profileRejected' if profile_socket else 'prepared']
             return None, None
         if thread:
             command += ['--thread', thread]
@@ -302,8 +344,9 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
         client = EngineDriver(process)
         return client, await client.read()
 
-    async def desktop(env, name):
-        process = await spawn([NODE, str(SHIM), 'app-server', '--listen', 'stdio://'], env, REPO)
+    async def desktop(env, name, private=False):
+        command = [str(args.cli)] if private else [NODE, str(SHIM)]
+        process = await spawn([*command, 'app-server', '--listen', 'stdio://'], env, REPO)
         client = Rpc(process)
         metadata = await client.call('initialize', {'clientInfo': {'name': name, 'version': '0.0.0'},
                                                      'capabilities': {'experimentalApi': True}})
@@ -324,7 +367,7 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
         (home / 'config.toml').write_text(config, encoding='utf-8')
         env = {**base_env, 'CODEX_HOME': str(home), 'RELE_DATA_DIR': str(directory / 'rele')}
         # Disable the optional native updater before any start: package installation
-        # must come entirely from the already installed, validated npm vendor tree.
+        # must come entirely from the validated local npm or real Desktop bytes.
         settings = home / 'app-server-daemon'
         if os.name == 'nt':
             # Let the native lifecycle create its exact owner-private Windows DACL.
@@ -342,7 +385,40 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
                 await windows_dpapi(env)
             await driver(env, workspace, prepare=True)
             assert not (home / 'app-server-control/app-server-control.sock').exists()
-            if order == 'rele-first':
+            if args.desktop_bundle:
+                # Seed ordinary history through the actual flat Desktop backend before
+                # Rele can prepare a native package or start its shared singleton.
+                peer = await desktop(env, 'actual_desktop_private_seed', private=True)
+                report['actualDesktopBackendExecuted'] = True
+                thread = (await peer.call('thread/start', {'cwd': str(workspace)}))['thread']['id']
+                await peer.call('thread/name/set', {'threadId': thread, 'name': 'Original signed Desktop thread'})
+                prior = (await peer.call('turn/start', {'threadId': thread,
+                    'input': [{'type': 'text', 'text': f'{order}-desktop-prior-context'}]}))['turn']['id']
+                await peer.completed(prior)
+                private_pid = (await peer.call('server/diagnostics'))['process']['id']
+                before_fence = len(records)
+                await driver(env, workspace, expected_error='shared-desktop-conflict')
+                assert len(records) == before_fence and (await peer.call('server/diagnostics'))['process']['id'] == private_pid
+                report['checks']['actual_private_desktop_owner_blocks_without_stopping_or_moving_thread'] = True
+                await peer.close(); peer = None
+                assert not (home / 'packages').exists()
+                assert not (home / 'app-server-control/app-server-control.sock').exists()
+                assert not (directory / 'rele/codex-desktop-packages').exists()
+                assert not list(install.rglob('codex-package.json'))
+                report['checks']['original_desktop_thread_history_precede_native_bootstrap'] = True
+                engine, ready = await driver(env, workspace, thread=thread)
+                pid = ready['runtimeProcessId']
+                assert ready['configuredExecutable'] == 'codex' and ready['catalogValidated']
+                assert ready['threadId'] == thread and pid != private_pid
+                report['desktopBootstrap'] = {'originalThreadId': thread, 'privateProcessId': private_pid,
+                    'nativeProcessId': pid, 'configuredExecutable': ready['configuredExecutable'],
+                    'codexHome': ready['runtime']['codexHome'], 'automaticDiscovery': True}
+                native_executables[env['CODEX_HOME']] = Path(ready['status']['executable'])
+                assert native_executables[env['CODEX_HOME']].is_relative_to(home / 'packages')
+                peer = await desktop(env, 'actual_desktop_shared_adapter')
+                await peer.call('thread/resume', {'threadId': thread, 'excludeTurns': True})
+                report['checks']['production_auto_discovery_bootstraps_desktop_only_same_thread_profile'] = True
+            elif order == 'rele-first':
                 engine, ready = await driver(env, workspace)
                 thread, pid = ready['threadId'], ready['runtimeProcessId']
                 peer = await desktop(env, 'desktop_after_rele')
@@ -381,11 +457,24 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
             assert Path(first['socketPath']).resolve() == (home / 'app-server-control/app-server-control.sock').resolve()
             assert (await peer.call('server/diagnostics'))['process']['id'] == pid
             installed = Path(first['managedCodexPath']).parent.parent / 'codex-package.json'
-            assert installed.is_file() and installed.read_bytes() == (args.package / 'codex-package.json').read_bytes()
+            assert installed.is_file()
+            if args.desktop_bundle:
+                manifest = json.loads(installed.read_text())
+                assert manifest == {'layoutVersion': 1, 'version': args.expected_version, 'target': 'x86_64-pc-windows-msvc',
+                    'variant': 'codex', 'entrypoint': 'bin/codex.exe', 'resourcesDir': 'codex-resources', 'pathDir': 'codex-path'}
+                mappings = {'codex.exe': 'bin/codex.exe', 'codex-code-mode-host.exe': 'bin/codex-code-mode-host.exe',
+                    'rg.exe': 'codex-path/rg.exe', 'codex-command-runner.exe': 'codex-resources/codex-command-runner.exe',
+                    'codex-windows-sandbox-setup.exe': 'codex-resources/codex-windows-sandbox-setup.exe'}
+                for name, relative in mappings.items():
+                    with (args.cli.parent / name).open('rb') as source, (installed.parent / relative).open('rb') as target:
+                        assert hashlib.file_digest(source, 'sha256').digest() == hashlib.file_digest(target, 'sha256').digest(), name
+                report['checks']['native_installed_package_matches_actual_desktop_backend_and_all_helpers'] = True
+            else:
+                assert installed.read_bytes() == (args.package / 'codex-package.json').read_bytes()
             assert not (settings / 'daemon-updater.pid').exists()
             report['checks'][f'{order}_native_start_idempotent_local_package_only'] = True
             before = len(records)
-            if order == 'rele-first':
+            if order == 'rele-first' and not args.desktop_bundle:
                 turn = (await peer.call('turn/start', {'threadId': thread,
                     'input': [{'type': 'text', 'text': f'{order}-desktop-prior-context'}]}))['turn']['id']
                 await peer.completed(turn)
@@ -413,6 +502,7 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
             running = await engine.command('wait', status='running')
             assert running['droppedQueueAcks'] == 1, 'The synthetic queue ACK was not withheld'
             request = next(row for row in running['requests'] if row['eventId'] == 'held-telegram')
+            assert str(uuid.UUID(request['id'])) == request['id']
             await engine.close(); engine = None
             assert (await peer.call('server/diagnostics'))['process']['id'] == pid
             assert (await peer.call('thread/read', {'threadId': thread}))['thread']['status']['type'] != 'idle'
@@ -426,6 +516,10 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
             assert any(row['requestId'] == request['id'] and row['origin']['platform'] == 'telegram' and row['status'] == 'sent'
                        for row in completed['deliveries'])
             report['checks']['rele_restart_after_lost_ack_preserves_active_native_turn_uuid_without_resend'] = True
+            if args.desktop_bundle:
+                report['desktopBootstrap']['recoveredRequestId'] = request['id']
+                report['desktopBootstrap']['recoveredTurnId'] = request['turnId']
+                report['desktopBootstrap']['recoveryNativeProcessId'] = restarted['runtimeProcessId']
             # An origin-owned approval is resolved by the real Engine; Desktop sees it.
             actions.append(('approval', None))
             await engine.command('ingest', platform='telegram', eventId='approval', text='shared-approval-request')
@@ -492,8 +586,11 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
             await engine.command('wait')
             report['checks']['interrupted_native_queue_explicit_continuation_without_resend'] = True
             assert all(marker in json.dumps(records[before]) for marker in
-                       ('rele-first-desktop-prior-context', 'rele-first-slack-request', 'held-original-request'))
+                       (f'{order}-desktop-prior-context', f'{order}-slack-request', 'held-original-request'))
             report['checks']['native_stop_start_restart_restores_original_id_history_and_rele_records'] = True
+            if args.desktop_bundle:
+                report['desktopBootstrap']['restartedNativeProcessId'] = new_pid
+                report['desktopBootstrap']['preservedRequestIds'] = sorted(preserved)
             assert (home / 'config.toml').read_text(encoding='utf-8') == config
             report['checks']['isolated_native_user_config_unchanged'] = True
         finally:
@@ -518,8 +615,11 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
                     raise RuntimeError(f'Isolated fixture cleanup failed: {cleanup_errors}')
 
     try:
-        await scenario('rele-first')
-        await scenario('desktop-first')
+        if args.desktop_bundle:
+            await scenario('desktop-bundle')
+        else:
+            await scenario('rele-first')
+            await scenario('desktop-first')
         report['syntheticProviderRequests'] = len(records)
         assert all(report['checks'].values())
         report['result'] = 'passed'

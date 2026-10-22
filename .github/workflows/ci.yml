@@ -53,6 +53,15 @@ jobs:
       - name: Verify bounded Windows fixture cleanup with a real file lock
         if: runner.os == 'Windows'
         run: node scripts/probe-installer-cleanup.mjs
+      - name: Verify actual Desktop-only bootstrap without npm Codex or RDP
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $desktopRoot = Join-Path $env:RUNNER_TEMP 'desktop-native-gate'
+          & ./scripts/windows/probe-desktop-package.ps1 -OutputDirectory $desktopRoot -PrepareNativeGate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./scripts/windows/ci-standard-user-canary.ps1 -RunGates -Phase Shared -DesktopBundle (Join-Path $desktopRoot 'payload') -DesktopInventory (Join-Path $desktopRoot 'desktop-package-inventory.json')
+          Copy-Item -LiteralPath windows-standard-user-results.json -Destination desktop-standard-user-results.json
       - name: Verify Windows installer and native shared gates as a standard user
         if: runner.os == 'Windows'
         shell: pwsh
@@ -108,6 +117,8 @@ jobs:
             installer-results.json
             installer-failure-results.json
             windows-standard-user-results.json
+            desktop-standard-user-results.json
+            ${{ runner.temp }}/desktop-native-gate/desktop-package-inventory.json
             installer-cleanup-probe-results.json
             installer-native-cleanup-results.json
             playwright-report/
@@ -183,7 +194,9 @@ jobs:
 
           Both installers include Node.js 24.19.0 and production dependencies. Codex discovery checks Desktop backend locations, versioned Windows CLI directories, running process metadata, and local CLI installations. Opening the installed application uses an expiring single-use login link. Existing chat bindings and saved tokens survive upgrades. Portable ZIP/TAR packages remain available.
 
-          New in rc.13: Recommended native shared Codex policy attaches to or starts one daemon in the original profile, discovers its private control socket again after restart, and preserves original conversation IDs and uncertain request UUIDs. Windows supplies immutable Desktop/interactive CLI adapters and owner-checked optional Desktop integration; Ubuntu uses an independent systemd starter/timer without a Desktop or user D-Bus session. Installer gates keep the actual native PID and an open Windows adapter connection through Rele restart/upgrade/uninstall. Exact Codex 0.163.0, alpha.10.2 and alpha.11 run raw, managed and shared native probes. Initial daemon setup requires a complete supported local Codex package. Rele does not change Codex's native updater policy; an unverified updated version blocks shared access while keeping accepted requests. Existing explicit targets require a deliberate shared-mode transition and one Quit/relaunch of a private Desktop. codex exec does not support the shared remote transport in these versions. Real Desktop GUI and phone/messenger acceptance remain open. See docs/RC13.md.
+          New in rc.14: An installed supported Windows Codex Desktop is sufficient for the first shared daemon bootstrap, without manually installing CLI. Rele validates and snapshots the five native components of one local Desktop bundle, then lets the native lifecycle install its own durable package in the original profile. A healthy daemon keeps priority. Partial bundles, source changes, escaping links, cache tampering and unknown versions fail closed. The launcher prefers the actual ChatGPT.exe GUI with compatibility for Codex.exe. Windows acceptance separately uses the backend from the signed official Desktop MSIX, no npm CLI, and preserves original thread/history and recovery; actual GUI and real phone/messenger acceptance remain open. No dependencies or database migration. See docs/RC14.md.
+
+          Previously in rc.13: Recommended native shared Codex policy attaches to or starts one daemon in the original profile, discovers its private control socket again after restart, and preserves original conversation IDs and uncertain request UUIDs. Windows supplies immutable Desktop/interactive CLI adapters and owner-checked optional Desktop integration; Ubuntu uses an independent systemd starter/timer without a Desktop or user D-Bus session. Installer gates keep the actual native PID and an open Windows adapter connection through Rele restart/upgrade/uninstall. Exact Codex 0.163.0, alpha.10.2 and alpha.11 run raw, managed and shared native probes. Initial daemon setup requires a complete supported local Codex package. Rele does not change Codex's native updater policy; an unverified updated version blocks shared access while keeping accepted requests. Existing explicit targets require a deliberate shared-mode transition and one Quit/relaunch of a private Desktop. codex exec does not support the shared remote transport in these versions. Real Desktop GUI and phone/messenger acceptance remain open. See docs/RC13.md.
 
           Previously in rc.12: Source-first Telegram/Slack tabs map discovered chats and threads to named Codex conversations. Separate per-source off/mention/all access defaults new sources to off, preserves legacy restrictions until an explicit change, and requires human-only DM allowlists. Per-source automatic creation and explicit recovery protect already accepted messages. SQLite migrates v5 to v6; back up before upgrading and use a compatible pre-v6 backup for rollback. Limited diagnostics runs before config loading and reads only the instance marker and public loopback health, without config/DPAPI/database/history access. Real Windows/Defender and messenger acceptance remain open. See docs/RC12.md.
 

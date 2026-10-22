@@ -1,5 +1,7 @@
-param([ValidateSet('Parent', 'Child')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce, [switch]$RunGates, [ValidateSet('Shared', 'Installer')][string]$Phase = 'Installer')
+param([ValidateSet('Parent', 'Child')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce, [switch]$RunGates, [ValidateSet('Shared', 'Installer')][string]$Phase = 'Installer', [string]$DesktopBundle, [string]$DesktopInventory)
 $ErrorActionPreference = 'Stop'
+if ($Phase -eq 'Shared' -and -not $RunGates) { throw 'Shared-only mode requires -RunGates.' }
+if (($DesktopBundle -or $DesktopInventory) -and ($Mode -ne 'Parent' -or $Phase -ne 'Shared' -or -not $RunGates -or -not $DesktopBundle -or -not $DesktopInventory)) { throw 'Actual Desktop inputs require Parent -RunGates -Phase Shared and both payload and inventory paths.' }
 $sourceRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $shell = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'PowerShell\7\pwsh.exe'
 if (-not (Test-Path -LiteralPath $shell) -or [Diagnostics.FileVersionInfo]::GetVersionInfo($shell).FileMajorPart -ne 7) { throw 'The trusted PowerShell 7 installation is required for this CI canary.' }
@@ -90,20 +92,28 @@ if ($Mode -eq 'Child') {
             $env:PATH = @((Split-Path $marker.node), (Split-Path $marker.python), (Join-Path (Split-Path $marker.python) 'Scripts'), $system, (Join-Path $system 'WindowsPowerShell\v1.0')) -join ';'
             $env:PYTHONNOUSERSITE = '1'; $env:PYTHONDONTWRITEBYTECODE = '1'
             $env:RELE_TEST_REPORT_DIR = Join-Path $FixtureRoot 'reports'; New-Item -ItemType Directory -Path $env:RELE_TEST_REPORT_DIR -Force | Out-Null
-            $env:RELE_TEST_CODEX_PREFIX = $marker.prefixes[0]; $env:RELE_TEST_CODEX_VERSION = '0.163.0'
+            if (-not $marker.desktopBundle) { $env:RELE_TEST_CODEX_PREFIX = $marker.prefixes[0]; $env:RELE_TEST_CODEX_VERSION = '0.163.0' }
             $evidence.gates = @()
         }
         if ($Phase -eq 'Shared') {
-            $evidence.stage = 'native-cleanup'
-            & $marker.node (Join-Path $sourceRoot 'scripts\probe-installer-cleanup.mjs') --native
-            if ($LASTEXITCODE -ne 0) { throw 'The standard-user native stop/workdir cleanup gate failed.' }
-            $evidence.gates += 'native-cleanup'
-            $versions = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11')
-            for ($index = 0; $index -lt $versions.Count; $index++) {
-                $version = $versions[$index]; $evidence.stage = 'shared-' + $version
-                & $marker.python (Join-Path $sourceRoot 'scripts\shared-protocol-probe.py') --codex-prefix $marker.prefixes[$index] --expected-version $version --report (Join-Path $env:RELE_TEST_REPORT_DIR ('shared-results-' + $version + '.json'))
-                if ($LASTEXITCODE -ne 0) { throw ('The standard-user native shared gate failed for ' + $version + '.') }
-                $evidence.gates += 'shared-' + $version
+            if ($marker.desktopBundle) {
+                $evidence.stage = 'shared-actual-desktop'
+                & $marker.python (Join-Path $sourceRoot 'scripts\shared-protocol-probe.py') --desktop-bundle $marker.desktopBundle --desktop-inventory $marker.desktopInventory --expected-version $marker.desktopVersion --report (Join-Path $env:RELE_TEST_REPORT_DIR 'shared-results-actual-desktop.json')
+                if ($LASTEXITCODE -ne 0) { throw 'The standard-user actual Desktop bootstrap gate failed.' }
+                $evidence.gates += 'shared-actual-desktop'
+                $evidence.actualDesktopGui = $false
+            } else {
+                $evidence.stage = 'native-cleanup'
+                & $marker.node (Join-Path $sourceRoot 'scripts\probe-installer-cleanup.mjs') --native
+                if ($LASTEXITCODE -ne 0) { throw 'The standard-user native stop/workdir cleanup gate failed.' }
+                $evidence.gates += 'native-cleanup'
+                $versions = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11')
+                for ($index = 0; $index -lt $versions.Count; $index++) {
+                    $version = $versions[$index]; $evidence.stage = 'shared-' + $version
+                    & $marker.python (Join-Path $sourceRoot 'scripts\shared-protocol-probe.py') --codex-prefix $marker.prefixes[$index] --expected-version $version --report (Join-Path $env:RELE_TEST_REPORT_DIR ('shared-results-' + $version + '.json'))
+                    if ($LASTEXITCODE -ne 0) { throw ('The standard-user native shared gate failed for ' + $version + '.') }
+                    $evidence.gates += 'shared-' + $version
+                }
             }
         } else {
             $evidence.stage = 'interactive-token'
@@ -161,8 +171,10 @@ if ($Mode -eq 'Child') {
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:CI -ne 'true' -or $env:RUNNER_OS -ne 'Windows') { throw 'Run this canary only on a disposable GitHub Windows runner.' }
 $Nonce = [Guid]::NewGuid().ToString('N'); $account = 'ReleCi' + $Nonce.Substring(0, 8)
 $operationalLog = 'Microsoft-Windows-TaskScheduler/Operational'
-& (Join-Path ([Environment]::GetFolderPath('System')) 'wevtutil.exe') sl $operationalLog /e:true
-if ($LASTEXITCODE -ne 0) { throw 'Cannot enable the disposable runner Task Scheduler diagnostic channel.' }
+if ($Phase -eq 'Installer') {
+    & (Join-Path ([Environment]::GetFolderPath('System')) 'wevtutil.exe') sl $operationalLog /e:true
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot enable the disposable runner Task Scheduler diagnostic channel.' }
+}
 $FixtureRoot = Join-Path ([IO.Path]::GetPathRoot($env:RUNNER_TEMP)) ('rc-' + $Nonce.Substring(0, 8))
 if (Test-Path -LiteralPath $FixtureRoot) { throw 'Fixture directory already exists.' }
 New-Item -ItemType Directory -Path $FixtureRoot | Out-Null
@@ -179,20 +191,35 @@ try {
     $sid = $user.SID.Value
     if (@(Get-LocalGroupMember -SID 'S-1-5-32-545' | Where-Object { $_.SID.Value -eq $sid }).Count -eq 0) { Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $account }
     if (@(Get-LocalGroupMember -SID 'S-1-5-32-544' | Where-Object { $_.SID.Value -eq $sid }).Count -ne 0) { throw 'Fixture user must not be an administrator.' }
-    Add-LocalGroupMember -SID 'S-1-5-32-555' -Member $account
+    if ($Phase -eq 'Installer') { Add-LocalGroupMember -SID 'S-1-5-32-555' -Member $account }
     & icacls.exe $sourceRoot /grant ('*' + $sid + ':(OI)(CI)(RX)') /T /C | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant fixture source read access.' }
     & icacls.exe $FixtureRoot /grant ('*' + $sid + ':(OI)(CI)(M)') /T /C | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant fixture write access.' }
-    $marker = @{ nonce = $Nonce; sid = $sid; phase = 'Installer'; runGates = $RunGates.IsPresent }
+    $marker = @{ nonce = $Nonce; sid = $sid; phase = 'Installer'; runGates = $RunGates.IsPresent; desktopBundle = $null; desktopInventory = $null }
     if ($RunGates) {
         $marker.node = (Get-Command node.exe -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
         $marker.python = (Get-Command python.exe -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
         foreach ($executable in @($marker.node, $marker.python)) {
             if ($executable -isnot [string] -or -not [IO.Path]::IsPathFullyQualified($executable) -or [IO.Path]::GetExtension($executable) -ne '.exe' -or -not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw 'An isolated gate runtime must resolve to one fully qualified executable.' }
         }
-        $marker.prefixes = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11') | ForEach-Object { Join-Path $env:RUNNER_TEMP ('codex-probe-' + $_) }
-        foreach ($path in (@((Split-Path $marker.node), (Split-Path $marker.python)) + $marker.prefixes)) {
+        $marker.prefixes = @()
+        $desktopReadPaths = @()
+        if ($DesktopBundle) {
+            $marker.desktopBundle = [IO.Path]::GetFullPath($DesktopBundle)
+            $marker.desktopInventory = [IO.Path]::GetFullPath($DesktopInventory)
+            $runnerRoot = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
+            foreach ($path in @($marker.desktopBundle, $marker.desktopInventory)) {
+                if (-not $path.StartsWith($runnerRoot, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $path)) { throw 'Desktop gate inputs must be existing paths under this disposable RUNNER_TEMP.' }
+            }
+            $inventory = Get-Content -LiteralPath $marker.desktopInventory -Raw | ConvertFrom-Json
+            if ($inventory.result -ne 'passed' -or $inventory.nativeGatePrepared -ne $true -or $inventory.package.signature.status -ne 'Valid' -or $inventory.backendVersion -notin @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11')) { throw 'The actual Desktop inventory is not a successful signed and versioned preparation.' }
+            $marker.desktopVersion = $inventory.backendVersion
+            $desktopReadPaths = @($marker.desktopBundle, (Split-Path $marker.desktopInventory))
+        } else {
+            $marker.prefixes = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11') | ForEach-Object { Join-Path $env:RUNNER_TEMP ('codex-probe-' + $_) }
+        }
+        foreach ($path in (@((Split-Path $marker.node), (Split-Path $marker.python)) + $marker.prefixes + $desktopReadPaths)) {
             if (-not (Test-Path -LiteralPath $path -PathType Container) -or -not [IO.Path]::IsPathRooted($path)) { throw 'An isolated gate runtime or native package is unavailable.' }
             & icacls.exe $path /grant ('*' + $sid + ':(OI)(CI)(RX)') /T /C | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'Cannot grant fixture gate runtime read access.' }
@@ -200,7 +227,7 @@ try {
     }
     $credential = New-Object System.Management.Automation.PSCredential ($env:COMPUTERNAME + '\' + $account), $password
     $resultPath = Join-Path $FixtureRoot 'windows-standard-user-results.json'
-    if ($RunGates) { $gatesDeadline = [DateTime]::UtcNow.AddMinutes(20) }
+    if ($RunGates) { $gatesDeadline = [DateTime]::UtcNow.AddMinutes($(if ($DesktopBundle) { 5 } else { 20 })) }
     if ($RunGates) {
         $parentStage = 'shared'
         $marker.phase = 'Shared'; $marker | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8
@@ -215,6 +242,11 @@ try {
         if ($child.ExitCode -ne 0 -or $receipt.result -ne 'passed' -or $receipt.selfElevated -ne $false) { foreach ($log in @('stdout.log', 'stderr.log')) { Get-Content -LiteralPath (Join-Path $FixtureRoot $log) -Tail 30 | Write-Output }; throw 'The standard-user native shared phase failed.' }
         $child.Dispose(); $child = $null
         Remove-Item -LiteralPath $resultPath
+        if ($Phase -eq 'Shared') {
+            $sharedOutcome | Add-Member -NotePropertyName rdpUsed -NotePropertyValue $false
+            $sharedOutcome | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $sourceRoot 'windows-standard-user-results.json') -Encoding UTF8
+            return
+        }
         $marker.phase = 'Installer'
     }
     $parentStage = 'rdp-session'
@@ -399,11 +431,11 @@ try {
         { if ($redirectorStartupChanged) { Set-Service -Name UmRdpService -StartupType $priorRedirectorStartup } },
         { if ($serviceStarted) { Stop-Service -Name TermService } },
         { if ($serviceStartupChanged) { Set-Service -Name TermService -StartupType $priorServiceStartup } },
-        { if ($user) { Remove-Canary $user.SID.Value } },
+        { if ($user -and $Phase -eq 'Installer') { Remove-Canary $user.SID.Value } },
         { if ($user) { Remove-FixtureProfile $user.SID.Value $profileCleanupFacts } },
         { if ($user) { Remove-LocalUser -SID $user.SID } },
         { if ($RunGates) {
-            foreach ($name in @('installer-results.json', 'installer-failure-results.json', 'installer-native-cleanup-results.json', 'shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json')) { $report = Join-Path $FixtureRoot ('reports\' + $name); if (Test-Path -LiteralPath $report) { Copy-Item -LiteralPath $report -Destination (Join-Path $sourceRoot $name) } }
+            foreach ($name in @('installer-results.json', 'installer-failure-results.json', 'installer-native-cleanup-results.json', 'shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json', 'shared-results-actual-desktop.json')) { $report = Join-Path $FixtureRoot ('reports\' + $name); if (Test-Path -LiteralPath $report) { Copy-Item -LiteralPath $report -Destination (Join-Path $sourceRoot $name) } }
             $stdout = Join-Path $FixtureRoot 'stdout.log'
             if (Test-Path -LiteralPath $stdout) {
                 $allowed = @('Windows installer smoke: an unknown startup script is preserved', 'Windows installer smoke: a previous portable process is not killed', 'Windows installer smoke: foreign Desktop settings are preserved without blocking installation', 'Windows installer smoke: the Codex wrapper preserves argv, profile, data and raw bytes', 'Windows installer smoke: launcher restart', 'Windows installer smoke: same-version upgrade with backup', 'Windows installer smoke: owned Desktop settings restore and later foreign changes survive uninstall', 'Windows installer smoke: uninstall preserves data', 'Windows installer cleanup: desktop-environment', 'Windows installer cleanup: held-adapter', 'Windows installer cleanup: native-daemon', 'Windows installer cleanup: files', 'Windows installer cleanup: complete')
@@ -421,7 +453,7 @@ try {
         if ($sharedOutcome) { $result | Add-Member -Force -NotePropertyName sharedPhase -NotePropertyValue $sharedOutcome }
         if ($rdp) { $result | Add-Member -Force -NotePropertyName rdpDiagnostics -NotePropertyValue $rdp.Diagnostics }
         if ($rdp) { $result | Add-Member -NotePropertyName rdpWindows -NotePropertyValue ($rdp.MstscWindows.ToArray()) }
-        $result | Add-Member -NotePropertyName rdpClient -NotePropertyValue 'mstsc'
+        if ($rdpStartedAt) { $result | Add-Member -NotePropertyName rdpClient -NotePropertyValue 'mstsc' }
         $result | Add-Member -NotePropertyName rdpTransport -NotePropertyValue $rdpTransport
         $result | Add-Member -NotePropertyName rdpModeBefore -NotePropertyValue $rdpModeBefore
         $result | Add-Member -NotePropertyName rdpModeAfter -NotePropertyValue $rdpModeAfter

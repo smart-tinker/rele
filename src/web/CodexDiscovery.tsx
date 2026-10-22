@@ -190,7 +190,7 @@ export function CodexDiscovery({
                     </small>
                   )}
                   {connection && startsServer && (
-                    <small>{transport === 'shared' ? 'Запуск общего Codex требует полного пакета CLI' : 'Доступен для сервера Rele'}</small>
+                    <small>{transport === 'shared' ? 'Можно использовать для общего Codex' : 'Доступен для сервера Rele'}</small>
                   )}
                   {isRecommended && <Status tone="good">Рекомендуется</Status>}
                   {!connection && (
