@@ -3,20 +3,48 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$OutputDirectory,
     [switch]$ProbeBackendVersion,
-    [switch]$PrepareNativeGate
+    [switch]$PrepareNativeGate,
+    [switch]$Standalone,
+    [string]$PackageFile
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-if ($env:GITHUB_ACTIONS -ne 'true' -or $env:OS -ne 'Windows_NT' -or -not $env:RUNNER_TEMP) {
-    throw 'Run this download/inventory probe only on a disposable GitHub Windows runner.'
+function Assert-NoReparsePath([string]$Path) {
+    $current = [IO.Path]::GetFullPath($Path)
+    while ($current) {
+        $item = $null
+        try { $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop }
+        catch [System.Management.Automation.ItemNotFoundException] { }
+        if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Fixture paths must not contain reparse points.' }
+        $current = [IO.Path]::GetDirectoryName($current)
+    }
+}
+
+if ($env:OS -ne 'Windows_NT' -or -not $env:RUNNER_TEMP -or (-not $Standalone -and $env:GITHUB_ACTIONS -ne 'true')) {
+    throw 'Run this probe on a disposable GitHub Windows runner or explicitly use -Standalone with disposable RUNNER_TEMP.'
+}
+if ($Standalone -and (-not [IO.Path]::IsPathFullyQualified($env:RUNNER_TEMP) -or -not (Test-Path -LiteralPath $env:RUNNER_TEMP -PathType Container))) {
+    throw 'Standalone mode requires an explicit existing absolute RUNNER_TEMP directory.'
 }
 $root = [IO.Path]::GetFullPath($OutputDirectory)
 $temporaryRoot = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
+if ($Standalone -and $temporaryRoot.TrimEnd('\') -eq [IO.Path]::GetPathRoot($temporaryRoot).TrimEnd('\')) { throw 'Standalone RUNNER_TEMP must not be a volume root.' }
 if (-not $root.StartsWith($temporaryRoot, [StringComparison]::OrdinalIgnoreCase) -or (Test-Path -LiteralPath $root)) {
     throw 'OutputDirectory must be a new directory under RUNNER_TEMP.'
+}
+$reusePackage = $PSBoundParameters.ContainsKey('PackageFile')
+if ($Standalone -or $reusePackage) { Assert-NoReparsePath $root }
+$sourcePackage = $null
+if ($reusePackage) {
+    if ([string]::IsNullOrWhiteSpace($PackageFile) -or -not [IO.Path]::IsPathFullyQualified($PackageFile)) { throw 'PackageFile must be an absolute local MSIX under RUNNER_TEMP.' }
+    $sourcePackage = [IO.Path]::GetFullPath($PackageFile)
+    if (-not $sourcePackage.StartsWith($temporaryRoot, [StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetExtension($sourcePackage) -ine '.msix' -or -not (Test-Path -LiteralPath $sourcePackage -PathType Leaf)) {
+        throw 'PackageFile must be an existing local MSIX strictly under RUNNER_TEMP.'
+    }
+    Assert-NoReparsePath $sourcePackage
 }
 $null = New-Item -ItemType Directory -Path $root
 $downloads = Join-Path $root 'downloads'
@@ -42,16 +70,23 @@ $exitCode = 1
 
 try {
     $package = Join-Path $downloads 'ChatGPT-x64.msix'
-    try {
-        $null = Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $package -TimeoutSec 90
-        $report.downloadAttempts += [ordered]@{ method = 'official-msix'; success = $true }
-        $report.acquisition = 'official-msix'
-    } catch {
-        $status = $null
-        $responseProperty = $_.Exception.PSObject.Properties['Response']
-        if ($responseProperty -and $responseProperty.Value) { $status = [int]$responseProperty.Value.StatusCode }
-        $report.downloadAttempts += [ordered]@{ method = 'official-msix'; success = $false; httpStatus = $status }
-        Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
+    if ($sourcePackage) {
+        $report.stage = 'local-package'
+        $failureCode = 'local-package-copy-failed'
+        Copy-Item -LiteralPath $sourcePackage -Destination $package
+        $report.acquisition = 'local-msix'
+    } else {
+        try {
+            $null = Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $package -TimeoutSec 90
+            $report.downloadAttempts += [ordered]@{ method = 'official-msix'; success = $true }
+            $report.acquisition = 'official-msix'
+        } catch {
+            $status = $null
+            $responseProperty = $_.Exception.PSObject.Properties['Response']
+            if ($responseProperty -and $responseProperty.Value) { $status = [int]$responseProperty.Value.StatusCode }
+            $report.downloadAttempts += [ordered]@{ method = 'official-msix'; success = $false; httpStatus = $status }
+            Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
+        }
     }
 
     if (-not $report.acquisition) {
