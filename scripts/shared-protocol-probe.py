@@ -359,12 +359,105 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
         while len(records) < count:
             await asyncio.sleep(.02)
 
+    async def ordinary_linux_cli(env, workspace, thread, peer, engine, pid):
+        # A real controlling PTY exercises normal interactive daemon discovery.
+        # Only fixed terminal queries are answered; no --remote, -c or Rele shim.
+        import errno
+        import fcntl
+        import pty
+        import struct
+        import termios
+
+        before = await engine.command('snapshot')
+        before_records = len(records)
+        previous_turns = {event['params']['turn']['id'] for event in peer.events if event.get('method') == 'turn/started'}
+        marker = 'ordinary-linux-cli-shared-request'
+        command = [str(args.cli), '--no-alt-screen', 'resume', thread, marker]
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 120, 0, 0))
+        terminal = os.fdopen(master, 'rb', buffering=0)
+        reader = asyncio.StreamReader()
+        transport, _ = await asyncio.get_running_loop().connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), terminal)
+        process = pump = None
+        output = bytearray()
+        queries = {b'\x1b[6n': b'\x1b[1;1R', b'\x1b[?u': b'\x1b[?0u\x1b[?1;2c', b'\x1b[c': b'\x1b[?1;2c',
+                   b'\x1b]10;?': b'\x1b]10;rgb:ffff/ffff/ffff\x1b\\', b'\x1b]11;?': b'\x1b]11;rgb:0000/0000/0000\x1b\\'}
+
+        async def read_terminal():
+            try:
+                while chunk := await reader.read(65536):
+                    output.extend(chunk)
+                    del output[:-65536]
+                    for query, reply in list(queries.items()):
+                        if query in output:
+                            os.write(master, reply)
+                            del queries[query]
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+
+        try:
+            process = await asyncio.create_subprocess_exec(*command, env={**env, 'TERM': 'xterm-256color'}, cwd=workspace,
+                stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
+                preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0))
+            processes.append(process)
+            os.close(slave); slave = None
+            pump = asyncio.create_task(read_terminal())
+            try:
+                await asyncio.wait_for(wait_records(before_records + 1), 45)
+            except TimeoutError:
+                raise RuntimeError('Ordinary CLI did not submit its initial prompt: ' + output.decode(errors='replace')[-2000:])
+            started = await peer.wait(lambda event: event.get('method') == 'turn/started'
+                and event['params'].get('threadId') == thread and event['params']['turn']['id'] not in previous_turns)
+            turn = started['params']['turn']['id']
+            await peer.completed(turn)
+            assert len(records) == before_records + 1
+            assert all(text in json.dumps(records[-1]) for text in
+                ('rele-first-desktop-prior-context', 'rele-first-slack-request', 'shared-passive-agent-context', marker))
+            after = await engine.command('wait')
+            assert after['threadId'] == thread and after['runtimeProcessId'] == pid
+            assert all(any(event == {'method': method, 'threadId': thread, 'turnId': turn} for event in after['observedTurns'])
+                       for method in ('turn/started', 'turn/completed'))
+            assert after['requests'] == before['requests'] and after['deliveries'] == before['deliveries']
+            os.write(master, b'\x04')
+            await asyncio.wait_for(process.wait(), 10)
+            assert process.returncode == 0, 'Ordinary CLI did not close cleanly'
+            assert (await peer.call('server/diagnostics'))['process']['id'] == pid
+            report['ordinaryLinuxCli'] = {'originalThreadId': thread, 'turnId': turn, 'backendProcessId': pid,
+                'arguments': command[1:], 'usedPty': True, 'usedRemoteOverride': False, 'usedReleWrapper': False}
+            report['checks']['ordinary_linux_cli_resume_shares_original_thread_and_backend_pid'] = True
+            report['checks']['ordinary_linux_cli_prompt_retains_full_shared_context'] = True
+            report['checks']['ordinary_linux_cli_turn_seen_by_rele_and_subscriber'] = True
+            report['checks']['ordinary_linux_cli_turn_creates_no_external_request_or_delivery'] = True
+        finally:
+            if slave is not None:
+                os.close(slave)
+            if process and process.returncode is None:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), 5)
+                except TimeoutError:
+                    process.kill(); await process.wait()
+            transport.close()
+            if pump:
+                await asyncio.gather(pump, return_exceptions=True)
+
     async def scenario(order):
         directory = root / order
         home, workspace = directory / 'c', directory / 'w'
         home.mkdir(parents=True)
         workspace.mkdir()
-        (home / 'config.toml').write_text(config, encoding='utf-8')
+        scenario_config = config
+        if sys.platform == 'linux':
+            scenario_config = 'suppress_unstable_features_warning=true\n' + config + f'''
+[analytics]
+enabled=false
+[tui]
+disable_paste_burst=true
+[projects.{json.dumps(str(workspace))}]
+trust_level="trusted"
+'''
+        (home / 'config.toml').write_text(scenario_config, encoding='utf-8')
         env = {**base_env, 'CODEX_HOME': str(home), 'RELE_DATA_DIR': str(directory / 'rele')}
         # Disable the optional native updater before any start: package installation
         # must come entirely from the validated local npm or real Desktop bytes.
@@ -488,6 +581,8 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
             assert all(marker in json.dumps(records[before + 1]) for marker in
                        (f'{order}-desktop-prior-context', 'shared-passive-agent-context', f'{order}-slack-request'))
             report['checks'][f'{order}_slack_full_context_and_exact_origin'] = True
+            if sys.platform == 'linux' and order == 'rele-first':
+                await ordinary_linux_cli(env, workspace, thread, peer, engine, pid)
             if order == 'desktop-first':
                 await engine.close()
                 engine = None
@@ -591,7 +686,7 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
             if args.desktop_bundle:
                 report['desktopBootstrap']['restartedNativeProcessId'] = new_pid
                 report['desktopBootstrap']['preservedRequestIds'] = sorted(preserved)
-            assert (home / 'config.toml').read_text(encoding='utf-8') == config
+            assert (home / 'config.toml').read_text(encoding='utf-8') == scenario_config
             report['checks']['isolated_native_user_config_unchanged'] = True
         finally:
             for event in holds:

@@ -54,12 +54,19 @@ if (values['expect-error']) {
     sender: { id: 'fixture-agent', name: 'Other agent', isBot: true }, text: 'shared-passive-agent-context',
     payload: { text: 'shared-passive-agent-context', preserved: { full: true } }, kind: 'message' }];
   const diagnostics: string[] = [];
+  const observedTurns: Array<{ method: string; threadId: string; turnId: string }> = [];
   let codex: CodexClient | undefined, engine: Engine | undefined;
   let threadId = values.thread;
   let loseNextQueueAck = false, droppedQueueAcks = 0, catalogValidated = false;
   const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
   async function start() {
     codex = new CodexClient(config.codex);
+    codex.on('notification', (event: { method: string; params: { threadId?: unknown; turn?: { id?: unknown } } }) => {
+      if (['turn/started', 'turn/completed'].includes(event.method) && typeof event.params.threadId === 'string' && typeof event.params.turn?.id === 'string') {
+        observedTurns.push({ method: event.method, threadId: event.params.threadId, turnId: event.params.turn.id });
+        if (observedTurns.length > 100) observedTurns.shift();
+      }
+    });
     await codex.connect();
     const enqueue = codex.enqueue.bind(codex);
     codex.enqueue = async (...args) => {
@@ -98,7 +105,7 @@ if (values['expect-error']) {
   async function snapshot() {
     if (!codex) throw new Error('Client is closed');
     return { threadId, configuredExecutable: config.codex.executable, status: codex.status(), runtime: codex.runtimeInfo(), runtimeProcessId: (await codex.diagnostics()).process.id,
-      droppedQueueAcks, catalogValidated, requests: store.listRequests(), deliveries: store.listDeliveries(), approvals: store.listApprovals(), diagnostics };
+      droppedQueueAcks, catalogValidated, observedTurns, requests: store.listRequests(), deliveries: store.listDeliveries(), approvals: store.listApprovals(), diagnostics };
   }
   const input = createInterface({ input: process.stdin });
   try {

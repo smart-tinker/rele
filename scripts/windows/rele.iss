@@ -54,7 +54,8 @@ russian.DesktopSkipped=Подключение Codex Desktop пропущено:
 russian.DataPreserved=При удалении программы настройки, связки чатов и резервные копии останутся в каталоге данных.
 
 [Tasks]
-Name: "desktop"; Description: "{cm:IntegrateDesktop}"; Flags: checkedonce
+; Fresh installs enable this task; UsePreviousTasks=yes preserves an explicit prior choice.
+Name: "desktop"; Description: "{cm:IntegrateDesktop}"
 
 [Files]
 Source: "{#StageDir}\Rele.exe"; Flags: dontcopy
