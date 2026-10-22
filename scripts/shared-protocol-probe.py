@@ -8,7 +8,9 @@ Desktop mode tests real backend bytes and production bootstrap, never the GUI.
 import argparse
 import asyncio
 import contextlib
+import difflib
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -359,7 +361,18 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
         while len(records) < count:
             await asyncio.sleep(.02)
 
-    async def ordinary_linux_cli(env, workspace, thread, peer, engine, pid):
+    def config_diff(stage, before, after):
+        # Both inputs belong to this fresh synthetic profile; never read a user config.
+        lines = list(itertools.islice(difflib.unified_diff(before.splitlines(keepends=True),
+            after.splitlines(keepends=True), fromfile='synthetic-before/config.toml',
+            tofile='synthetic-after/config.toml'), 81))
+        difference = ''.join(lines[:80])
+        report.setdefault('configDiagnostics', []).append({'stage': stage, 'changed': before != after,
+            'beforeSha256': hashlib.sha256(before.encode()).hexdigest(),
+            'afterSha256': hashlib.sha256(after.encode()).hexdigest(),
+            'unifiedDiff': difference[:8192], 'truncated': len(lines) > 80 or len(difference) > 8192})
+
+    async def ordinary_linux_cli(env, workspace, thread, peer, engine, pid, expected_config):
         # A real controlling PTY exercises normal interactive daemon discovery.
         # Only fixed terminal queries are answered; no --remote, -c or Rele shim.
         import errno
@@ -368,6 +381,11 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
         import struct
         import termios
 
+        config_path = Path(env['CODEX_HOME']) / 'config.toml'
+        before_config = config_path.read_text(encoding='utf-8')
+        if before_config != expected_config:
+            config_diff('before-ordinary-linux-cli', expected_config, before_config)
+        assert before_config == expected_config, 'Fixture config changed before ordinary native CLI launch'
         before = await engine.command('snapshot')
         before_records = len(records)
         previous_turns = {event['params']['turn']['id'] for event in peer.events if event.get('method') == 'turn/started'}
@@ -414,7 +432,7 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
             assert len(records) == before_records + 1
             assert all(text in json.dumps(records[-1]) for text in
                 ('rele-first-desktop-prior-context', 'rele-first-slack-request', 'shared-passive-agent-context', marker))
-            after = await engine.command('wait')
+            after = await engine.command('wait', turnId=turn)
             assert after['threadId'] == thread and after['runtimeProcessId'] == pid
             assert all(any(event == {'method': method, 'threadId': thread, 'turnId': turn} for event in after['observedTurns'])
                        for method in ('turn/started', 'turn/completed'))
@@ -423,6 +441,7 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
             await asyncio.wait_for(process.wait(), 10)
             assert process.returncode == 0, 'Ordinary CLI did not close cleanly'
             assert (await peer.call('server/diagnostics'))['process']['id'] == pid
+            config_diff('ordinary-linux-cli-exit', before_config, config_path.read_text(encoding='utf-8'))
             report['ordinaryLinuxCli'] = {'originalThreadId': thread, 'turnId': turn, 'backendProcessId': pid,
                 'arguments': command[1:], 'usedPty': True, 'usedRemoteOverride': False, 'usedReleWrapper': False}
             report['checks']['ordinary_linux_cli_resume_shares_original_thread_and_backend_pid'] = True
@@ -582,7 +601,7 @@ trust_level="trusted"
                        (f'{order}-desktop-prior-context', 'shared-passive-agent-context', f'{order}-slack-request'))
             report['checks'][f'{order}_slack_full_context_and_exact_origin'] = True
             if sys.platform == 'linux' and order == 'rele-first':
-                await ordinary_linux_cli(env, workspace, thread, peer, engine, pid)
+                await ordinary_linux_cli(env, workspace, thread, peer, engine, pid, scenario_config)
             if order == 'desktop-first':
                 await engine.close()
                 engine = None
@@ -686,7 +705,10 @@ trust_level="trusted"
             if args.desktop_bundle:
                 report['desktopBootstrap']['restartedNativeProcessId'] = new_pid
                 report['desktopBootstrap']['preservedRequestIds'] = sorted(preserved)
-            assert (home / 'config.toml').read_text(encoding='utf-8') == scenario_config
+            final_config = (home / 'config.toml').read_text(encoding='utf-8')
+            if final_config != scenario_config:
+                config_diff(f'{order}-scenario-final', scenario_config, final_config)
+            assert final_config == scenario_config, 'Isolated fixture config changed; see bounded configDiagnostics'
             report['checks']['isolated_native_user_config_unchanged'] = True
         finally:
             for event in holds:

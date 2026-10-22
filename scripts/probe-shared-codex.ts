@@ -128,7 +128,8 @@ if (values['expect-error']) {
         await engine!.settled();
       } else if (command.action === 'wait') {
         const until = Date.now() + 40_000;
-        const pending = () => command.status ? !store.listRequests().some(request =>
+        const pending = () => command.turnId ? !observedTurns.some(event =>
+          event.method === 'turn/completed' && event.threadId === threadId && event.turnId === command.turnId) : command.status ? !store.listRequests().some(request =>
           (!command.requestId || request.id === command.requestId) && request.status === command.status) : store.activeRequests().length > 0;
         while (pending() && Date.now() < until) { await engine!.pump(); await engine!.settled(); await delay(50); }
         if (pending()) throw new Error(`Shared requests did not reach expected state: ${JSON.stringify(store.listRequests())}`);
