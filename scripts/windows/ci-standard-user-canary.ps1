@@ -1,10 +1,22 @@
-param([ValidateSet('Parent', 'Child')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce, [switch]$RunGates, [ValidateSet('Shared', 'Installer')][string]$Phase = 'Installer', [string]$DesktopBundle, [string]$DesktopInventory)
+param([ValidateSet('Parent', 'Child')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce, [switch]$RunGates, [ValidateSet('Shared', 'Installer')][string]$Phase = 'Installer', [string]$DesktopBundle, [string]$DesktopInventory, [switch]$StandaloneShared, [string]$PowerShell7Path)
 $ErrorActionPreference = 'Stop'
+if ($StandaloneShared -and ($Mode -ne 'Parent' -or -not $RunGates -or $Phase -ne 'Shared')) { throw 'Standalone mode requires Parent -RunGates -Phase Shared.' }
 if ($Phase -eq 'Shared' -and -not $RunGates) { throw 'Shared-only mode requires -RunGates.' }
 if (($DesktopBundle -or $DesktopInventory) -and ($Mode -ne 'Parent' -or $Phase -ne 'Shared' -or -not $RunGates -or -not $DesktopBundle -or -not $DesktopInventory)) { throw 'Actual Desktop inputs require Parent -RunGates -Phase Shared and both payload and inventory paths.' }
 $sourceRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
-$shell = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'PowerShell\7\pwsh.exe'
-if (-not (Test-Path -LiteralPath $shell) -or [Diagnostics.FileVersionInfo]::GetVersionInfo($shell).FileMajorPart -ne 7) { throw 'The trusted PowerShell 7 installation is required for this CI canary.' }
+$shell = if ($PowerShell7Path) { $PowerShell7Path } else { Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'PowerShell\7\pwsh.exe' }
+if (-not [IO.Path]::IsPathFullyQualified($shell) -or [IO.Path]::GetFileName($shell) -ine 'pwsh.exe' -or -not (Test-Path -LiteralPath $shell -PathType Leaf) -or [Diagnostics.FileVersionInfo]::GetVersionInfo($shell).FileMajorPart -ne 7) { throw 'A fully qualified PowerShell 7 executable is required for this canary.' }
+if ($PowerShell7Path -and (Get-AuthenticodeSignature -LiteralPath $shell).Status -ne 'Valid') { throw 'The portable PowerShell 7 executable must have a valid Authenticode signature.' }
+function Assert-StandaloneScratchTree([string]$Path) {
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    if (-not $full.StartsWith(($standaloneRoot + '\'), [StringComparison]::OrdinalIgnoreCase)) { throw 'Standalone source and tools must be disposable copies under RUNNER_TEMP.' }
+    $entry = Get-Item -LiteralPath $full -Force
+    while ($entry) {
+        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Standalone fixture paths must not contain reparse points.' }
+        $entry = $entry.Parent
+    }
+    if (Get-ChildItem -LiteralPath $full -Recurse -Force -Attributes ReparsePoint | Select-Object -First 1) { throw 'Standalone fixture trees must not contain reparse points.' }
+}
 function Quote([string]$Value) { if ($Value.Contains('"')) { throw 'Invalid fixture argument.' }; return '"' + $Value + '"' }
 function Token-Elevated {
     $helper = Join-Path $FixtureRoot 'FixtureElevation.exe'
@@ -168,14 +180,23 @@ if ($Mode -eq 'Child') {
     exit 0
 }
 
-if ($env:GITHUB_ACTIONS -ne 'true' -or $env:CI -ne 'true' -or $env:RUNNER_OS -ne 'Windows') { throw 'Run this canary only on a disposable GitHub Windows runner.' }
+if (-not $StandaloneShared -and ($env:GITHUB_ACTIONS -ne 'true' -or $env:CI -ne 'true' -or $env:RUNNER_OS -ne 'Windows')) { throw 'Run this canary only on a disposable GitHub Windows runner.' }
+$standaloneRoot = $null
+if ($StandaloneShared) {
+    if (-not $env:RUNNER_TEMP -or -not [IO.Path]::IsPathFullyQualified($env:RUNNER_TEMP) -or -not (Test-Path -LiteralPath $env:RUNNER_TEMP -PathType Container)) { throw 'Standalone mode requires an explicit disposable RUNNER_TEMP directory.' }
+    $standaloneRoot = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
+    if ($standaloneRoot -eq [IO.Path]::GetPathRoot($standaloneRoot).TrimEnd('\')) { throw 'Standalone RUNNER_TEMP must not be a volume root.' }
+    Assert-StandaloneScratchTree $sourceRoot
+    Assert-StandaloneScratchTree (Split-Path $shell)
+}
 $Nonce = [Guid]::NewGuid().ToString('N'); $account = 'ReleCi' + $Nonce.Substring(0, 8)
 $operationalLog = 'Microsoft-Windows-TaskScheduler/Operational'
 if ($Phase -eq 'Installer') {
     & (Join-Path ([Environment]::GetFolderPath('System')) 'wevtutil.exe') sl $operationalLog /e:true
     if ($LASTEXITCODE -ne 0) { throw 'Cannot enable the disposable runner Task Scheduler diagnostic channel.' }
 }
-$FixtureRoot = Join-Path ([IO.Path]::GetPathRoot($env:RUNNER_TEMP)) ('rc-' + $Nonce.Substring(0, 8))
+$fixtureParent = if ($StandaloneShared) { $standaloneRoot } else { [IO.Path]::GetPathRoot($env:RUNNER_TEMP) }
+$FixtureRoot = Join-Path $fixtureParent ('rc-' + $Nonce.Substring(0, 8))
 if (Test-Path -LiteralPath $FixtureRoot) { throw 'Fixture directory already exists.' }
 New-Item -ItemType Directory -Path $FixtureRoot | Out-Null
 $user = $null; $child = $null; $credential = $null; $password = $null; $rdp = $null; $sharedOutcome = $null; $gatesDeadline = $null; $parentStage = 'setup'
@@ -219,8 +240,10 @@ try {
         } else {
             $marker.prefixes = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11') | ForEach-Object { Join-Path $env:RUNNER_TEMP ('codex-probe-' + $_) }
         }
-        foreach ($path in (@((Split-Path $marker.node), (Split-Path $marker.python)) + $marker.prefixes + $desktopReadPaths)) {
+        $portableShellPaths = if ($StandaloneShared) { @((Split-Path $shell)) } else { @() }
+        foreach ($path in (@((Split-Path $marker.node), (Split-Path $marker.python)) + $marker.prefixes + $desktopReadPaths + $portableShellPaths)) {
             if (-not (Test-Path -LiteralPath $path -PathType Container) -or -not [IO.Path]::IsPathRooted($path)) { throw 'An isolated gate runtime or native package is unavailable.' }
+            if ($StandaloneShared) { Assert-StandaloneScratchTree $path }
             & icacls.exe $path /grant ('*' + $sid + ':(OI)(CI)(RX)') /T /C | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'Cannot grant fixture gate runtime read access.' }
         }
@@ -232,6 +255,7 @@ try {
         $parentStage = 'shared'
         $marker.phase = 'Shared'; $marker | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8
         $arguments = '-NoProfile -NonInteractive -File ' + (Quote $PSCommandPath) + ' -Mode Child -FixtureRoot ' + (Quote $FixtureRoot) + ' -Nonce ' + $Nonce + ' -RunGates -Phase Shared'
+        if ($PowerShell7Path) { $arguments += ' -PowerShell7Path ' + (Quote $shell) }
         $child = Start-Process -FilePath $shell -ArgumentList $arguments -Credential $credential -LoadUserProfile -UseNewEnvironment -WorkingDirectory $FixtureRoot -RedirectStandardOutput (Join-Path $FixtureRoot 'stdout.log') -RedirectStandardError (Join-Path $FixtureRoot 'stderr.log') -PassThru
         $remaining = [Math]::Max(0, [int](($gatesDeadline - [DateTime]::UtcNow).TotalMilliseconds))
         if (-not $child.WaitForExit($remaining)) { throw 'The standard-user shared phase timed out.' }
@@ -294,6 +318,7 @@ try {
     $marker.rdpSessionId = $rdp.SessionId; $marker | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8
     $arguments = '-NoProfile -NonInteractive -File ' + (Quote $PSCommandPath) + ' -Mode Child -FixtureRoot ' + (Quote $FixtureRoot) + ' -Nonce ' + $Nonce
     if ($RunGates) { $arguments += ' -RunGates' }
+    if ($PowerShell7Path) { $arguments += ' -PowerShell7Path ' + (Quote $shell) }
     # RDP already loaded this exact user's hive and stays alive until this child exits.
     $profileHive = [Microsoft.Win32.Registry]::Users.OpenSubKey($sid)
     try { if ($marker.phase -ne 'Installer' -or $null -eq $profileHive) { throw 'The isolated RDP installer profile is not loaded.' } }

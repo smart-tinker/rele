@@ -1,9 +1,7 @@
 name: Rele CI and release candidate
 
+# Development checks run locally; dispatch the complete final matrix once before release.
 on:
-  pull_request:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       native_only:
@@ -16,7 +14,7 @@ permissions:
 
 concurrency:
   group: rele-${{ github.workflow }}-${{ github.ref }}-${{ inputs.native_only && 'native' || 'full' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 jobs:
   native-diagnostic:
