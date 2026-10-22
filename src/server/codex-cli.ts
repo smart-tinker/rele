@@ -142,7 +142,7 @@ export async function findDesktopExecutable(discovery: CodexDiscoveryResult, exi
 }
 
 export function validateStdioFlags(args: string[]): boolean {
-  // The daemon owns startup settings; a Desktop-only override cannot be silently discarded.
+  // The daemon owns startup settings; only the explicit Desktop transport hints below are exempt.
   const server = appServerInvocation(args);
   const incompatible = () => new CodexShimError('Параметры запуска Desktop несовместимы с общим Codex. Настройте общий профиль Codex.');
   if (!server || server.unknownPrefix) throw incompatible();
@@ -160,8 +160,10 @@ export function validateStdioFlags(args: string[]): boolean {
     else if (flags[index].startsWith('--config=')) override = flags[index].slice('--config='.length);
     else if (flags[index].startsWith('-c') && flags[index].length > 2) override = flags[index].slice(2);
     if (override === 'features.code_mode_host=true') { requireCodeModeHost = true; continue; }
-    // Official Desktop's configured WS transport skips these local helper toggles.
-    // Shared mode likewise keeps the daemon/profile plugin policy without editing it.
+    // Official Desktop's configured WS transport skips these local startup hints.
+    // Shared mode keeps the daemon/profile plugin and Windows sandbox policy;
+    // its sandbox backend can differ from a private Desktop server's.
+    if (override === 'features.prefer_mxc=true') continue;
     if (['mcp_servers.codex_app.enabled',
       'mcp_servers.code-review.enabled'].some(key =>
       override === `${key}=true` || override === `${key}=false`)) continue;

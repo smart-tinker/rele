@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { access, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { constants, createReadStream, realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -284,7 +284,8 @@ export async function ensureSharedCodex(target: CodexConnectionTarget, options: 
 
   const current = await run(launch.command, [...launch.args, 'app-server', 'daemon', 'version'], timeoutMs, env);
   if (current.code === 0) return validate(current, ['running']);
-  const socketPresent = await stat(expectedSocket).then(() => true, error => {
+  // Windows AF_UNIX markers can exist while stat/lstat rejects their metadata.
+  const socketPresent = await access(expectedSocket).then(() => true, error => {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
     throw new SharedCodexError('Нет доступа к сокету общего Codex.', 'shared-daemon-unavailable');
   });

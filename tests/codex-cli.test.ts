@@ -143,9 +143,10 @@ describe('Desktop framing over the shared native connection', () => {
     for (const flags of [['--listen', 'ws://127.0.0.1:1234'], ['-c', 'sqlite_home=/other'], ['--unknown']]) expect(() => validateStdioFlags(['app-server', ...flags])).toThrow();
   });
 
-  it('routes actual Desktop global config prefixes through the shared transport with only its known plugin hints', () => {
+  it('routes actual Desktop global config prefixes through the shared transport with only its known local hints', () => {
     for (const enabled of ['true', 'false']) {
       const argv = ['-c', 'features.code_mode_host=true', 'app-server', '--analytics-default-enabled',
+        '-c', 'features.prefer_mxc=true',
         '-c', `mcp_servers.codex_app.enabled=${enabled}`,
         '-c', `mcp_servers.code-review.enabled=${enabled}`];
       expect(shimMode(argv)).toBe('stdio');
@@ -162,6 +163,29 @@ describe('Desktop framing over the shared native connection', () => {
     }
   });
 
+  it('accepts only the literal Desktop MXC preference without changing the effective code mode check', () => {
+    for (const argv of [
+      ['-c', 'features.prefer_mxc=true', 'app-server'],
+      ['app-server', '--config=features.prefer_mxc=true'],
+      ['-cfeatures.prefer_mxc=true', 'app-server'],
+      ['--config', 'features.prefer_mxc=true', 'app-server'],
+    ]) {
+      expect(shimMode(argv)).toBe('stdio');
+      expect(validateStdioFlags(argv)).toBe(false);
+    }
+    for (const override of [
+      'features.prefer_mxc=false', 'features.prefer_mxc="true"', "features.prefer_mxc='true'",
+      ' features.prefer_mxc=true', 'features.prefer_mxc =true', 'features.prefer_mxc= true',
+      'features.prefer_mxc=true ', 'features.prefer_mxc=True', 'features.prefer_mxc=1',
+      'windows.require_mxc=true', 'windows.require_mxc=false', 'features.windows_sandbox_service=true',
+      'chatgpt_base_url="http://127.0.0.1:1234"', 'features.unknown=true',
+    ]) {
+      const argv = ['-c', 'features.code_mode_host=true', 'app-server', '-c', 'features.prefer_mxc=true', '-c', override];
+      expect(shimMode(argv)).toBe('stdio');
+      expect(() => validateStdioFlags(argv)).toThrow('Параметры запуска Desktop');
+    }
+  });
+
   it('never hides unknown Desktop startup overrides in real CLI passthrough', () => {
     for (const argv of [
       ['-c', 'features.code_mode_host=false', 'app-server'],
@@ -172,7 +196,6 @@ describe('Desktop framing over the shared native connection', () => {
       ['--profile', 'app-server', 'app-server', '--analytics-default-enabled'],
       ['--profile', 'app-server', 'app-server', 'proxy'],
       ['app-server', '-c', 'openai_base_url="http://127.0.0.1:1234"'],
-      ['app-server', '-c', 'features.prefer_mxc=true'],
       ['app-server', '-c', 'plugins.other.mcp_servers.other.enabled=true'],
       ['app-server', '-c', 'mcp_servers.code-review.enabled=1'],
       ['app-server', '-c'], ['app-server', '--listen'],

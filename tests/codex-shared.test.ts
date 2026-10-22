@@ -1,9 +1,11 @@
-import { mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CodexConnectionTarget, CodexDiscoveryResult } from '../src/shared/types.js';
 import { ensureSharedCodex, prepareDesktopCodexPackage, resolveSharedCodexExecutable, type SharedCodexOptions } from '../src/server/codex-shared.js';
+import { runCodexProbe } from '../src/server/codex-discovery.js';
 
 const directories: string[] = [];
 afterEach(async () => { for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true }); });
@@ -208,6 +210,34 @@ describe('native shared Codex lifecycle', () => {
     expect(f.run.mock.calls.filter(([, args]) => args.at(-1) === 'start')).toHaveLength(1);
     expect(await readFile(f.socketPath, 'utf8')).toBe('synthetic-stale-socket');
     expect(f.run.mock.calls.some(([, args]) => args.includes('--listen'))).toBe(false);
+  });
+
+  it.skipIf(process.platform !== 'win32')('passes a real stale Windows AF_UNIX marker to native singleton recovery', async () => {
+    const f = await fixture();
+    f.target.executable = await packageFixture(path.join(f.home, 'source-package'));
+    const powershell = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    const script = fileURLToPath(new URL('./fixtures/windows-unix-socket.ps1', import.meta.url));
+    try {
+      const created = await runCodexProbe(powershell,
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-SocketPath', f.socketPath], 10_000);
+      expect(created).toEqual({ code: 0, stdout: 'windows-unix-socket-created' });
+      // The fixture is a native AF_UNIX reparse marker, not a regular-file stand-in.
+      // Some supported Node/Windows versions cannot stat it even though it exists.
+      await access(f.socketPath);
+      f.run.mockImplementation(async (_command, args) => ({ code: args.at(-1) === 'version' ? 1 : 0,
+        stdout: args.at(-1) === '--version' ? 'codex-cli 0.163.0' : JSON.stringify({ ...f.daemon, status: 'started' }) }));
+      expect(await ensureSharedCodex(f.target, f.options)).toMatchObject({ transport: 'proxy', endpoint: f.socketPath, codexHome: f.home });
+      expect(f.run.mock.calls.filter(([, args]) => args.at(-1) === 'start')).toHaveLength(1);
+      expect(f.run.mock.calls.some(([, args]) => args.includes('--listen'))).toBe(false);
+      await access(f.socketPath);
+      await unlink(f.socketPath);
+      f.discovery.installations.push({ executable: f.target.executable, name: 'Private Desktop', source: 'desktop-process', running: true });
+      await expect(ensureSharedCodex(f.target, f.options)).rejects.toMatchObject({ code: 'shared-desktop-conflict' });
+      expect(f.run.mock.calls.filter(([, args]) => args.at(-1) === 'start')).toHaveLength(1);
+    } finally {
+      // Delete the owned marker directly: recursive directory cleanup may also stat it.
+      await unlink(f.socketPath).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; });
+    }
   });
 
   it.each(['stdio', 'websocket'])('blocks a second owner when native daemon is absent and private Desktop uses %s', async transport => {
