@@ -1,9 +1,9 @@
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CodexConnectionTarget, CodexDiscoveryResult } from '../src/shared/types.js';
-import { ensureSharedCodex, resolveSharedCodexExecutable, type SharedCodexOptions } from '../src/server/codex-shared.js';
+import { ensureSharedCodex, prepareDesktopCodexPackage, resolveSharedCodexExecutable, type SharedCodexOptions } from '../src/server/codex-shared.js';
 
 const directories: string[] = [];
 afterEach(async () => { for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true }); });
@@ -22,7 +22,7 @@ async function fixture() {
   }));
   const discovery: CodexDiscoveryResult = { installations: [], issues: [], recommendedManaged: { ...target, transport: 'managed' } };
   const discover = vi.fn().mockResolvedValue(discovery);
-  const env = { CODEX_HOME: '/inherited-profile', RELE_TEST_MARKER: 'preserved', OPENAI_API_KEY: 'synthetic-key' };
+  const env = { CODEX_HOME: '/inherited-profile', RELE_DATA_DIR: path.join(home, 'rele-data'), RELE_TEST_MARKER: 'preserved', OPENAI_API_KEY: 'synthetic-key' };
   return { home, target, socketPath, executable, daemon, run, discovery, discover, env, options: { run, discover, env } };
 }
 
@@ -37,7 +37,115 @@ async function packageFixture(root: string, version = '0.163.0'): Promise<string
   return path.join(root, entrypoint);
 }
 
+const desktopFiles = ['codex.exe', 'codex-code-mode-host.exe', 'codex-command-runner.exe', 'codex-windows-sandbox-setup.exe', 'rg.exe'];
+async function desktopFixture(root: string): Promise<string> {
+  const resources = path.join(root, 'app', 'resources');
+  await mkdir(resources, { recursive: true });
+  await writeFile(path.join(root, 'app', 'ChatGPT.exe'), 'synthetic-desktop-gui');
+  await writeFile(path.join(resources, 'app.asar'), 'synthetic-desktop-archive');
+  for (const name of desktopFiles) await writeFile(path.join(resources, name), `synthetic-desktop-${name}`);
+  return path.join(resources, 'codex.exe');
+}
+
+describe('local Desktop native package preparation', () => {
+  it('copies the five same-bundle helpers into the native layout and reuses only a verified immutable snapshot', async () => {
+    const f = await fixture(), desktop = await desktopFixture(path.join(f.home, 'desktop'));
+    const prepared = await prepareDesktopCodexPackage(desktop, f.options);
+    expect(prepared).toBeTruthy();
+    expect(path.relative(f.env.RELE_DATA_DIR, prepared!)).not.toMatch(/^\.\./u);
+    const root = path.dirname(path.dirname(prepared!));
+    expect(JSON.parse(await readFile(path.join(root, 'codex-package.json'), 'utf8'))).toMatchObject({ version: '0.163.0', target: 'x86_64-pc-windows-msvc', entrypoint: 'bin/codex.exe' });
+    for (const [source, target] of [[desktop, prepared!], [path.join(path.dirname(desktop), 'rg.exe'), path.join(root, 'codex-path', 'rg.exe')],
+      [path.join(path.dirname(desktop), 'codex-command-runner.exe'), path.join(root, 'codex-resources', 'codex-command-runner.exe')]]) {
+      expect(await readFile(target)).toEqual(await readFile(source));
+    }
+    expect(await prepareDesktopCodexPackage(desktop, f.options)).toBe(prepared);
+    expect(await readdir(path.dirname(root))).toEqual([path.basename(root)]);
+    expect(f.run.mock.calls.every(([, args]) => args.join(' ') === '--version')).toBe(true);
+    expect(await readdir(f.home)).not.toContain('packages');
+  });
+
+  it.each(['helper', 'asar', 'gui'])('does not stage a partial or unrecognized Desktop missing %s', async missing => {
+    const f = await fixture(), desktop = await desktopFixture(path.join(f.home, 'desktop'));
+    await rm(missing === 'gui' ? path.join(path.dirname(path.dirname(desktop)), 'ChatGPT.exe') : path.join(path.dirname(desktop), missing === 'asar' ? 'app.asar' : 'rg.exe'));
+    expect(await prepareDesktopCodexPackage(desktop, f.options)).toBeUndefined();
+    await expect(readdir(f.env.RELE_DATA_DIR)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(f.run).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unsupported native version without preparing or starting another runtime', async () => {
+    const f = await fixture(), desktop = await desktopFixture(path.join(f.home, 'desktop'));
+    f.run.mockResolvedValue({ code: 0, stdout: 'codex-cli 0.164.0' });
+    await expect(prepareDesktopCodexPackage(desktop, f.options)).rejects.toMatchObject({ code: 'shared-cli-unverified' });
+    await expect(readdir(f.env.RELE_DATA_DIR)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(f.run.mock.calls.map(([, args]) => args)).toEqual([['--version']]);
+  });
+
+  it('rejects resources linked outside the canonical Desktop bundle', async () => {
+    const f = await fixture(), desktop = await desktopFixture(path.join(f.home, 'desktop'));
+    const foreign = path.join(f.home, 'foreign');
+    await rename(path.dirname(desktop), foreign);
+    // A directory junction works without Windows developer-mode symlink privileges.
+    await symlink(foreign, path.dirname(desktop), process.platform === 'win32' ? 'junction' : 'dir');
+    await expect(prepareDesktopCodexPackage(desktop, f.options)).rejects.toMatchObject({ code: 'shared-desktop-package-invalid' });
+    expect(f.run).not.toHaveBeenCalled();
+  });
+
+  it('detects a source change while preparing and leaves no published package', async () => {
+    const f = await fixture(), desktop = await desktopFixture(path.join(f.home, 'desktop'));
+    f.run.mockImplementation(async () => {
+      await writeFile(path.join(path.dirname(desktop), 'rg.exe'), 'synthetic-changed-helper');
+      return { code: 0, stdout: 'codex-cli 0.163.0' };
+    });
+    await expect(prepareDesktopCodexPackage(desktop, f.options)).rejects.toMatchObject({ code: 'shared-desktop-package-invalid' });
+    expect(await readdir(path.join(f.env.RELE_DATA_DIR, 'codex-desktop-packages'))).toEqual([]);
+  });
+
+  it.each(['bytes', 'extra'])('fails closed on %s cache tampering without overwriting it', async tamper => {
+    const f = await fixture(), desktop = await desktopFixture(path.join(f.home, 'desktop'));
+    const prepared = (await prepareDesktopCodexPackage(desktop, f.options))!;
+    const changed = tamper === 'bytes' ? prepared : path.join(path.dirname(prepared), 'unexpected.dll');
+    await writeFile(changed, 'synthetic-cache-tamper');
+    await expect(prepareDesktopCodexPackage(desktop, f.options)).rejects.toMatchObject({ code: 'shared-desktop-package-invalid' });
+    expect(await readFile(changed, 'utf8')).toBe('synthetic-cache-tamper');
+  });
+
+  it('publishes one complete immutable package when two preparations race', async () => {
+    const f = await fixture(), desktop = await desktopFixture(path.join(f.home, 'desktop'));
+    const prepared = await Promise.all([prepareDesktopCodexPackage(desktop, f.options), prepareDesktopCodexPackage(desktop, f.options)]);
+    expect(prepared[0]).toBe(prepared[1]);
+    expect(await readdir(path.join(f.env.RELE_DATA_DIR, 'codex-desktop-packages'))).toHaveLength(1);
+    expect(await readFile(prepared[0]!, 'utf8')).toBe('synthetic-desktop-codex.exe');
+  });
+});
+
 describe('native shared Codex lifecycle', () => {
+  it.skipIf(process.platform !== 'win32')('starts from an installed Desktop alone using its snapshot and the original profile', async () => {
+    const f = await fixture(), desktop = await desktopFixture(path.join(f.home, 'desktop'));
+    f.discovery.recommendedManaged = { ...f.target, executable: desktop, transport: 'managed' };
+    f.discovery.installations.push({ executable: desktop, name: 'Desktop', source: 'desktop-install', version: '0.163.0', running: false });
+    f.run.mockImplementation(async (_command, args) => ({ code: args.at(-1) === 'version' ? 1 : 0,
+      stdout: args.at(-1) === '--version' ? 'codex-cli 0.163.0' : JSON.stringify({ ...f.daemon, status: 'started' }) }));
+    const target = { ...f.target, executable: 'codex' }, before = structuredClone(target);
+    expect(await ensureSharedCodex(target, f.options)).toMatchObject({ transport: 'proxy', codexHome: f.home, endpoint: f.socketPath });
+    const starts = f.run.mock.calls.filter(([, args]) => args.at(-1) === 'start');
+    expect(starts).toHaveLength(1);
+    expect(starts[0][0]).not.toBe(desktop);
+    expect(path.relative(f.env.RELE_DATA_DIR, starts[0][0])).not.toMatch(/^\.\./u);
+    expect(starts[0][3]).toMatchObject({ CODEX_HOME: f.home, RELE_TEST_MARKER: 'preserved' });
+    expect(target).toEqual(before);
+  });
+
+  it.each(['read-only', 'healthy'])('keeps Desktop package preparation out of %s resolution', async operation => {
+    const f = await fixture(), desktop = await desktopFixture(path.join(f.home, 'desktop'));
+    f.discovery.recommendedManaged = { ...f.target, executable: desktop, transport: 'managed' };
+    f.discovery.installations.push({ executable: desktop, name: 'Desktop', source: 'desktop-install', version: '0.163.0', running: true });
+    const target = { ...f.target, executable: 'codex' };
+    if (operation === 'read-only') expect(await resolveSharedCodexExecutable(target, f.options)).toBe(desktop);
+    else expect(await ensureSharedCodex(target, f.options)).toMatchObject({ transport: 'proxy', endpoint: f.socketPath });
+    await expect(readdir(f.env.RELE_DATA_DIR)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(f.run.mock.calls.some(([, args]) => args.at(-1) === 'start')).toBe(false);
+  });
   it('attaches an existing verified daemon without starting it or inspecting private Desktop owners', async () => {
     const f = await fixture();
     f.discovery.installations.push({ executable: f.target.executable, name: 'Private Desktop', source: 'desktop-process', running: true });

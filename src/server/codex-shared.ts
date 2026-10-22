@@ -1,13 +1,14 @@
 import { spawn } from 'node:child_process';
-import { readFile, realpath, stat } from 'node:fs/promises';
-import { realpathSync } from 'node:fs';
+import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { constants, createReadStream, realpathSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { CodexConnectionTarget, CodexDiscoveryResult } from '../shared/types.js';
 import { SUPPORTED_CODEX_VERSIONS } from '../shared/codex-runtime.js';
-import { isLocalCodexHome, isLocalSocketPath } from './config.js';
+import { defaultDataDirectory, isLocalCodexHome, isLocalSocketPath } from './config.js';
 import { discoverCodex } from './codex-discovery.js';
 import { codexEnvironment, environmentValue, resolveCodexLaunch } from './codex-launch.js';
 
@@ -116,6 +117,99 @@ async function completeCodexPackage(executable: string): Promise<boolean> {
   } catch { return false; }
 }
 
+const DESKTOP_PACKAGE_FILES = [
+  ['codex.exe', 'bin/codex.exe'],
+  ['codex-code-mode-host.exe', 'bin/codex-code-mode-host.exe'],
+  ['codex-command-runner.exe', 'codex-resources/codex-command-runner.exe'],
+  ['codex-windows-sandbox-setup.exe', 'codex-resources/codex-windows-sandbox-setup.exe'],
+  ['rg.exe', 'codex-path/rg.exe'],
+] as const;
+
+async function fileDigest(file: string): Promise<string> {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(file)) hash.update(chunk);
+  return hash.digest('hex');
+}
+
+/** Snapshot only Desktop's bundled native files; Codex owns installation into its original profile. */
+export async function prepareDesktopCodexPackage(executable: string, options: SharedCodexOptions = {}): Promise<string | undefined> {
+  if (process.arch !== 'x64' || path.basename(executable).toLowerCase() !== 'codex.exe'
+      || path.basename(path.dirname(executable)).toLowerCase() !== 'resources') return undefined;
+  const env = options.env ?? process.env;
+  let staging: string | undefined;
+  const invalid = () => new SharedCodexError('Не удалось проверить локальный пакет Desktop. Полностью закройте Desktop и повторите запуск; существующий Codex не заменён.', 'shared-desktop-package-invalid');
+  try {
+    const bundle = await realpath(path.dirname(path.dirname(executable)));
+    const inside = (file: string) => { const relative = path.relative(bundle, file); return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative); };
+    const localFile = async (file: string) => {
+      const resolved = await realpath(file);
+      if (!inside(resolved) || !(await stat(resolved)).isFile()) throw invalid();
+      return resolved;
+    };
+    const resources = path.join(bundle, 'resources');
+    if (!await stat(path.join(resources, 'app.asar')).then(info => info.isFile(), () => false)) return undefined;
+    const gui = await Promise.all(['ChatGPT.exe', 'Codex.exe'].map(name => stat(path.join(bundle, name)).then(info => info.isFile(), () => false)));
+    if (!gui.some(Boolean)) return undefined;
+    await localFile(path.join(resources, 'app.asar'));
+    await Promise.all(['ChatGPT.exe', 'Codex.exe'].filter((_, index) => gui[index]).map(name => localFile(path.join(bundle, name))));
+    const sources: Array<{ source: string; destination: string; digest: string }> = [];
+    for (const [name, destination] of DESKTOP_PACKAGE_FILES) {
+      const source = await localFile(path.join(resources, name));
+      sources.push({ source, destination, digest: await fileDigest(source) });
+    }
+    // Hash first so an update between --version and copying cannot mix releases.
+    const cli = await (options.run ?? runSharedCommand)(sources[0].source, ['--version'], Math.min(options.timeoutMs ?? 15_000, 4_000), env);
+    const version = cli.stdout.trim().match(/^codex(?:-cli)?\s+(\S+)(?:\s|$)/iu)?.[1];
+    if (cli.code !== 0 || !version || !SUPPORTED_CODEX_VERSIONS.includes(version)) throw new SharedCodexError(`Для общего daemon нужен проверенный Codex ${SUPPORTED_CODEX_VERSIONS.join(' или ')}.`, 'shared-cli-unverified');
+    const manifest = JSON.stringify({ layoutVersion: 1, version, target: 'x86_64-pc-windows-msvc', variant: 'codex', entrypoint: 'bin/codex.exe', resourcesDir: 'codex-resources', pathDir: 'codex-path' });
+    const digest = createHash('sha256').update(manifest).update(JSON.stringify(sources.map(({ destination, digest }) => [destination, digest]))).digest('hex');
+    const dataDirectory = path.resolve(environmentValue(env, 'RELE_DATA_DIR') || defaultDataDirectory());
+    if (!isLocalCodexHome(dataDirectory)) throw invalid();
+    await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
+    const data = await realpath(dataDirectory), cache = path.join(data, 'codex-desktop-packages');
+    await mkdir(cache, { recursive: true, mode: 0o700 });
+    if (!samePath(await realpath(cache), cache)) throw invalid();
+    const destination = path.join(cache, digest);
+    const unchanged = async () => {
+      for (let index = 0; index < sources.length; index++) {
+        const source = sources[index];
+        if (!samePath(await localFile(path.join(resources, DESKTOP_PACKAGE_FILES[index][0])), source.source) || await fileDigest(source.source) !== source.digest) throw invalid();
+      }
+    };
+    const verify = async (directory: string) => {
+      const entries = async (root: string, names: string[]) => {
+        const info = await lstat(root);
+        if (!info.isDirectory() || info.isSymbolicLink() || JSON.stringify((await readdir(root)).sort()) !== JSON.stringify(names.sort())) throw invalid();
+      };
+      await entries(directory, ['bin', 'codex-path', 'codex-resources', 'codex-package.json']);
+      for (const folder of ['bin', 'codex-path', 'codex-resources']) await entries(path.join(directory, folder), sources.filter(file => path.posix.dirname(file.destination) === folder).map(file => path.posix.basename(file.destination)));
+      for (const file of [...sources, { destination: 'codex-package.json', digest: createHash('sha256').update(manifest).digest('hex') }]) {
+        const target = path.join(directory, file.destination), info = await lstat(target);
+        if (!info.isFile() || info.isSymbolicLink() || await fileDigest(target) !== file.digest) throw invalid();
+      }
+    };
+    const exists = await lstat(destination).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
+    if (exists) { await unchanged(); await verify(destination); return path.join(destination, 'bin', 'codex.exe'); }
+    staging = await mkdtemp(path.join(cache, '.prepare-'));
+    for (const file of sources) {
+      const target = path.join(staging, file.destination);
+      await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+      await copyFile(file.source, target, constants.COPYFILE_EXCL);
+    }
+    await writeFile(path.join(staging, 'codex-package.json'), manifest, { flag: 'wx', mode: 0o600 });
+    await unchanged();
+    await verify(staging);
+    try { await rename(staging, destination); }
+    catch (error) { if (!['EEXIST', 'ENOTEMPTY', 'EPERM'].includes((error as NodeJS.ErrnoException).code || '')) throw error; }
+    await verify(destination);
+    return path.join(destination, 'bin', 'codex.exe');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    if (error instanceof SharedCodexError) throw error;
+    throw invalid();
+  } finally { if (staging) await rm(staging, { recursive: true, force: true }); }
+}
+
 /** Resolve only installed files and version metadata; this never starts the daemon. */
 export async function resolveSharedCodexExecutable(target: CodexConnectionTarget, options: SharedCodexOptions = {}): Promise<string> {
   const env = codexEnvironment(target.codexHome, options.env ?? process.env);
@@ -210,8 +304,14 @@ export async function ensureSharedCodex(target: CodexConnectionTarget, options: 
       for (const candidate of new Set([available.recommendedManaged?.executable, ...candidates.map(item => item.executable)])) {
         if (candidate && await completeCodexPackage(candidate)) { selected = candidate; break; }
       }
+      if (!selected && process.platform === 'win32') {
+        for (const candidate of candidates.filter(item => item.source === 'desktop-install' || item.source === 'desktop-process')) {
+          selected = await prepareDesktopCodexPackage(candidate.executable, { ...options, env });
+          if (selected) break;
+        }
+      }
     }
-    if (!selected) throw new SharedCodexError(`Для запуска общего Codex нужен полный пакет CLI ${SUPPORTED_CODEX_VERSIONS.join(' или ')}. Установите официальный npm-пакет @openai/codex или standalone CLI; отдельного codex.exe из Desktop недостаточно.`, 'shared-package-incomplete');
+    if (!selected) throw new SharedCodexError(`Для запуска общего Codex нужен полный пакет CLI или комплектная поставка Desktop ${SUPPORTED_CODEX_VERSIONS.join(' или ')}. Проверьте установку Codex; существующий сервер не заменён.`, 'shared-package-incomplete');
     launch = await resolveCodexLaunch(await resolveSharedCodexExecutable({ ...target, executable: selected }, { ...options, env }), { env });
   }
   // Native singleton locks and liveness checks own stale-socket recovery.

@@ -130,6 +130,10 @@ describe('Desktop framing over the shared native connection', () => {
     const fixture = { installations: [{ executable: 'C:\\Apps\\Codex\\resources\\codex.exe', name: 'Desktop', source: 'desktop-install' as const, running: false }, { executable: 'C:\\CLI\\codex.exe', name: 'CLI', source: 'path' as const, running: false }], issues: [] };
     const files = new Set(['C:\\Apps\\Codex\\resources\\app.asar', 'C:\\Apps\\Codex\\Codex.exe']);
     expect(await findDesktopExecutable(fixture, async file => files.has(file))).toBe('C:\\Apps\\Codex\\Codex.exe');
+    files.add('C:\\Apps\\Codex\\ChatGPT.exe');
+    expect(await findDesktopExecutable(fixture, async file => files.has(file))).toBe('C:\\Apps\\Codex\\ChatGPT.exe');
+    files.delete('C:\\Apps\\Codex\\Codex.exe');
+    expect(await findDesktopExecutable(fixture, async file => files.has(file))).toBe('C:\\Apps\\Codex\\ChatGPT.exe');
     await expect(findDesktopExecutable(fixture, async () => false)).rejects.toThrow();
     await expect(findDesktopExecutable({ ...fixture, installations: [...fixture.installations, { ...fixture.installations[0], executable: 'C:\\Other\\resources\\codex.exe' }] }, async () => true)).rejects.toThrow();
   });

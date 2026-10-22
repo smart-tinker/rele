@@ -112,8 +112,11 @@ export async function findDesktopExecutable(discovery: CodexDiscoveryResult, exi
   for (const item of discovery.installations) {
     if (!/[\\/]resources[\\/]codex\.exe$/iu.test(item.executable)) continue;
     const directory = path.win32.dirname(path.win32.dirname(item.executable));
-    const executable = path.win32.join(directory, 'Codex.exe');
-    if (await exists(path.win32.join(directory, 'resources', 'app.asar')) && await exists(executable)) candidates.add(executable);
+    if (!await exists(path.win32.join(directory, 'resources', 'app.asar'))) continue;
+    for (const name of ['ChatGPT.exe', 'Codex.exe']) {
+      const executable = path.win32.join(directory, name);
+      if (await exists(executable)) { candidates.add(executable); break; }
+    }
   }
   if (candidates.size !== 1) throw new CodexShimError('Не удалось однозначно найти Codex Desktop. Проверьте установку Desktop в панели Rele.');
   return [...candidates][0];
