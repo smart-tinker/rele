@@ -396,7 +396,12 @@ try {
   assert.equal(await exists(path.join(data, 'rele.sqlite')), true);
   assert.equal(await readFile(path.join(data, 'config.json'), 'utf8'), configured);
   assert.equal(await readFile(path.join(data, 'preserve-me.txt'), 'utf8'), 'installer smoke data\n');
-  const report = { platform: 'windows', version: metadata.version, installer: path.basename(installer), result: 'passed', perUser: true, interactiveToken: true, nativeLauncher: true, legacyStartupMigrated: true, foreignProcessPreserved: true, codexConsoleWrapper: true, immutableOpenAdapterPreservedAcrossUpgradeRemove: true, desktopEnvironmentOwnership: true, desktopEnvironmentFreshDefault: true, desktopEnvironmentUpgradeChoice: true, desktopEnvironmentOptOutPreserved: true, desktopLegacyTargetSafelySkipped: true, desktopProtectedSettingsFailureSafelySkipped: true, desktopConfigChangeWhileIntegratedRejected: true, actualEarlyDesktopPolicyRpc: true, nativeBackendPreservedAcrossRestartUpgradeRemove: true, health: true, restart: true, upgradeBackup: true, uninstall: true, dataPreserved: true };
+  const preflightTasks = powershell(`(@(Get-ScheduledTask -TaskName 'Rele-DesktopCheck-*' -ErrorAction SilentlyContinue | Where-Object {
+    $_.Actions.Count -eq 1 -and $_.Actions[0].Execute -eq (Join-Path $env:RELE_SMOKE_APP 'Rele.exe') -and
+    $_.Actions[0].Arguments -like 'desktop-check *'
+  })).Count`);
+  assert.equal(preflightTasks, '0', 'Completed and failed Desktop preflight tasks must be removed.');
+  const report = { platform: 'windows', version: metadata.version, installer: path.basename(installer), result: 'passed', perUser: true, interactiveToken: true, nativeLauncher: true, legacyStartupMigrated: true, foreignProcessPreserved: true, codexConsoleWrapper: true, immutableOpenAdapterPreservedAcrossUpgradeRemove: true, desktopEnvironmentOwnership: true, desktopEnvironmentFreshDefault: true, desktopEnvironmentUpgradeChoice: true, desktopEnvironmentOptOutPreserved: true, desktopLegacyTargetSafelySkipped: true, desktopProtectedSettingsFailureSafelySkipped: true, desktopConfigChangeWhileIntegratedRejected: true, actualEarlyDesktopPolicyRpc: true, temporaryDesktopPreflightTasksRemoved: true, nativeBackendPreservedAcrossRestartUpgradeRemove: true, health: true, restart: true, upgradeBackup: true, uninstall: true, dataPreserved: true };
   await writeFile(path.join(reportDirectory, 'installer-results.json'), JSON.stringify(report, null, 2) + '\n');
   console.log(JSON.stringify(report));
 } catch (error) {

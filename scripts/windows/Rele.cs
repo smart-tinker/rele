@@ -83,6 +83,15 @@ internal static class Rele
                 throw new InvalidOperationException("Каталог данных должен находиться вне каталога программы, чтобы удаление Rele сохранило данные.");
 
             if (command == "serve") return RunNode("serve", true);
+            if (command == "desktop-check")
+            {
+                if (!File.Exists(settingsPath) || !options.ContainsKey("--error-file"))
+                    throw new InvalidOperationException("Проверка Desktop требует существующую установку и файл результата.");
+                RunNode("--rele-desktop-check", false, true);
+                // An empty receipt distinguishes successful completion from a task that never ran.
+                File.WriteAllText(options["--error-file"], String.Empty, new UTF8Encoding(false));
+                return 0;
+            }
             if (command == "codex-desktop")
             {
                 ValidateDesktopIntegration();
@@ -470,10 +479,122 @@ internal static class Rele
         }
     }
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetProcessMitigationPolicy(IntPtr process, int policy, out uint flags, UIntPtr length);
+
+    private static dynamic OwnedDesktopCheckTask(dynamic folder, string name, string arguments)
+    {
+        dynamic task;
+        try { task = folder.GetTask(name); }
+        catch (Exception error)
+        {
+            if (error.HResult == unchecked((int)0x80070002)) return null;
+            throw;
+        }
+        dynamic definition = task.Definition;
+        if (definition.Actions.Count != 1 || definition.Actions[1].Type != 0 ||
+            !SamePath((string)definition.Actions[1].Path, Path.Combine(AppDirectory, "Rele.exe")) ||
+            (string)definition.Actions[1].Arguments != arguments ||
+            !SamePath((string)definition.Actions[1].WorkingDirectory, AppDirectory) ||
+            !IsCurrentUser((string)definition.Principal.UserId) ||
+            (int)definition.Principal.LogonType != 3 || (int)definition.Principal.RunLevel != 0)
+            throw new InvalidOperationException("Не удалось подтвердить владельца временной проверки Desktop. Чужая задача не изменена.");
+        return task;
+    }
+
+    private static void CheckDesktopIntegration()
+    {
+        uint flags;
+        if (!GetProcessMitigationPolicy(new IntPtr(-1), 16, out flags, new UIntPtr(4)))
+        {
+            int error = Marshal.GetLastWin32Error();
+            if (error != 87) throw new InvalidOperationException("Не удалось проверить защиту процесса Windows (" + error + ").");
+            flags = 0; // Older Windows versions do not support this mitigation policy.
+        }
+        if ((flags & 1) == 0) { RunNode("--rele-desktop-check", false, true); return; }
+
+        // Inno's inherited RedirectionGuard blocks Codex's per-user current junction.
+        // Keep the installer protected; Task Scheduler starts only this Desktop check outside its process tree.
+        string nonce = Guid.NewGuid().ToString("N");
+        string name = "Rele-DesktopCheck-" + nonce;
+        string directory = Path.Combine(Config.DataDirectory, "desktop-check-" + nonce);
+        var permissions = new System.Security.AccessControl.DirectorySecurity();
+        SecurityIdentifier sid = WindowsIdentity.GetCurrent().User;
+        permissions.SetOwner(sid);
+        permissions.SetAccessRuleProtection(true, false);
+        permissions.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(sid,
+            System.Security.AccessControl.FileSystemRights.FullControl,
+            System.Security.AccessControl.InheritanceFlags.ContainerInherit | System.Security.AccessControl.InheritanceFlags.ObjectInherit,
+            System.Security.AccessControl.PropagationFlags.None, System.Security.AccessControl.AccessControlType.Allow));
+        if (Directory.Exists(directory) || File.Exists(directory)) throw new InvalidOperationException("Каталог проверки Desktop уже существует.");
+        dynamic folder = TaskFolder();
+        string receipt = Path.Combine(directory, "result.txt");
+        string arguments = "desktop-check --quiet --error-file \"" + receipt + "\"";
+        // Scheduler does not inherit the installer's environment: keep this check on its original profile.
+        string home = Config.CodexHome;
+        if (String.IsNullOrEmpty(home)) home = Environment.GetEnvironmentVariable("CODEX_HOME");
+        if (String.IsNullOrEmpty(home)) home = Path.Combine(Environment.GetEnvironmentVariable("USERPROFILE") ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex");
+        if (home.IndexOf('"') >= 0) throw new InvalidOperationException("Путь профиля Codex содержит недопустимую кавычку.");
+        arguments += " --codex-home \"" + Regex.Replace(home, @"(\\+)$", "$1$1") + "\"";
+        Directory.CreateDirectory(directory, permissions);
+        Exception failure = null;
+        try
+        {
+            string xml = "<?xml version=\"1.0\" encoding=\"UTF-16\"?>" +
+                "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">" +
+                "<Principals><Principal id=\"User\"><UserId>" + sid.Value + "</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>" +
+                "<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" +
+                "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT90S</ExecutionTimeLimit></Settings>" +
+                "<Actions Context=\"User\"><Exec><Command>" + SecurityElement.Escape(Path.Combine(AppDirectory, "Rele.exe")) +
+                "</Command><Arguments>" + SecurityElement.Escape(arguments) + "</Arguments><WorkingDirectory>" + SecurityElement.Escape(AppDirectory) +
+                "</WorkingDirectory></Exec></Actions></Task>";
+            folder.RegisterTask(name, xml, 2, sid.Value, null, 3, null); // Create only; never replace an existing task.
+            dynamic task = OwnedDesktopCheckTask(folder, name, arguments);
+            task.Run(null);
+            var wait = Stopwatch.StartNew();
+            while (TaskActive(task) || (int)task.State == 4 || !File.Exists(receipt) ||
+                (int)task.LastTaskResult == 0x41301 || (int)task.LastTaskResult == 0x41303)
+            {
+                if (wait.ElapsedMilliseconds >= 75000) throw new InvalidOperationException("Проверка Desktop не завершилась за 75 секунд.");
+                Thread.Sleep(100);
+            }
+            if (new FileInfo(receipt).Length > 8192) throw new InvalidOperationException("Проверка Desktop вернула недопустимый результат.");
+            string error = File.ReadAllText(receipt);
+            if ((int)task.LastTaskResult != 0 || error.Length != 0)
+                throw new InvalidOperationException(error.Length == 0 ? "Проверка Desktop завершилась с ошибкой." : error);
+        }
+        catch (Exception error) { failure = error; throw; }
+        finally
+        {
+            try
+            {
+                dynamic task = OwnedDesktopCheckTask(folder, name, arguments);
+                if (task != null && TaskActive(task))
+                {
+                    task.Stop(0);
+                    var wait = Stopwatch.StartNew();
+                    while (TaskActive(task) && wait.ElapsedMilliseconds < 5000) Thread.Sleep(100);
+                }
+                task = OwnedDesktopCheckTask(folder, name, arguments);
+                if (task != null)
+                {
+                    if (TaskActive(task) || (int)task.State == 4) throw new InvalidOperationException("Временная проверка Desktop ещё работает; её задача и результат сохранены.");
+                    folder.DeleteTask(name, 0);
+                }
+                Directory.Delete(directory, true);
+            }
+            catch (Exception cleanup)
+            {
+                if (failure == null) throw;
+                Log("Desktop check cleanup failed: " + cleanup.Message);
+            }
+        }
+    }
+
     private static void InstallDesktopIntegration()
     {
         ValidateDesktopIntegration();
-        try { RunNode("--rele-desktop-check", false, true); }
+        try { CheckDesktopIntegration(); }
         catch (Exception error)
         {
             // A failed upgrade must not leave our unusable adapter as Desktop's default.
@@ -561,7 +682,7 @@ internal static class Rele
                 else lock (errors) { if (errors.Length < 4000) errors.AppendLine(line.Data); }
             };
             process.Start();
-            using (var job = background ? new ChildJob(process) : null)
+            using (var job = background || command == "--rele-desktop-check" ? new ChildJob(process) : null)
             {
                 process.BeginOutputReadLine(); process.BeginErrorReadLine();
                 if (background) process.WaitForExit();
