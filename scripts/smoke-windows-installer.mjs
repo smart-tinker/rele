@@ -73,6 +73,17 @@ async function assertSamePath(actual, expected) {
   const [actualPath, expectedPath] = await Promise.all([realpath(actual), realpath(expected)]);
   assert.equal(actualPath.toLowerCase(), expectedPath.toLowerCase());
 }
+async function assertOwnedDesktopEnvironment() {
+  const settings = JSON.parse(await readFile(path.join(application, 'rele-install.json'), 'utf8'));
+  assert.equal(settings.DesktopIntegrationOwned, true);
+  assert.ok(!settings.DesktopIntegrationWarning);
+  const values = desktopEnvironment();
+  await assertSamePath(values.CODEX_CLI_PATH, settings.DesktopCliPath);
+  assert.ok(values.CODEX_CLI_PATH.startsWith(path.join(data, 'codex-adapters') + path.sep));
+  assert.equal(values.CODEX_APP_SERVER_FORCE_CLI, '1');
+  assert.equal(values.CODEX_APP_SERVER_WS_URL, null);
+  return settings;
+}
 async function ready(previousPid) {
   for (let attempt = 0; attempt < 300; attempt++) {
     try {
@@ -99,7 +110,7 @@ async function stopped(address) {
 }
 
 const installArguments = ['/SP-', '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART',
-  '/TASKS=desktop', `/DIR=${application}`, `/RELEDATADIR=${data}`, `/RELETASKNAME=${task}`, '/RELEPORT=0', `/RELECODEXHOME=${codexHome}`];
+  `/DIR=${application}`, `/RELEDATADIR=${data}`, `/RELETASKNAME=${task}`, '/RELEPORT=0', `/RELECODEXHOME=${codexHome}`];
 try {
   // A fixed AppId is deliberate; refuse to disturb any existing installation on a reused runner.
   assert.equal(powershell('Test-Path -LiteralPath $env:RELE_SMOKE_REGISTRY'), 'False', 'The CI user already has Rele installed.');
@@ -161,9 +172,7 @@ try {
   legacyClosed = undefined;
   await rm(path.join(data, 'instance.json'));
 
-  console.log('Windows installer smoke: foreign Desktop settings are preserved without blocking installation');
-  const foreignDesktopEnvironment = { CODEX_CLI_PATH: 'C:\\Foreign Codex\\codex.exe', CODEX_APP_SERVER_FORCE_CLI: '0', CODEX_APP_SERVER_WS_URL: 'ws://127.0.0.1:59999' };
-  desktopEnvironment(foreignDesktopEnvironment);
+  console.log('Windows installer smoke: fresh installation enables Desktop environment integration by default');
   run(installer, [...installArguments, `/LOG=${path.join(temporary, 'install.log')}`]);
   const launcher = path.join(application, 'Rele.exe');
   const runtime = path.join(application, 'runtime', 'node.exe');
@@ -172,8 +181,18 @@ try {
   assert.equal(await exists(path.join(application, 'start-rele.cmd')), false, 'Installed startup must not depend on cmd.');
   assert.equal(run(runtime, [main, '--version']), metadata.version);
   instance = await ready();
-  const initialPid = instance.pid;
   sharedPid = await sharedBackendPid(codexFixture);
+  await assertOwnedDesktopEnvironment();
+
+  console.log('Windows installer smoke: foreign Desktop settings are preserved without blocking installation');
+  run(launcher, ['desktop-unintegrate', '--quiet']);
+  assert.deepEqual(desktopEnvironment(), emptyDesktopEnvironment);
+  const foreignDesktopEnvironment = { CODEX_CLI_PATH: 'C:\\Foreign Codex\\codex.exe', CODEX_APP_SERVER_FORCE_CLI: '0', CODEX_APP_SERVER_WS_URL: 'ws://127.0.0.1:59999' };
+  desktopEnvironment(foreignDesktopEnvironment);
+  const beforeConflictPid = instance.pid;
+  run(installer, [...installArguments, `/LOG=${path.join(temporary, 'foreign-desktop-upgrade.log')}`]);
+  instance = await ready(beforeConflictPid);
+  await sharedBackendPid(codexFixture, sharedPid);
   const settings = JSON.parse(await readFile(path.join(application, 'rele-install.json'), 'utf8'));
   await assertSamePath(settings.DataDirectory, data);
   assert.equal(settings.TaskName, task);
@@ -186,11 +205,8 @@ try {
   assert.deepEqual(desktopEnvironment(), foreignDesktopEnvironment);
   desktopEnvironment(emptyDesktopEnvironment);
   run(launcher, ['desktop-integrate', '--quiet']);
+  await assertOwnedDesktopEnvironment();
   const integratedEnvironment = desktopEnvironment();
-  await assertSamePath(integratedEnvironment.CODEX_CLI_PATH, JSON.parse(await readFile(path.join(application, 'rele-install.json'), 'utf8')).DesktopCliPath);
-  assert.ok(integratedEnvironment.CODEX_CLI_PATH.startsWith(path.join(data, 'codex-adapters') + path.sep));
-  assert.equal(integratedEnvironment.CODEX_APP_SERVER_FORCE_CLI, '1');
-  assert.equal(integratedEnvironment.CODEX_APP_SERVER_WS_URL, null);
   console.log('Windows installer smoke: the Codex wrapper preserves argv, profile, data and raw bytes');
   const shim = path.join(application, 'dist', 'server', 'codex-cli.js');
   const originalShim = await readFile(shim);
@@ -261,8 +277,9 @@ try {
   assert.equal(login.origin, new URL(instance.address).origin, 'The explicit browser link must point to this installed instance.');
 
   console.log('Windows installer smoke: launcher restart');
+  const beforeRestartPid = instance.pid;
   run(launcher, ['restart', '--quiet']);
-  instance = await ready(initialPid);
+  instance = await ready(beforeRestartPid);
   assert.equal(await readFile(path.join(data, 'config.json'), 'utf8'), configured);
   await sharedBackendPid(codexFixture, sharedPid);
   assert.equal((await heldAdapter.call('server/diagnostics')).process.id, sharedPid);
@@ -274,7 +291,7 @@ try {
   await sharedBackendPid(codexFixture, sharedPid);
   assert.equal((await heldAdapter.call('server/diagnostics')).process.id, sharedPid);
   process.kill(heldAdapter.child.pid, 0);
-  const upgradedSettings = JSON.parse(await readFile(path.join(application, 'rele-install.json'), 'utf8'));
+  const upgradedSettings = await assertOwnedDesktopEnvironment();
   assert.notEqual(upgradedSettings.DesktopCliPath, heldAdapterPath);
   assert.equal(await exists(heldAdapterPath), true);
   assert.equal(await readFile(path.join(data, 'preserve-me.txt'), 'utf8'), 'installer smoke data\n');
@@ -284,7 +301,23 @@ try {
   assert.equal(await exists(path.join(data, 'backups', backups[0], 'rele.sqlite')), true);
   assert.equal(await readFile(path.join(data, 'backups', backups[0], 'config.json'), 'utf8'), configured);
 
+  console.log('Windows installer smoke: an explicit Desktop integration opt-out survives the next default upgrade');
+  for (const [suffix, options] of [['opt-out', ['/MERGETASKS=!desktop']], ['preserve-opt-out', []]]) {
+    const previousPid = instance.pid;
+    run(installer, [...installArguments, ...options, `/LOG=${path.join(temporary, suffix + '.log')}`]);
+    instance = await ready(previousPid);
+    const optedOut = JSON.parse(await readFile(path.join(application, 'rele-install.json'), 'utf8'));
+    assert.equal(optedOut.DesktopIntegrationOwned, false);
+    assert.ok(!optedOut.DesktopIntegrationWarning);
+    assert.deepEqual(desktopEnvironment(), emptyDesktopEnvironment);
+    await sharedBackendPid(codexFixture, sharedPid);
+    assert.equal((await heldAdapter.call('server/diagnostics')).process.id, sharedPid);
+    assert.equal(await readFile(path.join(data, 'config.json'), 'utf8'), configured);
+  }
+
   console.log('Windows installer smoke: owned Desktop settings restore and later foreign changes survive uninstall');
+  run(launcher, ['desktop-integrate', '--quiet']);
+  await assertOwnedDesktopEnvironment();
   run(launcher, ['desktop-unintegrate', '--quiet']);
   assert.deepEqual(desktopEnvironment(), emptyDesktopEnvironment);
   run(launcher, ['desktop-integrate', '--quiet']);
@@ -305,7 +338,7 @@ try {
   assert.equal(await exists(path.join(data, 'rele.sqlite')), true);
   assert.equal(await readFile(path.join(data, 'config.json'), 'utf8'), configured);
   assert.equal(await readFile(path.join(data, 'preserve-me.txt'), 'utf8'), 'installer smoke data\n');
-  const report = { platform: 'windows', version: metadata.version, installer: path.basename(installer), result: 'passed', perUser: true, interactiveToken: true, nativeLauncher: true, legacyStartupMigrated: true, foreignProcessPreserved: true, codexConsoleWrapper: true, immutableOpenAdapterPreservedAcrossUpgradeRemove: true, desktopEnvironmentOwnership: true, nativeBackendPreservedAcrossRestartUpgradeRemove: true, health: true, restart: true, upgradeBackup: true, uninstall: true, dataPreserved: true };
+  const report = { platform: 'windows', version: metadata.version, installer: path.basename(installer), result: 'passed', perUser: true, interactiveToken: true, nativeLauncher: true, legacyStartupMigrated: true, foreignProcessPreserved: true, codexConsoleWrapper: true, immutableOpenAdapterPreservedAcrossUpgradeRemove: true, desktopEnvironmentOwnership: true, desktopEnvironmentFreshDefault: true, desktopEnvironmentUpgradeChoice: true, desktopEnvironmentOptOutPreserved: true, nativeBackendPreservedAcrossRestartUpgradeRemove: true, health: true, restart: true, upgradeBackup: true, uninstall: true, dataPreserved: true };
   await writeFile(path.join(reportDirectory, 'installer-results.json'), JSON.stringify(report, null, 2) + '\n');
   console.log(JSON.stringify(report));
 } catch (error) {

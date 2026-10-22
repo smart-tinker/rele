@@ -5,16 +5,57 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      native_only:
+        description: Run only the Ubuntu native shared Codex diagnostic (no packaging or release)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: rele-${{ github.workflow }}-${{ github.ref }}
+  group: rele-${{ github.workflow }}-${{ github.ref }}-${{ inputs.native_only && 'native' || 'full' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  native-diagnostic:
+    name: Native shared Codex diagnostic (Ubuntu)
+    if: github.event_name == 'workflow_dispatch' && inputs.native_only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24.19.0
+          cache: npm
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.13'
+      - run: npm ci
+      - run: npx tsc -p tsconfig.server.json
+      - name: Run the existing isolated native shared probe
+        shell: bash
+        run: |
+          python -m pip install -r scripts/protocol-requirements.txt
+          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11; do
+            npm install --prefix "$RUNNER_TEMP/codex-probe-$version" --ignore-scripts --no-audit --no-fund --no-package-lock "@openai/codex@$version"
+            python scripts/shared-protocol-probe.py --codex-prefix "$RUNNER_TEMP/codex-probe-$version" --expected-version "$version" --report "shared-results-$version.json"
+          done
+      - name: Keep native diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: native-shared-diagnostic-${{ github.run_id }}
+          path: shared-results-*.json
+          if-no-files-found: warn
+          retention-days: 30
+
   verify:
+    if: ${{ !inputs.native_only }}
     name: Verify and package (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -142,7 +183,7 @@ jobs:
   prerelease:
     name: Publish verified release candidate
     needs: verify
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && !inputs.native_only
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -194,7 +235,9 @@ jobs:
 
           Both installers include Node.js 24.19.0 and production dependencies. Codex discovery checks Desktop backend locations, versioned Windows CLI directories, running process metadata, and local CLI installations. Opening the installed application uses an expiring single-use login link. Existing chat bindings and saved tokens survive upgrades. Portable ZIP/TAR packages remain available.
 
-          New in rc.14: An installed supported Windows Codex Desktop is sufficient for the first shared daemon bootstrap, without manually installing CLI. Rele validates and snapshots the five native components of one local Desktop bundle, then lets the native lifecycle install its own durable package in the original profile. A healthy daemon keeps priority. Partial bundles, source changes, escaping links, cache tampering and unknown versions fail closed. The launcher prefers the actual ChatGPT.exe GUI with compatibility for Codex.exe. Windows acceptance separately uses the backend from the signed official Desktop MSIX, no npm CLI, and preserves original thread/history and recovery; actual GUI and real phone/messenger acceptance remain open. No dependencies or database migration. See docs/RC14.md.
+          New in rc.15: The Desktop adapter recognizes the actual global -c prefix before app-server, validates the shared profile/effective code_mode_host on a separate read-only connection, and follows shared WebSocket semantics for the two known private plugin startup hints; unknown startup overrides fail without a private fallback or config writes. Ordinary Windows Codex Desktop integration stays enabled across Rele upgrades; an explicit opt-out is remembered, conflicting settings are preserved, and default install/upgrade are checked without forcing /TASKS. Fully quit an already running private Desktop once, then launch it normally. Ubuntu ordinary interactive codex uses the native default shared daemon in the same user profile, without a PATH wrapper or shell edits. Explicit no-daemon/profile/special startup modes remain native choices; codex exec is not a shared remote client. Real Desktop GUI/Explorer launch and phone/reboot acceptance remain open. See docs/RC15.md.
+
+          Previously in rc.14: An installed supported Windows Codex Desktop is sufficient for the first shared daemon bootstrap, without manually installing CLI. Rele validates and snapshots the five native components of one local Desktop bundle, then lets the native lifecycle install its own durable package in the original profile. A healthy daemon keeps priority. Partial bundles, source changes, escaping links, cache tampering and unknown versions fail closed. The launcher prefers the actual ChatGPT.exe GUI with compatibility for Codex.exe. Windows acceptance separately uses the backend from the signed official Desktop MSIX, no npm CLI, and preserves original thread/history and recovery; actual GUI and real phone/messenger acceptance remain open. No dependencies or database migration. See docs/RC14.md.
 
           Previously in rc.13: Recommended native shared Codex policy attaches to or starts one daemon in the original profile, discovers its private control socket again after restart, and preserves original conversation IDs and uncertain request UUIDs. Windows supplies immutable Desktop/interactive CLI adapters and owner-checked optional Desktop integration; Ubuntu uses an independent systemd starter/timer without a Desktop or user D-Bus session. Installer gates keep the actual native PID and an open Windows adapter connection through Rele restart/upgrade/uninstall. Exact Codex 0.163.0, alpha.10.2 and alpha.11 run raw, managed and shared native probes. Initial daemon setup requires a complete supported local Codex package. Rele does not change Codex's native updater policy; an unverified updated version blocks shared access while keeping accepted requests. Existing explicit targets require a deliberate shared-mode transition and one Quit/relaunch of a private Desktop. codex exec does not support the shared remote transport in these versions. Real Desktop GUI and phone/messenger acceptance remain open. See docs/RC13.md.
 
