@@ -194,14 +194,36 @@ describe('Desktop framing over the shared native connection', () => {
     peer.on('message', raw => {
       const message = JSON.parse(raw.toString()); received.push(message);
       if (message.method === 'initialize') peer.send(JSON.stringify({ id: message.id, result: { codexHome: home } }));
+      if (message.method === 'configRequirements/read' || message.method === 'config/read') peer.send(JSON.stringify({ id: message.id, result: {} }));
       if (message.method === 'experimentalFeature/list') {
         peer.send(JSON.stringify({ method: 'unrelated/notification' }));
         peer.send(JSON.stringify({ id: message.id, result: { data: [{ name: 'code_mode_host', enabled: true, defaultEnabled: false }], nextCursor: null } }));
       }
     });
     await verifyDesktopCodeModeHost(socket, home);
-    expect(received.map(message => message.method)).toEqual(['initialize', 'initialized', 'experimentalFeature/list']);
+    expect(received.map(message => message.method)).toEqual(['initialize', 'initialized', 'experimentalFeature/list', 'configRequirements/read', 'config/read']);
+    expect(received[3]).not.toHaveProperty('params');
+    expect(received[4].params).toEqual({ includeLayers: false });
     expect(received[2].params).toEqual({});
+  });
+
+  it('rejects an early Desktop policy read failure before integration can be enabled', async () => {
+    const home = await mkdtemp(path.join(tmpdir(), 'rele-shim-policy-'));
+    cleanup.push(() => rm(home, { recursive: true, force: true }));
+    for (const method of ['configRequirements/read', 'config/read']) {
+      const { socket, peer } = await pair();
+      const methods: string[] = [];
+      peer.on('message', raw => {
+        const message = JSON.parse(raw.toString()); methods.push(message.method);
+        if (message.method === 'initialize') peer.send(JSON.stringify({ id: message.id, result: { codexHome: home } }));
+        if (message.method === 'experimentalFeature/list') peer.send(JSON.stringify({ id: message.id, result: { data: [{ name: 'code_mode_host', enabled: true }] } }));
+        if (message.method === 'configRequirements/read' || message.method === 'config/read') peer.send(JSON.stringify({ id: message.id,
+          ...(message.method === method ? { error: { code: -32000, message: 'private policy detail' } } : { result: {} }) }));
+      });
+      await expect(verifyDesktopCodeModeHost(socket, home)).rejects.toThrow();
+      expect(methods.at(-1)).toBe(method);
+      expect(methods).not.toContain('thread/start');
+    }
   });
 
   it('fails closed for a missing or disabled effective code mode, including a true registry default', async () => {
@@ -236,7 +258,7 @@ describe('Desktop framing over the shared native connection', () => {
     expect(methods).toEqual(['initialize']);
     const failed = await pair();
     failed.peer.once('message', () => failed.peer.close());
-    await expect(verifyDesktopCodeModeHost(failed.socket, home)).rejects.toThrow('features.code_mode_host=true');
+    await expect(verifyDesktopCodeModeHost(failed.socket, home)).rejects.toThrow('стартовые настройки Desktop');
   });
 
   it('bounds an unanswered read-only check and removes its listeners', async () => {
@@ -246,7 +268,7 @@ describe('Desktop framing over the shared native connection', () => {
     vi.useFakeTimers();
     try {
       const checked = verifyDesktopCodeModeHost(socket, home);
-      const failure = expect(checked).rejects.toThrow('features.code_mode_host=true');
+      const failure = expect(checked).rejects.toThrow('стартовые настройки Desktop');
       await vi.advanceTimersByTimeAsync(15_000);
       await failure;
       expect(socket.listenerCount('message')).toBe(0);
@@ -260,6 +282,7 @@ describe('Desktop framing over the shared native connection', () => {
     for (const argv of [['--version'], ['app-server', 'proxy'], ['app-server', 'generate-json-schema']]) expect(shimMode(argv)).toBe('passthrough');
     expect(shimMode(['exec', 'hello'])).toBe('unsupported');
     expect(shimMode(['--rele-desktop'])).toBe('desktop');
+    expect(shimMode(['--rele-desktop-check'])).toBe('desktop-check');
     expect(shimMode(['--rele-cli', 'resume', 'original-id'])).toBe('interactive');
     expect(shimMode(['--rele-daemon-start'])).toBe('daemon');
   });

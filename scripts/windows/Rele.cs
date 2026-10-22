@@ -103,8 +103,8 @@ internal static class Rele
             if (command == "desktop-integrate" || command == "desktop-unintegrate")
             {
                 if (!File.Exists(settingsPath)) throw new InvalidOperationException("Сначала установите Rele.");
-                if (command == "desktop-integrate") InstallDesktopIntegration(); else RemoveDesktopIntegration();
-                File.WriteAllText(settingsPath, Json.Serialize(Config), new UTF8Encoding(false));
+                try { if (command == "desktop-integrate") InstallDesktopIntegration(); else RemoveDesktopIntegration(); }
+                finally { File.WriteAllText(settingsPath, Json.Serialize(Config), new UTF8Encoding(false)); }
                 return 0;
             }
             if (command == "prepare-update")
@@ -473,6 +473,14 @@ internal static class Rele
     private static void InstallDesktopIntegration()
     {
         ValidateDesktopIntegration();
+        try { RunNode("--rele-desktop-check", false, true); }
+        catch (Exception error)
+        {
+            // A failed upgrade must not leave our unusable adapter as Desktop's default.
+            RemoveDesktopIntegration();
+            Config.DesktopIntegrationWarning = error.Message;
+            throw;
+        }
         PrepareDesktopAdapter();
         string cli = UserEnvironment("CODEX_CLI_PATH"), force = UserEnvironment("CODEX_APP_SERVER_FORCE_CLI");
         if (!Config.DesktopIntegrationOwned)

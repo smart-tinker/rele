@@ -93,8 +93,8 @@ export function stopInstallerCodex(target) {
 }
 
 // Keep the installed immutable adapter open as Desktop would, including its executable/file locks.
-export async function openInstallerAdapter(executable, env) {
-  const child = spawn(executable, ['app-server', '--listen', 'stdio://'], { env, cwd: path.dirname(executable), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+export async function openInstallerAdapter(executable, env, args = ['app-server', '--listen', 'stdio://']) {
+  const child = spawn(executable, args, { env, cwd: path.dirname(executable), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   child.stderr.resume();
   const pending = new Map();
   let nextId = 0;
@@ -111,7 +111,7 @@ export async function openInstallerAdapter(executable, env) {
       if (message.error) request.reject(new Error('The held installer adapter returned an RPC error.')); else request.resolve(message.result);
     } catch { fail(); }
   });
-  const call = (method, params = {}) => new Promise((resolve, reject) => {
+  const call = (method, params = method === 'configRequirements/read' ? undefined : {}) => new Promise((resolve, reject) => {
     const id = ++nextId;
     const timer = setTimeout(() => { pending.delete(id); reject(new Error('The held installer adapter RPC timed out.')); }, 20_000);
     pending.set(id, { resolve, reject, timer });

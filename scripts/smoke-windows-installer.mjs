@@ -206,6 +206,64 @@ try {
   desktopEnvironment(emptyDesktopEnvironment);
   run(launcher, ['desktop-integrate', '--quiet']);
   await assertOwnedDesktopEnvironment();
+  const configBeforeRejectedChange = await readFile(path.join(data, 'config.json'));
+  const environmentBeforeRejectedChange = desktopEnvironment();
+  const rejectedChange = await fetch(new URL('/api/config', instance.address), { method: 'PUT',
+    headers: { Authorization: `Bearer ${fixturePanelToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ codex: { transport: 'websocket', endpoint: 'ws://127.0.0.1:59998' } }), signal: AbortSignal.timeout(5000) });
+  assert.equal(rejectedChange.status, 400);
+  assert.match((await rejectedChange.json()).error, /отключите интеграцию Desktop/u);
+  assert.deepEqual(await readFile(path.join(data, 'config.json')), configBeforeRejectedChange);
+  assert.deepEqual(desktopEnvironment(), environmentBeforeRejectedChange);
+  console.log('Windows installer smoke: an old WebSocket target cannot replace Desktop with an unusable adapter');
+  const configFile = path.join(data, 'config.json');
+  const sharedConfigBytes = await readFile(configFile);
+  await nativeConfig.save(mergeConfig(nativeConfig.config, { codex: { transport: 'websocket',
+    executable: path.join(temporary, 'removed-desktop-version', 'codex.exe'), endpoint: 'ws://127.0.0.1:59998' } }));
+  const legacyConfigBytes = await readFile(configFile);
+  const versionRefused = spawnSync(path.join(application, 'Rele.Codex.exe'), ['--version'], { env, encoding: 'utf8', windowsHide: true, timeout: 60_000 });
+  assert.equal(versionRefused.status, 1);
+  assert.match(versionRefused.stderr, /Выбранный исполняемый файл Codex недоступен/u);
+  const beforeLegacyPid = instance.pid;
+  run(installer, [...installArguments, `/LOG=${path.join(temporary, 'legacy-target-upgrade.log')}`]);
+  instance = await ready(beforeLegacyPid);
+  assert.deepEqual(await readFile(configFile), legacyConfigBytes);
+  assert.deepEqual(desktopEnvironment(), emptyDesktopEnvironment);
+  const legacySettings = JSON.parse(await readFile(path.join(application, 'rele-install.json'), 'utf8'));
+  assert.equal(legacySettings.DesktopIntegrationOwned, false);
+  assert.match(legacySettings.DesktopIntegrationWarning, /режима «Общий Codex»/u);
+  const legacyRefused = spawnSync(launcher, ['desktop-integrate', '--quiet'], { env, windowsHide: true, timeout: 60_000 });
+  assert.equal(legacyRefused.status, 1);
+  assert.deepEqual(desktopEnvironment(), emptyDesktopEnvironment);
+  assert.deepEqual(await readFile(configFile), legacyConfigBytes);
+  await sharedBackendPid(codexFixture, sharedPid);
+  await writeFile(configFile, sharedConfigBytes);
+  run(launcher, ['restart', '--quiet']);
+  instance = await ready(instance.pid);
+  run(launcher, ['desktop-integrate', '--quiet']);
+  await assertOwnedDesktopEnvironment();
+
+  console.log('Windows installer smoke: protected-settings failure removes only an owned hook and preserves settings bytes');
+  const unreadableConfig = Buffer.from(JSON.stringify({ version: 1, encoding: 'dpapi', value: 'invalid-fixture-ciphertext' }));
+  await writeFile(configFile, unreadableConfig);
+  const protectedRefused = spawnSync(launcher, ['desktop-integrate', '--quiet'], { env, windowsHide: true, timeout: 60_000 });
+  assert.equal(protectedRefused.status, 1);
+  assert.deepEqual(desktopEnvironment(), emptyDesktopEnvironment);
+  assert.deepEqual(await readFile(configFile), unreadableConfig);
+  const protectedSettings = JSON.parse(await readFile(path.join(application, 'rele-install.json'), 'utf8'));
+  assert.equal(protectedSettings.DesktopIntegrationOwned, false);
+  assert.match(protectedSettings.DesktopIntegrationWarning, /защищённые настройки Rele/u);
+  await writeFile(configFile, sharedConfigBytes);
+  run(launcher, ['desktop-integrate', '--quiet']);
+  const healthySettings = await assertOwnedDesktopEnvironment();
+  const earlyPolicy = await openInstallerAdapter(healthySettings.DesktopCliPath, env,
+    ['-c', 'features.code_mode_host=true', 'app-server', '--analytics-default-enabled']);
+  try {
+    await earlyPolicy.call('configRequirements/read', {});
+    await earlyPolicy.call('config/read', { includeLayers: false });
+    assert.equal((await earlyPolicy.call('server/diagnostics')).process.id, sharedPid);
+  } finally { await earlyPolicy.close(); }
+  assert.deepEqual(await readFile(configFile), sharedConfigBytes);
   const integratedEnvironment = desktopEnvironment();
   console.log('Windows installer smoke: the Codex wrapper preserves argv, profile, data and raw bytes');
   const shim = path.join(application, 'dist', 'server', 'codex-cli.js');
@@ -338,7 +396,7 @@ try {
   assert.equal(await exists(path.join(data, 'rele.sqlite')), true);
   assert.equal(await readFile(path.join(data, 'config.json'), 'utf8'), configured);
   assert.equal(await readFile(path.join(data, 'preserve-me.txt'), 'utf8'), 'installer smoke data\n');
-  const report = { platform: 'windows', version: metadata.version, installer: path.basename(installer), result: 'passed', perUser: true, interactiveToken: true, nativeLauncher: true, legacyStartupMigrated: true, foreignProcessPreserved: true, codexConsoleWrapper: true, immutableOpenAdapterPreservedAcrossUpgradeRemove: true, desktopEnvironmentOwnership: true, desktopEnvironmentFreshDefault: true, desktopEnvironmentUpgradeChoice: true, desktopEnvironmentOptOutPreserved: true, nativeBackendPreservedAcrossRestartUpgradeRemove: true, health: true, restart: true, upgradeBackup: true, uninstall: true, dataPreserved: true };
+  const report = { platform: 'windows', version: metadata.version, installer: path.basename(installer), result: 'passed', perUser: true, interactiveToken: true, nativeLauncher: true, legacyStartupMigrated: true, foreignProcessPreserved: true, codexConsoleWrapper: true, immutableOpenAdapterPreservedAcrossUpgradeRemove: true, desktopEnvironmentOwnership: true, desktopEnvironmentFreshDefault: true, desktopEnvironmentUpgradeChoice: true, desktopEnvironmentOptOutPreserved: true, desktopLegacyTargetSafelySkipped: true, desktopProtectedSettingsFailureSafelySkipped: true, desktopConfigChangeWhileIntegratedRejected: true, actualEarlyDesktopPolicyRpc: true, nativeBackendPreservedAcrossRestartUpgradeRemove: true, health: true, restart: true, upgradeBackup: true, uninstall: true, dataPreserved: true };
   await writeFile(path.join(reportDirectory, 'installer-results.json'), JSON.stringify(report, null, 2) + '\n');
   console.log(JSON.stringify(report));
 } catch (error) {

@@ -101,6 +101,12 @@ async function main(): Promise<void> {
     try {
       const codexChanged = JSON.stringify(next.codex) !== JSON.stringify(config.config.codex);
       if (codexChanged && store.activeRequests().some(request => request.status !== 'queued')) throw new Error('Завершите или отмените активные запросы перед сменой подключения Codex.');
+      if (codexChanged && process.platform === 'win32') {
+        try {
+          const installation = JSON.parse(await readFile(path.join(root, 'rele-install.json'), 'utf8')) as { DesktopIntegrationOwned?: boolean };
+          if (installation.DesktopIntegrationOwned) throw new Error('Перед сменой сервера или профиля Codex отключите интеграцию Desktop в установщике Rele. Это сохраняет обычный запуск Desktop рабочим.');
+        } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+      }
       // Voice-only changes do not reconnect transports or expire approvals.
       const channelsChanged = JSON.stringify([next.telegram, next.slack]) !== JSON.stringify([config.config.telegram, config.config.slack]);
       await config.save(next);

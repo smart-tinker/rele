@@ -10,7 +10,7 @@ import { ConfigStore, defaultDataDirectory } from './config.js';
 import { codexEnvironment, fileExists, environmentValue, resolveCodexLaunch } from './codex-launch.js';
 import { ensureSharedCodex, SharedCodexError, resolveSharedCodexExecutable } from './codex-shared.js';
 import { discoverCodex } from './codex-discovery.js';
-import type { CodexDiscoveryResult } from '../shared/types.js';
+import type { CodexConnectionTarget, CodexDiscoveryResult } from '../shared/types.js';
 
 export class CodexShimError extends Error {}
 
@@ -114,10 +114,11 @@ function appServerInvocation(args: string[]): { index: number; unknownPrefix: bo
   return args[index]?.startsWith('-') && candidate !== -1 ? { index: candidate, unknownPrefix: true } : undefined;
 }
 
-export function shimMode(args: string[]): 'daemon' | 'stdio' | 'interactive' | 'desktop' | 'unsupported' | 'passthrough' {
+export function shimMode(args: string[]): 'daemon' | 'stdio' | 'interactive' | 'desktop' | 'desktop-check' | 'unsupported' | 'passthrough' {
   if (['exec', 'e', 'x'].includes(args[0])) return 'unsupported';
   if (args[0] === '--rele-daemon-start') return 'daemon';
   if (args[0] === '--rele-desktop') return 'desktop';
+  if (args[0] === '--rele-desktop-check') return 'desktop-check';
   if (args[0] === '--rele-cli') return 'interactive';
   const server = appServerInvocation(args);
   if (server && (server.unknownPrefix || !args[server.index + 1] || args[server.index + 1].startsWith('-'))) return 'stdio';
@@ -171,7 +172,7 @@ export function validateStdioFlags(args: string[]): boolean {
 
 /** A separate read-only connection keeps Desktop's initializer and RPC IDs untouched. */
 export async function verifyDesktopCodeModeHost(socket: WebSocket, codexHome: string): Promise<void> {
-  const unavailable = () => new CodexShimError('Не подтверждён features.code_mode_host=true в общем Codex. Проверьте общий профиль и штатно перезапустите Codex; Desktop не подключён.');
+  const unavailable = () => new CodexShimError('Общий Codex не подтвердил стартовые настройки Desktop. Подключение не проверено; проверьте состояние Codex в Rele.');
   let failure: Error | undefined;
   let pending: { id: number; resolve: (value: unknown) => void; reject: (error: Error) => void } | undefined;
   const fail = (error: Error) => { failure ??= error; pending?.reject(failure); pending = undefined; };
@@ -203,7 +204,9 @@ export async function verifyDesktopCodeModeHost(socket: WebSocket, codexHome: st
     await new Promise<void>((resolve, reject) => socket.send(JSON.stringify({ method: 'initialized' }), error => error ? reject(unavailable()) : resolve()));
     const features = await call(2, 'experimentalFeature/list', {}) as { data?: Array<{ name?: unknown; enabled?: unknown }> } | undefined;
     const matched = Array.isArray(features?.data) ? features.data.filter(feature => feature?.name === 'code_mode_host') : [];
-    if (matched.length !== 1 || matched[0].enabled !== true) throw unavailable();
+    if (matched.length !== 1 || matched[0].enabled !== true) throw new CodexShimError('Не подтверждён features.code_mode_host=true в общем Codex. Проверьте общий профиль и штатно перезапустите Codex; Desktop не подключён.');
+    await call(3, 'configRequirements/read', undefined);
+    await call(4, 'config/read', { includeLayers: false });
   } finally {
     clearTimeout(timer);
     socket.off('message', receive); socket.off('close', disconnected); socket.off('error', disconnected);
@@ -221,15 +224,23 @@ function sharedProxy(launch: Awaited<ReturnType<typeof resolveCodexLaunch>>, end
   return { socket, stop: () => { socket.terminate(); proxy.kill(); } };
 }
 
+async function verifyDesktopConnection(launch: Awaited<ReturnType<typeof resolveCodexLaunch>>, target: CodexConnectionTarget, env: NodeJS.ProcessEnv): Promise<void> {
+  if (!target.codexHome) throw new CodexShimError('Не подтверждён профиль общего Codex.');
+  const check = sharedProxy(launch, target.endpoint, env);
+  try { await once(check.socket, 'open'); await verifyDesktopCodeModeHost(check.socket, target.codexHome); }
+  finally { check.stop(); }
+}
+
 async function main(args: string[]): Promise<void> {
   const mode = shimMode(args);
   if (mode === 'unsupported') throw new CodexShimError('codex exec не поддерживает общий --remote в этой версии. Используйте интерактивный общий Codex CLI.');
-  const requireCodeModeHost = mode === 'stdio' && validateStdioFlags(args);
+  const requireCodeModeHost = mode === 'desktop-check' || mode === 'stdio' && validateStdioFlags(args);
   const config = new ConfigStore(defaultDataDirectory());
-  await config.load();
+  try { await config.load(); }
+  catch { throw new CodexShimError('Не удалось прочитать защищённые настройки Rele. Подключение Desktop не проверено; откройте Rele под владельцем установки.'); }
   // An explicit old endpoint is never silently replaced by a second owner.
   if (mode === 'daemon' && config.config.codex.transport !== 'shared') return;
-  if (mode !== 'passthrough' && config.config.codex.transport !== 'shared') throw new CodexShimError('Сначала выберите «Общий Codex» в настройках Rele.');
+  if (mode !== 'passthrough' && config.config.codex.transport !== 'shared') throw new CodexShimError('Подключение Desktop требует режима «Общий Codex» в Rele. Прежние адрес сервера и профиль сохранены; перейдите на общий режим после завершения текущих запросов.');
   const env = codexEnvironment(config.config.codex.codexHome);
   if (mode === 'daemon') delete env.RELE_CODEX_DAEMON_EXTERNAL;
   if (mode === 'desktop') {
@@ -251,7 +262,8 @@ async function main(args: string[]): Promise<void> {
     const cli = await Promise.all(wrapper.map(file => fileExists(file)));
     const shim = wrapper.find((_, index) => cli[index]);
     if (!shim) throw new CodexShimError('Адаптер Desktop не установлен. Переустановите Rele.');
-    await ensureSharedCodex(config.config.codex, { env });
+    const target = await ensureSharedCodex(config.config.codex, { env });
+    await verifyDesktopConnection(await resolveCodexLaunch(target.executable, { env }), target, env);
     const desktopEnv = { ...env };
     for (const key of Object.keys(desktopEnv)) if (['CODEX_CLI_PATH', 'CODEX_APP_SERVER_FORCE_CLI'].includes(key.toUpperCase())) delete desktopEnv[key];
     desktopEnv.CODEX_CLI_PATH = shim; desktopEnv.CODEX_APP_SERVER_FORCE_CLI = '1';
@@ -260,10 +272,20 @@ async function main(args: string[]): Promise<void> {
     return;
   }
   let target = config.config.codex;
-  if (mode !== 'passthrough') target = { ...await ensureSharedCodex(target, { env }), transport: 'shared' };
-  const launch = await resolveCodexLaunch(mode === 'passthrough' && target.executable === 'codex' ? await resolveSharedCodexExecutable(target, { env }) : target.executable, { env });
+  if (mode !== 'passthrough') {
+    try { target = { ...await ensureSharedCodex(target, { env }), transport: 'shared' }; }
+    catch (error) {
+      // Installation may precede the one allowed Quit; the adapter checks again after relaunch.
+      if (mode === 'desktop-check' && error instanceof SharedCodexError && error.code === 'shared-desktop-conflict') return;
+      throw error;
+    }
+  }
+  const executable = mode === 'passthrough' && target.executable === 'codex' ? await resolveSharedCodexExecutable(target, { env }) : target.executable;
+  let launch: Awaited<ReturnType<typeof resolveCodexLaunch>>;
+  try { launch = await resolveCodexLaunch(executable, { env }); }
+  catch { throw new CodexShimError('Выбранный исполняемый файл Codex недоступен. Повторите выбор Codex в Rele; сохранённый профиль не изменён.'); }
   if (mode === 'daemon') return;
-  if (mode !== 'stdio') {
+  if (mode !== 'stdio' && mode !== 'desktop-check') {
     const childArgs = mode === 'interactive' ? ['--remote', `unix://${target.endpoint}`, ...args.slice(1)] : args;
     const child = spawn(launch.command, [...launch.args, ...childArgs], { env, stdio: 'inherit', windowsHide: true });
     child.once('error', () => { process.stderr.write('Rele: не удалось запустить Codex CLI.\n'); process.exitCode = 1; });
@@ -271,12 +293,8 @@ async function main(args: string[]): Promise<void> {
     process.exitCode = code ?? 1;
     return;
   }
-  if (requireCodeModeHost) {
-    if (!target.codexHome) throw new CodexShimError('Не подтверждён профиль общего Codex.');
-    const check = sharedProxy(launch, target.endpoint, env);
-    try { await once(check.socket, 'open'); await verifyDesktopCodeModeHost(check.socket, target.codexHome); }
-    finally { check.stop(); }
-  }
+  if (requireCodeModeHost) await verifyDesktopConnection(launch, target, env);
+  if (mode === 'desktop-check') return;
   const { socket, stop } = sharedProxy(launch, target.endpoint, env);
   process.once('SIGTERM', stop);
   process.once('SIGINT', stop);
