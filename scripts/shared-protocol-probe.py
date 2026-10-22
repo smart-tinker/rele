@@ -473,6 +473,8 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
 enabled=false
 [tui]
 disable_paste_burst=true
+# Native TUI writes this accessibility marker on first run; seed only the fixture.
+screen_reader_detection_done=true
 [projects.{json.dumps(str(workspace))}]
 trust_level="trusted"
 '''
