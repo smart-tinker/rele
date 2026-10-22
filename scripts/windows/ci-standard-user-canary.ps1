@@ -259,7 +259,13 @@ try {
         $child = Start-Process -FilePath $shell -ArgumentList $arguments -Credential $credential -LoadUserProfile -UseNewEnvironment -WorkingDirectory $FixtureRoot -RedirectStandardOutput (Join-Path $FixtureRoot 'stdout.log') -RedirectStandardError (Join-Path $FixtureRoot 'stderr.log') -PassThru
         $remaining = [Math]::Max(0, [int](($gatesDeadline - [DateTime]::UtcNow).TotalMilliseconds))
         if (-not $child.WaitForExit($remaining)) { throw 'The standard-user shared phase timed out.' }
-        if (-not (Test-Path -LiteralPath $resultPath)) { throw 'The standard-user shared phase did not produce a receipt.' }
+        if (-not (Test-Path -LiteralPath $resultPath)) {
+            foreach ($log in @('stdout.log', 'stderr.log')) {
+                $logPath = Join-Path $FixtureRoot $log
+                if (Test-Path -LiteralPath $logPath -PathType Leaf) { Get-Content -LiteralPath $logPath -Tail 30 | Write-Output }
+            }
+            throw ('The standard-user shared phase did not produce a receipt; ExitCode=' + $child.ExitCode + '.')
+        }
         $receipt = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
         if ($receipt.nonce -ne $Nonce -or $receipt.sid -ne $sid -or $receipt.phase -ne 'Shared') { throw 'Invalid standard-user shared phase receipt.' }
         $receipt.PSObject.Properties.Remove('nonce'); $receipt.PSObject.Properties.Remove('sid'); $sharedOutcome = $receipt
