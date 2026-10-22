@@ -16,6 +16,11 @@ export class CodexShimError extends Error {}
 
 const MAX_FRAME_BYTES = 32 * 1024 * 1024;
 
+async function canonicalHome(value: string): Promise<string> {
+  const resolved = await realpath(value);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
 /** Only framing changes: Desktop's initialize, request IDs and notifications pass unchanged. */
 export async function bridgeCodexStdio(socket: WebSocket, input: Readable, output: Writable, maxFrameBytes = MAX_FRAME_BYTES, codexHome?: string): Promise<void> {
   let ended = false;
@@ -24,8 +29,7 @@ export async function bridgeCodexStdio(socket: WebSocket, input: Readable, outpu
   let confirmInitialize!: () => void, rejectInitialize!: (error: Error) => void;
   const initialized = new Promise<void>((resolve, reject) => { confirmInitialize = resolve; rejectInitialize = reject; });
   void initialized.catch(() => {});
-  const canonical = async (value: string) => { const resolved = await realpath(value); return process.platform === 'win32' ? resolved.toLowerCase() : resolved; };
-  const expectedHome = codexHome ? await canonical(codexHome) : undefined;
+  const expectedHome = codexHome ? await canonicalHome(codexHome) : undefined;
   let initializeTimer: NodeJS.Timeout | undefined;
   const closed = new Promise<void>((resolve, reject) => {
     if (expectedHome) initializeTimer = setTimeout(() => {
@@ -43,7 +47,7 @@ export async function bridgeCodexStdio(socket: WebSocket, input: Readable, outpu
         const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
         const message = JSON.parse(text) as { id?: string | number; result?: { codexHome?: string } };
         if (expectedHome && !profileConfirmed && initializeId !== undefined && message.id === initializeId && !('method' in message)) {
-          if (typeof message.result?.codexHome !== 'string' || await canonical(message.result.codexHome) !== expectedHome) throw new CodexShimError('Общий Codex ответил из другого профиля. Запросы Desktop не отправлены.');
+          if (typeof message.result?.codexHome !== 'string' || await canonicalHome(message.result.codexHome) !== expectedHome) throw new CodexShimError('Общий Codex ответил из другого профиля. Запросы Desktop не отправлены.');
           profileConfirmed = true; clearTimeout(initializeTimer); confirmInitialize();
         }
         const frame = JSON.stringify(message);
@@ -97,12 +101,26 @@ export async function bridgeCodexStdio(socket: WebSocket, input: Readable, outpu
   }
 }
 
+function appServerInvocation(args: string[]): { index: number; unknownPrefix: boolean } | undefined {
+  let index = 0;
+  while (index < args.length) {
+    if (args[index] === '-c' || args[index] === '--config') { index += 2; continue; }
+    if (args[index].startsWith('--config=') || args[index].startsWith('-c') && args[index].length > 2) { index++; continue; }
+    break;
+  }
+  if (args[index] === 'app-server') return { index, unknownPrefix: false };
+  // An unknown global startup option must not hide app-server in CLI passthrough.
+  const candidate = args.indexOf('app-server', index + 1);
+  return args[index]?.startsWith('-') && candidate !== -1 ? { index: candidate, unknownPrefix: true } : undefined;
+}
+
 export function shimMode(args: string[]): 'daemon' | 'stdio' | 'interactive' | 'desktop' | 'unsupported' | 'passthrough' {
   if (['exec', 'e', 'x'].includes(args[0])) return 'unsupported';
   if (args[0] === '--rele-daemon-start') return 'daemon';
   if (args[0] === '--rele-desktop') return 'desktop';
   if (args[0] === '--rele-cli') return 'interactive';
-  if (args[0] === 'app-server' && (!args[1] || args[1].startsWith('-'))) return 'stdio';
+  const server = appServerInvocation(args);
+  if (server && (server.unknownPrefix || !args[server.index + 1] || args[server.index + 1].startsWith('-'))) return 'stdio';
   return 'passthrough';
 }
 
@@ -122,21 +140,91 @@ export async function findDesktopExecutable(discovery: CodexDiscoveryResult, exi
   return [...candidates][0];
 }
 
-export function validateStdioFlags(args: string[]): void {
+export function validateStdioFlags(args: string[]): boolean {
   // The daemon owns startup settings; a Desktop-only override cannot be silently discarded.
-  const flags = args.slice(1);
+  const server = appServerInvocation(args);
+  const incompatible = () => new CodexShimError('Параметры запуска Desktop несовместимы с общим Codex. Настройте общий профиль Codex.');
+  if (!server || server.unknownPrefix) throw incompatible();
+  const flags = [...args.slice(0, server.index), ...args.slice(server.index + 1)];
+  let requireCodeModeHost = false;
   for (let index = 0; index < flags.length; index++) {
     if (flags[index] === '--analytics-default-enabled' || flags[index] === '--stdio') continue;
-    if (flags[index] === '--listen' && flags[++index] === 'stdio://') continue;
+    if (flags[index] === '--listen') {
+      if (flags[index + 1] !== 'stdio://') throw incompatible();
+      index++; continue;
+    }
     if (flags[index] === '--listen=stdio://') continue;
-    throw new CodexShimError('Параметры запуска Desktop несовместимы с общим Codex. Настройте общий профиль Codex.');
+    let override: string | undefined;
+    if (flags[index] === '-c' || flags[index] === '--config') override = flags[++index];
+    else if (flags[index].startsWith('--config=')) override = flags[index].slice('--config='.length);
+    else if (flags[index].startsWith('-c') && flags[index].length > 2) override = flags[index].slice(2);
+    if (override === 'features.code_mode_host=true') { requireCodeModeHost = true; continue; }
+    // Official Desktop's configured WS transport skips these local helper toggles.
+    // Shared mode likewise keeps the daemon/profile plugin policy without editing it.
+    if (['mcp_servers.codex_app.enabled',
+      'mcp_servers.code-review.enabled'].some(key =>
+      override === `${key}=true` || override === `${key}=false`)) continue;
+    throw incompatible();
   }
+  return requireCodeModeHost;
+}
+
+/** A separate read-only connection keeps Desktop's initializer and RPC IDs untouched. */
+export async function verifyDesktopCodeModeHost(socket: WebSocket, codexHome: string): Promise<void> {
+  const unavailable = () => new CodexShimError('Не подтверждён features.code_mode_host=true в общем Codex. Проверьте общий профиль и штатно перезапустите Codex; Desktop не подключён.');
+  let failure: Error | undefined;
+  let pending: { id: number; resolve: (value: unknown) => void; reject: (error: Error) => void } | undefined;
+  const fail = (error: Error) => { failure ??= error; pending?.reject(failure); pending = undefined; };
+  const receive = (data: WebSocket.RawData, binary: boolean) => {
+    try {
+      const bytes = Array.isArray(data) ? Buffer.concat(data) : Buffer.isBuffer(data) ? data : Buffer.from(data);
+      if (binary || bytes.length > MAX_FRAME_BYTES) throw unavailable();
+      const message = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as { id?: number; method?: string; result?: unknown; error?: unknown };
+      if (!message || typeof message !== 'object' || Array.isArray(message)) throw unavailable();
+      if (pending && message.id === pending.id && !('method' in message)) {
+        if ('error' in message) throw unavailable();
+        const current = pending; pending = undefined; current.resolve(message.result);
+      }
+    } catch { fail(unavailable()); }
+  };
+  const disconnected = () => fail(unavailable());
+  const timer = setTimeout(disconnected, 15_000);
+  socket.on('message', receive);
+  socket.on('close', disconnected);
+  socket.on('error', disconnected);
+  const call = (id: number, method: string, params: unknown) => new Promise<unknown>((resolve, reject) => {
+    if (failure) { reject(failure); return; }
+    pending = { id, resolve, reject };
+    socket.send(JSON.stringify({ id, method, params }), error => { if (error) fail(unavailable()); });
+  });
+  try {
+    const initialized = await call(1, 'initialize', { clientInfo: { name: 'rele_desktop_startup_check', version: '0.0.0' }, capabilities: { experimentalApi: true } }) as { codexHome?: unknown } | undefined;
+    if (typeof initialized?.codexHome !== 'string' || await canonicalHome(initialized.codexHome) !== await canonicalHome(codexHome)) throw new CodexShimError('Общий Codex ответил из другого профиля. Запросы Desktop не отправлены.');
+    await new Promise<void>((resolve, reject) => socket.send(JSON.stringify({ method: 'initialized' }), error => error ? reject(unavailable()) : resolve()));
+    const features = await call(2, 'experimentalFeature/list', {}) as { data?: Array<{ name?: unknown; enabled?: unknown }> } | undefined;
+    const matched = Array.isArray(features?.data) ? features.data.filter(feature => feature?.name === 'code_mode_host') : [];
+    if (matched.length !== 1 || matched[0].enabled !== true) throw unavailable();
+  } finally {
+    clearTimeout(timer);
+    socket.off('message', receive); socket.off('close', disconnected); socket.off('error', disconnected);
+  }
+}
+
+function sharedProxy(launch: Awaited<ReturnType<typeof resolveCodexLaunch>>, endpoint: string, env: NodeJS.ProcessEnv) {
+  const proxy = spawn(launch.command, [...launch.args, 'app-server', 'proxy', '--sock', endpoint], { env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  proxy.stderr.resume(); // Native diagnostics can contain paths or request details; do not copy them to Desktop.
+  const stream = Duplex.from({ readable: proxy.stdout, writable: proxy.stdin });
+  const socket = new WebSocket('ws://localhost/', { createConnection: () => stream as Socket, handshakeTimeout: 10_000, maxPayload: MAX_FRAME_BYTES, followRedirects: false });
+  socket.on('error', () => {});
+  proxy.once('error', () => socket.terminate());
+  proxy.once('exit', () => socket.terminate());
+  return { socket, stop: () => { socket.terminate(); proxy.kill(); } };
 }
 
 async function main(args: string[]): Promise<void> {
   const mode = shimMode(args);
   if (mode === 'unsupported') throw new CodexShimError('codex exec не поддерживает общий --remote в этой версии. Используйте интерактивный общий Codex CLI.');
-  if (mode === 'stdio') validateStdioFlags(args);
+  const requireCodeModeHost = mode === 'stdio' && validateStdioFlags(args);
   const config = new ConfigStore(defaultDataDirectory());
   await config.load();
   // An explicit old endpoint is never silently replaced by a second owner.
@@ -183,14 +271,13 @@ async function main(args: string[]): Promise<void> {
     process.exitCode = code ?? 1;
     return;
   }
-  const proxy = spawn(launch.command, [...launch.args, 'app-server', 'proxy', '--sock', target.endpoint], { env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
-  proxy.stderr.resume(); // Native diagnostics can contain paths or request details; do not copy them to Desktop.
-  const stream = Duplex.from({ readable: proxy.stdout, writable: proxy.stdin });
-  const socket = new WebSocket('ws://localhost/', { createConnection: () => stream as Socket, handshakeTimeout: 10_000, maxPayload: MAX_FRAME_BYTES, followRedirects: false });
-  socket.on('error', () => {});
-  proxy.once('error', () => socket.terminate());
-  proxy.once('exit', () => socket.terminate());
-  const stop = () => { socket.terminate(); proxy.kill(); };
+  if (requireCodeModeHost) {
+    if (!target.codexHome) throw new CodexShimError('Не подтверждён профиль общего Codex.');
+    const check = sharedProxy(launch, target.endpoint, env);
+    try { await once(check.socket, 'open'); await verifyDesktopCodeModeHost(check.socket, target.codexHome); }
+    finally { check.stop(); }
+  }
+  const { socket, stop } = sharedProxy(launch, target.endpoint, env);
   process.once('SIGTERM', stop);
   process.once('SIGINT', stop);
   try {

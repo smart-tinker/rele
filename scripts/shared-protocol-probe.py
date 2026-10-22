@@ -346,15 +346,24 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
         client = EngineDriver(process)
         return client, await client.read()
 
-    async def desktop(env, name, private=False):
+    async def desktop(env, name, private=False, plugin_helpers=False):
         command = [str(args.cli)] if private else [NODE, str(SHIM)]
-        process = await spawn([*command, 'app-server', '--listen', 'stdio://'], env, REPO)
+        enabled = str(plugin_helpers).lower()
+        # Exact current Desktop's ordinary local argv, including its global -c prefix.
+        flags = ['-c', 'features.code_mode_host=true', 'app-server', '--analytics-default-enabled',
+            '-c', f'mcp_servers.codex_app.enabled={enabled}',
+            '-c', f'mcp_servers.code-review.enabled={enabled}']
+        process = await spawn([*command, *flags], env, REPO)
         client = Rpc(process)
         metadata = await client.call('initialize', {'clientInfo': {'name': name, 'version': '0.0.0'},
                                                      'capabilities': {'experimentalApi': True}})
         assert f'/{args.expected_version} ' in metadata['userAgent'], metadata['userAgent']
         assert Path(metadata['codexHome']).resolve() == Path(env['CODEX_HOME']).resolve()
         await client.send({'method': 'initialized'})
+        if not private:
+            variants = report.setdefault('desktopStartupArgv', [])
+            if flags not in variants:
+                variants.append(flags)
         return client
 
     async def wait_records(count):
@@ -657,8 +666,12 @@ trust_level="trusted"
                 'input': [{'type': 'text', 'text': 'shared-native-question'}]}))['turn']['id']
             question = await peer.wait(lambda event: event.get('method') == 'item/tool/requestUserInput'
                                       and event['params'].get('turnId') == question_turn)
-            observer = await desktop(env, 'desktop_question_peer')
+            observer = await desktop(env, 'desktop_question_peer', plugin_helpers=True)
             await observer.call('thread/resume', {'threadId': thread, 'excludeTurns': True})
+            assert (await observer.call('server/diagnostics'))['process']['id'] == pid
+            assert len(report['desktopStartupArgv']) == 2
+            assert {flags[-1].rsplit('=', 1)[1] for flags in report['desktopStartupArgv']} == {'true', 'false'}
+            report['checks']['desktop_actual_global_config_argv_and_both_plugin_hint_variants_attach_same_native_pid'] = True
             replay = await observer.wait(lambda event: event.get('method') == 'item/tool/requestUserInput'
                                         and event['params'].get('turnId') == question_turn)
             assert replay['id'] == question['id'] and replay['params'] == question['params']
