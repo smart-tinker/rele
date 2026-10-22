@@ -35,7 +35,7 @@ jobs:
           $errors = $null
           [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $env:GITHUB_WORKSPACE 'scripts/windows/probe-desktop-package.ps1'), [ref]$tokens, [ref]$errors)
           if ($errors.Count) { throw 'Desktop inventory probe has PowerShell parse errors.' }
-          & ./scripts/windows/probe-desktop-package.ps1 -OutputDirectory (Join-Path $env:RUNNER_TEMP 'rele-desktop-package')
+          & ./scripts/windows/probe-desktop-package.ps1 -OutputDirectory (Join-Path $env:RUNNER_TEMP 'rele-desktop-package') -ProbeBackendVersion
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Keep inventory and the exact official package for follow-up verification
         if: always()

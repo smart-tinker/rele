@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [string]$OutputDirectory
+    [string]$OutputDirectory,
+    [switch]$ProbeBackendVersion
 )
 
 Set-StrictMode -Version Latest
@@ -29,6 +30,8 @@ $report = [ordered]@{
     requiredBasenamesPresent = [ordered]@{}
     declaredGuiExecutables = @(); manifestGuiExecutablePresent = $false; desktopAsarPresent = $false
     actualDesktopBundle = $false; actualDesktopGui = $false
+    backendVersionRequested = $ProbeBackendVersion.IsPresent; backendExecuted = $false
+    backendExecutable = $null; backendVersion = $null; backendExitCode = $null; backendProfileIsolated = $false
     codexOrAppExecuted = $false; appxInstalled = $false; userProfileRead = $false
     productAcceptance = $false
 }
@@ -163,12 +166,59 @@ try {
         }
         foreach ($name in $required) {
             $report.requiredBasenamesPresent[$name] = @($report.inventory | Where-Object {
-                [IO.Path]::GetFileName($_.path) -ieq $name -and $_.role -ne 'gui'
+                [IO.Path]::GetFileName($_.path) -ieq $name
             }).Count -gt 0
         }
         $report.manifestGuiExecutablePresent = @($report.inventory | Where-Object { $_.role -eq 'gui' }).Count -gt 0
         $report.desktopAsarPresent = @($report.inventory | Where-Object { $_.role -eq 'desktop-asar' }).Count -gt 0
         $report.actualDesktopBundle = $true
+        if ($ProbeBackendVersion) {
+            $report.stage = 'backend-version'
+            $failureCode = 'backend-not-in-official-bundle'
+            $backend = @($report.inventory | Where-Object { $_.path -ieq 'app/resources/codex.exe' })
+            if ($backend.Count -ne 1) { throw 'The exact Desktop resources backend is absent.' }
+            $backendPath = Join-Path $payload 'app\resources\codex.exe'
+            if ((Get-FileHash -LiteralPath $backendPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $backend[0].sha256) {
+                throw 'The extracted backend differs from the signed package inventory.'
+            }
+            $versionHome = Join-Path $root 'codex-version-profile'
+            $null = New-Item -ItemType Directory -Path $versionHome
+            $start = [Diagnostics.ProcessStartInfo]::new()
+            $start.FileName = $backendPath
+            $start.Arguments = '--version'
+            $start.WorkingDirectory = $versionHome
+            $start.UseShellExecute = $false
+            $start.CreateNoWindow = $true
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            $start.EnvironmentVariables['CODEX_HOME'] = $versionHome
+            foreach ($name in @('OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN')) { $start.EnvironmentVariables.Remove($name) }
+            $process = [Diagnostics.Process]::new()
+            $process.StartInfo = $start
+            $failureCode = 'backend-version-failed'
+            try {
+                if (-not $process.Start()) { throw 'The Desktop backend version process could not start.' }
+                $report.backendExecuted = $true
+                $report.codexOrAppExecuted = $true
+                $report.backendExecutable = 'app/resources/codex.exe'
+                $report.backendProfileIsolated = $true
+                $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+                $stderrTask = $process.StandardError.ReadToEndAsync()
+                if (-not $process.WaitForExit(20000)) {
+                    $failureCode = 'backend-version-timeout'
+                    $process.Kill()
+                    $null = $process.WaitForExit(5000)
+                    throw 'The owned backend version process exceeded its deadline.'
+                }
+                $report.backendExitCode = $process.ExitCode
+                if ($process.ExitCode -ne 0) { throw 'The Desktop backend rejected --version.' }
+                $failureCode = 'backend-version-output-unexpected'
+                if (-not $stdoutTask.Wait(2000) -or -not $stderrTask.Wait(2000)) { throw 'The version output did not close.' }
+                $match = [regex]::Match($stdoutTask.Result, '\Acodex-cli (?<version>[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?)\s*\z')
+                if (-not $match.Success -or $stdoutTask.Result.Length -gt 256 -or $stderrTask.Result.Length) { throw 'The backend did not return only a Codex CLI version.' }
+                $report.backendVersion = $match.Groups['version'].Value
+            } finally { $process.Dispose() }
+        }
         $report.result = 'passed'
         $report.stage = 'complete'
         $exitCode = 0
