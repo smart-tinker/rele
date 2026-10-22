@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { chmod, copyFile, cp, lstat, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, cp, lstat, mkdir, readFile, readdir, readlink, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -14,7 +14,7 @@ const output = path.join(root, 'release');
 const packageRoot = path.join(output, 'debian-stage');
 await rm(packageRoot, { recursive: true, force: true });
 for (const directory of ['DEBIAN', 'opt', 'usr/bin', 'usr/lib/systemd/system']) await mkdir(path.join(packageRoot, directory), { recursive: true });
-await cp(stage, path.join(packageRoot, 'opt/rele'), { recursive: true });
+await cp(stage, path.join(packageRoot, 'opt/rele'), { recursive: true, verbatimSymlinks: true });
 await copyFile(path.join(root, 'scripts/linux-service.mjs'), path.join(packageRoot, 'opt/rele/scripts/linux-service.mjs'));
 for (const file of ['rele', 'rele-codex', 'rele.service', 'rele-codex.service', 'rele-codex.timer', 'postinst', 'prerm', 'postrm']) {
   const unit = /\.(service|timer)$/u.test(file);
@@ -30,7 +30,14 @@ const pending = [packageRoot];
 while (pending.length) {
   const entry = pending.pop();
   const info = await lstat(entry);
-  if (info.isSymbolicLink()) continue;
+  if (info.isSymbolicLink()) {
+    const target = await readlink(entry);
+    const resolved = path.resolve(path.dirname(entry), target);
+    if (path.isAbsolute(target) || (resolved !== packageRoot && !resolved.startsWith(packageRoot + path.sep))) {
+      throw new Error(`Debian payload symlink escapes the package: ${path.relative(packageRoot, entry)}`);
+    }
+    continue;
+  }
   if (info.isDirectory()) {
     await chmod(entry, 0o755);
     for (const name of await readdir(entry)) pending.push(path.join(entry, name));
