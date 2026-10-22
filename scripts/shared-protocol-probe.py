@@ -520,7 +520,7 @@ trust_level="trusted"
                 await peer.completed(prior)
                 private_pid = (await peer.call('server/diagnostics'))['process']['id']
                 checked = await spawn([NODE, str(SHIM), '--rele-desktop-check'], env, REPO)
-                await asyncio.wait_for(checked.communicate(), 60)
+                await output_and_exit(checked, 60)
                 assert checked.returncode == 0
                 assert (await peer.call('server/diagnostics'))['process']['id'] == private_pid
                 report['checks']['desktop_install_preflight_defers_only_for_live_private_owner'] = True
