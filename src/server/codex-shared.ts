@@ -310,6 +310,9 @@ export async function ensureSharedCodex(target: CodexConnectionTarget, options: 
           if (selected) break;
         }
       }
+    } else if (process.platform === 'win32') {
+      // An explicitly selected Desktop may supply its own bytes, never another installation.
+      selected = await prepareDesktopCodexPackage(launch.executable, { ...options, env });
     }
     if (!selected) throw new SharedCodexError(`Для запуска общего Codex нужен полный пакет CLI или комплектная поставка Desktop ${SUPPORTED_CODEX_VERSIONS.join(' или ')}. Проверьте установку Codex; существующий сервер не заменён.`, 'shared-package-incomplete');
     launch = await resolveCodexLaunch(await resolveSharedCodexExecutable({ ...target, executable: selected }, { ...options, env }), { env });

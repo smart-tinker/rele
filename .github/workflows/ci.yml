@@ -5,103 +5,16 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      windows_desktop_native:
-        description: Verify only the actual Desktop-only native bootstrap as a standard user
-        type: boolean
-        default: false
-      windows_desktop_inventory:
-        description: Inspect only the real official Desktop MSIX package
-        type: boolean
-        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: rele-${{ github.workflow }}-${{ github.ref }}-${{ inputs.windows_desktop_native == true && 'desktop-native' || inputs.windows_desktop_inventory == true && 'desktop-inventory' || 'full' }}
+  group: rele-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  windows-desktop-inventory:
-    name: Inspect the real Desktop package (Windows)
-    if: github.event_name == 'workflow_dispatch' && inputs.windows_desktop_inventory == true
-    runs-on: windows-2025
-    timeout-minutes: 8
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - name: Parse and inspect the official Desktop package without installation
-        shell: pwsh
-        run: |
-          $tokens = $null
-          $errors = $null
-          [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $env:GITHUB_WORKSPACE 'scripts/windows/probe-desktop-package.ps1'), [ref]$tokens, [ref]$errors)
-          if ($errors.Count) { throw 'Desktop inventory probe has PowerShell parse errors.' }
-          & ./scripts/windows/probe-desktop-package.ps1 -OutputDirectory (Join-Path $env:RUNNER_TEMP 'rele-desktop-package') -ProbeBackendVersion
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Keep inventory and the exact official package for follow-up verification
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: desktop-package-inventory
-          path: |
-            ${{ runner.temp }}/rele-desktop-package/desktop-package-inventory.json
-            ${{ runner.temp }}/rele-desktop-package/downloads/**/*.msix
-            ${{ runner.temp }}/rele-desktop-package/downloads/**/*.appx
-          if-no-files-found: ignore
-          compression-level: 0
-          retention-days: 7
-
-  windows-desktop-native:
-    name: Verify Desktop-only native bootstrap (Windows)
-    if: github.event_name == 'workflow_dispatch' && inputs.windows_desktop_native == true
-    runs-on: windows-2025
-    timeout-minutes: 12
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        with:
-          node-version: 24.19.0
-          cache: npm
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: '3.13'
-      - run: npm ci
-      - run: npm run build
-      - run: python -m pip install -r scripts/protocol-requirements.txt
-      - name: Verify actual Desktop-only bootstrap without npm Codex or RDP
-        shell: pwsh
-        run: |
-          foreach ($script in @('scripts/windows/probe-desktop-package.ps1', 'scripts/windows/ci-standard-user-canary.ps1')) {
-            $tokens = $null
-            $errors = $null
-            [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $env:GITHUB_WORKSPACE $script), [ref]$tokens, [ref]$errors)
-            if ($errors.Count) { throw 'Desktop native gate has PowerShell parse errors.' }
-          }
-          $desktopRoot = Join-Path $env:RUNNER_TEMP 'desktop-native-gate'
-          & ./scripts/windows/probe-desktop-package.ps1 -OutputDirectory $desktopRoot -PrepareNativeGate
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & ./scripts/windows/ci-standard-user-canary.ps1 -RunGates -Phase Shared -DesktopBundle (Join-Path $desktopRoot 'payload') -DesktopInventory (Join-Path $desktopRoot 'desktop-package-inventory.json')
-          Copy-Item -LiteralPath windows-standard-user-results.json -Destination desktop-standard-user-results.json
-      - name: Keep the actual Desktop gate evidence
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: desktop-native-verification
-          path: |
-            ${{ runner.temp }}/desktop-native-gate/desktop-package-inventory.json
-            shared-results-actual-desktop.json
-            desktop-standard-user-results.json
-            windows-standard-user-results.json
-          if-no-files-found: ignore
-          retention-days: 14
-
   verify:
-    if: github.event_name != 'workflow_dispatch' || (inputs.windows_desktop_inventory != true && inputs.windows_desktop_native != true)
     name: Verify and package (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -140,6 +53,15 @@ jobs:
       - name: Verify bounded Windows fixture cleanup with a real file lock
         if: runner.os == 'Windows'
         run: node scripts/probe-installer-cleanup.mjs
+      - name: Verify actual Desktop-only bootstrap without npm Codex or RDP
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $desktopRoot = Join-Path $env:RUNNER_TEMP 'desktop-native-gate'
+          & ./scripts/windows/probe-desktop-package.ps1 -OutputDirectory $desktopRoot -PrepareNativeGate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./scripts/windows/ci-standard-user-canary.ps1 -RunGates -Phase Shared -DesktopBundle (Join-Path $desktopRoot 'payload') -DesktopInventory (Join-Path $desktopRoot 'desktop-package-inventory.json')
+          Copy-Item -LiteralPath windows-standard-user-results.json -Destination desktop-standard-user-results.json
       - name: Verify Windows installer and native shared gates as a standard user
         if: runner.os == 'Windows'
         shell: pwsh
@@ -195,6 +117,8 @@ jobs:
             installer-results.json
             installer-failure-results.json
             windows-standard-user-results.json
+            desktop-standard-user-results.json
+            ${{ runner.temp }}/desktop-native-gate/desktop-package-inventory.json
             installer-cleanup-probe-results.json
             installer-native-cleanup-results.json
             playwright-report/
@@ -270,7 +194,9 @@ jobs:
 
           Both installers include Node.js 24.19.0 and production dependencies. Codex discovery checks Desktop backend locations, versioned Windows CLI directories, running process metadata, and local CLI installations. Opening the installed application uses an expiring single-use login link. Existing chat bindings and saved tokens survive upgrades. Portable ZIP/TAR packages remain available.
 
-          New in rc.13: Recommended native shared Codex policy attaches to or starts one daemon in the original profile, discovers its private control socket again after restart, and preserves original conversation IDs and uncertain request UUIDs. Windows supplies immutable Desktop/interactive CLI adapters and owner-checked optional Desktop integration; Ubuntu uses an independent systemd starter/timer without a Desktop or user D-Bus session. Installer gates keep the actual native PID and an open Windows adapter connection through Rele restart/upgrade/uninstall. Exact Codex 0.163.0, alpha.10.2 and alpha.11 run raw, managed and shared native probes. Initial daemon setup requires a complete supported local Codex package. Rele does not change Codex's native updater policy; an unverified updated version blocks shared access while keeping accepted requests. Existing explicit targets require a deliberate shared-mode transition and one Quit/relaunch of a private Desktop. codex exec does not support the shared remote transport in these versions. Real Desktop GUI and phone/messenger acceptance remain open. See docs/RC13.md.
+          New in rc.14: An installed supported Windows Codex Desktop is sufficient for the first shared daemon bootstrap, without manually installing CLI. Rele validates and snapshots the five native components of one local Desktop bundle, then lets the native lifecycle install its own durable package in the original profile. A healthy daemon keeps priority. Partial bundles, source changes, escaping links, cache tampering and unknown versions fail closed. The launcher prefers the actual ChatGPT.exe GUI with compatibility for Codex.exe. Windows acceptance separately uses the backend from the signed official Desktop MSIX, no npm CLI, and preserves original thread/history and recovery; actual GUI and real phone/messenger acceptance remain open. No dependencies or database migration. See docs/RC14.md.
+
+          Previously in rc.13: Recommended native shared Codex policy attaches to or starts one daemon in the original profile, discovers its private control socket again after restart, and preserves original conversation IDs and uncertain request UUIDs. Windows supplies immutable Desktop/interactive CLI adapters and owner-checked optional Desktop integration; Ubuntu uses an independent systemd starter/timer without a Desktop or user D-Bus session. Installer gates keep the actual native PID and an open Windows adapter connection through Rele restart/upgrade/uninstall. Exact Codex 0.163.0, alpha.10.2 and alpha.11 run raw, managed and shared native probes. Initial daemon setup requires a complete supported local Codex package. Rele does not change Codex's native updater policy; an unverified updated version blocks shared access while keeping accepted requests. Existing explicit targets require a deliberate shared-mode transition and one Quit/relaunch of a private Desktop. codex exec does not support the shared remote transport in these versions. Real Desktop GUI and phone/messenger acceptance remain open. See docs/RC13.md.
 
           Previously in rc.12: Source-first Telegram/Slack tabs map discovered chats and threads to named Codex conversations. Separate per-source off/mention/all access defaults new sources to off, preserves legacy restrictions until an explicit change, and requires human-only DM allowlists. Per-source automatic creation and explicit recovery protect already accepted messages. SQLite migrates v5 to v6; back up before upgrading and use a compatible pre-v6 backup for rollback. Limited diagnostics runs before config loading and reads only the instance marker and public loopback health, without config/DPAPI/database/history access. Real Windows/Defender and messenger acceptance remain open. See docs/RC12.md.
 

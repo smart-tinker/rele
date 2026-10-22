@@ -136,6 +136,36 @@ describe('native shared Codex lifecycle', () => {
     expect(target).toEqual(before);
   });
 
+  it.skipIf(process.platform !== 'win32').each(['complete', 'partial'])('keeps an explicit %s Desktop bound to only its selected bundle', async completeness => {
+    const f = await fixture(), desktop = await desktopFixture(path.join(f.home, 'selected-desktop'));
+    const alternate = await desktopFixture(path.join(f.home, 'other-desktop'));
+    await writeFile(desktop, 'synthetic-explicit-selected-native');
+    const full = await packageFixture(path.join(f.home, 'other-cli'));
+    f.discovery.recommendedManaged = { ...f.target, executable: full, transport: 'managed' };
+    f.discovery.installations.push(
+      { executable: alternate, name: 'Other Desktop', source: 'desktop-install', version: '0.163.0', running: false },
+      { executable: full, name: 'Other CLI', source: 'path', version: '0.163.0', running: false },
+    );
+    f.run.mockImplementation(async (_command, args) => ({ code: args.at(-1) === 'version' ? 1 : 0,
+      stdout: args.at(-1) === '--version' ? 'codex-cli 0.163.0' : JSON.stringify({ ...f.daemon, status: 'started' }) }));
+    const target = { ...f.target, executable: desktop }, before = structuredClone(target);
+    if (completeness === 'partial') {
+      await rm(path.join(path.dirname(desktop), 'rg.exe'));
+      await expect(ensureSharedCodex(target, f.options)).rejects.toMatchObject({ code: 'shared-package-incomplete' });
+      expect(f.run.mock.calls.some(([, args]) => args.at(-1) === 'start')).toBe(false);
+      await expect(readdir(f.env.RELE_DATA_DIR)).rejects.toMatchObject({ code: 'ENOENT' });
+    } else {
+      expect(await ensureSharedCodex(target, f.options)).toMatchObject({ transport: 'proxy', codexHome: f.home });
+      const starts = f.run.mock.calls.filter(([, args]) => args.at(-1) === 'start');
+      expect(starts).toHaveLength(1);
+      expect(await readFile(starts[0][0], 'utf8')).toBe('synthetic-explicit-selected-native');
+    }
+    expect(f.run.mock.calls.some(([command]) => command === alternate || command === full)).toBe(false);
+    expect(f.discover).toHaveBeenCalledTimes(1);
+    expect(f.discover).toHaveBeenCalledWith(expect.objectContaining({ processesOnly: true }));
+    expect(target).toEqual(before);
+  });
+
   it.each(['read-only', 'healthy'])('keeps Desktop package preparation out of %s resolution', async operation => {
     const f = await fixture(), desktop = await desktopFixture(path.join(f.home, 'desktop'));
     f.discovery.recommendedManaged = { ...f.target, executable: desktop, transport: 'managed' };
