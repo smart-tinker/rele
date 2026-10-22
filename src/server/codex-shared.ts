@@ -318,7 +318,16 @@ export async function ensureSharedCodex(target: CodexConnectionTarget, options: 
     launch = await resolveCodexLaunch(await resolveSharedCodexExecutable({ ...target, executable: selected }, { ...options, env }), { env });
   }
   // Native singleton locks and liveness checks own stale-socket recovery.
+  const deadline = Date.now() + timeoutMs;
   const started = await run(launch.command, [...launch.args, 'app-server', 'daemon', 'start'], timeoutMs, env);
-  if (started.code !== 0) throw new SharedCodexError('Не удалось запустить штатный общий daemon Codex. Проверьте выбранный CLI и профиль; Rele повторит подключение.', 'shared-daemon-unavailable');
+  if (started.code !== 0) {
+    // A failed control command can still leave the native daemon becoming ready.
+    while (Date.now() < deadline) {
+      const current = await run(launch.command, [...launch.args, 'app-server', 'daemon', 'version'], Math.max(1, deadline - Date.now()), env);
+      if (current.code === 0) return validate(current, ['running']);
+      if (Date.now() < deadline) await delay(Math.min(250, deadline - Date.now()));
+    }
+    throw new SharedCodexError('Не удалось запустить штатный общий daemon Codex. Проверьте выбранный CLI и профиль; Rele повторит подключение.', 'shared-daemon-unavailable');
+  }
   return validate(started, ['started', 'alreadyRunning']);
 }

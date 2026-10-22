@@ -413,14 +413,50 @@ describe('native shared Codex lifecycle', () => {
     expect(f.run).toHaveBeenCalledTimes(1);
   });
 
+  it('reconciles a failed native start with delayed readiness without starting twice', async () => {
+    const f = await fixture();
+    f.target.executable = await packageFixture(path.join(f.home, 'source-package'));
+    let startAttempted = false, versionCalls = 0;
+    f.run.mockImplementation(async (_command, args) => {
+      if (args.at(-1) === '--version') return { code: 0, stdout: 'codex-cli 0.163.0' };
+      if (args.at(-1) === 'start') { startAttempted = true; return { code: 1, stdout: 'synthetic-private-error' }; }
+      return startAttempted && ++versionCalls === 2 ? { code: 0, stdout: JSON.stringify(f.daemon) } : { code: 1, stdout: '' };
+    });
+    await expect(ensureSharedCodex(f.target, f.options)).resolves.toMatchObject({ transport: 'proxy', endpoint: f.socketPath, codexHome: f.home });
+    expect(f.run.mock.calls.map(([, args]) => args.at(-1))).toEqual(['--version', 'version', 'start', 'version', 'version']);
+    expect(f.run.mock.calls.at(-1)![2]).toBeLessThan(15_000);
+  });
+
+  it.each(['profile', 'version', 'json'])('rejects an invalid %s readiness receipt after failed startup', async field => {
+    const f = await fixture();
+    f.target.executable = await packageFixture(path.join(f.home, 'source-package'));
+    f.run.mockResolvedValueOnce({ code: 0, stdout: 'codex-cli 0.163.0' })
+      .mockResolvedValueOnce({ code: 1, stdout: '' }).mockResolvedValueOnce({ code: 1, stdout: '' })
+      .mockResolvedValue({ code: 0, stdout: field === 'json' ? 'synthetic-private-error' : JSON.stringify({ ...f.daemon,
+        ...(field === 'profile' ? { socketPath: path.join(path.dirname(f.home), 'foreign', 'control.sock') } : { managedCodexVersion: '0.164.0' }) }) });
+    const error = await ensureSharedCodex(f.target, f.options).catch(error => error);
+    expect(error).toMatchObject({ code: field === 'profile' ? 'shared-profile-mismatch' : 'shared-daemon-invalid' });
+    expect(error.message).not.toContain('synthetic-private');
+    expect(f.run.mock.calls).toHaveLength(4);
+  });
+
   it('keeps native startup failures sanitized without fallback to another runtime', async () => {
     const f = await fixture();
     f.target.executable = await packageFixture(path.join(f.home, 'source-package'));
     f.run.mockResolvedValueOnce({ code: 0, stdout: 'codex-cli 0.163.0' }).mockResolvedValue({ code: 1, stdout: 'synthetic-private-error' });
-    const error = await ensureSharedCodex(f.target, f.options).catch(error => error);
+    const error = await ensureSharedCodex(f.target, { ...f.options, timeoutMs: 20 }).catch(error => error);
     expect(error).toMatchObject({ code: 'shared-daemon-unavailable' });
     expect(error.message).not.toContain('synthetic-private');
     expect(f.run.mock.calls.filter(([, args]) => args.at(-1) === 'start')).toHaveLength(1);
+  });
+
+  it('does not extend the native start budget for readiness readback', async () => {
+    const f = await fixture();
+    f.target.executable = await packageFixture(path.join(f.home, 'source-package'));
+    f.run.mockResolvedValueOnce({ code: 0, stdout: 'codex-cli 0.163.0' }).mockResolvedValueOnce({ code: 1, stdout: '' })
+      .mockImplementationOnce(async () => { await new Promise(resolve => setTimeout(resolve, 10)); return { code: 1, stdout: '' }; });
+    await expect(ensureSharedCodex(f.target, { ...f.options, timeoutMs: 5 })).rejects.toMatchObject({ code: 'shared-daemon-unavailable' });
+    expect(f.run.mock.calls.map(([, args]) => args.at(-1))).toEqual(['--version', 'version', 'start']);
   });
 
   it('bounds and sanitizes real synthetic command output without reading native auth or history', async () => {
