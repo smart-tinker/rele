@@ -471,8 +471,12 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
                 await asyncio.gather(pump, return_exceptions=True)
 
     async def scenario(order):
-        directory = root / order
+        # Keep fixture paths below the native Windows AF_UNIX SUN_LEN limit.
+        directory = root / {'rele-first': 'r', 'desktop-first': 'f', 'desktop-bundle': 'd'}[order]
         home, workspace = directory / 'c', directory / 'w'
+        if os.name == 'nt':
+            assert len(str(home / 'app-server-control/app-server-control.sock').encode('utf-8')) < 108, \
+                'Windows native socket path must be shorter than 108 UTF-8 bytes; use a shorter RUNNER_TEMP.'
         home.mkdir(parents=True)
         workspace.mkdir()
         scenario_config = config
