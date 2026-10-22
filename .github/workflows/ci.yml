@@ -6,6 +6,10 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      windows_desktop_native:
+        description: Verify only the actual Desktop-only native bootstrap as a standard user
+        type: boolean
+        default: false
       windows_desktop_inventory:
         description: Inspect only the real official Desktop MSIX package
         type: boolean
@@ -15,7 +19,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: rele-${{ github.workflow }}-${{ github.ref }}-${{ inputs.windows_desktop_inventory == true && 'desktop-inventory' || 'full' }}
+  group: rele-${{ github.workflow }}-${{ github.ref }}-${{ inputs.windows_desktop_native == true && 'desktop-native' || inputs.windows_desktop_inventory == true && 'desktop-inventory' || 'full' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -50,8 +54,54 @@ jobs:
           compression-level: 0
           retention-days: 7
 
+  windows-desktop-native:
+    name: Verify Desktop-only native bootstrap (Windows)
+    if: github.event_name == 'workflow_dispatch' && inputs.windows_desktop_native == true
+    runs-on: windows-2025
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24.19.0
+          cache: npm
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.13'
+      - run: npm ci
+      - run: npm run build
+      - run: python -m pip install -r scripts/protocol-requirements.txt
+      - name: Verify actual Desktop-only bootstrap without npm Codex or RDP
+        shell: pwsh
+        run: |
+          foreach ($script in @('scripts/windows/probe-desktop-package.ps1', 'scripts/windows/ci-standard-user-canary.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $env:GITHUB_WORKSPACE $script), [ref]$tokens, [ref]$errors)
+            if ($errors.Count) { throw 'Desktop native gate has PowerShell parse errors.' }
+          }
+          $desktopRoot = Join-Path $env:RUNNER_TEMP 'desktop-native-gate'
+          & ./scripts/windows/probe-desktop-package.ps1 -OutputDirectory $desktopRoot -PrepareNativeGate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./scripts/windows/ci-standard-user-canary.ps1 -RunGates -Phase Shared -DesktopBundle (Join-Path $desktopRoot 'payload') -DesktopInventory (Join-Path $desktopRoot 'desktop-package-inventory.json')
+          Copy-Item -LiteralPath windows-standard-user-results.json -Destination desktop-standard-user-results.json
+      - name: Keep the actual Desktop gate evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: desktop-native-verification
+          path: |
+            ${{ runner.temp }}/desktop-native-gate/desktop-package-inventory.json
+            shared-results-actual-desktop.json
+            desktop-standard-user-results.json
+            windows-standard-user-results.json
+          if-no-files-found: ignore
+          retention-days: 14
+
   verify:
-    if: github.event_name != 'workflow_dispatch' || inputs.windows_desktop_inventory != true
+    if: github.event_name != 'workflow_dispatch' || (inputs.windows_desktop_inventory != true && inputs.windows_desktop_native != true)
     name: Verify and package (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45

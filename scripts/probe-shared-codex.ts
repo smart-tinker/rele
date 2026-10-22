@@ -12,7 +12,7 @@ import type { Endpoint, Platform, SlackTranscriptMessage } from '../src/shared/t
 
 const { values } = parseArgs({ options: {
   executable: { type: 'string' }, home: { type: 'string' }, directory: { type: 'string' },
-  thread: { type: 'string' }, prepare: { type: 'boolean' }, 'profile-socket': { type: 'string' },
+  thread: { type: 'string' }, prepare: { type: 'boolean' }, 'profile-socket': { type: 'string' }, 'expect-error': { type: 'string' },
 } });
 if (!values.executable || !values.home || !values.directory || !process.env.RELE_DATA_DIR) throw new Error('Missing isolated fixture paths');
 const config = { ...structuredClone(defaultConfig), codex: {
@@ -21,7 +21,14 @@ const config = { ...structuredClone(defaultConfig), codex: {
 const saved = new ConfigStore(defaultDataDirectory());
 await saved.load();
 await saved.save(config);
-if (values['profile-socket']) {
+if (values['expect-error']) {
+  const client = new CodexClient(config.codex);
+  try { await client.connect(); } catch { /* Assert the exact production fence below. */ }
+  const status = client.status();
+  await client.close();
+  if (status.connected || status.errorCode !== values['expect-error']) throw new Error('Expected production shared owner fence was not observed');
+  process.stdout.write(JSON.stringify({ expectedError: status.errorCode, disconnected: true }) + '\n');
+} else if (values['profile-socket']) {
   // Test-only resolver fault: the real native initialize response must still fence another profile.
   const client = new CodexClient(config.codex, { shared: async target => ({
     ...target, transport: 'proxy', endpoint: values['profile-socket']!,
@@ -90,7 +97,7 @@ if (values['profile-socket']) {
   }
   async function snapshot() {
     if (!codex) throw new Error('Client is closed');
-    return { threadId, status: codex.status(), runtime: codex.runtimeInfo(), runtimeProcessId: (await codex.diagnostics()).process.id,
+    return { threadId, configuredExecutable: config.codex.executable, status: codex.status(), runtime: codex.runtimeInfo(), runtimeProcessId: (await codex.diagnostics()).process.id,
       droppedQueueAcks, catalogValidated, requests: store.listRequests(), deliveries: store.listDeliveries(), approvals: store.listApprovals(), diagnostics };
   }
   const input = createInterface({ input: process.stdin });

@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$OutputDirectory,
-    [switch]$ProbeBackendVersion
+    [switch]$ProbeBackendVersion,
+    [switch]$PrepareNativeGate
 )
 
 Set-StrictMode -Version Latest
@@ -30,7 +31,8 @@ $report = [ordered]@{
     requiredBasenamesPresent = [ordered]@{}
     declaredGuiExecutables = @(); manifestGuiExecutablePresent = $false; desktopAsarPresent = $false
     actualDesktopBundle = $false; actualDesktopGui = $false
-    backendVersionRequested = $ProbeBackendVersion.IsPresent; backendExecuted = $false
+    nativeGatePrepared = $false; nativeGatePayloadDirectory = $null
+    backendVersionRequested = ($ProbeBackendVersion.IsPresent -or $PrepareNativeGate.IsPresent); backendExecuted = $false
     backendExecutable = $null; backendVersion = $null; backendExitCode = $null; backendProfileIsolated = $false
     codexOrAppExecuted = $false; appxInstalled = $false; userProfileRead = $false
     productAcceptance = $false
@@ -148,7 +150,7 @@ try {
                 path = $relative; size = $entry.Length; role = $(if ($isGui) { 'gui' } elseif ($isAsar) { 'desktop-asar' } else { 'backend-or-helper' })
                 sha256 = $null; fileVersion = $null; productVersion = $null; packageVersion = $null
             }
-            if (-not $isAsar) {
+            if (-not $isAsar -or $PrepareNativeGate) {
                 $destination = Join-Path $payload $relative.Replace('/', '\')
                 $null = New-Item -ItemType Directory -Force -Path ([IO.Path]::GetDirectoryName($destination))
                 [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $destination, $false)
@@ -172,7 +174,7 @@ try {
         $report.manifestGuiExecutablePresent = @($report.inventory | Where-Object { $_.role -eq 'gui' }).Count -gt 0
         $report.desktopAsarPresent = @($report.inventory | Where-Object { $_.role -eq 'desktop-asar' }).Count -gt 0
         $report.actualDesktopBundle = $true
-        if ($ProbeBackendVersion) {
+        if ($ProbeBackendVersion -or $PrepareNativeGate) {
             $report.stage = 'backend-version'
             $failureCode = 'backend-not-in-official-bundle'
             $backend = @($report.inventory | Where-Object { $_.path -ieq 'app/resources/codex.exe' })
@@ -218,6 +220,15 @@ try {
                 if (-not $match.Success -or $stdoutTask.Result.Length -gt 256 -or $stderrTask.Result.Length) { throw 'The backend did not return only a Codex CLI version.' }
                 $report.backendVersion = $match.Groups['version'].Value
             } finally { $process.Dispose() }
+        }
+        if ($PrepareNativeGate) {
+            if (-not $report.desktopAsarPresent -or -not $report.manifestGuiExecutablePresent) { throw 'The real Desktop resources are incomplete.' }
+            foreach ($name in $required | Where-Object { $_ -ne 'codex-package.json' }) {
+                if (-not $report.requiredBasenamesPresent[$name]) { throw 'A required real Desktop helper is absent.' }
+            }
+            if ($report.requiredBasenamesPresent['codex-package.json']) { throw 'The Desktop gate must start without a prepared native manifest.' }
+            $report.nativeGatePrepared = $true
+            $report.nativeGatePayloadDirectory = $payload
         }
         $report.result = 'passed'
         $report.stage = 'complete'
