@@ -869,7 +869,10 @@ describe('Codex managed runtime', () => {
 
   it.each([
     ['0.163.0-alpha.10.2', true],
+    ['0.163.0-alpha.11.2', true],
     ['0.163.0-alpha.10.3', false],
+    ['0.163.0-alpha.11.3', false],
+    ['0.163.0-alpha.11.2.extra', false],
     ['0.163.0-alpha.10.2.extra', false],
     ['0.163.0+custom', false],
   ])('keeps the complete runtime version %s in the exact write gate', async (version, verified) => {

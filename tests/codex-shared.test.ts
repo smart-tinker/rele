@@ -123,12 +123,12 @@ describe('local Desktop native package preparation', () => {
 });
 
 describe('native shared Codex lifecycle', () => {
-  it.skipIf(process.platform !== 'win32')('starts from an installed Desktop alone using its snapshot and the original profile', async () => {
+  it.skipIf(process.platform !== 'win32').each(['0.163.0', '0.163.0-alpha.11.2'])('starts from an installed Desktop %s alone using its snapshot and the original profile', async version => {
     const f = await fixture(), desktop = await desktopFixture(path.join(f.home, 'desktop'));
     f.discovery.recommendedManaged = { ...f.target, executable: desktop, transport: 'managed' };
-    f.discovery.installations.push({ executable: desktop, name: 'Desktop', source: 'desktop-install', version: '0.163.0', running: false });
+    f.discovery.installations.push({ executable: desktop, name: 'Desktop', source: 'desktop-install', version, running: false });
     f.run.mockImplementation(async (_command, args) => ({ code: args.at(-1) === 'version' ? 1 : 0,
-      stdout: args.at(-1) === '--version' ? 'codex-cli 0.163.0' : JSON.stringify({ ...f.daemon, status: 'started' }) }));
+      stdout: args.at(-1) === '--version' ? `codex-cli ${version}` : JSON.stringify({ ...f.daemon, managedCodexVersion: version, status: 'started' }) }));
     const target = { ...f.target, executable: 'codex' }, before = structuredClone(target);
     expect(await ensureSharedCodex(target, f.options)).toMatchObject({ transport: 'proxy', codexHome: f.home, endpoint: f.socketPath });
     const starts = f.run.mock.calls.filter(([, args]) => args.at(-1) === 'start');

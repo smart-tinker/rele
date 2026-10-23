@@ -119,7 +119,7 @@ if ($Mode -eq 'Child') {
                 & $marker.node (Join-Path $sourceRoot 'scripts\probe-installer-cleanup.mjs') --native
                 if ($LASTEXITCODE -ne 0) { throw 'The standard-user native stop/workdir cleanup gate failed.' }
                 $evidence.gates += 'native-cleanup'
-                $versions = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11')
+                $versions = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2')
                 for ($index = 0; $index -lt $versions.Count; $index++) {
                     $version = $versions[$index]; $evidence.stage = 'shared-' + $version
                     & $marker.python (Join-Path $sourceRoot 'scripts\shared-protocol-probe.py') --codex-prefix $marker.prefixes[$index] --expected-version $version --report (Join-Path $env:RELE_TEST_REPORT_DIR ('shared-results-' + $version + '.json'))
@@ -234,11 +234,11 @@ try {
                 if (-not $path.StartsWith($runnerRoot, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $path)) { throw 'Desktop gate inputs must be existing paths under this disposable RUNNER_TEMP.' }
             }
             $inventory = Get-Content -LiteralPath $marker.desktopInventory -Raw | ConvertFrom-Json
-            if ($inventory.result -ne 'passed' -or $inventory.nativeGatePrepared -ne $true -or $inventory.package.signature.status -ne 'Valid' -or $inventory.backendVersion -notin @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11')) { throw 'The actual Desktop inventory is not a successful signed and versioned preparation.' }
+            if ($inventory.result -ne 'passed' -or $inventory.nativeGatePrepared -ne $true -or $inventory.package.signature.status -ne 'Valid' -or $inventory.backendVersion -notin @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2')) { throw 'The actual Desktop inventory is not a successful signed and versioned preparation.' }
             $marker.desktopVersion = $inventory.backendVersion
             $desktopReadPaths = @($marker.desktopBundle, (Split-Path $marker.desktopInventory))
         } else {
-            $marker.prefixes = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11') | ForEach-Object { Join-Path $env:RUNNER_TEMP ('codex-probe-' + $_) }
+            $marker.prefixes = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2') | ForEach-Object { Join-Path $env:RUNNER_TEMP ('codex-probe-' + $_) }
         }
         $portableShellPaths = if ($StandaloneShared) { @((Split-Path $shell)) } else { @() }
         foreach ($path in (@((Split-Path $marker.node), (Split-Path $marker.python)) + $marker.prefixes + $desktopReadPaths + $portableShellPaths)) {
@@ -466,7 +466,7 @@ try {
         { if ($user) { Remove-FixtureProfile $user.SID.Value $profileCleanupFacts } },
         { if ($user) { Remove-LocalUser -SID $user.SID } },
         { if ($RunGates) {
-            foreach ($name in @('installer-results.json', 'installer-failure-results.json', 'installer-native-cleanup-results.json', 'shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json', 'shared-results-actual-desktop.json')) { $report = Join-Path $FixtureRoot ('reports\' + $name); if (Test-Path -LiteralPath $report) { Copy-Item -LiteralPath $report -Destination (Join-Path $sourceRoot $name) } }
+            foreach ($name in @('installer-results.json', 'installer-failure-results.json', 'installer-native-cleanup-results.json', 'shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json', 'shared-results-0.163.0-alpha.11.2.json', 'shared-results-actual-desktop.json')) { $report = Join-Path $FixtureRoot ('reports\' + $name); if (Test-Path -LiteralPath $report) { Copy-Item -LiteralPath $report -Destination (Join-Path $sourceRoot $name) } }
             $stdout = Join-Path $FixtureRoot 'stdout.log'
             if (Test-Path -LiteralPath $stdout) {
                 $allowed = @('Windows installer smoke: an unknown startup script is preserved', 'Windows installer smoke: a previous portable process is not killed', 'Windows installer smoke: foreign Desktop settings are preserved without blocking installation', 'Windows installer smoke: the Codex wrapper preserves argv, profile, data and raw bytes', 'Windows installer smoke: launcher restart', 'Windows installer smoke: same-version upgrade with backup', 'Windows installer smoke: owned Desktop settings restore and later foreign changes survive uninstall', 'Windows installer smoke: uninstall preserves data', 'Windows installer cleanup: desktop-environment', 'Windows installer cleanup: held-adapter', 'Windows installer cleanup: native-daemon', 'Windows installer cleanup: files', 'Windows installer cleanup: complete')

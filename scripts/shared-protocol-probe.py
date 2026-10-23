@@ -21,7 +21,7 @@ import uuid
 
 from aiohttp import web
 
-VERSIONS = ['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11']
+VERSIONS = ['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2']
 REPO = Path(__file__).resolve().parent.parent
 NODE = shutil.which('node')
 DRIVER = REPO / 'scripts/probe-shared-codex.ts'
