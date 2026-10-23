@@ -9,6 +9,7 @@ import WebSocket from 'ws';
 import { ConfigStore, defaultDataDirectory } from './config.js';
 import { codexEnvironment, fileExists, environmentValue, resolveCodexLaunch } from './codex-launch.js';
 import { ensureSharedCodex, SharedCodexError, resolveSharedCodexExecutable } from './codex-shared.js';
+import { setupSharedCodex } from './codex-setup.js';
 import { discoverCodex } from './codex-discovery.js';
 import type { CodexConnectionTarget, CodexDiscoveryResult } from '../shared/types.js';
 
@@ -114,11 +115,12 @@ function appServerInvocation(args: string[]): { index: number; unknownPrefix: bo
   return args[index]?.startsWith('-') && candidate !== -1 ? { index: candidate, unknownPrefix: true } : undefined;
 }
 
-export function shimMode(args: string[]): 'daemon' | 'stdio' | 'interactive' | 'desktop' | 'desktop-check' | 'unsupported' | 'passthrough' {
+export function shimMode(args: string[]): 'daemon' | 'stdio' | 'interactive' | 'desktop' | 'desktop-check' | 'desktop-setup' | 'unsupported' | 'passthrough' {
   if (['exec', 'e', 'x'].includes(args[0])) return 'unsupported';
   if (args[0] === '--rele-daemon-start') return 'daemon';
   if (args[0] === '--rele-desktop') return 'desktop';
   if (args[0] === '--rele-desktop-check') return 'desktop-check';
+  if (args[0] === '--rele-desktop-setup') return 'desktop-setup';
   if (args[0] === '--rele-cli') return 'interactive';
   const server = appServerInvocation(args);
   if (server && (server.unknownPrefix || !args[server.index + 1] || args[server.index + 1].startsWith('-'))) return 'stdio';
@@ -238,6 +240,19 @@ async function main(args: string[]): Promise<void> {
   if (mode === 'unsupported') throw new CodexShimError('codex exec не поддерживает общий --remote в этой версии. Используйте интерактивный общий Codex CLI.');
   const requireCodeModeHost = mode === 'desktop-check' || mode === 'stdio' && validateStdioFlags(args);
   const config = new ConfigStore(defaultDataDirectory());
+  if (mode === 'desktop-setup') {
+    await setupSharedCodex(config, async (candidate, env) => {
+      let target: CodexConnectionTarget;
+      try { target = await ensureSharedCodex(candidate, { env }); }
+      catch (error) {
+        // The one allowed Quit releases the private Desktop; ordinary launch checks again.
+        if (error instanceof SharedCodexError && error.code === 'shared-desktop-conflict') return;
+        throw error;
+      }
+      await verifyDesktopConnection(await resolveCodexLaunch(target.executable, { env }), target, env);
+    });
+    return;
+  }
   try { await config.load(); }
   catch { throw new CodexShimError('Не удалось прочитать защищённые настройки Rele. Подключение Desktop не проверено; откройте Rele под владельцем установки.'); }
   // An explicit old endpoint is never silently replaced by a second owner.

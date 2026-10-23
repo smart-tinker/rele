@@ -22,6 +22,7 @@ internal static class Rele
         public string CodexHome { get; set; }
         public string OwnerSid { get; set; }
         public bool DesktopIntegrationOwned { get; set; }
+        public bool? DesktopIntegrationRequested { get; set; }
         public string PreviousCodexCliPath { get; set; }
         public string PreviousForceCli { get; set; }
         public string DesktopIntegrationWarning { get; set; }
@@ -49,7 +50,7 @@ internal static class Rele
         {
             for (int i = 1; i < args.Length; i++)
             {
-                if (args[i] == "--quiet" || args[i] == "--backup" || args[i] == "--desktop-integration") options.Add(args[i], "true");
+                if (args[i] == "--quiet" || args[i] == "--backup" || args[i] == "--desktop-integration" || args[i] == "--prepare-codex") options.Add(args[i], "true");
                 else if (Array.IndexOf(new[] { "--app-dir", "--data-dir", "--task-name", "--port", "--codex-home", "--error-file", "--warning-file", "--path-file" }, args[i]) >= 0 && i + 1 < args.Length)
                     options.Add(args[i], args[++i]);
                 else throw new InvalidOperationException("Неизвестный параметр Rele.");
@@ -72,6 +73,7 @@ internal static class Rele
                 throw new InvalidOperationException("Обновление должно использовать прежние каталог данных и фоновую задачу Rele.");
             if (!String.IsNullOrEmpty(Config.OwnerSid) && Config.OwnerSid != currentUser.Value)
                 throw new InvalidOperationException("Эта установка Rele принадлежит другой учётной записи Windows.");
+            bool ownedSettings = File.Exists(settingsPath) && Config.OwnerSid == currentUser.Value;
             Config.OwnerSid = currentUser.Value;
             Config.DataDirectory = Path.GetFullPath(Value(options, "--data-dir", Config.DataDirectory));
             Config.TaskName = Value(options, "--task-name", Config.TaskName);
@@ -82,12 +84,19 @@ internal static class Rele
             if (SamePath(Config.DataDirectory, AppDirectory) || Config.DataDirectory.StartsWith(AppDirectory.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("Каталог данных должен находиться вне каталога программы, чтобы удаление Rele сохранило данные.");
 
+            if (command == "desktop-choice")
+            {
+                if (!options.ContainsKey("--path-file")) throw new InvalidOperationException("Укажите файл результата desktop-choice.");
+                string choice = ownedSettings && Config.DesktopIntegrationRequested.HasValue ? (Config.DesktopIntegrationRequested.Value ? "on" : "off") : String.Empty;
+                File.WriteAllText(options["--path-file"], choice, new UTF8Encoding(false));
+                return 0;
+            }
             if (command == "serve") return RunNode("serve", true);
             if (command == "desktop-check")
             {
                 if (!File.Exists(settingsPath) || !options.ContainsKey("--error-file"))
                     throw new InvalidOperationException("Проверка Desktop требует существующую установку и файл результата.");
-                RunNode("--rele-desktop-check", false, true);
+                RunNode(options.ContainsKey("--prepare-codex") ? "--rele-desktop-setup" : "--rele-desktop-check", false, true);
                 // An empty receipt distinguishes successful completion from a task that never ran.
                 File.WriteAllText(options["--error-file"], String.Empty, new UTF8Encoding(false));
                 return 0;
@@ -112,7 +121,9 @@ internal static class Rele
             if (command == "desktop-integrate" || command == "desktop-unintegrate")
             {
                 if (!File.Exists(settingsPath)) throw new InvalidOperationException("Сначала установите Rele.");
-                try { if (command == "desktop-integrate") InstallDesktopIntegration(); else RemoveDesktopIntegration(); }
+                Config.DesktopIntegrationRequested = command == "desktop-integrate";
+                try { if (command == "desktop-integrate") InstallDesktopIntegration(false); else RemoveDesktopIntegration(); }
+                catch (Exception error) { Config.DesktopIntegrationWarning = error.Message; throw; }
                 finally { File.WriteAllText(settingsPath, Json.Serialize(Config), new UTF8Encoding(false)); }
                 return 0;
             }
@@ -130,13 +141,14 @@ internal static class Rele
                 if (!File.Exists(settingsPath) && !options.ContainsKey("--codex-home") && legacy != null && legacy.CodexHome != null)
                     Config.CodexHome = legacy.CodexHome;
                 Directory.CreateDirectory(AppDirectory);
+                Config.DesktopIntegrationRequested = options.ContainsKey("--desktop-integration");
                 PrepareDesktopAdapter();
                 File.WriteAllText(settingsPath, Json.Serialize(Config), new UTF8Encoding(false));
                 if (options.ContainsKey("--backup")) Backup();
                 Config.DesktopIntegrationWarning = null;
                 if (options.ContainsKey("--desktop-integration"))
                 {
-                    try { InstallDesktopIntegration(); }
+                    try { InstallDesktopIntegration(true); }
                     catch (Exception error)
                     {
                         Config.DesktopIntegrationWarning = error.Message;
@@ -502,7 +514,7 @@ internal static class Rele
         return task;
     }
 
-    private static void CheckDesktopIntegration()
+    private static void CheckDesktopIntegration(bool prepareCodex)
     {
         uint flags;
         if (!GetProcessMitigationPolicy(new IntPtr(-1), 16, out flags, new UIntPtr(4)))
@@ -511,7 +523,7 @@ internal static class Rele
             if (error != 87) throw new InvalidOperationException("Не удалось проверить защиту процесса Windows (" + error + ").");
             flags = 0; // Older Windows versions do not support this mitigation policy.
         }
-        if ((flags & 1) == 0) { RunNode("--rele-desktop-check", false, true); return; }
+        if ((flags & 1) == 0) { RunNode(prepareCodex ? "--rele-desktop-setup" : "--rele-desktop-check", false, true); return; }
 
         // Inno's inherited RedirectionGuard blocks Codex's per-user current junction.
         // Keep the installer protected; Task Scheduler starts only this Desktop check outside its process tree.
@@ -530,6 +542,7 @@ internal static class Rele
         dynamic folder = TaskFolder();
         string receipt = Path.Combine(directory, "result.txt");
         string arguments = "desktop-check --quiet --error-file \"" + receipt + "\"";
+        if (prepareCodex) arguments += " --prepare-codex";
         // Scheduler does not inherit the installer's environment: keep this check on its original profile.
         string home = Config.CodexHome;
         if (String.IsNullOrEmpty(home)) home = Environment.GetEnvironmentVariable("CODEX_HOME");
@@ -591,10 +604,10 @@ internal static class Rele
         }
     }
 
-    private static void InstallDesktopIntegration()
+    private static void InstallDesktopIntegration(bool prepareCodex)
     {
         ValidateDesktopIntegration();
-        try { CheckDesktopIntegration(); }
+        try { CheckDesktopIntegration(prepareCodex); }
         catch (Exception error)
         {
             // A failed upgrade must not leave our unusable adapter as Desktop's default.
@@ -603,6 +616,7 @@ internal static class Rele
             throw;
         }
         PrepareDesktopAdapter();
+        ValidateDesktopIntegration();
         string cli = UserEnvironment("CODEX_CLI_PATH"), force = UserEnvironment("CODEX_APP_SERVER_FORCE_CLI");
         if (!Config.DesktopIntegrationOwned)
         {
@@ -682,7 +696,7 @@ internal static class Rele
                 else lock (errors) { if (errors.Length < 4000) errors.AppendLine(line.Data); }
             };
             process.Start();
-            using (var job = background || command == "--rele-desktop-check" ? new ChildJob(process) : null)
+            using (var job = background || command == "--rele-desktop-check" || command == "--rele-desktop-setup" ? new ChildJob(process) : null)
             {
                 process.BeginOutputReadLine(); process.BeginErrorReadLine();
                 if (background) process.WaitForExit();

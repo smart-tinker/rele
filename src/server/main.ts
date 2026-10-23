@@ -1,7 +1,7 @@
 import { readFile, writeFile, mkdir, rm, copyFile, chmod, stat, realpath, readdir, rename } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createServer } from 'node:net';
+import { acquireGatewayLock } from './gateway-lock.js';
 import { ConfigStore, defaultDataDirectory, type AppConfig } from './config.js';
 import { Store } from './store.js';
 import { CodexClient } from './codex.js';
@@ -53,13 +53,7 @@ async function main(): Promise<void> {
 
   const port = Number(process.env.RELE_PORT ?? 3210);
   if (!Number.isSafeInteger(port) || port < 0 || port > 65535) throw new Error('RELE_PORT должен быть от 0 до 65535.');
-  // The OS owns this socket lock; it is released even after SIGKILL or a power loss.
-  // Its name is local to this data directory and exposes no protocol or credentials.
-  const { createHash } = await import('node:crypto');
-  const lockName = createHash('sha256').update(await realpath(config.directory)).digest('hex').slice(0, 24);
-  const lockAddress = process.platform === 'win32' ? `\\\\.\\pipe\\rele-${lockName}` : `\0rele-${lockName}`;
-  const lock = createServer(socket => socket.destroy());
-  await new Promise<void>((resolve, reject) => { lock.once('error', () => reject(new Error('Rele уже запущен с этим каталогом данных.'))); lock.listen(lockAddress, resolve); });
+  const lock = await acquireGatewayLock(config.directory);
   let store: Store;
   try { store = new Store(database); } catch (error) { lock.close(); throw error; }
   const temporaryRoot = path.join(config.directory, 'temp');

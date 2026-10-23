@@ -306,6 +306,7 @@ describe('Desktop framing over the shared native connection', () => {
     expect(shimMode(['exec', 'hello'])).toBe('unsupported');
     expect(shimMode(['--rele-desktop'])).toBe('desktop');
     expect(shimMode(['--rele-desktop-check'])).toBe('desktop-check');
+    expect(shimMode(['--rele-desktop-setup'])).toBe('desktop-setup');
     expect(shimMode(['--rele-cli', 'resume', 'original-id'])).toBe('interactive');
     expect(shimMode(['--rele-daemon-start'])).toBe('daemon');
   });

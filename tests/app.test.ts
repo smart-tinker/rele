@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 import { createApp } from '../src/server/app.js';
 import {
   ConfigStore,
@@ -37,7 +38,7 @@ function makeApp() {
     },
     codex: { token: 'synthetic-codex-secret' },
   });
-  const engine = {
+  const engine = Object.assign(new EventEmitter(), {
     channels: {} as Partial<Record<'telegram' | 'slack', Channel>>,
     targetFingerprint: vi.fn().mockReturnValue('synthetic-app-target'),
     cancel: vi.fn().mockResolvedValue(undefined),
@@ -45,7 +46,7 @@ function makeApp() {
     reconcile: vi.fn().mockResolvedValue(undefined),
     retryDelivery: vi.fn(),
     resolveApproval: vi.fn().mockResolvedValue(undefined),
-  };
+  });
   const codex = {
     runtimeInfo: vi.fn().mockReturnValue({ platformOs: 'linux', platformFamily: 'unix', codexHome: '/home/example/.codex', userAgent: 'test' }),
     listThreads: vi.fn().mockResolvedValue([
@@ -80,6 +81,7 @@ function makeApp() {
   const discovery = vi.fn().mockResolvedValue({ installations: [], issues: [{ code: 'not-found', message: 'Codex не найден.' }] });
   const desktopIntegration = {
     status: vi.fn().mockResolvedValue({ available: true, enabled: false, lastCheckFailed: true }),
+    shouldRetry: vi.fn().mockResolvedValue(false),
     setEnabled: vi.fn().mockImplementation(async (enabled: boolean) => ({ available: true, enabled, lastCheckFailed: false })),
   };
   const app = createApp({
@@ -157,6 +159,118 @@ describe('explicit Desktop integration controls', () => {
     await vi.waitFor(() => expect(f.configure).toHaveBeenCalledOnce());
     expect((await f.app.inject({ url: '/api/codex/desktop-integration', method: 'POST', headers, payload: { enabled: false } })).statusCode).toBe(409);
     release(); expect((await save).statusCode).toBe(200);
+  });
+});
+
+describe('pending automatic Desktop integration', () => {
+  it('retries a pending choice once after readiness and removes its listener on close', async () => {
+    const f = makeApp();
+    f.desktopIntegration.shouldRetry.mockResolvedValue(true);
+    await f.app.ready();
+    await vi.waitFor(() => expect(f.desktopIntegration.setEnabled).toHaveBeenCalledExactlyOnceWith(true));
+    for (let i = 0; i < 3; i++) f.engine.emit('change');
+    expect((await f.app.inject({ url: '/api/codex/desktop-integration', headers })).statusCode).toBe(200);
+    expect((await f.app.inject({ url: '/api/state', headers })).statusCode).toBe(200);
+    expect(f.desktopIntegration.setEnabled).toHaveBeenCalledOnce();
+    expect(f.configure).not.toHaveBeenCalled();
+    expect(f.codex.connect).not.toHaveBeenCalled();
+    expect(f.engine.listenerCount('change')).toBe(1);
+    await f.app.close();
+    expect(f.engine.listenerCount('change')).toBe(0);
+    f.engine.emit('change');
+    expect(f.desktopIntegration.setEnabled).toHaveBeenCalledOnce();
+  });
+
+  it('waits for saved shared mode and a connected supported native queue', async () => {
+    const f = makeApp();
+    f.desktopIntegration.shouldRetry.mockResolvedValue(true);
+    const status = { configured: true, connected: false, queueSupported: false, desktopVerified: false };
+    f.codex.status = () => status;
+    await f.app.ready();
+    expect(f.desktopIntegration.shouldRetry).not.toHaveBeenCalled();
+    f.config.config.codex.transport = 'websocket';
+    status.connected = true; status.queueSupported = true; f.engine.emit('change');
+    expect(f.desktopIntegration.shouldRetry).not.toHaveBeenCalled();
+    f.config.config.codex.transport = 'shared'; status.queueSupported = false; f.engine.emit('change');
+    expect(f.desktopIntegration.shouldRetry).not.toHaveBeenCalled();
+    status.queueSupported = true; f.engine.emit('change');
+    await vi.waitFor(() => expect(f.desktopIntegration.setEnabled).toHaveBeenCalledExactlyOnceWith(true));
+  });
+
+  it('never launches without pending intent and respects an explicit opt-out for this gateway lifetime', async () => {
+    const f = makeApp();
+    await f.app.ready();
+    for (let i = 0; i < 3; i++) { f.engine.emit('change'); await Promise.resolve(); }
+    expect(f.desktopIntegration.shouldRetry).toHaveBeenCalledOnce();
+    expect(f.desktopIntegration.setEnabled).not.toHaveBeenCalled();
+    expect((await f.app.inject({ url: '/api/codex/desktop-integration', method: 'POST', headers, payload: { enabled: false } })).statusCode).toBe(200);
+    f.desktopIntegration.shouldRetry.mockResolvedValue(true);
+    f.engine.emit('change');
+    expect(f.desktopIntegration.setEnabled).toHaveBeenCalledExactlyOnceWith(false);
+  });
+
+  it('holds the config guard during intent read and native retry and releases it after failure', async () => {
+    const f = makeApp();
+    let finishRead!: (value: boolean) => void;
+    let finishRetry!: () => void;
+    f.desktopIntegration.shouldRetry.mockImplementationOnce(() => new Promise(resolve => { finishRead = resolve; }));
+    f.desktopIntegration.setEnabled.mockImplementationOnce(async () => {
+      await new Promise<void>(resolve => { finishRetry = resolve; });
+      throw new Error('PRIVATE_NATIVE_FAILURE with sensitive settings');
+    });
+    await f.app.ready();
+    const requests = [
+      { url: '/api/config', method: 'PUT' as const, payload: { codex: { transport: 'shared' } } },
+      { url: '/api/codex/connect', method: 'POST' as const },
+      { url: '/api/codex/desktop-integration', method: 'POST' as const, payload: { enabled: false } },
+    ];
+    for (const request of requests) expect((await f.app.inject({ ...request, headers })).statusCode).toBe(409);
+    expect(f.desktopIntegration.setEnabled).not.toHaveBeenCalled();
+    finishRead(true);
+    await vi.waitFor(() => expect(f.desktopIntegration.setEnabled).toHaveBeenCalledOnce());
+    for (const request of requests) expect((await f.app.inject({ ...request, headers })).statusCode).toBe(409);
+    finishRetry();
+    await vi.waitFor(async () => expect((await f.app.inject({ url: '/api/codex/connect', method: 'POST', headers })).statusCode).toBe(200));
+    f.engine.emit('change'); f.engine.emit('change');
+    const response = await f.app.inject({ url: '/api/codex/desktop-integration', headers });
+    expect(response.statusCode).toBe(200);
+    expect(response.body).not.toContain('PRIVATE_NATIVE_FAILURE');
+    expect(f.desktopIntegration.setEnabled).toHaveBeenCalledOnce();
+    expect(f.configure).not.toHaveBeenCalled();
+  });
+
+  it.each(['shared', 'websocket'] as const)('rechecks the saved target after a concurrent config change to %s', async transport => {
+    const f = makeApp();
+    f.config.config.codex.transport = 'websocket';
+    f.config.config.codex.endpoint = 'ws://127.0.0.1:4500';
+    f.desktopIntegration.shouldRetry.mockResolvedValue(true);
+    await f.app.ready();
+    let finishSave!: () => void;
+    f.configure.mockImplementationOnce(async next => {
+      await new Promise<void>(resolve => { finishSave = resolve; });
+      f.config.config = next;
+    });
+    const save = f.app.inject({ url: '/api/config', method: 'PUT', headers, payload: { codex: { transport } } }).then(response => response);
+    await vi.waitFor(() => expect(f.configure).toHaveBeenCalledOnce());
+    f.engine.emit('change');
+    expect(f.desktopIntegration.setEnabled).not.toHaveBeenCalled();
+    finishSave(); expect((await save).statusCode).toBe(200);
+    if (transport === 'shared') await vi.waitFor(() => expect(f.desktopIntegration.setEnabled).toHaveBeenCalledExactlyOnceWith(true));
+    else expect(f.desktopIntegration.setEnabled).not.toHaveBeenCalled();
+  });
+
+  it('does not launch if the native connection disappears while pending intent is read', async () => {
+    const f = makeApp();
+    let finishRead!: (value: boolean) => void;
+    f.desktopIntegration.shouldRetry.mockImplementationOnce(() => new Promise(resolve => { finishRead = resolve; }));
+    await f.app.ready();
+    f.codex.status = () => ({ configured: true, connected: false, queueSupported: false, desktopVerified: false });
+    finishRead(true); await Promise.resolve();
+    expect(f.desktopIntegration.setEnabled).not.toHaveBeenCalled();
+    f.codex.status = () => ({ configured: true, connected: true, queueSupported: true, desktopVerified: false });
+    f.desktopIntegration.shouldRetry.mockResolvedValue(true);
+    f.engine.emit('change');
+    await vi.waitFor(() => expect(f.desktopIntegration.setEnabled).toHaveBeenCalledExactlyOnceWith(true));
   });
 });
 

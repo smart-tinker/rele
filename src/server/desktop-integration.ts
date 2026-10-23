@@ -6,6 +6,7 @@ import type { DesktopIntegrationState } from '../shared/types.js';
 
 const unavailable: DesktopIntegrationState = { available: false, enabled: false, lastCheckFailed: false };
 const execute = promisify(execFile);
+type Installation = { DesktopIntegrationOwned: boolean; DesktopIntegrationRequested?: boolean | null; DesktopIntegrationWarning?: unknown };
 
 async function runLauncher(executable: string, args: string[]): Promise<void> {
   await execute(executable, args, { windowsHide: true, timeout: 90_000, maxBuffer: 16 * 1024 });
@@ -20,19 +21,30 @@ export class DesktopIntegration {
     private readonly run = runLauncher,
   ) {}
 
-  async status(): Promise<DesktopIntegrationState> {
-    if (this.platform !== 'win32') return { ...unavailable };
+  private async installation(): Promise<Installation | undefined> {
+    if (this.platform !== 'win32') return;
     try {
       const file = path.join(this.root, 'rele-install.json');
-      if ((await stat(file)).size > 64 * 1024 || !(await stat(path.join(this.root, 'Rele.exe'))).isFile()) return { ...unavailable };
+      if ((await stat(file)).size > 64 * 1024 || !(await stat(path.join(this.root, 'Rele.exe'))).isFile()) return;
       const marker = JSON.parse(await readFile(file, 'utf8')) as Record<string, unknown>;
       if (typeof marker.DataDirectory !== 'string' || typeof marker.OwnerSid !== 'string' || !/^S-1-\d+(?:-\d+)+$/u.test(marker.OwnerSid) ||
           typeof marker.TaskName !== 'string' || !/^Rele-[A-Za-z0-9._-]{1,120}$/u.test(marker.TaskName) ||
-          typeof marker.DesktopIntegrationOwned !== 'boolean') return { ...unavailable };
+          typeof marker.DesktopIntegrationOwned !== 'boolean' ||
+          marker.DesktopIntegrationRequested != null && typeof marker.DesktopIntegrationRequested !== 'boolean') return;
       const [installed, running] = await Promise.all([realpath(marker.DataDirectory), realpath(this.directory)]);
-      if (installed.toLowerCase() !== running.toLowerCase()) return { ...unavailable };
-      return { available: true, enabled: marker.DesktopIntegrationOwned, lastCheckFailed: typeof marker.DesktopIntegrationWarning === 'string' && !!marker.DesktopIntegrationWarning };
-    } catch { return { ...unavailable }; }
+      if (installed.toLowerCase() !== running.toLowerCase()) return;
+      return marker as Installation;
+    } catch { return; }
+  }
+
+  async status(): Promise<DesktopIntegrationState> {
+    const marker = await this.installation();
+    return marker ? { available: true, enabled: marker.DesktopIntegrationOwned, lastCheckFailed: typeof marker.DesktopIntegrationWarning === 'string' && !!marker.DesktopIntegrationWarning } : { ...unavailable };
+  }
+
+  async shouldRetry(): Promise<boolean> {
+    const marker = await this.installation();
+    return marker?.DesktopIntegrationRequested === true && !marker.DesktopIntegrationOwned;
   }
 
   async setEnabled(enabled: boolean): Promise<DesktopIntegrationState> {

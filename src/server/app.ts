@@ -24,6 +24,7 @@ export interface AppServices {
   discoverCodex?: typeof discoverCodex;
   desktopIntegration?: {
     status(): Promise<DesktopIntegrationState>;
+    shouldRetry(): Promise<boolean>;
     setEnabled(enabled: boolean): Promise<DesktopIntegrationState>;
   };
 }
@@ -189,6 +190,36 @@ export function createApp(services: AppServices) {
   });
   app.get('/api/catalog/telegram', async () => engine.channels.telegram?.discoveryInfo?.() ?? { command: '/rele_register' });
   let configuring = false;
+  let closing = false;
+  let automaticIntegrationChecked = false;
+  let automaticIntegration: Promise<void> | undefined;
+  function retryDesktopIntegration(): void {
+    const integration = services.desktopIntegration;
+    if (!integration || closing || configuring || automaticIntegrationChecked || config.config.codex.transport !== 'shared') return;
+    const codex = services.codex();
+    const ready = () => {
+      const status = codex.status();
+      return !closing && config.config.codex.transport === 'shared' && services.codex() === codex && status.connected && status.queueSupported;
+    };
+    if (!ready()) return;
+    configuring = true;
+    automaticIntegration = (async () => {
+      try {
+        const pending = await integration.shouldRetry();
+        if (!ready()) return;
+        automaticIntegrationChecked = true;
+        if (pending) await integration.setEnabled(true);
+      } catch {
+        // The native launcher records a warning; a failed automatic retry must not stop the gateway.
+      } finally { configuring = false; automaticIntegration = undefined; }
+    })();
+  }
+  app.addHook('onReady', async () => { engine.on('change', retryDesktopIntegration); retryDesktopIntegration(); });
+  app.addHook('onClose', async () => {
+    closing = true;
+    engine.off('change', retryDesktopIntegration);
+    await automaticIntegration;
+  });
   app.get('/api/codex/desktop-integration', async (): Promise<DesktopIntegrationState> =>
     services.desktopIntegration?.status() ?? { available: false, enabled: false, lastCheckFailed: false });
   app.post('/api/codex/desktop-integration', async request => {
@@ -197,6 +228,7 @@ export function createApp(services: AppServices) {
     if (configuring) throw new ApiError(409, 'Настройки сохраняются. Дождитесь завершения изменения подключения.');
     if (!services.desktopIntegration) throw new ApiError(400, 'Управление интеграцией доступно в установленном Rele для Windows.');
     if (body.enabled && config.config.codex.transport !== 'shared') throw new ApiError(400, 'Сначала выберите «Общий Codex» с исходным профилем и сохраните настройки.');
+    automaticIntegrationChecked = true;
     configuring = true;
     try { return await services.desktopIntegration.setEnabled(body.enabled); }
     finally { configuring = false; }
@@ -314,7 +346,7 @@ export function createApp(services: AppServices) {
     if (configuring) throw new ApiError(409, 'Настройки уже сохраняются.');
     configuring = true;
     try { const next = mergeConfig(config.config, request.body); await validateAutoLinkRules(next); await services.configure(next); return { config: publicConfig(config.config) }; }
-    finally { configuring = false; }
+    finally { configuring = false; retryDesktopIntegration(); }
   });
 
   async function validateAutoLinkRules(next: AppConfig) {

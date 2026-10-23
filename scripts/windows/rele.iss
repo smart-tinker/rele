@@ -56,7 +56,7 @@ russian.DesktopRetry=После устранения причины открой
 russian.DataPreserved=При удалении программы настройки, связки чатов и резервные копии останутся в каталоге данных.
 
 [Tasks]
-; Fresh installs enable this task; UsePreviousTasks=yes preserves an explicit prior choice.
+; Fresh installs enable this task; recorded intent also preserves a later panel opt-out.
 Name: "desktop"; Description: "{cm:IntegrateDesktop}"
 
 [Files]
@@ -111,15 +111,6 @@ begin
   if Result = '' then Result := GetPreviousData(Name, DefaultValue);
 end;
 
-procedure InitializeWizard;
-begin
-  InstallDataDir := ParameterOrPrevious('RELEDATADIR', ExpandConstant('{localappdata}\Rele'));
-  InstallTaskName := ParameterOrPrevious('RELETASKNAME', '');
-  InstallPort := ParameterOrPrevious('RELEPORT', '3210');
-  InstallCodexHome := ParameterOrPrevious('RELECODEXHOME', '');
-  WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 + CustomMessage('DataPreserved');
-end;
-
 function SettingsArguments: String;
 begin
   Result := ' --app-dir ' + Quoted(ExpandConstant('{app}')) +
@@ -149,6 +140,49 @@ begin
     for I := 0 to GetArrayLength(ErrorLines) - 1 do Result := Result + ErrorLines[I] + #13#10;
   if Result = '' then Result := 'Rele could not complete the operation. Exit code: ' + IntToStr(ExitCode);
   Log(Result);
+end;
+
+function ExplicitTaskSelection: Boolean;
+var
+  I: Integer;
+  Argument: String;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+  begin
+    Argument := Uppercase(ParamStr(I));
+    if (Pos('/TASKS=', Argument) = 1) or (Pos('/MERGETASKS=', Argument) = 1) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+procedure InitializeWizard;
+var
+  PathFile: String;
+  ErrorText: String;
+  Choice: AnsiString;
+begin
+  InstallDataDir := ParameterOrPrevious('RELEDATADIR', ExpandConstant('{localappdata}\Rele'));
+  InstallTaskName := ParameterOrPrevious('RELETASKNAME', '');
+  InstallPort := ParameterOrPrevious('RELEPORT', '3210');
+  InstallCodexHome := ParameterOrPrevious('RELECODEXHOME', '');
+  WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 + CustomMessage('DataPreserved');
+  if not ExplicitTaskSelection and FileExists(ExpandConstant('{app}\rele-install.json')) then
+  begin
+    ExtractTemporaryFile('Rele.exe');
+    PathFile := ExpandConstant('{tmp}\rele-desktop-choice.txt');
+    DeleteFile(PathFile);
+    ErrorText := RunLauncher(ExpandConstant('{tmp}\Rele.exe'), 'desktop-choice' + SettingsArguments + ' --path-file ' + Quoted(PathFile));
+    if ErrorText <> '' then Log('Previous Desktop choice was not read: ' + ErrorText)
+    else if LoadStringFromFile(PathFile, Choice) then
+    begin
+      if Choice = 'on' then WizardSelectTasks('desktop')
+      else if Choice = 'off' then WizardSelectTasks('');
+    end;
+  end;
 end;
 
 function SharedCodexPath(Param: String): String;
