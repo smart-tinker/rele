@@ -57,7 +57,6 @@ internal static class CodexControlDirectory
                 RequireDirectory(held, ancestor);
             }
             SafeFileHandle homeHandle = guards[guards.Count - 1];
-            RequireOwner(homeHandle, user);
             string control = Path.Combine(home, "app-server-control");
             SafeFileHandle old = OpenOptional(control, ReadControl | ReadAttributes | Delete, true);
             if (old == null) { Unchanged(); return; }
@@ -66,6 +65,8 @@ internal static class CodexControlDirectory
             RawSecurityDescriptor oldSecurity = RequireOwner(old, user);
             CheckEntries(control, user);
             if (IsPrivate(oldSecurity, user)) { Unchanged(); return; }
+            // Parent ownership is required for migration, not for using an already private native namespace.
+            RequireOwner(homeHandle, user);
 
             string state = Path.Combine(home, "app-server-daemon");
             SafeFileHandle stateHandle = OpenOptional(state, ReadControl | ReadAttributes, true);
