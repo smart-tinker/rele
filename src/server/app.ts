@@ -16,7 +16,7 @@ export interface AppServices {
   store: Store;
   config: ConfigStore;
   engine: Engine;
-  codex: () => Pick<CodexClient, 'listThreads' | 'connect' | 'status'> & Partial<Pick<CodexClient, 'runtimeInfo'>>;
+  codex: () => Pick<CodexClient, 'listThreads' | 'connect' | 'status' | 'isVerifiedVersion'> & Partial<Pick<CodexClient, 'runtimeInfo'>>;
   configure: (next: AppConfig) => Promise<void>;
   version: string;
   webDirectory?: string;
@@ -199,7 +199,7 @@ export function createApp(services: AppServices) {
     const codex = services.codex();
     const ready = () => {
       const status = codex.status();
-      return !closing && config.config.codex.transport === 'shared' && services.codex() === codex && status.connected && status.queueSupported;
+      return !closing && config.config.codex.transport === 'shared' && services.codex() === codex && status.connected && codex.isVerifiedVersion();
     };
     if (!ready()) return;
     configuring = true;

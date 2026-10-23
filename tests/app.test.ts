@@ -66,6 +66,7 @@ function makeApp() {
       },
     ]),
     connect: vi.fn().mockResolvedValue(undefined),
+    isVerifiedVersion: vi.fn().mockReturnValue(true),
     status: () => ({
       configured: true,
       connected: true,
@@ -181,20 +182,23 @@ describe('pending automatic Desktop integration', () => {
     expect(f.desktopIntegration.setEnabled).toHaveBeenCalledOnce();
   });
 
-  it('waits for saved shared mode and a connected supported native queue', async () => {
+  it('waits for saved shared mode and a verified runtime while allowing a fresh profile without a probed queue', async () => {
     const f = makeApp();
     f.desktopIntegration.shouldRetry.mockResolvedValue(true);
+    f.codex.listThreads.mockResolvedValue([]);
+    f.codex.isVerifiedVersion.mockReturnValue(false);
     const status = { configured: true, connected: false, queueSupported: false, desktopVerified: false };
     f.codex.status = () => status;
     await f.app.ready();
     expect(f.desktopIntegration.shouldRetry).not.toHaveBeenCalled();
     f.config.config.codex.transport = 'websocket';
-    status.connected = true; status.queueSupported = true; f.engine.emit('change');
+    status.connected = true; f.codex.isVerifiedVersion.mockReturnValue(true); f.engine.emit('change');
     expect(f.desktopIntegration.shouldRetry).not.toHaveBeenCalled();
-    f.config.config.codex.transport = 'shared'; status.queueSupported = false; f.engine.emit('change');
+    f.config.config.codex.transport = 'shared'; f.codex.isVerifiedVersion.mockReturnValue(false); f.engine.emit('change');
     expect(f.desktopIntegration.shouldRetry).not.toHaveBeenCalled();
-    status.queueSupported = true; f.engine.emit('change');
+    f.codex.isVerifiedVersion.mockReturnValue(true); f.engine.emit('change');
     await vi.waitFor(() => expect(f.desktopIntegration.setEnabled).toHaveBeenCalledExactlyOnceWith(true));
+    expect(status.queueSupported).toBe(false);
   });
 
   it('never launches without pending intent and respects an explicit opt-out for this gateway lifetime', async () => {
@@ -259,15 +263,17 @@ describe('pending automatic Desktop integration', () => {
     else expect(f.desktopIntegration.setEnabled).not.toHaveBeenCalled();
   });
 
-  it('does not launch if the native connection disappears while pending intent is read', async () => {
+  it.each(['connection', 'verified version'] as const)('does not launch if the native %s disappears while pending intent is read', async lost => {
     const f = makeApp();
     let finishRead!: (value: boolean) => void;
     f.desktopIntegration.shouldRetry.mockImplementationOnce(() => new Promise(resolve => { finishRead = resolve; }));
     await f.app.ready();
-    f.codex.status = () => ({ configured: true, connected: false, queueSupported: false, desktopVerified: false });
+    if (lost === 'connection') f.codex.status = () => ({ configured: true, connected: false, queueSupported: false, desktopVerified: false });
+    else f.codex.isVerifiedVersion.mockReturnValue(false);
     finishRead(true); await Promise.resolve();
     expect(f.desktopIntegration.setEnabled).not.toHaveBeenCalled();
-    f.codex.status = () => ({ configured: true, connected: true, queueSupported: true, desktopVerified: false });
+    f.codex.status = () => ({ configured: true, connected: true, queueSupported: false, desktopVerified: false });
+    f.codex.isVerifiedVersion.mockReturnValue(true);
     f.desktopIntegration.shouldRetry.mockResolvedValue(true);
     f.engine.emit('change');
     await vi.waitFor(() => expect(f.desktopIntegration.setEnabled).toHaveBeenCalledExactlyOnceWith(true));
