@@ -103,8 +103,20 @@ internal static class CodexControlDirectory
                     {
                         Rename(old, backup); movedOld = true;
                         Rename(fresh, control); published = true;
-                        RequireDirectory(fresh, control);
-                        if (!IsPrivate(RequireOwner(fresh, user), user)) Fail("published-not-private");
+                        // Verify identity through the published name, independent of a renamed handle's path.
+                        // SHARE_DELETE permits this read alongside fresh's existing DELETE access;
+                        // fresh itself keeps share=3 and continues to exclude external rename/delete.
+                        using (SafeFileHandle publishedHandle = CreateFile(control, ReadControl | ReadAttributes, 7, IntPtr.Zero, 3, OpenReparse | BackupSemantics, IntPtr.Zero))
+                        {
+                            if (publishedHandle.IsInvalid) Fail("published-open-failed");
+                            AttributeTag attributes = Attributes(publishedHandle);
+                            if ((attributes.Attributes & DirectoryAttribute) == 0 || (attributes.Attributes & ReparseAttribute) != 0) Fail("unsafe-directory");
+                            FileIdentity heldIdentity, publishedIdentity;
+                            if (!GetFileInformationByHandleEx(fresh, 18, out heldIdentity, (uint)Marshal.SizeOf(typeof(FileIdentity)))) Fail("published-identity-failed");
+                            if (!GetFileInformationByHandleEx(publishedHandle, 18, out publishedIdentity, (uint)Marshal.SizeOf(typeof(FileIdentity)))) Fail("published-identity-failed");
+                            if (heldIdentity.Volume != publishedIdentity.Volume || heldIdentity.Low != publishedIdentity.Low || heldIdentity.High != publishedIdentity.High) Fail("published-identity-mismatch");
+                            if (!IsPrivate(RequireOwner(publishedHandle, user), user)) Fail("published-not-private");
+                        }
                     }
                     catch
                     {
@@ -354,11 +366,13 @@ internal static class CodexControlDirectory
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool GetExitCodeProcess(IntPtr handle, out uint code);
     [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr handle);
     [StructLayout(LayoutKind.Sequential)] private struct AttributeTag { public uint Attributes, Tag; }
+    [StructLayout(LayoutKind.Sequential)] private struct FileIdentity { public ulong Volume, Low, High; }
     [StructLayout(LayoutKind.Sequential)] private struct Overlapped { public UIntPtr Internal, InternalHigh; public uint Offset, OffsetHigh; public IntPtr Event; }
     [StructLayout(LayoutKind.Sequential)] private struct SecurityAttributes { public int Length; public IntPtr Descriptor; [MarshalAs(UnmanagedType.Bool)] public bool Inherit; }
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool CreateDirectory(string name, ref SecurityAttributes security);
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int kind, out AttributeTag information, uint size);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int kind, out FileIdentity information, uint size);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern uint GetFinalPathNameByHandle(SafeFileHandle handle, StringBuilder name, uint capacity, uint flags);
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int kind, IntPtr information, uint size);
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool LockFileEx(SafeFileHandle handle, uint flags, uint reserved, uint low, uint high, ref Overlapped overlap);

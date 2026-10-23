@@ -99,7 +99,8 @@ describe.skipIf(process.platform !== 'win32')('native Windows control directory 
     for (const [name, bytes] of Object.entries(files)) await writeFile(path.join(f.control, name), bytes);
     const before = await descriptor(f);
     expect(before.ownerMatches).toBe(true); expect(before.private).toBe(false);
-    expect(await invoke(f, code)).toEqual({ code: 0, stdout: '{"status":"migrated"}\r\n', stderr: '' });
+    const migrated = await invoke(f, code);
+    expect(migrated, `Migration helper result: ${JSON.stringify(migrated)}`).toEqual({ code: 0, stdout: '{"status":"migrated"}\r\n', stderr: '' });
     expect(await descriptor(f)).toMatchObject({ ownerMatches: true, private: true, protected: true });
     expect(await readdir(f.control)).toEqual([]);
     const names = await backups(f); expect(names).toHaveLength(1);
