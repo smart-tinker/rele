@@ -87,6 +87,7 @@ var
   InstallPort: String;
   InstallCodexHome: String;
   SharedCodexExecutable: String;
+  DesktopChoiceApplied: Boolean;
 
 function Quoted(Value: String): String;
 var
@@ -160,16 +161,22 @@ begin
 end;
 
 procedure InitializeWizard;
-var
-  PathFile: String;
-  ErrorText: String;
-  Choice: AnsiString;
 begin
   InstallDataDir := ParameterOrPrevious('RELEDATADIR', ExpandConstant('{localappdata}\Rele'));
   InstallTaskName := ParameterOrPrevious('RELETASKNAME', '');
   InstallPort := ParameterOrPrevious('RELEPORT', '3210');
   InstallCodexHome := ParameterOrPrevious('RELECODEXHOME', '');
   WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 + CustomMessage('DataPreserved');
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+var
+  PathFile: String;
+  ErrorText: String;
+  Choice: AnsiString;
+begin
+  if (CurPageID <> wpSelectTasks) or DesktopChoiceApplied then Exit;
+  DesktopChoiceApplied := True;
   if not ExplicitTaskSelection and FileExists(ExpandConstant('{app}\rele-install.json')) then
   begin
     ExtractTemporaryFile('Rele.exe');
@@ -180,7 +187,7 @@ begin
     else if LoadStringFromFile(PathFile, Choice) then
     begin
       if Choice = 'on' then WizardSelectTasks('desktop')
-      else if Choice = 'off' then WizardSelectTasks('');
+      else if Choice = 'off' then WizardSelectTasks('!desktop');
     end;
   end;
 end;
