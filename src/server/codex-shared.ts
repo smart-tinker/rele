@@ -4,13 +4,14 @@ import { constants, createReadStream, realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { CodexConnectionTarget, CodexDiscoveryResult } from '../shared/types.js';
 import { SUPPORTED_CODEX_VERSIONS } from '../shared/codex-runtime.js';
 import { defaultDataDirectory, isLocalCodexHome, isLocalSocketPath } from './config.js';
 import { discoverCodex } from './codex-discovery.js';
-import { codexEnvironment, environmentValue, resolveCodexLaunch } from './codex-launch.js';
+import { codexEnvironment, environmentValue, resolveCodexLaunch, type CodexLaunch } from './codex-launch.js';
 
 export class SharedCodexError extends Error {
   constructor(message: string, readonly code: string) { super(message); this.name = 'SharedCodexError'; }
@@ -22,6 +23,16 @@ export interface SharedCodexOptions {
   discover?: typeof discoverCodex;
   run?: (command: string, args: string[], timeoutMs: number, env: NodeJS.ProcessEnv) => Promise<CommandResult>;
   timeoutMs?: number;
+  prepareControlDirectory?: (home: string, launch: CodexLaunch, env: NodeJS.ProcessEnv) => Promise<void>;
+}
+
+async function prepareWindowsControlDirectory(home: string, launch: CodexLaunch, env: NodeJS.ProcessEnv): Promise<void> {
+  if (process.platform !== 'win32') return;
+  const helper = fileURLToPath(new URL('../../dist/native/Rele.Process.exe', import.meta.url));
+  const result = await runSharedCommand(helper, ['--repair-codex-control', home, '--', launch.command, ...launch.args], 10_000, env);
+  if (result.code !== 0 || !/^\{"status":"(?:unchanged|migrated)"\}\s*$/u.test(result.stdout)) {
+    throw new SharedCodexError('Не удалось безопасно подготовить служебный каталог общего Codex. Его владелец, права, содержимое или состояние запуска требуют проверки; существующие файлы сохранены.', 'shared-control-migration-required');
+  }
 }
 
 /** Bound only the native control command; its daemon has an independent lifetime. */
@@ -291,11 +302,11 @@ export async function ensureSharedCodex(target: CodexConnectionTarget, options: 
   });
   const found = await (options.discover ?? discoverCodex)({ env, ...(target.codexHome ? { codexHome: target.codexHome } : {}), processesOnly: true });
   const ownerIssue = found.issues.find(issue => ['windows-discovery-unavailable', 'process-discovery-unavailable', 'process-owner-unavailable'].includes(issue.code));
-  if (!socketPresent && ownerIssue) {
+  if (ownerIssue) {
     const trace = found.issues.find(issue => /^windows-probe-(?:timeout|unavailable|output-limit|exit|json|failed)-(?:startup|process-provider|process-query|process-parse|owner-query|parent-query|packages|json-provider|json|done)$/u.test(issue.code))?.code;
     throw new SharedCodexError(`Не удалось проверить существующий сервер Desktop (${ownerIssue.code}${trace ? `; ${trace}` : ''}). Проверьте доступ Rele к процессам текущего пользователя; новый сервер не запущен.`, 'shared-owner-unknown');
   }
-  if (!socketPresent && found.installations.some(item => item.running)) throw new SharedCodexError('Codex Desktop уже использует отдельный сервер. Один раз полностью закройте Desktop и запустите его через Rele.Codex; затем повторите подключение. Rele не завершает чужие процессы.', 'shared-desktop-conflict');
+  if (found.installations.some(item => item.running && item.connection?.transport !== 'proxy') || !socketPresent && found.installations.some(item => item.running)) throw new SharedCodexError('Codex Desktop уже использует отдельный сервер. После завершения его задач один раз полностью закройте Desktop и откройте снова с включённой интеграцией Rele. Rele не завершает чужие процессы.', 'shared-desktop-conflict');
   if (!await completeCodexPackage(launch.executable)) {
     let selected: string | undefined;
     if (target.executable === 'codex') {
@@ -318,6 +329,7 @@ export async function ensureSharedCodex(target: CodexConnectionTarget, options: 
     if (!selected) throw new SharedCodexError(`Для запуска общего Codex нужен полный пакет CLI или комплектная поставка Desktop ${SUPPORTED_CODEX_VERSIONS.join(' или ')}. Проверьте установку Codex; существующий сервер не заменён.`, 'shared-package-incomplete');
     launch = await resolveCodexLaunch(await resolveSharedCodexExecutable({ ...target, executable: selected }, { ...options, env }), { env });
   }
+  await (options.prepareControlDirectory ?? prepareWindowsControlDirectory)(selectedHome, launch, env);
   // Native singleton locks and liveness checks own stale-socket recovery.
   const deadline = Date.now() + timeoutMs;
   const started = await run(launch.command, [...launch.args, 'app-server', 'daemon', 'start'], timeoutMs, env);

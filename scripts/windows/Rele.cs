@@ -420,7 +420,7 @@ internal static class Rele
     private static void PrepareDesktopAdapter()
     {
         var files = new SortedDictionary<string, string>(StringComparer.Ordinal);
-        foreach (string file in new[] { "Rele.Codex.exe", "runtime\\node.exe", "package.json" }) files.Add(file, Path.Combine(AppDirectory, file));
+        foreach (string file in new[] { "Rele.Codex.exe", "runtime\\node.exe", "dist\\native\\Rele.Process.exe", "package.json" }) files.Add(file, Path.Combine(AppDirectory, file));
         foreach (string tree in new[] { "dist\\server", "dist\\shared", "node_modules\\ws" })
             foreach (string file in Directory.GetFiles(Path.Combine(AppDirectory, tree), "*", SearchOption.AllDirectories))
                 files.Add(file.Substring(AppDirectory.TrimEnd('\\').Length + 1), file);

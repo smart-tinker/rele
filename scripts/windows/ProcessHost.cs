@@ -27,6 +27,7 @@ internal sealed class ProcessHost : IDisposable
 
     private static int Main(string[] args)
     {
+        if (args.Length > 0 && args[0] == "--repair-codex-control") return CodexControlDirectory.Run(args);
         using (var host = new ProcessHost())
         {
             try
@@ -243,7 +244,7 @@ internal sealed class ProcessHost : IDisposable
         return result;
     }
 
-    private static string Quote(string value)
+    internal static string Quote(string value)
     {
         var result = new StringBuilder("\"");
         int slashes = 0;

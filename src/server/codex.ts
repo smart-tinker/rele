@@ -443,7 +443,7 @@ export class CodexClient extends EventEmitter {
     await this.cleanup;
     this.runtime = undefined;
     this.version = undefined;
-    this.setState({ connected: false, queueSupported: false, codexHome: undefined, error: undefined, errorCode: undefined });
+    this.setState({ connected: false, queueSupported: false, codexHome: undefined });
     let target: CodexConnectionTarget = { executable: this.config.executable, transport: this.config.transport, endpoint: this.config.endpoint ?? '', ...(this.config.codexHome ? { codexHome: this.config.codexHome } : {}) };
     if (target.transport === 'shared') target = await (this.options.shared ?? ensureSharedCodex)(target, { ...(this.options.discover ? { discover: this.options.discover } : {}) });
     else if (target.transport !== 'websocket' && target.executable === 'codex') {
@@ -554,7 +554,7 @@ export class CodexClient extends EventEmitter {
       catch { throw new SharedCodexError('Общий Codex использует другой профиль или платформу. Выберите исходный локальный профиль; запись остановлена.', 'shared-profile-mismatch'); }
     }
     this.version = this.runtime.userAgent.match(/\/(\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?)(?=\s|$)/u)?.[1];
-    this.setState({ name: this.version ? `Codex ${this.version}` : 'Codex', connected: true, codexHome: this.runtime.codexHome });
+    this.setState({ name: this.version ? `Codex ${this.version}` : 'Codex', connected: true, codexHome: this.runtime.codexHome, error: undefined, errorCode: undefined });
     if (!this.isVerifiedVersion()) {
       this.setState({ error: `Запись доступна для проверенного Codex ${SUPPORTED_CODEX_VERSIONS.join(' или ')}; подключён ${this.version || 'неизвестный runtime'}.` });
     } else {

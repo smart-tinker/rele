@@ -12,6 +12,7 @@ import { TelegramChannel } from './channels/telegram.js';
 import { SlackChannel } from './channels/slack.js';
 import type { ChannelCallbacks } from './channels/common.js';
 import { instanceDiagnostics, openPanel, serverStatus, stopServer } from './lifecycle.js';
+import { DesktopIntegration } from './desktop-integration.js';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const version = (JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')) as { version: string }).version;
@@ -104,7 +105,7 @@ async function main(): Promise<void> {
       if (codexChanged && process.platform === 'win32') {
         try {
           const installation = JSON.parse(await readFile(path.join(root, 'rele-install.json'), 'utf8')) as { DesktopIntegrationOwned?: boolean };
-          if (installation.DesktopIntegrationOwned) throw new Error('Перед сменой сервера или профиля Codex отключите интеграцию Desktop в установщике Rele. Это сохраняет обычный запуск Desktop рабочим.');
+          if (installation.DesktopIntegrationOwned) throw new Error('Перед сменой сервера или профиля Codex отключите интеграцию Desktop в разделе «Codex». Это сохраняет обычный запуск Desktop рабочим.');
         } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
       }
       // Voice-only changes do not reconnect transports or expire approvals.
@@ -124,7 +125,8 @@ async function main(): Promise<void> {
       if (channelsChanged) { attachChannels(); activity.start(); }
     } finally { engine.suspend(false); }
   }
-  app = createApp({ store, config, engine, codex: () => codex, configure, version, webDirectory: path.join(root, 'dist', 'web'), shutdown });
+  app = createApp({ store, config, engine, codex: () => codex, configure, version, webDirectory: path.join(root, 'dist', 'web'), shutdown,
+    desktopIntegration: new DesktopIntegration(root, config.directory) });
   const instanceFile = path.join(config.directory, 'instance.json');
   const temporaryInstance = path.join(config.directory, `instance-${process.pid}.tmp`);
   try {

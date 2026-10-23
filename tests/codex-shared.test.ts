@@ -25,7 +25,8 @@ async function fixture() {
   const discovery: CodexDiscoveryResult = { installations: [], issues: [], recommendedManaged: { ...target, transport: 'managed' } };
   const discover = vi.fn().mockResolvedValue(discovery);
   const env = { CODEX_HOME: '/inherited-profile', RELE_DATA_DIR: path.join(home, 'rele-data'), RELE_TEST_MARKER: 'preserved', OPENAI_API_KEY: 'synthetic-key' };
-  return { home, target, socketPath, executable, daemon, run, discovery, discover, env, options: { run, discover, env } };
+  const prepareControlDirectory = vi.fn<NonNullable<SharedCodexOptions['prepareControlDirectory']>>().mockResolvedValue(undefined);
+  return { home, target, socketPath, executable, daemon, run, discovery, discover, env, prepareControlDirectory, options: { run, discover, env, prepareControlDirectory } };
 }
 
 async function packageFixture(root: string, version = '0.163.0'): Promise<string> {
@@ -198,6 +199,46 @@ describe('native shared Codex lifecycle', () => {
     await ensureSharedCodex(f.target, f.options);
     expect(f.run.mock.calls.map(([, args]) => args).at(-1)).toEqual(['app-server', 'daemon', 'start']);
     expect(f.run.mock.calls.some(([, args]) => args.includes('--json'))).toBe(false);
+    expect(f.prepareControlDirectory).toHaveBeenCalledExactlyOnceWith(f.home, expect.objectContaining({ executable: f.target.executable }), expect.objectContaining({ CODEX_HOME: f.home }));
+  });
+
+  it('keeps an existing ready daemon and its control directory untouched', async () => {
+    const f = await fixture();
+    await ensureSharedCodex(f.target, f.options);
+    expect(f.prepareControlDirectory).not.toHaveBeenCalled();
+    expect(f.discover).not.toHaveBeenCalled();
+    expect(f.run.mock.calls.map(([, args]) => args.at(-1))).toEqual(['--version', 'version']);
+  });
+
+  it.each(['stdio', 'websocket'])('does not let a stale marker bypass the private %s Desktop fence', async transport => {
+    const f = await fixture();
+    await writeFile(f.socketPath, 'owned-stale-marker');
+    f.run.mockResolvedValueOnce({ code: 0, stdout: 'codex-cli 0.163.0' }).mockResolvedValueOnce({ code: 1, stdout: '' });
+    f.discovery.installations.push({ executable: f.target.executable, name: 'Private Desktop', source: 'desktop-process', running: true,
+      ...(transport === 'websocket' ? { connection: { ...f.target, transport: 'websocket', endpoint: 'ws://127.0.0.1:45678' } } : {}) });
+    await expect(ensureSharedCodex(f.target, f.options)).rejects.toMatchObject({ code: 'shared-desktop-conflict' });
+    expect(f.prepareControlDirectory).not.toHaveBeenCalled();
+    expect(await readFile(f.socketPath, 'utf8')).toBe('owned-stale-marker');
+    expect(f.run.mock.calls.some(([, args]) => args.at(-1) === 'start')).toBe(false);
+  });
+
+  it('does not migrate a stale control directory when process ownership is unknown', async () => {
+    const f = await fixture();
+    await writeFile(f.socketPath, 'owned-stale-marker');
+    f.run.mockResolvedValueOnce({ code: 0, stdout: 'codex-cli 0.163.0' }).mockResolvedValueOnce({ code: 1, stdout: '' });
+    f.discovery.issues.push({ code: 'process-owner-unavailable', message: 'synthetic-private-diagnostic' });
+    await expect(ensureSharedCodex(f.target, f.options)).rejects.toMatchObject({ code: 'shared-owner-unknown' });
+    expect(f.prepareControlDirectory).not.toHaveBeenCalled();
+    expect(await readFile(f.socketPath, 'utf8')).toBe('owned-stale-marker');
+  });
+
+  it('does not start another runtime when safe control-directory preparation refuses', async () => {
+    const f = await fixture();
+    f.target.executable = await packageFixture(path.join(f.home, 'source-package'));
+    f.run.mockResolvedValueOnce({ code: 0, stdout: 'codex-cli 0.163.0' }).mockResolvedValueOnce({ code: 1, stdout: '' });
+    f.prepareControlDirectory.mockRejectedValue(new Error('fixed refusal'));
+    await expect(ensureSharedCodex(f.target, f.options)).rejects.toThrow('fixed refusal');
+    expect(f.run.mock.calls.some(([, args]) => args.at(-1) === 'start')).toBe(false);
   });
 
   it('lets the native singleton recover its stale socket instead of creating a private server', async () => {

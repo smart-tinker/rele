@@ -3,6 +3,7 @@ import type {
   CodexConnectionTarget,
   CodexDiscoveryResult,
   CodexThread,
+  DesktopIntegrationState,
 } from '../../src/shared/types';
 import { fixtureState, installApi, openPanel, panelToken } from './fixtures';
 
@@ -387,4 +388,141 @@ test('shared mode saves an automatic policy without a transient endpoint and pre
   await expect(page.getByLabel('Режим работы', { exact: true })).toHaveValue('shared');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath('shared-mobile.png'), fullPage: true });
+});
+
+test('legacy WebSocket settings require a saved shared target and an explicit Desktop integration action', async ({ page }, testInfo) => {
+  const state = fixtureState(true);
+  const saved: CodexConnectionTarget = {
+    executable: '/opt/example/legacy/codex',
+    transport: 'websocket',
+    endpoint: 'ws://127.0.0.1:4500',
+    codexHome: '/profiles/legacy',
+  };
+  state.config.codex = { ...saved, tokenConfigured: true };
+  state.codex = { ...state.codex, ...saved, connected: false };
+  const api = await installApi(page, state);
+  let desktop: DesktopIntegrationState = { available: true, enabled: false, lastCheckFailed: true };
+  const desktopActions: Array<{ enabled: boolean }> = [];
+  await page.route('**/api/codex/desktop-integration', async (route) => {
+    const request = route.request();
+    expect(request.headers().authorization).toBe(`Bearer ${panelToken}`);
+    if (request.method() === 'GET') {
+      await route.fulfill({ json: desktop });
+      return;
+    }
+    expect(request.method()).toBe('POST');
+    const body = request.postDataJSON() as { enabled: boolean };
+    desktopActions.push(body);
+    desktop = { ...desktop, enabled: body.enabled, lastCheckFailed: false };
+    await route.fulfill({ json: desktop });
+  });
+  await openPanel(page);
+  await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  const integration = page.getByRole('region', { name: 'Обычный запуск Codex Desktop', exact: true });
+  const enable = integration.getByRole('button', { name: 'Подключить обычный Codex Desktop', exact: true });
+  await expect(integration).toContainText('Интеграция отключена в настройках установки');
+  await expect(integration).toContainText('Последняя попытка подключения Desktop не прошла проверку.');
+  await expect(enable).toBeDisabled();
+  expect(api.mutations).toEqual([]);
+  expect(desktopActions).toEqual([]);
+
+  await page.getByRole('button', { name: 'Перейти на общий Codex', exact: true }).click();
+  await expect(page.getByLabel('Режим работы', { exact: true })).toHaveValue('shared');
+  await expect(page.getByLabel('Папка профиля Codex', { exact: true })).toHaveValue('/profiles/legacy');
+  await expect(enable).toBeDisabled();
+  await expect(integration).toContainText('Сначала сохраните настройки Codex.');
+  expect(api.mutations).toEqual([]);
+  expect(desktopActions).toEqual([]);
+
+  await page.getByRole('button', { name: 'Сохранить Codex', exact: true }).click();
+  const savedMutations = [{
+    method: 'PUT',
+    path: '/api/config',
+    body: { codex: { executable: 'codex', transport: 'shared', endpoint: '', codexHome: '/profiles/legacy' } },
+  }];
+  await expect.poll(() => api.mutations).toEqual(savedMutations);
+  await expect(enable).toBeEnabled();
+  await expect(integration).toContainText('Интеграция отключена в настройках установки');
+  expect(desktopActions).toEqual([]);
+  expect(state.codex.connected).toBe(false);
+
+  await enable.click();
+  await expect.poll(() => desktopActions).toEqual([{ enabled: true }]);
+  await expect(integration).toContainText('Интеграция включена в настройках установки');
+  await expect(integration).not.toContainText('Последняя попытка подключения Desktop не прошла проверку.');
+  await expect(page.getByText('Интеграция Desktop включена. После завершения текущих задач полностью выйдите из Desktop и откройте его обычным способом.', { exact: true })).toBeVisible();
+  expect(api.mutations).toEqual(savedMutations);
+  expect(state.codex.connected).toBe(false);
+  await page.screenshot({ path: testInfo.outputPath('desktop-integration-enabled-desktop.png'), fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(integration.getByRole('button', { name: 'Отключить интеграцию Desktop', exact: true })).toBeEnabled();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath('desktop-integration-enabled-mobile.png'), fullPage: true });
+});
+
+test('Desktop integration keeps failed actions retryable and can be disabled with an unsaved profile', async ({ page }) => {
+  const state = fixtureState(true);
+  state.config.codex = { executable: 'codex', transport: 'shared', endpoint: '', codexHome: '/profiles/shared', tokenConfigured: false };
+  const api = await installApi(page, state);
+  let desktop: DesktopIntegrationState = { available: true, enabled: false, lastCheckFailed: true };
+  let fail = true;
+  const failure = 'Пример: проверка общего Codex не прошла.';
+  const desktopActions: Array<{ enabled: boolean }> = [];
+  await page.route('**/api/codex/desktop-integration', async (route) => {
+    const request = route.request();
+    if (request.method() === 'GET') {
+      await route.fulfill({ json: desktop });
+      return;
+    }
+    expect(request.method()).toBe('POST');
+    const body = request.postDataJSON() as { enabled: boolean };
+    desktopActions.push(body);
+    if (fail) {
+      await route.fulfill({ status: 409, json: { error: failure } });
+      return;
+    }
+    desktop = { ...desktop, enabled: body.enabled, lastCheckFailed: false };
+    await route.fulfill({ json: desktop });
+  });
+  await openPanel(page);
+  await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  const integration = page.getByRole('region', { name: 'Обычный запуск Codex Desktop', exact: true });
+  const enable = integration.getByRole('button', { name: 'Подключить обычный Codex Desktop', exact: true });
+  const profile = page.getByLabel('Папка профиля Codex', { exact: true });
+  await expect(enable).toBeEnabled();
+  await profile.fill('/profiles/unsaved');
+  await expect(enable).toBeDisabled();
+  expect(desktopActions).toEqual([]);
+  await profile.fill('/profiles/shared');
+  await enable.click();
+  await expect(page.getByText(failure, { exact: true })).toBeVisible();
+  await expect(integration).toContainText('Интеграция отключена в настройках установки');
+  await expect(integration).toContainText('Последняя попытка подключения Desktop не прошла проверку.');
+  await expect(enable).toBeEnabled();
+  expect(desktopActions).toEqual([{ enabled: true }]);
+
+  fail = false;
+  await enable.click();
+  const disable = integration.getByRole('button', { name: 'Отключить интеграцию Desktop', exact: true });
+  await expect(disable).toBeEnabled();
+  await expect(page.getByText(failure, { exact: true })).toHaveCount(0);
+  await profile.fill('/profiles/unsaved');
+  await expect(disable).toBeEnabled();
+  await disable.click();
+  await expect(enable).toBeDisabled();
+  await expect(integration).toContainText('Интеграция отключена в настройках установки');
+  expect(desktopActions).toEqual([{ enabled: true }, { enabled: true }, { enabled: false }]);
+  expect(state.config.codex.codexHome).toBe('/profiles/shared');
+  expect(api.mutations).toEqual([]);
+});
+
+test('unavailable Desktop integration exposes no action that changes ordinary Desktop startup', async ({ page }) => {
+  const api = await installApi(page, fixtureState(true));
+  await openPanel(page);
+  await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  const integration = page.getByRole('region', { name: 'Обычный запуск Codex Desktop', exact: true });
+  await expect(integration).toContainText('Управление интеграцией доступно в установленном Rele для Windows.');
+  await expect(integration.getByRole('button', { name: 'Подключить обычный Codex Desktop', exact: true })).toHaveCount(0);
+  await expect(integration.getByRole('button', { name: 'Отключить интеграцию Desktop', exact: true })).toHaveCount(0);
+  expect(api.mutations).toEqual([]);
 });

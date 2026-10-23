@@ -78,6 +78,10 @@ function makeApp() {
   let currentCodex = codex;
   const shutdown = vi.fn().mockResolvedValue(undefined);
   const discovery = vi.fn().mockResolvedValue({ installations: [], issues: [{ code: 'not-found', message: 'Codex не найден.' }] });
+  const desktopIntegration = {
+    status: vi.fn().mockResolvedValue({ available: true, enabled: false, lastCheckFailed: true }),
+    setEnabled: vi.fn().mockImplementation(async (enabled: boolean) => ({ available: true, enabled, lastCheckFailed: false })),
+  };
   const app = createApp({
     store,
     config,
@@ -87,6 +91,7 @@ function makeApp() {
     version: '0.1.0-test',
     shutdown,
     discoverCodex: discovery,
+    desktopIntegration,
   });
   opened.push({ app, store });
   const endpoint: Endpoint = {
@@ -101,8 +106,59 @@ function makeApp() {
     updatedAt: '2026-10-18T20:00:00Z',
   };
   store.upsertEndpoint(endpoint);
-  return { app, store, config, engine, codex, configure, endpoint, shutdown, discovery, replaceCodex: () => { currentCodex = { ...codex }; } };
+  return { app, store, config, engine, codex, configure, endpoint, shutdown, discovery, desktopIntegration, replaceCodex: () => { currentCodex = { ...codex }; } };
 }
+
+describe('explicit Desktop integration controls', () => {
+  it('authenticates reads and writes, validates the action and never enables integration while merely saving shared mode', async () => {
+    const f = makeApp();
+    const route = '/api/codex/desktop-integration';
+    expect((await f.app.inject({ url: route })).statusCode).toBe(401);
+    expect((await f.app.inject({ url: route, method: 'POST', payload: { enabled: true } })).statusCode).toBe(401);
+    expect(f.desktopIntegration.status).not.toHaveBeenCalled();
+    expect((await f.app.inject({ url: route, headers })).json()).toEqual({ available: true, enabled: false, lastCheckFailed: true });
+    for (const payload of [{ enabled: 'true' }, { enabled: true, executable: 'other' }, {}]) {
+      expect((await f.app.inject({ url: route, method: 'POST', headers, payload })).statusCode).toBe(400);
+    }
+    f.config.config.codex = { transport: 'websocket', executable: 'old-explicit-codex', endpoint: 'ws://127.0.0.1:4500' };
+    expect((await f.app.inject({ url: route, method: 'POST', headers, payload: { enabled: true } })).statusCode).toBe(400);
+    expect(f.desktopIntegration.setEnabled).not.toHaveBeenCalled();
+    expect((await f.app.inject({ url: '/api/config', method: 'PUT', headers, payload: { codex: { transport: 'shared' } } })).statusCode).toBe(200);
+    expect(f.desktopIntegration.setEnabled).not.toHaveBeenCalled();
+    f.codex.status = () => ({ configured: true, connected: false, queueSupported: false, desktopVerified: false });
+    expect((await f.app.inject({ url: route, method: 'POST', headers, payload: { enabled: true } })).json()).toEqual({ available: true, enabled: true, lastCheckFailed: false });
+    expect(f.desktopIntegration.setEnabled).toHaveBeenCalledExactlyOnceWith(true);
+    expect(f.codex.connect).not.toHaveBeenCalled();
+    expect(f.engine.cancel).not.toHaveBeenCalled();
+  });
+
+  it('serializes config, connect and integration actions, releases the guard after failure and permits explicit disable', async () => {
+    const f = makeApp();
+    let release!: () => void;
+    f.desktopIntegration.setEnabled.mockImplementationOnce(async () => {
+      await new Promise<void>(resolve => { release = resolve; });
+      throw new Error('Synthetic check failed');
+    });
+    const pending = f.app.inject({ url: '/api/codex/desktop-integration', method: 'POST', headers, payload: { enabled: true } }).then(response => response);
+    await vi.waitFor(() => expect(f.desktopIntegration.setEnabled).toHaveBeenCalledOnce());
+    for (const request of [
+      { url: '/api/config', method: 'PUT' as const, payload: { codex: { transport: 'shared' } } },
+      { url: '/api/codex/connect', method: 'POST' as const },
+      { url: '/api/codex/desktop-integration', method: 'POST' as const, payload: { enabled: false } },
+    ]) expect((await f.app.inject({ ...request, headers })).statusCode).toBe(409);
+    expect(f.configure).not.toHaveBeenCalled();
+    release(); expect((await pending).statusCode).toBe(400);
+    f.config.config.codex.transport = 'websocket';
+    expect((await f.app.inject({ url: '/api/codex/desktop-integration', method: 'POST', headers, payload: { enabled: false } })).statusCode).toBe(200);
+    expect(f.desktopIntegration.setEnabled).toHaveBeenLastCalledWith(false);
+
+    f.configure.mockImplementationOnce(async () => { await new Promise<void>(resolve => { release = resolve; }); });
+    const save = f.app.inject({ url: '/api/config', method: 'PUT', headers, payload: { codex: { transport: 'shared' } } }).then(response => response);
+    await vi.waitFor(() => expect(f.configure).toHaveBeenCalledOnce());
+    expect((await f.app.inject({ url: '/api/codex/desktop-integration', method: 'POST', headers, payload: { enabled: false } })).statusCode).toBe(409);
+    release(); expect((await save).statusCode).toBe(200);
+  });
+});
 
 describe('installed application lifecycle', () => {
   it('exchanges an authenticated launcher link only once, with the same local origin boundary', async () => {

@@ -255,6 +255,12 @@ export interface CodexConnectionState extends ConnectionState {
   errorCode?: string;
 }
 
+export interface DesktopIntegrationState {
+  available: boolean;
+  enabled: boolean;
+  lastCheckFailed: boolean;
+}
+
 export interface PublicConfig {
   autoLinkRules?: AutoLinkRule[];
   codex: CodexConnectionTarget & { tokenConfigured: boolean };

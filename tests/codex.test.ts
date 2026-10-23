@@ -7,6 +7,7 @@ import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { WebSocket, WebSocketServer } from 'ws';
 import { CodexClient, CodexThreadBusyError, CodexTransportError, classifyCodexConnectionFailure, type CodexNotification } from '../src/server/codex.js';
+import { SharedCodexError } from '../src/server/codex-shared.js';
 
 interface Rpc { id?: string | number; method?: string; params: Record<string, unknown>; result?: unknown; error?: { code: number; message: string } }
 type Handler = (message: Rpc, socket: WebSocket) => unknown | Promise<unknown>;
@@ -173,6 +174,25 @@ describe('Codex native shared policy', () => {
     await f.peer.connect();
     expect(f.peer.status().connected).toBe(true);
     expect((await f.peer.listThreads())[0].id).toBe(threadId);
+  });
+
+  it('keeps the last connection error visible during retry and clears it after a verified reconnect', async () => {
+    const f = await sharedFixture();
+    f.shared.mockRejectedValueOnce(new SharedCodexError('Fixed safe startup failure.', 'shared-daemon-unavailable'));
+    await expect(f.client.connect()).rejects.toMatchObject({ code: 'shared-daemon-unavailable' });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    f.shared.mockImplementationOnce(async () => {
+      await gate;
+      return { ...f.target, transport: 'websocket', endpoint: f.endpoint, codexHome: f.home };
+    });
+    const retry = f.client.connect();
+    try {
+      await until(() => f.shared.mock.calls.length === 2);
+      expect(f.client.status()).toMatchObject({ connected: false, error: 'Fixed safe startup failure.', errorCode: 'shared-daemon-unavailable' });
+    } finally { release(); }
+    await retry;
+    expect(f.client.status()).toMatchObject({ connected: true, queueSupported: true, error: undefined, errorCode: undefined });
   });
 
   it.each([false, true])('rejects a different profile before any catalog or queue call (implicit profile: %s)', async implicitProfile => {

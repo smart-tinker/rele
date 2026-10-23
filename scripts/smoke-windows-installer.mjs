@@ -237,10 +237,28 @@ try {
   assert.deepEqual(desktopEnvironment(), emptyDesktopEnvironment);
   assert.deepEqual(await readFile(configFile), legacyConfigBytes);
   await sharedBackendPid(codexFixture, sharedPid);
-  await writeFile(configFile, sharedConfigBytes);
-  run(launcher, ['restart', '--quiet']);
-  instance = await ready(instance.pid);
-  run(launcher, ['desktop-integrate', '--quiet']);
+  const integrationUrl = new URL('/api/codex/desktop-integration', instance.address);
+  const panelHeaders = { authorization: `Bearer ${fixturePanelToken}`, 'content-type': 'application/json' };
+  const integrationStatus = async () => {
+    const response = await fetch(integrationUrl, { headers: panelHeaders, signal: AbortSignal.timeout(5000) });
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  assert.deepEqual(await integrationStatus(), { available: true, enabled: false, lastCheckFailed: true });
+  const saveShared = await fetch(new URL('/api/config', instance.address), { method: 'PUT', headers: panelHeaders,
+    body: JSON.stringify({ codex: codexFixture }), signal: AbortSignal.timeout(5000) });
+  assert.equal(saveShared.status, 200);
+  assert.equal((await saveShared.json()).config.codex.codexHome, codexHome);
+  const explicitlySavedShared = await readFile(configFile);
+  assert.deepEqual(await integrationStatus(), { available: true, enabled: false, lastCheckFailed: true });
+  assert.deepEqual(desktopEnvironment(), emptyDesktopEnvironment, 'Saving shared mode must not enable integration implicitly.');
+  const enableDesktop = await fetch(integrationUrl, { method: 'POST', headers: panelHeaders,
+    body: JSON.stringify({ enabled: true }), signal: AbortSignal.timeout(100_000) });
+  assert.equal(enableDesktop.status, 200);
+  assert.deepEqual(await enableDesktop.json(), { available: true, enabled: true, lastCheckFailed: false });
+  assert.equal(JSON.parse(await readFile(path.join(data, 'instance.json'), 'utf8')).pid, instance.pid, 'Integration retry must not restart Rele.');
+  assert.deepEqual(await readFile(configFile), explicitlySavedShared);
+  await sharedBackendPid(codexFixture, sharedPid);
   await assertOwnedDesktopEnvironment();
 
   console.log('Windows installer smoke: protected-settings failure removes only an owned hook and preserves settings bytes');

@@ -298,6 +298,10 @@ export async function installApi(
       await route.fulfill({ json: catalog.discovery ?? fixtureDiscovery() });
       return;
     }
+    if (request.method() === 'GET' && url.pathname === '/api/codex/desktop-integration') {
+      await route.fulfill({ json: { available: false, enabled: false, lastCheckFailed: false } });
+      return;
+    }
     if (request.method() === 'GET' && url.pathname === '/api/threads') {
       await route.fulfill({
         json: {

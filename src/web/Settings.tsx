@@ -1,10 +1,11 @@
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import type {
   CodexTransport,
   ConnectionState,
   DashboardState,
+  DesktopIntegrationState,
 } from '../shared/types';
-import { ReleApi } from './client';
+import { errorText, ReleApi } from './client';
 import { useAction } from './hooks';
 import { useCodexThreads } from './useCodexThreads';
 import {
@@ -429,6 +430,33 @@ export function CodexSettings({
   } = useCodexThreads(api, state);
   const [threadQuery, setThreadQuery] = useState('');
   const action = useAction();
+  const [desktop, setDesktop] = useState<DesktopIntegrationState | null>(null);
+  const [desktopError, setDesktopError] = useState('');
+  const [desktopRevision, setDesktopRevision] = useState(0);
+  const savedTarget = JSON.stringify([codexTargetKey(state.config.codex), state.config.codex.codexHome ?? '']);
+  const pendingTarget = selection === 'auto'
+    ? { ...automaticCodex, transport }
+    : { transport, executable: executable.trim(), endpoint: ['shared', 'managed'].includes(transport) ? '' : endpoint.trim() };
+  const unsavedCodex = savedTarget !== JSON.stringify([codexTargetKey(pendingTarget), codexHome.trim()]) || !!token.trim();
+  useEffect(() => {
+    const controller = new AbortController();
+    setDesktop(null); setDesktopError('');
+    void api.request<DesktopIntegrationState>('/api/codex/desktop-integration', 'GET', undefined, controller.signal).then(
+      value => { if (!controller.signal.aborted) setDesktop(value); },
+      error => { if (!controller.signal.aborted) setDesktopError(errorText(error)); },
+    );
+    return () => controller.abort();
+  }, [api, desktopRevision, savedTarget]);
+  const setDesktopEnabled = async (enabled: boolean) => {
+    const result = await action.run(
+      () => api.request<DesktopIntegrationState>('/api/codex/desktop-integration', 'POST', { enabled }),
+      enabled
+        ? 'Интеграция Desktop включена. После завершения текущих задач полностью выйдите из Desktop и откройте его обычным способом.'
+        : 'Интеграция Desktop отключена. Работающие окна и задачи продолжают работу.',
+    );
+    if (result.ok) setDesktop(result.value);
+    else setDesktopRevision(value => value + 1);
+  };
   const chooseMode = (mode: CodexTransport) => {
     setTransport(mode);
     setEndpoint('');
@@ -570,7 +598,7 @@ export function CodexSettings({
           {transport === 'shared' ? (
             <div className="codex-mode-copy">
               <p>Rele подключается к общему Codex или запускает его. Сервер восстанавливается после перезапусков и работает без открытого Desktop.</p>
-              <p className="field-hint">Для совместной работы запускайте Desktop через установленный адаптер Rele. После первого подключения полностью выйдите из Desktop и откройте его снова. Существующие разговоры и профиль сохраняются.</p>
+              <p className="field-hint">Для совместной работы подключите обычный запуск Desktop ниже. Существующие разговоры и профиль сохраняются.</p>
             </div>
           ) : transport === 'managed' ? (
             <div className="codex-mode-copy">
@@ -701,6 +729,33 @@ export function CodexSettings({
           </div>
         </div>
       </form>
+      <section className="settings-section" aria-labelledby="desktop-integration-title">
+        <h2 id="desktop-integration-title">Обычный запуск Codex Desktop</h2>
+        <div className="form-stack">
+          {desktopError ? <Notice>{desktopError}</Notice> : desktop ? (
+            desktop.available ? (
+              <>
+                <Status tone={desktop.enabled ? 'good' : 'warning'}>
+                  {desktop.enabled ? 'Интеграция включена в настройках установки' : 'Интеграция отключена в настройках установки'}
+                </Status>
+                {desktop.lastCheckFailed && <Notice tone="warning">Последняя попытка подключения Desktop не прошла проверку. Проверьте подключение Codex и повторите попытку.</Notice>}
+                <p className="field-hint">Это настройка следующего запуска Desktop. Работающие окна и задачи не закрываются. После включения дождитесь завершения задач, полностью выйдите из Desktop и откройте его обычным способом.</p>
+                {desktop.enabled ? <p className="field-hint">Перед сменой сервера или профиля Codex сначала отключите интеграцию.</p> : unsavedCodex ? <p className="field-hint">Сначала сохраните настройки Codex.</p> : state.config.codex.transport !== 'shared' ? <p className="field-hint">Для подключения выберите «Общий Codex» с исходным профилем и сохраните настройки.</p> : null}
+                <div>
+                  <Button
+                    busy={action.busy}
+                    disabled={!desktop.enabled && (unsavedCodex || state.config.codex.transport !== 'shared')}
+                    onClick={() => void setDesktopEnabled(!desktop.enabled)}
+                  >
+                    {desktop.enabled ? 'Отключить интеграцию Desktop' : 'Подключить обычный Codex Desktop'}
+                  </Button>
+                </div>
+              </>
+            ) : <p className="field-hint">Управление интеграцией доступно в установленном Rele для Windows. Здесь настройки обычного запуска Desktop не изменяются.</p>
+          ) : <p className="field-hint">Проверяем настройки интеграции…</p>}
+          <div><Button icon="refresh" disabled={action.busy || !desktop && !desktopError} onClick={() => setDesktopRevision(value => value + 1)}>Обновить статус Desktop</Button></div>
+        </div>
+      </section>
       <section className="threads-section" aria-labelledby="threads-title">
         <div className="section-heading">
           <h2 id="threads-title">Разговоры Codex</h2>

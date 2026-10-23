@@ -8,7 +8,7 @@ import { isLocalCodexHome, isLocalWorkspace, mergeConfig, publicConfig } from '.
 import type { Store } from './store.js';
 import type { Engine } from './engine.js';
 import type { CodexClient } from './codex.js';
-import type { DashboardState, Endpoint, Platform, SlackSyncJournal } from '../shared/types.js';
+import type { DashboardState, DesktopIntegrationState, Endpoint, Platform, SlackSyncJournal } from '../shared/types.js';
 import { ChannelError } from './channels/common.js';
 import { discoverCodex } from './codex-discovery.js';
 
@@ -22,6 +22,10 @@ export interface AppServices {
   webDirectory?: string;
   shutdown?: () => Promise<void>;
   discoverCodex?: typeof discoverCodex;
+  desktopIntegration?: {
+    status(): Promise<DesktopIntegrationState>;
+    setEnabled(enabled: boolean): Promise<DesktopIntegrationState>;
+  };
 }
 
 class ApiError extends Error { constructor(readonly statusCode: number, message: string) { super(message); } }
@@ -185,6 +189,18 @@ export function createApp(services: AppServices) {
   });
   app.get('/api/catalog/telegram', async () => engine.channels.telegram?.discoveryInfo?.() ?? { command: '/rele_register' });
   let configuring = false;
+  app.get('/api/codex/desktop-integration', async (): Promise<DesktopIntegrationState> =>
+    services.desktopIntegration?.status() ?? { available: false, enabled: false, lastCheckFailed: false });
+  app.post('/api/codex/desktop-integration', async request => {
+    const body = object(request.body); fields(body, ['enabled']);
+    if (typeof body.enabled !== 'boolean') throw new ApiError(400, 'enabled должен быть логическим значением.');
+    if (configuring) throw new ApiError(409, 'Настройки сохраняются. Дождитесь завершения изменения подключения.');
+    if (!services.desktopIntegration) throw new ApiError(400, 'Управление интеграцией доступно в установленном Rele для Windows.');
+    if (body.enabled && config.config.codex.transport !== 'shared') throw new ApiError(400, 'Сначала выберите «Общий Codex» с исходным профилем и сохраните настройки.');
+    configuring = true;
+    try { return await services.desktopIntegration.setEnabled(body.enabled); }
+    finally { configuring = false; }
+  });
   function legacyRule(endpoint: Endpoint) {
     return config.config.autoLinkRules.find(rule => rule.enabled && rule.platform === endpoint.platform && rule.accountId === endpoint.accountId && rule.chatId === endpoint.chatId);
   }

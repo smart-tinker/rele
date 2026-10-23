@@ -42,6 +42,7 @@ english.SharedCli=Codex CLI (shared with Rele)
 english.IntegrateDesktop=Connect ordinary Codex Desktop launches to the shared Codex backend
 english.DesktopNotice=After enabling Desktop integration, fully quit Codex Desktop once, then open it again. Existing tasks are not stopped by this installer.
 english.DesktopSkipped=Codex Desktop integration was skipped:
+english.DesktopRetry=After resolving the cause, open Rele → Codex and explicitly connect ordinary Codex Desktop launches. Keep the original profile; Rele will not change it automatically.
 english.DataPreserved=Rele's settings, chat bindings, and backups remain in the data directory when the program is uninstalled.
 russian.OpenRele=Открыть Rele
 russian.RestartRele=Перезапустить Rele
@@ -51,6 +52,7 @@ russian.SharedCli=Codex CLI (общий с Rele)
 russian.IntegrateDesktop=Подключить обычный запуск Codex Desktop к общему Codex
 russian.DesktopNotice=После подключения полностью закройте Codex Desktop один раз и откройте снова. Установщик не останавливает его текущие задачи.
 russian.DesktopSkipped=Подключение Codex Desktop пропущено:
+russian.DesktopRetry=После устранения причины откройте Rele → Codex и явно подключите обычный запуск Desktop. Сохраните исходный профиль: Rele не меняет его автоматически.
 russian.DataPreserved=При удалении программы настройки, связки чатов и резервные копии останутся в каталоге данных.
 
 [Tasks]
@@ -208,7 +210,7 @@ begin
     if LoadStringFromFile(WarningFile, WarningText) then
     begin
       Log(CustomMessage('DesktopSkipped') + ' ' + UTF8Decode(WarningText));
-      WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 + CustomMessage('DesktopSkipped') + ' ' + UTF8Decode(WarningText);
+      WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 + CustomMessage('DesktopSkipped') + ' ' + UTF8Decode(WarningText) + #13#10 + CustomMessage('DesktopRetry');
     end
     else if WizardIsTaskSelected('desktop') then
       WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 + CustomMessage('DesktopNotice');
