@@ -22,8 +22,12 @@ $acl = $info.GetAccessControl($sections)
 if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -cne $sid.Value) { throw 'Test directory owner differs' }
 if ($Action -eq 'Private' -or $Action -eq 'Legacy') {
     if ([IO.Directory]::GetFileSystemEntries($target).Length -ne 0) { throw 'ACL setup requires an empty owned directory' }
-    $permissions = [Security.AccessControl.DirectorySecurity]::new()
-    $permissions.SetOwner($sid)
+    # Preserve the existing owner/group; a filtered token needs only WRITE_DAC here.
+    $permissions = $acl
+    $permissions.SetAccessRuleProtection($true, $false)
+    foreach ($rule in $permissions.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier])) {
+        $permissions.RemoveAccessRuleSpecific($rule)
+    }
     $permissions.SetAccessRuleProtection(($Action -eq 'Private'), $false)
     $permissions.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
         $sid, [Security.AccessControl.FileSystemRights]::FullControl,
