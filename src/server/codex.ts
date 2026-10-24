@@ -32,6 +32,7 @@ export interface CodexServerRequest extends CodexNotification { id: RpcId }
 export interface RequestLocation {
   state: 'queued' | 'running' | 'completed' | 'failed' | 'interrupted' | 'not_found';
   queuedSubmissionId?: string;
+  soleQueuedSubmission?: boolean;
   turnId?: string;
   text?: string;
   mixed?: boolean;
@@ -367,11 +368,21 @@ export class CodexClient extends EventEmitter {
     return { queuedSubmissionId: response.queuedSubmission.id };
   }
 
-  /** Explicit continuation after an interrupted queue; never steers another active turn. */
-  async startQueued(threadId: string, queuedSubmissionId?: string): Promise<{ turn: HistoryTurn }> {
+  /** Continue only the selected submission; native admission never steers an active turn. */
+  async startQueued(threadId: string, queuedSubmissionId: string): Promise<{ turn: HistoryTurn }> {
+    if (!queuedSubmissionId?.trim()) throw new Error('Укажите подтверждённый элемент очереди Codex.');
     this.requireQueue();
     await this.subscribe(threadId);
-    return this.call('thread/queue/start', { threadId, ...(queuedSubmissionId ? { queuedSubmissionId } : {}) });
+    try {
+      const response = await this.call<{ turn: HistoryTurn }>('thread/queue/start', { threadId, queuedSubmissionId });
+      if (!response?.turn?.id) throw new CodexTransportError('Codex не подтвердил ход продолжения очереди. Требуется сверка перед повтором.', 'queue-start-unconfirmed');
+      return response;
+    } catch (error) {
+      if (error instanceof CodexRpcError && error.code === -32600 && /^thread already has an active or pending turn$/iu.test(error.message)) {
+        throw new CodexThreadBusyError(threadId, 'non_idle');
+      }
+      throw error;
+    }
   }
 
   async deleteQueued(threadId: string, queuedSubmissionId: string): Promise<{ deleted: boolean }> {
@@ -417,7 +428,7 @@ export class CodexClient extends EventEmitter {
       }
       cursor = nextPage(page.nextCursor, seen);
     } while (cursor);
-    return queued.length ? { state: 'queued', queuedSubmissionId: queued[0].id } : { state: 'not_found' };
+    return queued.length ? { state: 'queued', queuedSubmissionId: queued[0].id, soleQueuedSubmission: queue.length === 1 } : { state: 'not_found' };
   }
 
   async diagnostics(): Promise<{ process: { id: number }; gauges: unknown[] }> {

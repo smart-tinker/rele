@@ -212,7 +212,7 @@ describe('Codex native shared policy', () => {
     await expect(f.client.enqueue(threadId, 'Original shared request', clientId)).rejects.toBeInstanceOf(CodexTransportError);
     await f.client.connect();
     expect(f.shared).toHaveBeenCalledTimes(2);
-    expect(await f.client.findRequest(threadId, clientId)).toEqual({ state: 'queued', queuedSubmissionId: 'accepted' });
+    expect(await f.client.findRequest(threadId, clientId)).toEqual({ state: 'queued', queuedSubmissionId: 'accepted', soleQueuedSubmission: true });
     expect(f.calls.filter(call => call.method === 'thread/queue/add')).toHaveLength(1);
     expect(f.calls.filter(call => call.method === 'thread/resume').every(call => call.params.threadId === threadId)).toBe(true);
     expect(f.calls.some(call => ['thread/start', 'thread/fork', 'turn/start'].includes(call.method ?? ''))).toBe(false);
@@ -572,7 +572,7 @@ describe('Codex shared-runtime adapter', () => {
       'thread/queue/list': () => ({ data: [{ id: 'queue-id', clientUserMessageId: clientId }], nextCursor: null }),
     });
     await f.client.connect();
-    expect(await f.client.findRequest(threadId, clientId)).toEqual({ state: 'queued', queuedSubmissionId: 'queue-id' });
+    expect(await f.client.findRequest(threadId, clientId)).toEqual({ state: 'queued', queuedSubmissionId: 'queue-id', soleQueuedSubmission: true });
     f.handlers['thread/turns/list'] = message => message.params.cursor
       ? { data: [{ id: 'completed-turn', status: 'completed', items: [
         { type: 'userMessage', clientId },
@@ -601,6 +601,48 @@ describe('Codex shared-runtime adapter', () => {
     ], nextCursor: null }) });
     await f.client.connect();
     await expect(f.client.findRequest(threadId, clientId)).rejects.toThrow('несколько запросов');
+  });
+
+  it('does not mark a queued request safe for automatic continuation when another native entry exists on a later page', async () => {
+    const clientId = randomUUID();
+    const f = await fixture({ 'thread/queue/list': message => message.params.cursor
+      ? { data: [{ id: 'foreign', clientUserMessageId: randomUUID() }], nextCursor: null }
+      : { data: [{ id: 'own', clientUserMessageId: clientId }], nextCursor: 'later' } });
+    await f.client.connect();
+    expect(await f.client.findRequest(threadId, clientId)).toEqual({ state: 'queued', queuedSubmissionId: 'own', soleQueuedSubmission: false });
+    expect(f.calls.some(call => call.method === 'thread/queue/start')).toBe(false);
+  });
+
+  it('requires the exact native queue ID and never substitutes the queue head', async () => {
+    const f = await fixture({ 'thread/queue/start': () => ({ turn: { id: 'exact-turn', status: 'inProgress', items: [] } }) });
+    await f.client.connect();
+    await expect(f.client.startQueued(threadId, '')).rejects.toThrow('подтверждённый элемент');
+    expect(f.calls.some(call => call.method === 'thread/queue/start')).toBe(false);
+    await expect(f.client.startQueued(threadId, 'own-entry')).resolves.toMatchObject({ turn: { id: 'exact-turn' } });
+    expect(f.calls.filter(call => call.method === 'thread/queue/start').map(call => call.params)).toEqual([{ threadId, queuedSubmissionId: 'own-entry' }]);
+    expect(f.calls.some(call => call.method === 'turn/start')).toBe(false);
+  });
+
+  it('classifies only the explicit native idle-admission rejection as a retryable busy queue', async () => {
+    const f = await fixture({ 'thread/queue/start': (message, socket) => {
+      socket.send(JSON.stringify({ id: message.id, error: { code: -32600, message: 'thread already has an active or pending turn' } }));
+      return noResponse;
+    } });
+    await f.client.connect();
+    await expect(f.client.startQueued(threadId, 'own-entry')).rejects.toMatchObject({ name: 'CodexThreadBusyError', reason: 'non_idle' });
+    f.handlers['thread/queue/start'] = (message, socket) => {
+      socket.send(JSON.stringify({ id: message.id, error: { code: -32600, message: 'queued submission not found: own-entry' } }));
+      return noResponse;
+    };
+    await expect(f.client.startQueued(threadId, 'own-entry')).rejects.toMatchObject({ name: 'CodexRpcError' });
+  });
+
+  it('keeps an accepted but unconfirmed queue start uncertain without repeating it', async () => {
+    const f = await fixture({ 'thread/queue/start': () => ({}) });
+    await f.client.connect();
+    await expect(f.client.startQueued(threadId, 'own-entry')).rejects.toMatchObject({ uncertain: true, code: 'queue-start-unconfirmed' });
+    expect(f.calls.filter(call => call.method === 'thread/queue/start')).toHaveLength(1);
+    expect(f.calls.some(call => call.method === 'thread/queue/add')).toBe(false);
   });
 
   it('forwards approval requests and rejects responses after another client resolves them', async () => {

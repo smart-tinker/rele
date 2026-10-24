@@ -47,7 +47,7 @@ class FakeCodex extends EventEmitter implements CodexGateway {
   rejectRequest = vi.fn(async (_rpcId: string | number, _message: string) => {});
   interrupt = vi.fn(async (_threadId: string, _turnId: string) => {});
   deleteQueued = vi.fn(async (_threadId: string, _queuedSubmissionId: string) => ({ deleted: true }));
-  startQueued = vi.fn(async (_threadId: string, _queuedSubmissionId?: string) => ({ turn: { id: 'resumed-turn', status: 'inProgress', items: [] } }));
+  startQueued = vi.fn(async (_threadId: string, _queuedSubmissionId: string) => ({ turn: { id: 'resumed-turn', status: 'inProgress', items: [] } }));
   notification(event: CodexNotification): void { this.emit('notification', event); }
   request(event: CodexServerRequest): void { this.emit('request', event); }
   connection(connected: boolean): void { this.connected = connected; this.emit('status'); }
@@ -342,6 +342,177 @@ describe('Engine correlation and queue', () => {
     await reconciliation;
     expect(f.store.getRequest(request.id)?.status).toBe('cancelled');
     expect(f.store.listDeliveries()).toEqual([]);
+  });
+});
+
+describe('Engine continuation after native Stop', () => {
+  function ownQueue(f: ReturnType<typeof fixture>, request: ReleRequest, soleQueuedSubmission = true): RequestLocation {
+    const location: RequestLocation = { state: 'queued', queuedSubmissionId: `queue-${request.id}`, soleQueuedSubmission };
+    f.codex.locations.set(request.id, location);
+    return location;
+  }
+
+  it('automatically starts the fresh own submission after Stop while preserving the original origin and UUID', async () => {
+    const f = fixture();
+    const stopped = await acceptRequest(f, 'telegram', 'stopped');
+    await running(f, stopped);
+    f.codex.locations.set(stopped.id, { state: 'interrupted', turnId: 'turn-1' });
+    f.codex.notification({ method: 'turn/completed', params: { threadId: THREAD, turn: { id: 'turn-1', status: 'interrupted' } } });
+    await f.engine.settled();
+    f.codex.enqueue.mockImplementationOnce(async (_thread, _text, clientId) => {
+      const queuedSubmissionId = `queue-${clientId}`;
+      f.codex.locations.set(clientId, { state: 'queued', queuedSubmissionId, soleQueuedSubmission: true });
+      return { queuedSubmissionId };
+    });
+    f.codex.startQueued.mockImplementationOnce(async (_thread, queuedSubmissionId) => {
+      const requestId = queuedSubmissionId.slice('queue-'.length);
+      f.codex.running(requestId, 'fresh-turn');
+      return { turn: { id: 'fresh-turn', status: 'inProgress', items: [] } };
+    });
+    const fresh = await acceptRequest(f, 'slack', 'fresh-after-stop');
+    await f.engine.settled();
+    expect(f.codex.startQueued).toHaveBeenCalledExactlyOnceWith(THREAD, `queue-${fresh.id}`);
+    expect(f.store.getRequest(stopped.id)?.status).toBe('interrupted');
+    expect(f.store.getRequest(fresh.id)).toMatchObject({ status: 'running', turnId: 'fresh-turn', origin: fresh.origin });
+    f.codex.complete(fresh.id, 'Fresh own result', 'fresh-turn');
+    await f.engine.settled(); await f.engine.pump();
+    expect(f.slack.deliver.mock.calls.some(([delivery]) => delivery.requestId === fresh.id && delivery.body === 'Fresh own result')).toBe(true);
+    expect(f.telegram.deliver.mock.calls.some(([delivery]) => delivery.requestId === fresh.id)).toBe(false);
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(2);
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+  });
+
+  it('keeps a foreign native queue paused automatically but permits explicit continuation of the selected own entry', async () => {
+    const f = fixture(), request = await acceptRequest(f, 'telegram');
+    ownQueue(f, request, false);
+    await f.engine.reconcile(request.id);
+    expect(f.codex.startQueued).not.toHaveBeenCalled();
+    await f.engine.resume(request.id);
+    expect(f.codex.startQueued).toHaveBeenCalledExactlyOnceWith(THREAD, `queue-${request.id}`);
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries only after a confirmed busy refusal and never interrupts the active Desktop turn', async () => {
+    const f = fixture(), request = await acceptRequest(f, 'telegram');
+    ownQueue(f, request);
+    f.codex.startQueued.mockRejectedValueOnce(new CodexThreadBusyError(THREAD, 'non_idle'));
+    await f.engine.reconcile(request.id);
+    expect(f.store.getRequest(request.id)?.status).toBe('starting');
+    expect(f.store.getMeta(`queue-start-attempt:${request.id}`)).toBe('');
+    await f.engine.reconcile(request.id);
+    expect(f.codex.startQueued).toHaveBeenCalledTimes(2);
+    expect(f.codex.startQueued.mock.calls.every(args => args[1] === `queue-${request.id}`)).toBe(true);
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('recovers a lost enqueue ACK by UUID and starts the existing sole submission without enqueueing again', async () => {
+    const f = fixture();
+    f.codex.enqueue.mockImplementationOnce(async (_thread, _text, clientId) => {
+      f.codex.locations.set(clientId, { state: 'queued', queuedSubmissionId: 'accepted-native-entry', soleQueuedSubmission: true });
+      throw new CodexTransportError('Lost queue/add ACK');
+    });
+    const request = await acceptRequest(f, 'telegram');
+    await f.engine.reconcile(request.id);
+    expect(f.codex.startQueued).toHaveBeenCalledExactlyOnceWith(THREAD, 'accepted-native-entry');
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+    expect(f.store.getRequest(request.id)?.queuedSubmissionId).toBe('accepted-native-entry');
+  });
+
+  it('persists a lost queue/start ACK fence across restart and recovers later completion without repeating either mutation', async () => {
+    const f = fixture(), request = await acceptRequest(f, 'telegram');
+    ownQueue(f, request);
+    f.codex.startQueued.mockRejectedValueOnce(new CodexTransportError('Lost queue/start ACK'));
+    await f.engine.reconcile(request.id);
+    expect(f.store.getRequest(request.id)?.status).toBe('uncertain');
+    await f.engine.reconcile(request.id);
+    expect(f.codex.startQueued).toHaveBeenCalledTimes(1);
+    await f.engine.stop();
+    const restarted = fixture({ path: f.path, start: false });
+    ownQueue(restarted, request);
+    restarted.engine.start(); await restarted.engine.settled(); await restarted.engine.reconcile(request.id);
+    expect(restarted.codex.startQueued).not.toHaveBeenCalled();
+    expect(restarted.codex.enqueue).not.toHaveBeenCalled();
+    expect(restarted.store.getRequest(request.id)?.status).toBe('uncertain');
+    restarted.codex.locations.set(request.id, { state: 'completed', turnId: 'accepted-before-loss', text: 'Recovered result' });
+    await restarted.engine.reconcile(request.id); await restarted.engine.pump();
+    expect(restarted.store.getRequest(request.id)?.status).toBe('completed');
+    expect(restarted.telegram.deliver).toHaveBeenCalledTimes(1);
+    expect(restarted.codex.startQueued).not.toHaveBeenCalled();
+  });
+
+  it.each(['pause', 'source-off', 'suspend', 'mixed', 'cancel', 'replace', 'disconnect', 'unverified'] as const)('rechecks %s after the native queue lookup before any automatic mutation', async guard => {
+    const f = fixture(), request = await acceptRequest(f, 'slack');
+    const location = ownQueue(f, request), gate = deferred<RequestLocation>();
+    f.codex.findRequest.mockImplementationOnce(() => gate.promise);
+    const before = f.codex.findRequest.mock.calls.length;
+    const checking = f.engine.reconcile(request.id);
+    await vi.waitFor(() => expect(f.codex.findRequest.mock.calls.length).toBe(before + 1));
+    if (guard === 'pause') f.store.updateConversation(request.conversationId, { paused: true });
+    if (guard === 'source-off') f.store.setSourceAccess(f.eps.slack.id, { mode: 'off' });
+    if (guard === 'suspend') f.engine.suspend(true);
+    if (guard === 'mixed') f.store.setMeta(`mixed:${request.id}`, '1');
+    if (guard === 'cancel') await f.engine.cancel(request.id);
+    if (guard === 'replace') f.engine.replaceCodex(new FakeCodex());
+    if (guard === 'disconnect') f.codex.connection(false);
+    if (guard === 'unverified') f.codex.verifiedVersion = false;
+    gate.resolve(location); await checking; await f.engine.settled();
+    expect(f.codex.startQueued).not.toHaveBeenCalled();
+    expect(f.store.listRequests()).toHaveLength(1);
+  });
+
+  it('keeps the cancellation fence after a lost delete ACK and a Rele restart', async () => {
+    const f = fixture(), request = await acceptRequest(f, 'telegram');
+    ownQueue(f, request);
+    f.codex.deleteQueued.mockRejectedValueOnce(new CodexTransportError('Lost delete ACK'));
+    await expect(f.engine.cancel(request.id)).rejects.toThrow('Lost delete ACK');
+    await f.engine.reconcile(request.id);
+    expect(f.codex.startQueued).not.toHaveBeenCalled();
+    await f.engine.stop();
+    const restarted = fixture({ path: f.path, start: false });
+    ownQueue(restarted, request); restarted.engine.start(); await restarted.engine.settled();
+    expect(restarted.store.getMeta(`cancel-requested:${request.id}`)).toBe('1');
+    expect(restarted.codex.startQueued).not.toHaveBeenCalled();
+    expect(restarted.codex.enqueue).not.toHaveBeenCalled();
+    await expect(restarted.engine.resume(request.id)).rejects.toThrow('отмену');
+  });
+
+  it('cancels the exact own turn if it starts while the queued deletion is in flight', async () => {
+    const f = fixture(), request = await acceptRequest(f, 'telegram');
+    const location = ownQueue(f, request), startAck = deferred<{ turn: { id: string; status: string; items: never[] } }>();
+    f.codex.startQueued.mockImplementationOnce(() => startAck.promise);
+    const continuing = f.engine.reconcile(request.id);
+    await vi.waitFor(() => expect(f.codex.startQueued).toHaveBeenCalledTimes(1));
+    f.codex.deleteQueued.mockImplementationOnce(async () => {
+      f.codex.locations.set(request.id, { state: 'running', turnId: 'exact-own-started-turn' });
+      return { deleted: false };
+    });
+    await f.engine.cancel(request.id);
+    expect(f.codex.deleteQueued).toHaveBeenCalledExactlyOnceWith(THREAD, location.queuedSubmissionId);
+    expect(f.codex.interrupt).toHaveBeenCalledExactlyOnceWith(THREAD, 'exact-own-started-turn');
+    startAck.resolve({ turn: { id: 'exact-own-started-turn', status: 'inProgress', items: [] } });
+    await continuing;
+    f.codex.locations.set(request.id, { state: 'interrupted', turnId: 'exact-own-started-turn' });
+    await f.engine.reconcile(request.id);
+    expect(f.store.getRequest(request.id)?.status).toBe('interrupted');
+    expect(f.codex.startQueued).toHaveBeenCalledTimes(1);
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('shares one native start between manual resume and reconciliation', async () => {
+    const f = fixture(), request = await acceptRequest(f, 'telegram');
+    ownQueue(f, request);
+    const gate = deferred<{ turn: { id: string; status: string; items: never[] } }>();
+    f.codex.startQueued.mockImplementationOnce(() => gate.promise);
+    const automatic = f.engine.reconcile(request.id);
+    await vi.waitFor(() => expect(f.codex.startQueued).toHaveBeenCalledTimes(1));
+    const manual = f.engine.resume(request.id);
+    await Promise.resolve();
+    f.codex.locations.set(request.id, { state: 'running', turnId: 'one-start' });
+    gate.resolve({ turn: { id: 'one-start', status: 'inProgress', items: [] } });
+    await Promise.all([automatic, manual]); await f.engine.settled();
+    expect(f.codex.startQueued).toHaveBeenCalledTimes(1);
+    expect(f.store.getRequest(request.id)?.turnId).toBe('one-start');
   });
 });
 

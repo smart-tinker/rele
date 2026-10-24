@@ -716,13 +716,21 @@ trust_level="trusted"
             assert after_backend['runtimeProcessId'] == new_pid and after_backend['threadId'] == thread
             assert {row['id'] for row in after_backend['requests']} == preserved
             before = len(records)
-            await engine.command('ingest', platform='telegram', eventId='after-native-restart', text='after-native-restart-request')
-            queued = await engine.command('wait', status='starting')
-            continued = next(row for row in queued['requests'] if row['eventId'] == 'after-native-restart')
-            assert len(records) == before, 'An interrupted native queue resumed without explicit continuation'
-            await engine.command('resume', requestId=continued['id'])
-            await engine.command('wait')
-            report['checks']['interrupted_native_queue_explicit_continuation_without_resend'] = True
+            ingressed = await engine.command('ingest', platform='telegram', eventId='after-native-restart', text='after-native-restart-request')
+            continued = next(row for row in ingressed['requests'] if row['eventId'] == 'after-native-restart')
+            assert str(uuid.UUID(continued['id'])) == continued['id']
+            completed = await engine.command('wait')
+            recovered = [row for row in completed['requests'] if row['eventId'] == 'after-native-restart']
+            assert len(recovered) == 1 and recovered[0]['id'] == continued['id']
+            assert recovered[0]['status'] == 'completed' and recovered[0]['origin'] == continued['origin']
+            assert len(records) == before + 1, 'Automatic continuation duplicated the accepted request'
+            turns = (await peer.call('thread/turns/list', {'threadId': thread, 'limit': 100,
+                     'itemsView': 'full', 'sortDirection': 'desc'}))['data']
+            own_turns = [turn for turn in turns if any(item.get('type') == 'userMessage'
+                         and item.get('clientId') == continued['id'] for item in turn['items'])]
+            assert len(own_turns) == 1 and own_turns[0]['id'] == recovered[0]['turnId']
+            assert next(row for row in completed['requests'] if row['id'] == cancel['id'])['status'] == 'interrupted'
+            report['checks']['interrupted_native_queue_automatic_continuation_without_resend'] = True
             assert all(marker in json.dumps(records[before]) for marker in
                        (f'{order}-desktop-prior-context', f'{order}-slack-request', 'held-original-request'))
             report['checks']['native_stop_start_restart_restores_original_id_history_and_rele_records'] = True

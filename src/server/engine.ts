@@ -41,6 +41,7 @@ export class Engine extends EventEmitter {
   private approvals = new Map<string, { accept: boolean; decline: string }>();
   private fileChanges = new Map<string, string>();
   private resolutions = new Set<string>();
+  private startingQueued = new Map<string, Promise<void>>();
   private lastReconcile = 0;
   private suspended = false;
   private readonly slackSync: SlackSync;
@@ -210,21 +211,37 @@ export class Engine extends EventEmitter {
   async cancel(id: string): Promise<void> {
     const request = this.store.getRequest(id);
     if (!request || terminal(request.status)) throw new Error('Запрос уже завершён.');
+    // A lost cancellation ACK must never let reconciliation restart the original request.
+    this.store.setMeta(`cancel-requested:${id}`, '1');
     if (request.status === 'queued' || request.status === 'transcribing') {
       this.store.finishRequest(id, { status: 'cancelled', error: undefined }, []);
       await this.releaseIdleThread(request.conversationId);
       this.changed(); return;
     }
     const conversation = this.store.getConversation(request.conversationId)!;
-    const found = await this.codex.findRequest(conversation.threadId, request.id);
+    const client = this.codex, epoch = this.epoch;
+    let found = await client.findRequest(conversation.threadId, request.id);
+    if (client !== this.codex || epoch !== this.epoch) throw new Error('Соединение Codex изменилось. Сверьте отмену запроса.');
     if (found.mixed || this.isMixed(request.id)) throw new Error('В ход добавлено сообщение другого клиента Codex. Автоматическая отмена смешанного хода недоступна.');
     if (found.state === 'queued' && found.queuedSubmissionId) {
-      const removed = await this.codex.deleteQueued(conversation.threadId, found.queuedSubmissionId);
-      if (!removed.deleted) throw new Error('Запрос уже начал выполняться. Сверьте состояние и повторите отмену.');
-      this.store.finishRequest(id, { status: 'cancelled' }, []);
-    } else if (found.state === 'running' && found.turnId) {
-      await this.codex.interrupt(conversation.threadId, found.turnId);
-    } else if (found.state !== 'not_found') {
+      const removed = await client.deleteQueued(conversation.threadId, found.queuedSubmissionId);
+      if (client !== this.codex || epoch !== this.epoch) throw new Error('Соединение Codex изменилось. Сверьте отмену запроса.');
+      if (removed.deleted) {
+        this.store.finishRequest(id, { status: 'cancelled' }, []);
+        await this.releaseIdleThread(request.conversationId);
+        this.changed(); return;
+      }
+      found = await client.findRequest(conversation.threadId, request.id);
+      if (['queued', 'not_found'].includes(found.state) && this.startingQueued.has(id)) {
+        await this.startingQueued.get(id)!.catch(() => {});
+        found = await client.findRequest(conversation.threadId, request.id);
+      }
+    }
+    if (client !== this.codex || epoch !== this.epoch) throw new Error('Соединение Codex изменилось. Сверьте отмену запроса.');
+    if (found.mixed || this.isMixed(request.id)) throw new Error('В ход добавлено сообщение другого клиента Codex. Автоматическая отмена смешанного хода недоступна.');
+    if (found.state === 'running' && found.turnId) {
+      await client.interrupt(conversation.threadId, found.turnId);
+    } else if (!['queued', 'not_found'].includes(found.state)) {
       this.finishFromHistory(request, found);
     } else throw new Error('Codex пока не подтвердил состояние запроса. Отмена без сверки недоступна.');
     await this.releaseIdleThread(request.conversationId);
@@ -235,10 +252,42 @@ export class Engine extends EventEmitter {
     const request = this.store.getRequest(id);
     if (!request || terminal(request.status)) throw new Error('Запрос уже завершён.');
     const conversation = this.store.getConversation(request.conversationId)!;
-    const found = await this.codex.findRequest(conversation.threadId, id);
+    const client = this.codex, epoch = this.epoch;
+    const found = await client.findRequest(conversation.threadId, id);
+    if (client !== this.codex || epoch !== this.epoch) throw new Error('Соединение Codex изменилось. Сверьте запрос перед продолжением.');
     if (found.state !== 'queued' || !found.queuedSubmissionId) throw new Error('Запрос не находится в очереди Codex.');
-    await this.codex.startQueued(conversation.threadId, found.queuedSubmissionId);
+    await this.continueQueued(request, found, false);
     await this.reconcile(id);
+  }
+
+  private continueQueued(request: ReleRequest, found: RequestLocation, automatic: boolean): Promise<void> {
+    const pending = this.startingQueued.get(request.id);
+    if (pending) return pending;
+    const client = this.codex, epoch = this.epoch;
+    const operation = (async () => {
+      const current = this.store.getRequest(request.id)!;
+      if (terminal(current.status)) return;
+      if (current.turnId || this.isMixed(current.id) || this.store.getMeta(`cancel-requested:${current.id}`)) {
+        throw new Error('Этот запрос нельзя продолжить; сверьте его состояние и отмену.');
+      }
+      const key = `queue-start-attempt:${current.id}`;
+      if (this.store.getMeta(key)) throw new Error('Результат прежнего запуска очереди ещё не подтверждён. Требуется сверка без повторного запуска.');
+      if (automatic && (!found.soleQueuedSubmission || this.stopped || this.suspended || this.waitsForSource(current)
+        || this.store.getConversation(current.conversationId)?.paused || !client.status().connected
+        || !client.status().queueSupported || !client.isVerifiedVersion())) return;
+      if (!found.queuedSubmissionId) throw new Error('Элемент очереди Codex не подтверждён.');
+      // Starting a queued item is a separate mutation; persist its fence before the wire write.
+      this.store.setMeta(key, found.queuedSubmissionId);
+      try {
+        await client.startQueued(this.store.getConversation(current.conversationId)!.threadId, found.queuedSubmissionId);
+        if (client !== this.codex || epoch !== this.epoch) throw new Error('Соединение изменилось во время запуска очереди. Требуется сверка.');
+      } catch (error) {
+        if (error instanceof CodexThreadBusyError) this.store.setMeta(key, '');
+        throw error;
+      }
+    })().finally(() => { if (this.startingQueued.get(request.id) === operation) this.startingQueued.delete(request.id); });
+    this.startingQueued.set(request.id, operation);
+    return operation;
   }
 
   retryDelivery(id: string): void {
@@ -254,22 +303,29 @@ export class Engine extends EventEmitter {
     const request = this.store.getRequest(id);
     if (!request || terminal(request.status) || ['queued', 'transcribing'].includes(request.status)) return;
     this.reconciling.add(id);
+    const client = this.codex, epoch = this.epoch;
     try {
       const conversation = this.store.getConversation(request.conversationId)!;
       await this.releasing.get(conversation.id);
-      await this.codex.subscribe(conversation.threadId);
+      await client.subscribe(conversation.threadId);
+      if (client !== this.codex || epoch !== this.epoch) return;
       this.ownedThreads.add(conversation.id);
-      const found = await this.codex.findRequest(conversation.threadId, id);
-      if (terminal(this.store.getRequest(id)!.status)) return;
+      const found = await client.findRequest(conversation.threadId, id);
+      if (client !== this.codex || epoch !== this.epoch || terminal(this.store.getRequest(id)!.status)) return;
       if (found.mixed) this.store.setMeta(`mixed:${id}`, '1');
       if (found.state === 'not_found') this.store.updateRequest(id, { status: 'uncertain', error: 'Запрос не найден в очереди и истории Codex. Автоматическая повторная отправка запрещена; требуется сверка.' });
-      else if (found.state === 'queued') this.store.updateRequest(id, { status: 'starting', queuedSubmissionId: found.queuedSubmissionId, error: undefined });
+      else if (found.state === 'queued') {
+        this.store.updateRequest(id, { status: 'starting', queuedSubmissionId: found.queuedSubmissionId, error: undefined });
+        await this.continueQueued(request, found, true);
+      }
       else if (found.state === 'running') {
         const pending = this.store.listApprovals(1000).some(approval => approval.requestId === id && approval.status === 'pending');
         this.store.updateRequest(id, { status: this.isMixed(id) ? 'uncertain' : pending ? 'waiting_approval' : 'running', turnId: found.turnId, error: this.isMixed(id) ? mixedMessage : undefined });
       } else this.finishFromHistory(request, found);
     } catch (error) {
-      if (!terminal(this.store.getRequest(id)!.status)) this.store.updateRequest(id, { status: 'uncertain', error: this.options.redact(error) });
+      if (client === this.codex && epoch === this.epoch && !terminal(this.store.getRequest(id)!.status)) {
+        this.store.updateRequest(id, { status: error instanceof CodexThreadBusyError && this.store.getRequest(id)?.queuedSubmissionId ? 'starting' : 'uncertain', error: this.options.redact(error) });
+      }
     } finally {
       this.reconciling.delete(id);
       if (this.reconcileAgain.delete(id) && !this.stopped) this.track(this.reconcile(id));
@@ -430,6 +486,7 @@ export class Engine extends EventEmitter {
       const result = await this.codex.enqueue(conversation.threadId, request.text, request.id);
       // The userMessage and completion notifications may arrive before this ACK.
       this.store.updateRequest(request.id, { queuedSubmissionId: result.queuedSubmissionId });
+      this.track(this.reconcile(request.id));
     } catch (error) {
       if (error instanceof CodexThreadBusyError) {
         // Ownership failed before queue/add: the original request and origin stay durable.
