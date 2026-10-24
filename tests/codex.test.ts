@@ -937,8 +937,12 @@ describe('Codex managed runtime', () => {
   it.each([
     ['0.163.0-alpha.10.2', true],
     ['0.163.0-alpha.11.2', true],
+    ['0.164.0-alpha.11.1', true],
     ['0.163.0-alpha.10.3', false],
     ['0.163.0-alpha.11.3', false],
+    ['0.164.0-alpha.11', false],
+    ['0.164.0-alpha.11.2', false],
+    ['0.164.0-alpha.11.1.extra', false],
     ['0.163.0-alpha.11.2.extra', false],
     ['0.163.0-alpha.10.2.extra', false],
     ['0.163.0+custom', false],

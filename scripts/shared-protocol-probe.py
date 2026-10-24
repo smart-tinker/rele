@@ -25,7 +25,7 @@ import websockets
 from websockets.exceptions import ConnectionClosedError
 from websockets.protocol import State
 
-VERSIONS = ['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2']
+VERSIONS = ['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1']
 REPO = Path(__file__).resolve().parent.parent
 NODE = shutil.which('node')
 DRIVER = REPO / 'scripts/probe-shared-codex.ts'
@@ -38,12 +38,15 @@ def arguments():
     source.add_argument('--codex-prefix', type=Path)
     source.add_argument('--desktop-bundle', type=Path)
     parser.add_argument('--desktop-inventory', type=Path)
+    parser.add_argument('--installed-desktop', action='store_true')
     parser.add_argument('--expected-version', choices=VERSIONS, required=True)
     parser.add_argument('--report', type=Path, required=True)
     parser.add_argument('--windows-app-template', type=Path)
     parser.add_argument('--windows-runtime', choices=['source', 'packaged'], default='source')
     args = parser.parse_args()
     args.retain_fixture = False
+    if args.installed_desktop and (os.name != 'nt' or not args.desktop_bundle or not args.desktop_inventory):
+        parser.error('Installed Desktop mode requires Windows, --desktop-bundle and the signed --desktop-inventory.')
     if os.name == 'nt':
         if not args.windows_app_template:
             parser.error('Windows shared gate requires --windows-app-template with Rele.exe and dist/native/Rele.Process.exe.')
@@ -206,7 +209,7 @@ def frame(event):
 
 async def gate(args, root):
     report = {'codexVersion': args.expected_version, 'platform': os.name, 'actualDesktopTested': False, 'actualDesktopGui': False,
-              'actualDesktopBundle': bool(args.desktop_bundle), 'actualDesktopBackendExecuted': False,
+              'actualDesktopBundle': bool(args.desktop_bundle), 'installedDesktop': args.installed_desktop, 'actualDesktopBackendExecuted': False,
               'realModelRequests': 0, 'realMessengerRequests': 0, 'checks': {}}
     records, actions, holds, errors, drainers, processes = [], [], [], [], [], []
     native_executables = {}
@@ -288,11 +291,12 @@ stream_max_retries=0
                      'HTTP_PROXY': 'http://127.0.0.1:9', 'HTTPS_PROXY': 'http://127.0.0.1:9',
                      'ALL_PROXY': 'http://127.0.0.1:9'})
     if args.desktop_bundle:
-        # Use an ordinary supported install root, not injected discovery results or a
-        # prepared CLI package. Every selected file remains the real signed ZIP entry.
+        # Keep installed Appx discovery real; copied bundles use the existing isolated install root.
         local = root / 'desktop-user/AppData/Local'
-        install = local / 'Programs/ChatGPT'
-        shutil.copytree(args.desktop_bundle, install)
+        local.mkdir(parents=True, exist_ok=True)
+        install = args.desktop_bundle if args.installed_desktop else local / 'Programs/ChatGPT'
+        if not args.installed_desktop:
+            shutil.copytree(args.desktop_bundle, install)
         for row in args.inventory['inventory']:
             source = install / row['path']
             assert source.is_file() and source.stat().st_size == row['size'], row['path']
@@ -430,7 +434,7 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
 
     async def driver(env, workspace, prepare=False, thread=None, profile_socket=None, expected_error=None):
         command = [NODE, str(REPO / 'node_modules/tsx/dist/cli.mjs'), str(DRIVER),
-                   '--executable', 'codex' if args.desktop_bundle else str(args.cli), '--home', env['CODEX_HOME'], '--directory', str(workspace)]
+                   '--executable', 'codex' if args.desktop_bundle and not args.installed_desktop else str(args.cli), '--home', env['CODEX_HOME'], '--directory', str(workspace)]
         if os.name == 'nt':
             app_dir = windows_fixtures.get(env['CODEX_HOME'], windows_fixtures[next(iter(windows_fixtures))])['application']
             command += ['--runtime-directory' if args.windows_runtime == 'packaged' else '--windows-install-dir', str(app_dir)]
@@ -641,16 +645,17 @@ trust_level="trusted"
                 report['checks']['original_desktop_thread_history_precede_native_bootstrap'] = True
                 engine, ready = await driver(env, workspace, thread=thread)
                 pid = ready['runtimeProcessId']
-                assert ready['configuredExecutable'] == 'codex' and ready['catalogValidated']
+                assert ready['configuredExecutable'] == (str(args.cli) if args.installed_desktop else 'codex') and ready['catalogValidated']
                 assert ready['threadId'] == thread and pid != private_pid
                 report['desktopBootstrap'] = {'originalThreadId': thread, 'privateProcessId': private_pid,
                     'nativeProcessId': pid, 'configuredExecutable': ready['configuredExecutable'],
-                    'codexHome': ready['runtime']['codexHome'], 'automaticDiscovery': True}
+                    'codexHome': ready['runtime']['codexHome'], 'automaticDiscovery': not args.installed_desktop}
                 native_executables[env['CODEX_HOME']] = Path(ready['status']['executable'])
                 assert native_executables[env['CODEX_HOME']].resolve() == args.cli.resolve()
                 peer = await desktop(env, 'actual_desktop_direct_ws_peer')
                 await peer.call('thread/resume', {'threadId': thread, 'excludeTurns': True})
-                report['checks']['production_auto_discovery_bootstraps_desktop_only_same_thread_profile'] = True
+                report['checks']['explicit_installed_desktop_backend_same_thread_profile' if args.installed_desktop
+                    else 'production_auto_discovery_bootstraps_desktop_only_same_thread_profile'] = True
             elif order == 'rele-first':
                 engine, ready = await driver(env, workspace)
                 thread, pid = ready['threadId'], ready['runtimeProcessId']

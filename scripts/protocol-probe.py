@@ -22,7 +22,7 @@ import websockets
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--codex', help='Path to the native Codex binary (codex.exe on Windows).')
 parser.add_argument('--codex-prefix', help='npm install prefix containing the exact @openai/codex version under test.')
-parser.add_argument('--expected-version', default='0.163.0', choices=['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2'])
+parser.add_argument('--expected-version', default='0.163.0', choices=['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1'])
 parser.add_argument('--report', type=pathlib.Path, help='Write the sanitized fixture result as JSON.')
 args = parser.parse_args()
 if args.codex_prefix:
