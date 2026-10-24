@@ -779,8 +779,10 @@ trust_level="trusted"
             report['checks']['desktop_question_late_replay_and_peer_answer_share_owner'] = True
             # The command is bounded and writes only inside this disposable workspace.
             ready_file, late_file = workspace / 'cancel-ready.json', workspace / 'cancel-late.txt'
-            command_script = 'const f=require("node:fs");f.writeFileSync(process.argv[1],JSON.stringify({pid:process.pid}));setTimeout(()=>f.writeFileSync(process.argv[2],"not-stopped"),12000);'
-            command_args = [NODE, '-e', command_script, str(ready_file), str(late_file)]
+            command_file = workspace / 'cancel-child.cjs'
+            # PowerShell 5 strips embedded JS quotes from native -e arguments.
+            command_file.write_text('const f=require("node:fs");f.writeFileSync(process.argv[2],JSON.stringify({pid:process.pid}));setTimeout(()=>f.writeFileSync(process.argv[3],"not-stopped"),12000);', encoding='utf-8')
+            command_args = [str(Path(NODE).resolve(strict=True)), str(command_file), str(ready_file), str(late_file)]
             shell_command = ('& ' + ' '.join("'" + value.replace("'", "''") + "'" for value in command_args)
                              if os.name == 'nt' else shlex.join(command_args))
             hold_cancel = asyncio.Event(); holds.append(hold_cancel)
