@@ -1,8 +1,15 @@
 using System;
 using System.Diagnostics;
+using System.Collections.Generic;
+using System.IO;
+using System.Net;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Security.Principal;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
+using System.Web.Script.Serialization;
 using Microsoft.Win32.SafeHandles;
 
 // Internal byte-transparent host. Its private Job owns the child before the child can run.
@@ -24,10 +31,26 @@ internal sealed class ProcessHost : IDisposable
     private bool stopped;
     private readonly ManualResetEvent stopRequested = new ManualResetEvent(false);
     private string relayFailure;
+    private bool websocketOwner;
+    private uint childPid;
+    private string childStartedAt;
+
+    private sealed class WebSocketOwner
+    {
+        public int Version { get; set; }
+        public string OwnerSid { get; set; }
+        public string Executable { get; set; }
+        public string ExecutableSha256 { get; set; }
+        public string HostSha256 { get; set; }
+        public string CodexHome { get; set; }
+        public string Endpoint { get; set; }
+        public string TaskName { get; set; }
+    }
 
     private static int Main(string[] args)
     {
         if (args.Length > 0 && args[0] == "--repair-codex-control") return CodexControlDirectory.Run(args);
+        if (args.Length > 0 && args[0] == "--codex-websocket-owner") return RunWebSocketOwner(args);
         using (var host = new ProcessHost())
         {
             try
@@ -46,6 +69,97 @@ internal sealed class ProcessHost : IDisposable
                 return 1;
             }
         }
+    }
+
+    private static int RunWebSocketOwner(string[] args)
+    {
+        try
+        {
+            if (args.Length != 2 || !Path.IsPathRooted(args[1]) || Path.GetFileName(args[1]) != "owner.json")
+                throw new InvalidOperationException("invalid WebSocket owner marker");
+            string directory = Path.GetDirectoryName(Path.GetFullPath(args[1]));
+            RequirePrivateDirectory(directory);
+            var json = new JavaScriptSerializer();
+            string marker = File.ReadAllText(args[1]);
+            WebSocketOwner owner = json.Deserialize<WebSocketOwner>(marker);
+            using (var hash = SHA256.Create())
+                if (BitConverter.ToString(hash.ComputeHash(Encoding.UTF8.GetBytes(marker))).Replace("-", "").ToLowerInvariant() != Path.GetFileName(directory))
+                    throw new InvalidOperationException("WebSocket owner marker changed");
+            Uri endpoint;
+            if (owner == null || owner.Version != 1 || owner.OwnerSid != WindowsIdentity.GetCurrent().User.Value ||
+                !Uri.TryCreate(owner.Endpoint, UriKind.Absolute, out endpoint) || endpoint.Scheme != "ws" || endpoint.Host != "127.0.0.1" ||
+                endpoint.Port <= 0 || endpoint.Port > 65535 || endpoint.AbsolutePath != "/" || !String.IsNullOrEmpty(endpoint.Query) ||
+                !String.IsNullOrEmpty(endpoint.Fragment) || !String.IsNullOrEmpty(endpoint.UserInfo) ||
+                !Path.IsPathRooted(owner.CodexHome) || !Path.IsPathRooted(owner.Executable) ||
+                !Regex.IsMatch(owner.TaskName ?? "", @"^Rele-[A-Za-z0-9._-]{1,130}$") ||
+                !Regex.IsMatch(owner.ExecutableSha256 ?? "", "^[a-f0-9]{64}$") ||
+                !Regex.IsMatch(owner.HostSha256 ?? "", "^[a-f0-9]{64}$"))
+                throw new InvalidOperationException("WebSocket owner identity does not match");
+            string executable = Process.GetCurrentProcess().MainModule.FileName;
+            if (!String.Equals(Path.GetDirectoryName(executable), directory, StringComparison.OrdinalIgnoreCase) ||
+                Hash(executable) != owner.HostSha256 || Hash(owner.Executable) != owner.ExecutableSha256)
+                throw new InvalidOperationException("WebSocket owner executable changed");
+            // The task is independent of Rele's gateway; only this host owns the native child Job.
+            using (var operation = new FileStream(Path.Combine(directory, "owner.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
+            using (var native = new FileStream(owner.Executable, FileMode.Open, FileAccess.Read, FileShare.Read))
+            using (var host = new ProcessHost())
+            {
+                Environment.SetEnvironmentVariable("CODEX_HOME", owner.CodexHome);
+                Environment.SetEnvironmentVariable("CODEX_CLI_PATH", null);
+                Environment.SetEnvironmentVariable("CODEX_APP_SERVER_FORCE_CLI", null);
+                Environment.SetEnvironmentVariable("CODEX_APP_SERVER_WS_URL", null);
+                host.websocketOwner = true;
+                using (var hash = SHA256.Create())
+                    if (BitConverter.ToString(hash.ComputeHash(native)).Replace("-", "").ToLowerInvariant() != owner.ExecutableSha256)
+                        throw new InvalidOperationException("native executable changed before launch");
+                host.Start(new[] { "--", owner.Executable, "-c", "features.code_mode_host=true", "app-server", "--listen", owner.Endpoint });
+                WriteOwnerReceipt(json, directory, owner, host.childPid, host.childStartedAt, null);
+                host.WaitForStop();
+                uint exitCode;
+                if (!GetExitCodeProcess(host.process, out exitCode)) throw Failure("read native exit code");
+                host.Stop();
+                WriteOwnerReceipt(json, directory, owner, host.childPid, host.childStartedAt, exitCode);
+                return unchecked((int)exitCode);
+            }
+        }
+        catch (Exception error)
+        {
+            Report(error is InvalidOperationException ? error.Message : "WebSocket owner failed");
+            return 1;
+        }
+    }
+
+    private static string Hash(string file)
+    {
+        using (var hash = SHA256.Create()) using (var input = File.OpenRead(file))
+            return BitConverter.ToString(hash.ComputeHash(input)).Replace("-", "").ToLowerInvariant();
+    }
+
+    private static void RequirePrivateDirectory(string directory)
+    {
+        if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0) throw new InvalidOperationException("owner directory is redirected");
+        var security = Directory.GetAccessControl(directory);
+        SecurityIdentifier sid = WindowsIdentity.GetCurrent().User;
+        if (!security.GetOwner(typeof(SecurityIdentifier)).Equals(sid) || !security.AreAccessRulesProtected)
+            throw new InvalidOperationException("owner directory is not private");
+        foreach (System.Security.AccessControl.FileSystemAccessRule rule in security.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+            if (rule.AccessControlType == System.Security.AccessControl.AccessControlType.Allow && !rule.IdentityReference.Equals(sid))
+                throw new InvalidOperationException("owner directory has a foreign access grant");
+    }
+
+    private static void WriteOwnerReceipt(JavaScriptSerializer json, string directory, WebSocketOwner owner, uint pid, string startedAt, uint? exitCode)
+    {
+        var receipt = new Dictionary<string, object> {
+            { "ownerSid", owner.OwnerSid }, { "endpoint", owner.Endpoint }, { "codexHome", owner.CodexHome },
+            { "executable", owner.Executable }, { "executableSha256", owner.ExecutableSha256 },
+            { "hostPid", Process.GetCurrentProcess().Id }, { "nativePid", pid }, { "exitCode", exitCode },
+            { "status", exitCode.HasValue ? "exited" : "running" }
+        };
+        receipt.Add("hostStartedAt", Process.GetCurrentProcess().StartTime.ToUniversalTime().ToString("o"));
+        receipt.Add("nativeStartedAt", startedAt);
+        string path = Path.Combine(directory, "receipt.json"), temporary = path + ".new";
+        File.WriteAllText(temporary, json.Serialize(receipt), new UTF8Encoding(false));
+        if (File.Exists(path)) File.Replace(temporary, path, null); else File.Move(temporary, path);
     }
 
     private void Start(string[] args)
@@ -69,12 +183,21 @@ internal sealed class ProcessHost : IDisposable
         bool attributeListInitialized = false;
         try
         {
-            if (!CreatePipe(out inputRead, out inputWrite, ref attributes, 0)) throw Failure("create child input pipe");
-            childInput = new SafeFileHandle(inputWrite, true);
-            inputWrite = IntPtr.Zero;
-            if (!SetHandleInformation(childInput, 1, 0)) throw Failure("protect child input writer");
-            output = InheritableStandardHandle(-11);
-            errorOutput = InheritableStandardHandle(-12);
+            if (websocketOwner)
+            {
+                inputRead = NullHandle(ref attributes, 0x80000000);
+                output = NullHandle(ref attributes, 0x40000000);
+                errorOutput = NullHandle(ref attributes, 0x40000000);
+            }
+            else
+            {
+                if (!CreatePipe(out inputRead, out inputWrite, ref attributes, 0)) throw Failure("create child input pipe");
+                childInput = new SafeFileHandle(inputWrite, true);
+                inputWrite = IntPtr.Zero;
+                if (!SetHandleInformation(childInput, 1, 0)) throw Failure("protect child input writer");
+                output = InheritableStandardHandle(-11);
+                errorOutput = InheritableStandardHandle(-12);
+            }
 
             UIntPtr attributeSize = UIntPtr.Zero;
             InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref attributeSize);
@@ -112,6 +235,8 @@ internal sealed class ProcessHost : IDisposable
                 throw Failure("create suspended child");
             process = created.Process;
             primaryThread = created.Thread;
+            childPid = created.ProcessId;
+            using (Process child = Process.GetProcessById(checked((int)childPid))) childStartedAt = child.StartTime.ToUniversalTime().ToString("o");
             if (!AssignProcessToJobObject(job, process)) throw Failure("assign suspended child to private job");
             assigned = true;
             if (ResumeThread(primaryThread) == UInt32.MaxValue) throw Failure("resume guarded child");
@@ -128,9 +253,17 @@ internal sealed class ProcessHost : IDisposable
             Close(ref errorOutput);
         }
 
+        if (websocketOwner) return; // Scheduler stdin is NUL; EOF must not terminate a WebSocket server.
         var relay = new Thread(RelayInput);
         relay.IsBackground = true;
         relay.Start();
+    }
+
+    private static IntPtr NullHandle(ref SecurityAttributes attributes, uint access)
+    {
+        IntPtr handle = CreateFile("NUL", access, 3, ref attributes, 3, 0, IntPtr.Zero);
+        if (handle == new IntPtr(-1)) throw Failure("open explicit NUL handle");
+        return handle;
     }
 
     private void RelayInput()
@@ -344,4 +477,6 @@ internal sealed class ProcessHost : IDisposable
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool ReadFile(IntPtr file, byte[] buffer, uint count, out uint read, IntPtr overlapped);
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool WriteFile(SafeFileHandle file, byte[] buffer, uint count, out uint written, IntPtr overlapped);
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern IntPtr CreateFile(string path, uint access, uint share, ref SecurityAttributes attributes, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Native shared daemon + real Rele adapter/Engine + Desktop NDJSON shim gate.
+"""Real shared Codex/Engine gate: Linux native UDS, Windows installed direct WS owner.
 
 Only isolated profiles, complete npm vendor packages or signed Desktop payloads,
 a fake Responses provider and synthetic messenger channels are used. The optional
@@ -21,21 +21,13 @@ import tempfile
 import uuid
 
 from aiohttp import web
+import websockets
 
 VERSIONS = ['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2']
 REPO = Path(__file__).resolve().parent.parent
 NODE = shutil.which('node')
 DRIVER = REPO / 'scripts/probe-shared-codex.ts'
 SHIM = REPO / 'dist/server/codex-cli.js'
-WINDOWS_NATIVE_CONTROL_SCRIPT = '''import { spawn } from 'node:child_process';
-const child = spawn(process.argv[1], process.argv.slice(2), {
-  windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
-});
-child.stdout.pipe(process.stdout);
-child.stderr.pipe(process.stderr);
-child.once('error', () => { console.error('native-control-spawn-failed'); process.exitCode = 1; });
-child.once('close', code => { process.exitCode = code ?? 1; });
-'''
 
 
 def arguments():
@@ -46,7 +38,23 @@ def arguments():
     parser.add_argument('--desktop-inventory', type=Path)
     parser.add_argument('--expected-version', choices=VERSIONS, required=True)
     parser.add_argument('--report', type=Path, required=True)
+    parser.add_argument('--windows-app-template', type=Path)
+    parser.add_argument('--windows-runtime', choices=['source', 'packaged'], default='source')
     args = parser.parse_args()
+    args.retain_fixture = False
+    if os.name == 'nt':
+        if not args.windows_app_template:
+            parser.error('Windows shared gate requires --windows-app-template with Rele.exe and dist/native/Rele.Process.exe.')
+        args.windows_app_template = args.windows_app_template.resolve(strict=True)
+        for name in ['Rele.exe', 'dist/native/Rele.Process.exe']:
+            if not (args.windows_app_template / name).is_file():
+                parser.error(f'Windows application template is missing {name}.')
+        if args.windows_runtime == 'packaged':
+            for name in ['dist/server/engine.js', 'dist/server/codex.js', 'node_modules/ws/package.json']:
+                if not (args.windows_app_template / name).is_file():
+                    parser.error(f'Packaged Windows template is missing {name}.')
+    elif args.windows_app_template or args.windows_runtime != 'source':
+        parser.error('Windows fixture options require Windows.')
     binary = 'codex.exe' if os.name == 'nt' else 'codex'
     args.inventory = None
     if args.desktop_bundle:
@@ -75,20 +83,27 @@ def arguments():
         metadata = json.loads(manifest.read_text())
         if metadata.get('entrypoint') != f'bin/{binary}' or metadata.get('version') != args.expected_version:
             parser.error('Native vendor package manifest does not match the selected version and executable.')
-    if not NODE or not SHIM.is_file():
+    if not NODE or os.name != 'nt' and not SHIM.is_file():
         parser.error('Build Rele including dist/server/codex-cli.js before the shared gate.')
     return args
 
 
 class Rpc:
-    """JSON-RPC client over the production Desktop shim's NDJSON stdio."""
-    def __init__(self, process):
-        self.process, self.pending, self.events = process, {}, []
+    """Same peer protocol over direct Windows WS or the existing Linux NDJSON shim."""
+    def __init__(self, process=None, ws=None):
+        self.process, self.ws, self.pending, self.events = process, ws, {}, []
         self.reader = asyncio.create_task(self.pump())
 
     async def pump(self):
         try:
-            while raw := await self.process.stdout.readline():
+            async def messages():
+                if self.ws is not None:
+                    async for raw in self.ws:
+                        yield raw
+                else:
+                    while raw := await self.process.stdout.readline():
+                        yield raw
+            async for raw in messages():
                 item = json.loads(raw)
                 if 'method' not in item and item.get('id') in self.pending:
                     future = self.pending.pop(item['id'])
@@ -103,6 +118,9 @@ class Rpc:
             self.pending.clear()
 
     async def send(self, item):
+        if self.ws is not None:
+            await self.ws.send(json.dumps(item))
+            return
         self.process.stdin.write((json.dumps(item) + '\n').encode())
         await self.process.stdin.drain()
 
@@ -132,6 +150,10 @@ class Rpc:
                                and event['params']['turn']['id'] == turn)
 
     async def close(self):
+        if self.ws is not None:
+            await self.ws.close()
+            await self.reader
+            return
         if self.process.returncode is None:
             self.process.stdin.close()
             try:
@@ -179,6 +201,15 @@ async def gate(args, root):
               'realModelRequests': 0, 'realMessengerRequests': 0, 'checks': {}}
     records, actions, holds, errors, drainers, processes = [], [], [], [], [], []
     native_executables = {}
+    windows_fixtures = {}
+    if os.name == 'nt':
+        report['windowsSharedRuntime'] = args.windows_runtime
+        report['windowsPeerTransport'] = 'direct-websocket'
+        report['windowsControlHashes'] = {name: hashlib.sha256((args.windows_app_template / name).read_bytes()).hexdigest()
+            for name in ['Rele.exe', 'dist/native/Rele.Process.exe']}
+        runtime_files = ['dist/server/engine.js', 'dist/server/codex.js', 'dist/server/codex-shared.js'] if args.windows_runtime == 'packaged' else ['src/server/engine.ts', 'src/server/codex.ts', 'src/server/codex-shared.ts']
+        runtime_root = args.windows_app_template if args.windows_runtime == 'packaged' else REPO
+        report['windowsRuntimeHashes'] = {name: hashlib.sha256((runtime_root / name).read_bytes()).hexdigest() for name in runtime_files}
 
     async def provider(request):
         if request.method != 'POST' or not request.path.endswith('/responses'):
@@ -322,12 +353,67 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
             'dpapi:input-read', 'dpapi:protected', 'dpapi:roundtrip'], 'Synthetic Windows DPAPI stages incomplete'
         report['checks']['windowsDpapi'] = True
 
+    async def prepare_windows(env, directory):
+        app_dir = directory / 'a'
+        app_dir.mkdir()
+        shutil.copy2(args.windows_app_template / 'Rele.exe', app_dir / 'Rele.exe')
+        if args.windows_runtime == 'packaged':
+            shutil.copytree(args.windows_app_template / 'dist', app_dir / 'dist')
+            shutil.copytree(args.windows_app_template / 'node_modules/ws', app_dir / 'node_modules/ws')
+            (app_dir / 'package.json').write_text('{"type":"module","private":true}')
+        else:
+            (app_dir / 'dist/native').mkdir(parents=True)
+            shutil.copy2(args.windows_app_template / 'dist/native/Rele.Process.exe', app_dir / 'dist/native/Rele.Process.exe')
+        data = Path(env['RELE_DATA_DIR'])
+        data.mkdir()
+        process = await spawn(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+            '[Security.Principal.WindowsIdentity]::GetCurrent().User.Value'], env, root)
+        sid = (await output_and_exit(process, 15)).decode().strip()
+        assert process.returncode == 0 and sid.startswith('S-1-5-21-') and all(c in 'S0123456789-' for c in sid), 'Unconfirmed fixture owner SID'
+        task = 'Rele-Shared-' + uuid.uuid4().hex
+        metadata = {'OwnerSid': sid, 'DataDirectory': str(data), 'TaskName': task, 'Port': 0,
+            'CodexHome': env['CODEX_HOME'], 'DesktopIntegrationRequested': False, 'DesktopIntegrationOwned': False}
+        settings_file = app_dir / 'rele-install.json'
+        settings_file.write_text(json.dumps(metadata), encoding='utf-8')
+        windows_fixtures[env['CODEX_HOME']] = {'application': app_dir, 'target': {
+            'executable': str(args.cli), 'transport': 'shared', 'endpoint': '', 'codexHome': env['CODEX_HOME'],
+            'installSettingsPath': str(settings_file), 'fixtureDataDirectory': str(data), 'fixtureTaskName': task}}
+
+    async def owner_stop(env):
+        fixture = windows_fixtures[env['CODEX_HOME']]
+        # Reuse installer acceptance's task/principal/action/hash/birth guards; no generic task kill.
+        script = '''import { pathToFileURL } from 'node:url';
+const { captureInstallerOwner, stopInstallerCodex } = await import(pathToFileURL(process.argv[1]).href);
+const target = JSON.parse(process.argv[2]);
+await captureInstallerOwner(target);
+if (!target.desktopOwner) { console.log(JSON.stringify({status:'notRunning'})); }
+else { console.log(JSON.stringify(stopInstallerCodex(target))); }
+'''
+        process = await spawn([NODE, '--input-type=module', '-e', script,
+            str(REPO / 'scripts/installer-codex-fixture.mjs'), json.dumps(fixture['target'])], env, root)
+        output = await output_and_exit(process, 40)
+        assert process.returncode == 0, ('owner-stop', errors[-10:])
+        return json.loads(output)
+
     async def native(env, operation):
-        command = [str(native_executables.get(env['CODEX_HOME'], args.cli)), 'app-server', 'daemon', operation]
         if os.name == 'nt':
-            # Match Rele's Node launcher: libuv owns a breakaway-capable child
-            # Job. Native Codex still performs its own detached-launch preflight.
-            command = [NODE, '--input-type=module', '-e', WINDOWS_NATIVE_CONTROL_SCRIPT, *command]
+            fixture = windows_fixtures[env['CODEX_HOME']]
+            if operation in ('stop', 'restart'):
+                stopped = await owner_stop(env)
+                if operation == 'stop':
+                    return stopped
+            process = await spawn([str(fixture['application'] / 'Rele.exe'), 'codex-start', '--quiet',
+                '--codex-executable', str(args.cli), '--codex-home', env['CODEX_HOME']], env, root)
+            output = await output_and_exit(process, 45)
+            assert process.returncode == 0, (operation, errors[-10:])
+            receipt = json.loads(output)
+            assert receipt['status'] in ('started', 'alreadyRunning') and receipt['codexHome'] == env['CODEX_HOME']
+            assert Path(receipt['executable']).resolve() == args.cli.resolve()
+            assert receipt['executableSha256'] == hashlib.sha256(args.cli.read_bytes()).hexdigest()
+            fixture['endpoint'] = receipt['endpoint']
+            fixture['target']['endpoint'] = receipt['endpoint']
+            return receipt
+        command = [str(native_executables.get(env['CODEX_HOME'], args.cli)), 'app-server', 'daemon', operation]
         process = await spawn(command, env, root)
         output = await output_and_exit(process, 20)
         assert process.returncode == 0, (operation, errors[-10:])
@@ -336,6 +422,9 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
     async def driver(env, workspace, prepare=False, thread=None, profile_socket=None, expected_error=None):
         command = [NODE, str(REPO / 'node_modules/tsx/dist/cli.mjs'), str(DRIVER),
                    '--executable', 'codex' if args.desktop_bundle else str(args.cli), '--home', env['CODEX_HOME'], '--directory', str(workspace)]
+        if os.name == 'nt':
+            app_dir = windows_fixtures.get(env['CODEX_HOME'], windows_fixtures[next(iter(windows_fixtures))])['application']
+            command += ['--runtime-directory' if args.windows_runtime == 'packaged' else '--windows-install-dir', str(app_dir)]
         if prepare or profile_socket or expected_error:
             option = ['--expect-error', expected_error] if expected_error else ['--profile-socket', str(profile_socket)] if profile_socket else ['--prepare']
             process = await spawn([*command, *option], env, REPO)
@@ -357,14 +446,27 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
         flags = ['-c', 'features.code_mode_host=true', 'app-server', '--analytics-default-enabled',
             '-c', f'mcp_servers.codex_app.enabled={enabled}',
             '-c', f'mcp_servers.code-review.enabled={enabled}']
-        process = await spawn([*command, *flags], env, REPO)
-        client = Rpc(process)
+        if os.name == 'nt' and not private:
+            receipt = await native(env, 'start')
+            deadline = asyncio.get_running_loop().time() + 20
+            while True:
+                try:
+                    ws = await websockets.connect(receipt['endpoint'], proxy=None, open_timeout=1, max_size=2**26)
+                    break
+                except (OSError, TimeoutError):
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise
+                    await asyncio.sleep(.1)
+            client = Rpc(ws=ws)
+        else:
+            process = await spawn([*command, *flags], env, REPO)
+            client = Rpc(process)
         metadata = await client.call('initialize', {'clientInfo': {'name': name, 'version': '0.0.0'},
                                                      'capabilities': {'experimentalApi': True}})
         assert f'/{args.expected_version} ' in metadata['userAgent'], metadata['userAgent']
         assert Path(metadata['codexHome']).resolve() == Path(env['CODEX_HOME']).resolve()
         await client.send({'method': 'initialized'})
-        if not private:
+        if not private and os.name != 'nt':
             variants = report.setdefault('desktopStartupArgv', [])
             if flags not in variants:
                 variants.append(flags)
@@ -479,9 +581,6 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
         # Keep fixture paths below the native Windows AF_UNIX SUN_LEN limit.
         directory = root / {'rele-first': 'r', 'desktop-first': 'f', 'desktop-bundle': 'd'}[order]
         home, workspace = directory / 'c', directory / 'w'
-        if os.name == 'nt':
-            assert len(str(home / 'app-server-control/app-server-control.sock').encode('utf-8')) < 108, \
-                'Windows native socket path must be shorter than 108 UTF-8 bytes; use a shorter RUNNER_TEMP.'
         home.mkdir(parents=True)
         workspace.mkdir()
         scenario_config = config
@@ -502,15 +601,11 @@ trust_level="trusted"
         # must come entirely from the validated local npm or real Desktop bytes.
         settings = home / 'app-server-daemon'
         if os.name == 'nt':
-            # Let the native lifecycle create its exact owner-private Windows DACL.
-            # Stop on this fresh profile only initializes state; it starts no backend.
-            assert not settings.exists() and not (home / 'app-server-control/app-server-control.sock').exists()
-            assert (await native(env, 'stop'))['status'] == 'notRunning'
-            assert settings.is_dir()
+            await prepare_windows(env, directory)
         else:
             settings.mkdir()
-        (settings / 'settings.json').write_text(json.dumps({'shutdownGraceSeconds': 1,
-            'updater': {'autoUpdateEnabled': False}}), encoding='utf-8')
+            (settings / 'settings.json').write_text(json.dumps({'shutdownGraceSeconds': 1,
+                'updater': {'autoUpdateEnabled': False}}), encoding='utf-8')
         engine = peer = observer = None
         try:
             if os.name == 'nt':
@@ -528,15 +623,7 @@ trust_level="trusted"
                     'input': [{'type': 'text', 'text': f'{order}-desktop-prior-context'}]}))['turn']['id']
                 await peer.completed(prior)
                 private_pid = (await peer.call('server/diagnostics'))['process']['id']
-                checked = await spawn([NODE, str(SHIM), '--rele-desktop-check'], env, REPO)
-                await output_and_exit(checked, 60)
-                assert checked.returncode == 0
-                assert (await peer.call('server/diagnostics'))['process']['id'] == private_pid
-                report['checks']['desktop_install_preflight_defers_only_for_live_private_owner'] = True
-                before_fence = len(records)
-                await driver(env, workspace, expected_error='shared-desktop-conflict')
-                assert len(records) == before_fence and (await peer.call('server/diagnostics'))['process']['id'] == private_pid
-                report['checks']['actual_private_desktop_owner_blocks_without_stopping_or_moving_thread'] = True
+                # Seed and close this fixture's private server; no adapter or private-owner takeover.
                 await peer.close(); peer = None
                 assert not (home / 'packages').exists()
                 assert not (home / 'app-server-control/app-server-control.sock').exists()
@@ -551,8 +638,8 @@ trust_level="trusted"
                     'nativeProcessId': pid, 'configuredExecutable': ready['configuredExecutable'],
                     'codexHome': ready['runtime']['codexHome'], 'automaticDiscovery': True}
                 native_executables[env['CODEX_HOME']] = Path(ready['status']['executable'])
-                assert native_executables[env['CODEX_HOME']].is_relative_to(home / 'packages')
-                peer = await desktop(env, 'actual_desktop_shared_adapter')
+                assert native_executables[env['CODEX_HOME']].resolve() == args.cli.resolve()
+                peer = await desktop(env, 'actual_desktop_direct_ws_peer')
                 await peer.call('thread/resume', {'threadId': thread, 'excludeTurns': True})
                 report['checks']['production_auto_discovery_bootstraps_desktop_only_same_thread_profile'] = True
             elif order == 'rele-first':
@@ -584,32 +671,26 @@ trust_level="trusted"
                 before_requests = len(records)
                 before_threads = await peer.call('thread/list', {})
                 await driver({**env, 'CODEX_HOME': str(wrong_home), 'RELE_DATA_DIR': str(directory / 'other-rele')},
-                    workspace, profile_socket=home / 'app-server-control/app-server-control.sock')
+                    workspace, profile_socket=windows_fixtures[env['CODEX_HOME']]['endpoint'] if os.name == 'nt' else home / 'app-server-control/app-server-control.sock')
                 assert not (wrong_home / 'app-server-control/app-server-control.sock').exists()
                 assert len(records) == before_requests and (await peer.call('thread/list', {})) == before_threads
                 assert (await peer.call('server/diagnostics'))['process']['id'] == pid
                 report['checks']['native_initialize_wrong_profile_rejected_before_thread_or_model_work'] = True
             first, again = await native(env, 'start'), await native(env, 'start')
             assert first['status'] == again['status'] == 'alreadyRunning'
-            assert Path(first['socketPath']).resolve() == (home / 'app-server-control/app-server-control.sock').resolve()
             assert (await peer.call('server/diagnostics'))['process']['id'] == pid
-            installed = Path(first['managedCodexPath']).parent.parent / 'codex-package.json'
-            assert installed.is_file()
-            if args.desktop_bundle:
-                manifest = json.loads(installed.read_text())
-                assert manifest == {'layoutVersion': 1, 'version': args.expected_version, 'target': 'x86_64-pc-windows-msvc',
-                    'variant': 'codex', 'entrypoint': 'bin/codex.exe', 'resourcesDir': 'codex-resources', 'pathDir': 'codex-path'}
-                mappings = {'codex.exe': 'bin/codex.exe', 'codex-code-mode-host.exe': 'bin/codex-code-mode-host.exe',
-                    'rg.exe': 'codex-path/rg.exe', 'codex-command-runner.exe': 'codex-resources/codex-command-runner.exe',
-                    'codex-windows-sandbox-setup.exe': 'codex-resources/codex-windows-sandbox-setup.exe'}
-                for name, relative in mappings.items():
-                    with (args.cli.parent / name).open('rb') as source, (installed.parent / relative).open('rb') as target:
-                        assert hashlib.file_digest(source, 'sha256').digest() == hashlib.file_digest(target, 'sha256').digest(), name
-                report['checks']['native_installed_package_matches_actual_desktop_backend_and_all_helpers'] = True
+            if os.name == 'nt':
+                assert first['processId'] == again['processId'] == pid
+                assert first['endpoint'] == again['endpoint']
+                assert not (home / 'packages').exists() and not (home / 'app-server-control/app-server-control.sock').exists()
+                report['checks'][f'{order}_direct_owner_idempotent_original_backend_without_native_daemon_or_adapter'] = True
             else:
+                assert Path(first['socketPath']).resolve() == (home / 'app-server-control/app-server-control.sock').resolve()
+                installed = Path(first['managedCodexPath']).parent.parent / 'codex-package.json'
+                assert installed.is_file()
                 assert installed.read_bytes() == (args.package / 'codex-package.json').read_bytes()
-            assert not (settings / 'daemon-updater.pid').exists()
-            report['checks'][f'{order}_native_start_idempotent_local_package_only'] = True
+                assert not (settings / 'daemon-updater.pid').exists()
+                report['checks'][f'{order}_native_start_idempotent_local_package_only'] = True
             before = len(records)
             if order == 'rele-first' and not args.desktop_bundle:
                 turn = (await peer.call('turn/start', {'threadId': thread,
@@ -683,9 +764,12 @@ trust_level="trusted"
             observer = await desktop(env, 'desktop_question_peer', plugin_helpers=True)
             await observer.call('thread/resume', {'threadId': thread, 'excludeTurns': True})
             assert (await observer.call('server/diagnostics'))['process']['id'] == pid
-            assert len(report['desktopStartupArgv']) == 2
-            assert {flags[-1].rsplit('=', 1)[1] for flags in report['desktopStartupArgv']} == {'true', 'false'}
-            report['checks']['desktop_actual_global_config_argv_and_both_plugin_hint_variants_attach_same_native_pid'] = True
+            if os.name == 'nt':
+                report['checks']['direct_ws_peers_attach_same_native_pid_without_desktop_adapter'] = True
+            else:
+                assert len(report['desktopStartupArgv']) == 2
+                assert {flags[-1].rsplit('=', 1)[1] for flags in report['desktopStartupArgv']} == {'true', 'false'}
+                report['checks']['desktop_actual_global_config_argv_and_both_plugin_hint_variants_attach_same_native_pid'] = True
             replay = await observer.wait(lambda event: event.get('method') == 'item/tool/requestUserInput'
                                         and event['params'].get('turnId') == question_turn)
             assert replay['id'] == question['id'] and replay['params'] == question['params']
@@ -810,6 +894,8 @@ trust_level="trusted"
             except Exception as error:
                 cleanup_errors.append(repr(error))
             if cleanup_errors:
+                args.retain_fixture = True
+                report['retainedFixture'] = str(root)
                 report.setdefault('cleanupErrors', []).extend(cleanup_errors)
                 if primary_error is None:
                     raise RuntimeError(f'Isolated fixture cleanup failed: {cleanup_errors}')
@@ -849,5 +935,11 @@ trust_level="trusted"
 
 if __name__ == '__main__':
     args = arguments()
-    with tempfile.TemporaryDirectory(prefix='rs-', dir=os.environ.get('RUNNER_TEMP')) as directory:
-        asyncio.run(gate(args, Path(directory)))
+    directory = Path(tempfile.mkdtemp(prefix='rs-', dir=os.environ.get('RUNNER_TEMP')))
+    try:
+        asyncio.run(gate(args, directory))
+    finally:
+        # A failed owner/receipt guard means a scheduled Task may still reference
+        # these private files. Preserve them for exact-identity cleanup by the caller.
+        if not args.retain_fixture:
+            shutil.rmtree(directory)

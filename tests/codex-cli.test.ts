@@ -6,7 +6,7 @@ import { PassThrough } from 'node:stream';
 import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocket, WebSocketServer } from 'ws';
-import { bridgeCodexStdio, shimMode, validateStdioFlags, findDesktopExecutable, verifyDesktopCodeModeHost } from '../src/server/codex-cli.js';
+import { bridgeCodexStdio, desktopConnectionEnvironment, shimMode, validateStdioFlags, findDesktopExecutable, verifyDesktopCodeModeHost, verifyDesktopConnection } from '../src/server/codex-cli.js';
 
 const cleanup: Array<() => void | Promise<void>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -26,6 +26,38 @@ async function pair() {
 }
 
 describe('Desktop framing over the shared native connection', () => {
+  it('launches Desktop with only its direct socket address and preserves unrelated process settings', () => {
+    const target = { transport: 'websocket' as const, executable: 'native-codex.exe', endpoint: 'ws://127.0.0.1:54321' };
+    const env = { CODEX_HOME: 'original-profile', RELE_TEST_MARKER: 'preserved' };
+    expect(desktopConnectionEnvironment(env, target)).toEqual({ ...env, CODEX_APP_SERVER_WS_URL: target.endpoint });
+    expect(env).not.toHaveProperty('CODEX_APP_SERVER_WS_URL');
+    expect(desktopConnectionEnvironment({ ...env, codex_app_server_ws_url: target.endpoint }, target)).toEqual({ ...env, CODEX_APP_SERVER_WS_URL: target.endpoint });
+    for (const conflict of [{ CODEX_CLI_PATH: 'foreign.exe' }, { CODEX_APP_SERVER_FORCE_CLI: '1' }, { CODEX_APP_SERVER_WS_URL: 'ws://127.0.0.1:12345' }]) {
+      expect(() => desktopConnectionEnvironment({ ...env, ...conflict }, target)).toThrow();
+    }
+    expect(() => desktopConnectionEnvironment(env, { ...target, endpoint: 'ws://0.0.0.0:54321' })).toThrow();
+    expect(() => desktopConnectionEnvironment(env, { ...target, transport: 'proxy' })).toThrow();
+  });
+
+  it('checks Desktop policy directly over WebSocket without launching a CLI proxy', async () => {
+    const home = await mkdtemp(path.join(tmpdir(), 'rele-desktop-direct-'));
+    cleanup.push(() => rm(home, { recursive: true, force: true }));
+    const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+    await once(server, 'listening');
+    cleanup.push(() => new Promise<void>(resolve => { for (const socket of server.clients) socket.terminate(); server.close(() => resolve()); }));
+    const methods: string[] = [];
+    server.on('connection', socket => socket.on('message', raw => {
+      const message = JSON.parse(raw.toString()); methods.push(message.method);
+      if (message.method === 'initialize') socket.send(JSON.stringify({ id: message.id, result: { codexHome: home } }));
+      if (message.method === 'experimentalFeature/list') socket.send(JSON.stringify({ id: message.id, result: { data: [{ name: 'code_mode_host', enabled: true }] } }));
+      if (message.method === 'configRequirements/read' || message.method === 'config/read') socket.send(JSON.stringify({ id: message.id, result: {} }));
+    }));
+    await verifyDesktopConnection({ command: 'must-never-run.exe', args: [], executable: 'must-never-run.exe' }, {
+      transport: 'websocket', executable: 'unused.exe', endpoint: `ws://127.0.0.1:${(server.address() as AddressInfo).port}`, codexHome: home,
+    }, {});
+    expect(methods).toEqual(['initialize', 'initialized', 'experimentalFeature/list', 'configRequirements/read', 'config/read']);
+  });
+
   it('forwards initialize, IDs, notifications and approval replies without synthesizing an initializer', async () => {
     const { socket, peer, input, output } = await pair();
     const received: unknown[] = [];

@@ -68,7 +68,6 @@ Name: "{group}\{cm:OpenRele}"; Filename: "{app}\Rele.exe"; Parameters: "open"; W
 Name: "{group}\{cm:RestartRele}"; Filename: "{app}\Rele.exe"; Parameters: "restart"; WorkingDir: "{app}"
 Name: "{group}\{cm:StopRele}"; Filename: "{app}\Rele.exe"; Parameters: "stop"; WorkingDir: "{app}"
 Name: "{group}\{cm:SharedDesktop}"; Filename: "{app}\Rele.exe"; Parameters: "codex-desktop"; WorkingDir: "{app}"
-Name: "{group}\{cm:SharedCli}"; Filename: "{code:SharedCodexPath}"; Parameters: "--rele-cli"; WorkingDir: "{code:SharedCodexDirectory}"
 
 [Run]
 Filename: "{app}\Rele.exe"; Parameters: "open"; Description: "{cm:OpenRele}"; Flags: nowait postinstall skipifsilent; Check: CanOpenRele
@@ -86,7 +85,6 @@ var
   InstallTaskName: String;
   InstallPort: String;
   InstallCodexHome: String;
-  SharedCodexExecutable: String;
   DesktopChoiceApplied: Boolean;
 
 function Quoted(Value: String): String;
@@ -190,32 +188,6 @@ begin
       else if Choice = 'off' then WizardSelectTasks('!desktop');
     end;
   end;
-end;
-
-function SharedCodexPath(Param: String): String;
-var
-  PathFile: String;
-  ErrorText: String;
-  PathText: AnsiString;
-begin
-  if SharedCodexExecutable <> '' then
-  begin
-    Result := SharedCodexExecutable;
-    Exit;
-  end;
-  PathFile := ExpandConstant('{tmp}\rele-codex-path.txt');
-  DeleteFile(PathFile);
-  ErrorText := RunLauncher(ExpandConstant('{app}\Rele.exe'), 'adapter-path' + SettingsArguments + ' --path-file ' + Quoted(PathFile));
-  if ErrorText <> '' then RaiseException(ErrorText);
-  if not LoadStringFromFile(PathFile, PathText) then RaiseException('Cannot read the shared Codex adapter path.');
-  Result := UTF8Decode(PathText);
-  if not FileExists(Result) then RaiseException('The shared Codex adapter is missing.');
-  SharedCodexExecutable := Result;
-end;
-
-function SharedCodexDirectory(Param: String): String;
-begin
-  Result := ExtractFileDir(SharedCodexPath(Param));
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
