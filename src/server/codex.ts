@@ -36,6 +36,20 @@ export interface RequestLocation {
   turnId?: string;
   text?: string;
   mixed?: boolean;
+  commandItems?: CodexCommandItem[];
+}
+export interface CodexCommandItem { id: string; processId: string | null; completed?: true }
+export interface CodexTerminal { itemId: string; processId: string }
+export interface CodexTerminalSnapshot { serverId: number; terminals: CodexTerminal[] }
+const nativeProcessId = (value: unknown): value is string => typeof value === 'string' && /^\d+$/u.test(value) && Number(value) > 0 && Number(value) <= 0x7fffffff;
+/** Canonical startup items bind a command to its turn even before native publishes its PID. */
+export function codexCommandItem(value: unknown): CodexCommandItem | undefined {
+  if (!value || typeof value !== 'object') return;
+  const item = value as Record<string, unknown>;
+  if (item.type !== 'commandExecution' || item.source === 'unifiedExecInteraction' || item.kind === 'writeStdin'
+    || typeof item.id !== 'string' || !item.id || item.processId != null && !nativeProcessId(item.processId)) return;
+  return { id: item.id, processId: item.processId == null ? null : item.processId as string,
+    ...(['completed', 'failed', 'declined'].includes(String(item.status)) ? { completed: true as const } : {}) };
 }
 export interface CodexRuntime { userAgent: string; codexHome: string; platformFamily: string; platformOs: string }
 interface QueueEntry { id: string; clientUserMessageId: string }
@@ -395,6 +409,29 @@ export class CodexClient extends EventEmitter {
     await this.call('turn/interrupt', { threadId, turnId });
   }
 
+  async backgroundTerminals(threadId: string): Promise<CodexTerminalSnapshot> {
+    this.requireQueue();
+    const runtime = this.runtime;
+    const diagnostic = await this.diagnostics();
+    const entries = await this.pages<CodexTerminal>('thread/backgroundTerminals/list', { threadId, limit: 100 });
+    if (runtime !== this.runtime || !this.state.connected || !Number.isSafeInteger(diagnostic?.process?.id) || diagnostic.process.id <= 0
+      || entries.some(entry => !entry || typeof entry.itemId !== 'string' || !entry.itemId || !nativeProcessId(entry.processId))) {
+      throw new CodexTransportError('Codex не подтвердил идентичность фоновых команд. Отмена команды требует сверки.', 'terminal-identity-unconfirmed');
+    }
+    return { serverId: diagnostic.process.id, terminals: entries.map(({ itemId, processId }) => ({ itemId, processId })) };
+  }
+
+  async terminateBackgroundTerminal(threadId: string, target: CodexTerminal & { serverId: number }): Promise<void> {
+    const current = await this.backgroundTerminals(threadId);
+    const matching = current.terminals.filter(entry => entry.itemId === target.itemId);
+    if (current.serverId !== target.serverId || matching.length !== 1 || matching[0].processId !== target.processId) {
+      throw new CodexTransportError('Фоновая команда или сервер изменились. Адресное завершение не отправлено.', 'terminal-identity-changed');
+    }
+    // Native has no expected-item CAS: revalidate immediately, never terminate a stored PID blindly.
+    const result = await this.call<{ terminated: boolean }>('thread/backgroundTerminals/terminate', { threadId, processId: target.processId });
+    if (result?.terminated !== true) throw new CodexTransportError('Codex не подтвердил завершение фоновой команды.', 'terminal-stop-unconfirmed');
+  }
+
   /** A not_found result is evidence for operator review, not permission to resend queue/add. */
   async findRequest(threadId: string, clientId: string): Promise<RequestLocation> {
     const queue = await this.pages<QueueEntry>('thread/queue/list', { threadId, limit: 100 });
@@ -423,6 +460,7 @@ export class CodexClient extends EventEmitter {
           state: state as RequestLocation['state'], turnId: turn.id,
           ...(mixed ? { mixed: true } : {
             text: answers.length ? answers.map(item => item.text || '').join('\n\n') : legacy.at(-1)?.text,
+            ...(turn.items.some(item => codexCommandItem(item)) ? { commandItems: turn.items.flatMap(item => { const command = codexCommandItem(item); return command ? [command] : []; }) } : {}),
           }),
         };
       }

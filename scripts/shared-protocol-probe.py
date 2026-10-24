@@ -14,6 +14,7 @@ import itertools
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import sys
 import tempfile
@@ -192,7 +193,10 @@ async def gate(args, root):
             await response.write(frame({'type': 'response.created', 'response': {'id': f'resp-{index}'}}))
             if action == 'hold':
                 await event.wait()
-            if action == 'approval':
+            if action == 'shell':
+                item = {'type': 'function_call', 'name': 'exec_command', 'call_id': f'call-{index}',
+                        'arguments': json.dumps(event)}
+            elif action == 'approval':
                 item = {'type': 'function_call', 'name': 'exec_command', 'call_id': f'call-{index}',
                         'arguments': json.dumps({'cmd': 'echo rele-shared-no-execution', 'sandbox_permissions': 'require_escalated',
                                                 'justification': 'Synthetic shared fixture: decline, never execute.'})}
@@ -471,6 +475,7 @@ if ([Text.Encoding]::UTF8.GetString($u) -cne $s) { throw 'Synthetic roundtrip mi
                 await asyncio.gather(pump, return_exceptions=True)
 
     async def scenario(order):
+        shell_deadline = None
         # Keep fixture paths below the native Windows AF_UNIX SUN_LEN limit.
         directory = root / {'rele-first': 'r', 'desktop-first': 'f', 'desktop-bundle': 'd'}[order]
         home, workspace = directory / 'c', directory / 'w'
@@ -688,18 +693,62 @@ trust_level="trusted"
             await peer.completed(question_turn)
             assert 'Yes' in json.dumps(records[-1])
             report['checks']['desktop_question_late_replay_and_peer_answer_share_owner'] = True
-            hold_cancel = asyncio.Event(); holds.append(hold_cancel); actions.append(('hold', hold_cancel))
+            # The command is bounded and writes only inside this disposable workspace.
+            ready_file, late_file = workspace / 'cancel-ready.json', workspace / 'cancel-late.txt'
+            command_script = 'const f=require("node:fs");f.writeFileSync(process.argv[1],JSON.stringify({pid:process.pid}));setTimeout(()=>f.writeFileSync(process.argv[2],"not-stopped"),12000);'
+            command_args = [NODE, '-e', command_script, str(ready_file), str(late_file)]
+            shell_command = ('& ' + ' '.join("'" + value.replace("'", "''") + "'" for value in command_args)
+                             if os.name == 'nt' else shlex.join(command_args))
+            hold_cancel = asyncio.Event(); holds.append(hold_cancel)
+            actions.extend([('shell', {'cmd': shell_command, 'yield_time_ms': 1000, 'max_output_tokens': 100,
+                'sandbox_permissions': 'require_escalated', 'justification': 'Run only the bounded disposable shell cancellation fixture.'}),
+                ('hold', hold_cancel)])
             before = len(records)
             await engine.command('ingest', platform='telegram', eventId='cancel', text='shared-cancel-request')
-            await asyncio.wait_for(wait_records(before + 1), 25)
+            pending = await engine.command('wait', status='waiting_approval')
+            shell_approval = next(item for item in pending['approvals'] if item['status'] == 'pending')
+            shell_deadline = asyncio.get_running_loop().time() + 15
+            await engine.command('answer', approvalId=shell_approval['id'], decision='accept')
+            await asyncio.wait_for(wait_records(before + 2), 25)
+            assert ready_file.is_file(), 'Approved shell child did not start'
+            shell_deadline = asyncio.get_running_loop().time() + 13
+            child_pid = json.loads(ready_file.read_text())['pid']
             running = await engine.command('wait', status='running')
             cancel = next(row for row in running['requests'] if row['eventId'] == 'cancel')
-            await engine.command('cancel', requestId=cancel['id'])
+            command_item = await peer.wait(lambda event: event.get('method') == 'item/started'
+                and event['params'].get('turnId') == cancel['turnId']
+                and event['params'].get('item', {}).get('type') == 'commandExecution')
+            item_id = command_item['params']['item']['id']
+            terminal_page = await peer.call('thread/backgroundTerminals/list', {'threadId': thread, 'limit': 100})
+            assert not terminal_page.get('nextCursor'), 'Unexpected terminal pagination in the disposable fixture'
+            terminals = terminal_page['data']
+            assert len([item for item in terminals if item['itemId'] == item_id]) == 1
+            assert (await engine.command('snapshot', processId=child_pid))['probeProcessAlive']
+            queued = await engine.command('ingest', platform='slack', eventId='after-shell-cancel', text='shared-after-shell-cancel')
+            following = next(row for row in queued['requests'] if row['eventId'] == 'after-shell-cancel')
+            assert following['status'] == 'queued'
+            cancelled = await engine.command('cancel', requestId=cancel['id'], processId=child_pid)
+            assert not cancelled['probeProcessAlive'], 'Engine cancelled the model but left its shell child alive'
             aborted = await peer.completed(cancel['turnId'])
             assert aborted['params']['turn']['status'] == 'interrupted'
             hold_cancel.set()
-            await engine.command('wait')
+            completed = await engine.command('wait')
+            following_rows = [row for row in completed['requests'] if row['id'] == following['id']]
+            assert len(following_rows) == 1 and following_rows[0]['status'] == 'completed'
+            assert following_rows[0]['origin'] == following['origin']
+            checks = [item for item in completed['cancellationProcessChecks'] if item['turnId'] == following_rows[0]['turnId']]
+            assert len(checks) == 1 and checks[0]['processAlive'] is False, 'Next turn started before shell cleanup'
+            assert len([item for item in completed['deliveries'] if item['requestId'] == following['id']
+                        and item['origin'] == following['origin'] and item['status'] == 'sent']) == 1
+            assert (await peer.call('server/diagnostics'))['process']['id'] == pid
+            terminal_page = await peer.call('thread/backgroundTerminals/list', {'threadId': thread, 'limit': 100})
+            assert not terminal_page.get('nextCursor'), 'Unexpected terminal pagination in the disposable fixture'
+            terminals = terminal_page['data']
+            assert not any(item['itemId'] == item_id for item in terminals)
+            await asyncio.sleep(13)
+            assert not late_file.exists(), 'Cancelled shell wrote its delayed marker'
             report['checks']['origin_engine_cancels_exact_native_turn_seen_by_desktop'] = True
+            report['checks']['engine_shell_stop_cleans_owned_process_before_next_origin_turn_without_backend_restart'] = True
             preserved = {row['id'] for row in (await engine.command('snapshot'))['requests']}
             await engine.close(); engine = None
             await observer.close(); observer = None
@@ -745,6 +794,8 @@ trust_level="trusted"
         finally:
             for event in holds:
                 event.set()
+            if shell_deadline:
+                await asyncio.sleep(max(0, shell_deadline - asyncio.get_running_loop().time()))
             primary_error = sys.exc_info()[1]
             cleanup_errors = []
             for client in (engine, observer, peer):

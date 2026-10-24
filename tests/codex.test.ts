@@ -645,6 +645,31 @@ describe('Codex shared-runtime adapter', () => {
     expect(f.calls.some(call => call.method === 'thread/queue/add')).toBe(false);
   });
 
+  it('exposes nullable canonical command IDs and terminates only a revalidated native terminal pair', async () => {
+    const clientId = randomUUID();
+    const terminals = [{ itemId: 'own-command', processId: '1234', command: 'never-export-this-command' },
+      { itemId: 'foreign-command', processId: '5678', command: 'foreign-command-body' }];
+    const f = await fixture({
+      'server/diagnostics': () => ({ process: { id: 42 } }),
+      'thread/turns/list': () => ({ data: [{ id: 'own-turn', status: 'inProgress', items: [
+        { type: 'userMessage', clientId }, { type: 'commandExecution', id: 'own-command', processId: null },
+      ] }], nextCursor: null }),
+      'thread/backgroundTerminals/list': () => ({ data: terminals, nextCursor: null }),
+      'thread/backgroundTerminals/terminate': () => ({ terminated: true }),
+    });
+    await f.client.connect();
+    expect(await f.client.findRequest(threadId, clientId)).toMatchObject({ turnId: 'own-turn', commandItems: [{ id: 'own-command', processId: null }] });
+    expect(await f.client.backgroundTerminals(threadId)).toEqual({ serverId: 42, terminals: [
+      { itemId: 'own-command', processId: '1234' }, { itemId: 'foreign-command', processId: '5678' },
+    ] });
+    await f.client.terminateBackgroundTerminal(threadId, { serverId: 42, itemId: 'own-command', processId: '1234' });
+    expect(f.calls.filter(call => call.method === 'thread/backgroundTerminals/terminate').map(call => call.params))
+      .toEqual([{ threadId, processId: '1234' }]);
+    terminals[0].processId = '9999';
+    await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, itemId: 'own-command', processId: '1234' })).rejects.toThrow();
+    expect(f.calls.filter(call => call.method === 'thread/backgroundTerminals/terminate')).toHaveLength(1);
+  });
+
   it('forwards approval requests and rejects responses after another client resolves them', async () => {
     const f = await fixture();
     await f.client.connect();

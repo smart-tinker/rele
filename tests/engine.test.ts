@@ -45,9 +45,20 @@ class FakeCodex extends EventEmitter implements CodexGateway {
   findRequest = vi.fn(async (_threadId: string, clientId: string): Promise<RequestLocation> => this.locations.get(clientId) ?? { state: 'not_found' });
   respond = vi.fn(async (_rpcId: string | number, _result: unknown) => {});
   rejectRequest = vi.fn(async (_rpcId: string | number, _message: string) => {});
-  interrupt = vi.fn(async (_threadId: string, _turnId: string) => {});
+  interrupt = vi.fn(async (threadId: string, turnId: string) => {
+    for (const [id, location] of this.locations) if (location.turnId === turnId && location.state === 'running') {
+      this.locations.set(id, { ...location, state: 'interrupted' });
+    }
+    this.notification({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'interrupted' } } });
+  });
   deleteQueued = vi.fn(async (_threadId: string, _queuedSubmissionId: string) => ({ deleted: true }));
   startQueued = vi.fn(async (_threadId: string, _queuedSubmissionId: string) => ({ turn: { id: 'resumed-turn', status: 'inProgress', items: [] } }));
+  terminals: Array<{ itemId: string; processId: string }> = [];
+  serverId = 42;
+  backgroundTerminals = vi.fn(async (_threadId: string) => ({ serverId: this.serverId, terminals: this.terminals.map(row => ({ ...row })) }));
+  terminateBackgroundTerminal = vi.fn(async (_threadId: string, target: { serverId: number; itemId: string; processId: string }) => {
+    this.terminals = this.terminals.filter(row => row.itemId !== target.itemId || row.processId !== target.processId);
+  });
   notification(event: CodexNotification): void { this.emit('notification', event); }
   request(event: CodexServerRequest): void { this.emit('request', event); }
   connection(connected: boolean): void { this.connected = connected; this.emit('status'); }
@@ -513,6 +524,134 @@ describe('Engine continuation after native Stop', () => {
     await Promise.all([automatic, manual]); await f.engine.settled();
     expect(f.codex.startQueued).toHaveBeenCalledTimes(1);
     expect(f.store.getRequest(request.id)?.turnId).toBe('one-start');
+  });
+});
+
+describe('Engine scoped shell cancellation', () => {
+  async function shell(f: ReturnType<typeof fixture>) {
+    const request = await acceptRequest(f, 'telegram', 'own-shell');
+    await running(f, request, 'shell-turn');
+    f.codex.notification({ method: 'item/started', params: { threadId: THREAD, turnId: 'shell-turn',
+      item: { type: 'commandExecution', id: 'own-command', processId: null } } });
+    await f.engine.settled();
+    f.codex.terminals.push({ itemId: 'own-command', processId: '1234' });
+    return request;
+  }
+
+  it('holds completion, release and the next request until exact own terminal cleanup while late items still arrive', async () => {
+    const f = fixture();
+    f.store.removeBinding(f.conversation.id, f.conversation.bindings.find(binding => binding.platform === 'slack')!.id);
+    f.codex.terminals = [{ itemId: 'foreign-command', processId: '9876' }];
+    const request = await acceptRequest(f, 'telegram', 'cancel-own-shell');
+    await running(f, request, 'shell-turn');
+    f.codex.notification({ method: 'item/started', params: { threadId: THREAD, turnId: 'shell-turn',
+      item: { type: 'commandExecution', id: 'own-command', processId: null } } });
+    await f.engine.settled();
+    f.codex.terminals.push({ itemId: 'own-command', processId: '1234' });
+    f.codex.interrupt.mockImplementationOnce(async () => {
+      f.codex.locations.set(request.id, { state: 'interrupted', turnId: 'shell-turn' });
+      f.codex.notification({ method: 'turn/completed', params: { threadId: THREAD, turn: { id: 'shell-turn', status: 'interrupted' } } });
+    });
+    const cleanup = deferred<void>(); void cleanup.promise.catch(() => {});
+    f.codex.terminateBackgroundTerminal.mockImplementationOnce(async () => {
+      await cleanup.promise;
+      f.codex.terminals = f.codex.terminals.filter(row => row.itemId !== 'own-command');
+    });
+    const cancelling = f.engine.cancel(request.id);
+    await vi.waitFor(() => expect(f.codex.terminateBackgroundTerminal).toHaveBeenCalledOnce());
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'shell-turn',
+      item: { type: 'commandExecution', id: 'own-command', processId: '1234' } } });
+    await vi.waitFor(() => expect(f.store.getMeta(`request-command-items:${request.id}`)).toContain('1234'));
+    const next = await acceptRequest(f, 'telegram', 'after-shell-stop');
+    await f.engine.pump();
+    expect(f.store.getRequest(request.id)?.status).toBe('uncertain');
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+    expect(f.codex.releaseThread).not.toHaveBeenCalled();
+    expect(f.store.listDeliveries().some(row => row.requestId === request.id && row.key === 'terminal:error')).toBe(false);
+    cleanup.resolve(); await cancelling; await f.engine.settled(); await f.engine.pump(); await f.engine.settled();
+    expect(f.store.getRequest(request.id)?.status).toBe('interrupted');
+    expect(f.codex.terminateBackgroundTerminal).toHaveBeenCalledExactlyOnceWith(THREAD, { serverId: 42, itemId: 'own-command', processId: '1234' });
+    expect(f.codex.terminals).toEqual([{ itemId: 'foreign-command', processId: '9876' }]);
+    expect(f.diagnostics).toEqual([]);
+    expect(f.store.getRequest(next.id)).toMatchObject({ status: 'starting' });
+    expect(f.codex.enqueue).toHaveBeenLastCalledWith(THREAD, next.text, next.id);
+  });
+
+  it.each(['running', 'interrupted'] as const)('reconciles a lost terminate ACK on the same connection from %s without replaying a persisted PID', async state => {
+    const f = fixture(), request = await shell(f);
+    if (state === 'interrupted') f.codex.locations.set(request.id, { state, turnId: 'shell-turn' });
+    f.codex.terminateBackgroundTerminal.mockImplementationOnce(async () => {
+      f.codex.terminals = [];
+      throw new CodexTransportError('Lost terminal ACK');
+    });
+    await expect(f.engine.cancel(request.id)).rejects.toThrow('Lost terminal ACK');
+    expect(f.store.getRequest(request.id)?.status).toBe('uncertain');
+    expect(f.store.listDeliveries().some(row => row.requestId === request.id && row.key === 'terminal:error')).toBe(false);
+    await f.engine.reconcile(request.id); await f.engine.settled();
+    expect(f.store.getRequest(request.id)?.status).toBe('interrupted');
+    expect(f.codex.terminateBackgroundTerminal).toHaveBeenCalledTimes(1);
+    expect(f.codex.interrupt).toHaveBeenCalledTimes(state === 'running' ? 1 : 0);
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps pending cleanup uncertain after Engine restart even with the same server PID and an empty registry', async () => {
+    const f = fixture(), request = await shell(f);
+    f.codex.terminateBackgroundTerminal.mockImplementationOnce(async () => {
+      f.codex.terminals = [];
+      throw new CodexTransportError('Lost terminal ACK');
+    });
+    await expect(f.engine.cancel(request.id)).rejects.toThrow('Lost terminal ACK');
+    await f.engine.stop();
+    const restarted = fixture({ path: f.path, start: false });
+    restarted.codex.locations.set(request.id, { state: 'interrupted', turnId: 'shell-turn' });
+    restarted.engine.start(); await restarted.engine.settled(); await restarted.engine.reconcile(request.id);
+    expect(restarted.store.getRequest(request.id)).toMatchObject({ status: 'uncertain', error: expect.stringContaining('соединение отмены потеряно') });
+    expect(restarted.codex.serverId).toBe(f.codex.serverId);
+    expect(restarted.codex.terminals).toEqual([]);
+    expect(restarted.codex.interrupt).not.toHaveBeenCalled();
+    expect(restarted.codex.terminateBackgroundTerminal).not.toHaveBeenCalled();
+    expect(restarted.codex.subscribe).not.toHaveBeenCalled();
+    expect(restarted.codex.backgroundTerminals).not.toHaveBeenCalled();
+    expect(restarted.store.listDeliveries().some(row => row.requestId === request.id && row.key === 'terminal:error')).toBe(false);
+  });
+
+  it('does not terminate an unmapped fresh terminal or release the request as stopped', async () => {
+    const f = fixture(), request = await acceptRequest(f, 'telegram');
+    await running(f, request, 'shell-turn');
+    f.codex.terminals.push({ itemId: 'unmapped-command', processId: '1234' });
+    await expect(f.engine.cancel(request.id)).rejects.toThrow('не подтверждены');
+    expect(f.codex.interrupt).toHaveBeenCalledExactlyOnceWith(THREAD, 'shell-turn');
+    expect(f.codex.terminateBackgroundTerminal).not.toHaveBeenCalled();
+    expect(f.store.getRequest(request.id)?.status).toBe('uncertain');
+    expect(f.codex.releaseThread).not.toHaveBeenCalled();
+  });
+
+  it('does not accept an empty registry while a canonical startup item has no completion or termination receipt', async () => {
+    const f = fixture(), request = await shell(f);
+    f.codex.terminals = [];
+    await expect(f.engine.cancel(request.id)).rejects.toThrow('не подтверждены');
+    expect(f.store.getRequest(request.id)?.status).toBe('uncertain');
+    expect(f.codex.terminateBackgroundTerminal).not.toHaveBeenCalled();
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'shell-turn',
+      item: { type: 'commandExecution', id: 'own-command', processId: null } } });
+    await f.engine.settled(); await f.engine.reconcile(request.id); await f.engine.settled();
+    expect(f.store.getRequest(request.id)?.status).toBe('interrupted');
+  });
+
+  it('cancels locally while the pre-enqueue terminal snapshot is pending without sending the original request', async () => {
+    const f = fixture();
+    f.store.removeBinding(f.conversation.id, f.conversation.bindings.find(binding => binding.platform === 'slack')!.id);
+    const baseline = deferred<{ serverId: number; terminals: Array<{ itemId: string; processId: string }> }>();
+    f.codex.backgroundTerminals.mockImplementationOnce(() => baseline.promise);
+    await f.engine.receive(f.message('telegram', 'cancel-before-enqueue'));
+    await vi.waitFor(() => expect(f.codex.backgroundTerminals).toHaveBeenCalledOnce());
+    const request = f.store.listRequests()[0];
+    await f.engine.cancel(request.id);
+    baseline.resolve({ serverId: 42, terminals: [] }); await f.engine.settled();
+    expect(f.store.getRequest(request.id)?.status).toBe('cancelled');
+    expect(f.codex.enqueue).not.toHaveBeenCalled();
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+    expect(f.codex.terminateBackgroundTerminal).not.toHaveBeenCalled();
   });
 });
 

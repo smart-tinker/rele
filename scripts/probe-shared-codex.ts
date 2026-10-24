@@ -55,16 +55,26 @@ if (values['expect-error']) {
     payload: { text: 'shared-passive-agent-context', preserved: { full: true } }, kind: 'message' }];
   const diagnostics: string[] = [];
   const observedTurns: Array<{ method: string; threadId: string; turnId: string }> = [];
+  const cancellationProcessChecks: Array<{ turnId: string; processAlive: boolean }> = [];
+  let cancellationProcess: { id: number; turnId: string } | undefined;
   let codex: CodexClient | undefined, engine: Engine | undefined;
   let threadId = values.thread;
   let loseNextQueueAck = false, droppedQueueAcks = 0, catalogValidated = false;
-  const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const alive = (pid: number) => {
+    try { process.kill(pid, 0); return true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false; throw error; }
+  };
   async function start() {
     codex = new CodexClient(config.codex);
     codex.on('notification', (event: { method: string; params: { threadId?: unknown; turn?: { id?: unknown } } }) => {
       if (['turn/started', 'turn/completed'].includes(event.method) && typeof event.params.threadId === 'string' && typeof event.params.turn?.id === 'string') {
         observedTurns.push({ method: event.method, threadId: event.params.threadId, turnId: event.params.turn.id });
         if (observedTurns.length > 100) observedTurns.shift();
+        if (event.method === 'turn/started' && event.params.threadId === threadId
+            && cancellationProcess && event.params.turn.id !== cancellationProcess.turnId) {
+          cancellationProcessChecks.push({ turnId: event.params.turn.id, processAlive: alive(cancellationProcess.id) });
+          cancellationProcess = undefined;
+        }
       }
     });
     await codex.connect();
@@ -102,10 +112,12 @@ if (values['expect-error']) {
     engine.on('diagnostic', message => diagnostics.push(String(message)));
     engine.start();
   }
-  async function snapshot() {
+  async function snapshot(processId?: number) {
     if (!codex) throw new Error('Client is closed');
     return { threadId, configuredExecutable: config.codex.executable, status: codex.status(), runtime: codex.runtimeInfo(), runtimeProcessId: (await codex.diagnostics()).process.id,
-      droppedQueueAcks, catalogValidated, observedTurns, requests: store.listRequests(), deliveries: store.listDeliveries(), approvals: store.listApprovals(), diagnostics };
+      droppedQueueAcks, catalogValidated, observedTurns, cancellationProcessChecks,
+      ...(processId ? { probeProcessAlive: alive(processId) } : {}),
+      requests: store.listRequests(), deliveries: store.listDeliveries(), approvals: store.listApprovals(), diagnostics };
   }
   const input = createInterface({ input: process.stdin });
   try {
@@ -113,7 +125,9 @@ if (values['expect-error']) {
     process.stdout.write(JSON.stringify({ ready: true, ...(await snapshot()) }) + '\n');
     for await (const line of input) {
       const command = JSON.parse(line) as { action: string; platform?: Platform; text?: string; eventId?: string;
-        requestId?: string; approvalId?: string; status?: string; turnId?: string; loseAck?: boolean };
+        requestId?: string; approvalId?: string; status?: string; turnId?: string; loseAck?: boolean;
+        decision?: 'accept' | 'decline'; processId?: number };
+      if (command.processId !== undefined && (!Number.isSafeInteger(command.processId) || command.processId <= 0)) throw new Error('Invalid fixture process ID');
       if (command.action === 'ingest') {
         loseNextQueueAck = command.loseAck === true;
         const platform = command.platform!;
@@ -135,10 +149,16 @@ if (values['expect-error']) {
         if (pending()) throw new Error(`Shared requests did not reach expected state: ${JSON.stringify(store.listRequests())}`);
         await engine!.pump(); await engine!.settled();
       } else if (command.action === 'answer') {
-        await engine!.resolveApproval(command.approvalId!, 'decline');
+        if (command.decision !== undefined && !['accept', 'decline'].includes(command.decision)) throw new Error('Invalid fixture approval decision');
+        await engine!.resolveApproval(command.approvalId!, command.decision ?? 'decline');
       } else if (command.action === 'resume') {
         await engine!.resume(command.requestId!);
       } else if (command.action === 'cancel') {
+        if (command.processId) {
+          const request = store.listRequests().find(request => request.id === command.requestId);
+          if (!request?.turnId) throw new Error('Missing cancellation fixture turn');
+          cancellationProcess = { id: command.processId, turnId: request.turnId };
+        }
         await engine!.cancel(command.requestId!);
       } else if (command.action === 'close') {
         const pid = (await codex!.diagnostics()).process.id;
@@ -146,7 +166,7 @@ if (values['expect-error']) {
         process.stdout.write(JSON.stringify({ stopped: true, runtimeProcessId: pid, backendAlive: alive(pid) }) + '\n');
         break;
       } else if (command.action !== 'snapshot') throw new Error('Unknown shared fixture command');
-      process.stdout.write(JSON.stringify({ action: command.action, ...(await snapshot()) }) + '\n');
+      process.stdout.write(JSON.stringify({ action: command.action, ...(await snapshot(command.processId)) }) + '\n');
     }
   } finally {
     input.close();
