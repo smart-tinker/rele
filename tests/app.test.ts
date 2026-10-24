@@ -168,7 +168,7 @@ describe('pending automatic Desktop integration', () => {
     const f = makeApp();
     f.desktopIntegration.shouldRetry.mockResolvedValue(true);
     await f.app.ready();
-    await vi.waitFor(() => expect(f.desktopIntegration.setEnabled).toHaveBeenCalledExactlyOnceWith(true));
+    await vi.waitFor(() => expect(f.desktopIntegration.setEnabled).toHaveBeenCalledExactlyOnceWith(true, true));
     for (let i = 0; i < 3; i++) f.engine.emit('change');
     expect((await f.app.inject({ url: '/api/codex/desktop-integration', headers })).statusCode).toBe(200);
     expect((await f.app.inject({ url: '/api/state', headers })).statusCode).toBe(200);
@@ -197,7 +197,7 @@ describe('pending automatic Desktop integration', () => {
     f.config.config.codex.transport = 'shared'; f.codex.isVerifiedVersion.mockReturnValue(false); f.engine.emit('change');
     expect(f.desktopIntegration.shouldRetry).not.toHaveBeenCalled();
     f.codex.isVerifiedVersion.mockReturnValue(true); f.engine.emit('change');
-    await vi.waitFor(() => expect(f.desktopIntegration.setEnabled).toHaveBeenCalledExactlyOnceWith(true));
+    await vi.waitFor(() => expect(f.desktopIntegration.setEnabled).toHaveBeenCalledExactlyOnceWith(true, true));
     expect(status.queueSupported).toBe(false);
   });
 
@@ -259,7 +259,7 @@ describe('pending automatic Desktop integration', () => {
     f.engine.emit('change');
     expect(f.desktopIntegration.setEnabled).not.toHaveBeenCalled();
     finishSave(); expect((await save).statusCode).toBe(200);
-    if (transport === 'shared') await vi.waitFor(() => expect(f.desktopIntegration.setEnabled).toHaveBeenCalledExactlyOnceWith(true));
+    if (transport === 'shared') await vi.waitFor(() => expect(f.desktopIntegration.setEnabled).toHaveBeenCalledExactlyOnceWith(true, true));
     else expect(f.desktopIntegration.setEnabled).not.toHaveBeenCalled();
   });
 
@@ -276,7 +276,7 @@ describe('pending automatic Desktop integration', () => {
     f.codex.isVerifiedVersion.mockReturnValue(true);
     f.desktopIntegration.shouldRetry.mockResolvedValue(true);
     f.engine.emit('change');
-    await vi.waitFor(() => expect(f.desktopIntegration.setEnabled).toHaveBeenCalledExactlyOnceWith(true));
+    await vi.waitFor(() => expect(f.desktopIntegration.setEnabled).toHaveBeenCalledExactlyOnceWith(true, true));
   });
 });
 

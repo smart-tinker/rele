@@ -157,7 +157,7 @@ export async function openInstallerWebSocket(target) {
   const { CodexClient } = await import('../dist/server/codex.js');
   const client = new CodexClient({ ...target, transport: 'websocket', endpoint: target.endpoint });
   await client.connect();
-  return { call: (method, params) => client.call(method, params), close: () => client.close() };
+  return { call: (method, params = {}) => client.call(method, params), close: () => client.close() };
 }
 
 // Keep the installed immutable adapter open as Desktop would, including its executable/file locks.

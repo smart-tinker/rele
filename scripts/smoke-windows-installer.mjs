@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { createReadStream } from 'node:fs';
+import { createReadStream, existsSync, readFileSync } from 'node:fs';
 import { access, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -44,9 +44,13 @@ let fixturePanelToken;
 let failed = false;
 
 function run(command, args, options = {}) {
-  const result = spawnSync(command, args, { encoding: 'utf8', env, windowsHide: true, timeout: 120_000, maxBuffer: 1024 * 1024, ...options });
+  const errorFile = path.basename(command).toLowerCase() === 'rele.exe' && ['desktop-integrate', 'desktop-unintegrate'].includes(args[0])
+    ? path.join(temporary, `controller-${randomUUID()}.txt`) : undefined;
+  const result = spawnSync(command, errorFile ? [...args, '--error-file', errorFile] : args,
+    { encoding: 'utf8', env, windowsHide: true, timeout: 120_000, maxBuffer: 1024 * 1024, ...options });
   if (result.error) throw result.error;
-  assert.equal(result.status, 0, result.stderr || `${path.basename(command)} exited ${result.status}`);
+  const controllerError = result.status !== 0 && errorFile && existsSync(errorFile) ? readFileSync(errorFile, 'utf8') : '';
+  assert.equal(result.status, 0, result.stderr || controllerError || `${path.basename(command)} exited ${result.status}`);
   return result.stdout.trim();
 }
 function powershell(code, options) {
@@ -490,6 +494,31 @@ try {
   };
   const serviceLog = await readFile(path.join(data, 'logs', 'service.log'), 'utf8').catch(() => 'No fixture service log.');
   const evidence = { platform: 'windows', result: 'failed', error: sanitize(error.message), serviceLog: sanitize(serviceLog.slice(-12_000)), native: {} };
+  const describeUrl = value => {
+    if (value == null || value === '') return { kind: 'empty' };
+    if (typeof value !== 'string') return { kind: 'invalid' };
+    const match = /^ws:\/\/127\.0\.0\.1:([1-9]\d{0,4})\/?$/u.exec(value);
+    return match?.[0] === value && Number(match[1]) <= 65535 ? { kind: 'loopback', value }
+      : { kind: 'other', sha256: createHash('sha256').update(value).digest('hex') };
+  };
+  try {
+    const marker = JSON.parse(await readFile(path.join(application, 'rele-install.json'), 'utf8'));
+    evidence.desktopIntegration = {};
+    for (const key of ['DesktopIntegrationRequested', 'DesktopIntegrationOwned']) {
+      evidence.desktopIntegration[key] = typeof marker[key] === 'boolean' ? marker[key] : null;
+    }
+    for (const key of ['InstalledCodexWebSocketUrl', 'PreviousCodexWebSocketUrl', 'CodexWebSocketEndpoint']) evidence.desktopIntegration[key] = describeUrl(marker[key]);
+    const warning = marker.DesktopIntegrationWarning;
+    evidence.desktopIntegration.DesktopIntegrationWarning = typeof warning === 'string' && warning
+      ? { present: true, sha256: createHash('sha256').update(warning).digest('hex') } : { present: false };
+  } catch { evidence.desktopIntegration = { unavailable: true }; }
+  evidence.desktopEnvironment = { caller: Object.entries(env).filter(([key]) => key.toUpperCase() === 'CODEX_APP_SERVER_WS_URL')
+    .map(([key, value]) => ({ key, ...describeUrl(value) })) };
+  try { evidence.desktopEnvironment.user = describeUrl(desktopEnvironment().CODEX_APP_SERVER_WS_URL); }
+  catch { evidence.desktopEnvironment.user = { unavailable: true }; }
+  try {
+    evidence.desktopEnvironment.machine = describeUrl(JSON.parse(powershell("@{ value = [Environment]::GetEnvironmentVariable('CODEX_APP_SERVER_WS_URL', 'Machine') } | ConvertTo-Json -Compress")).value);
+  } catch { evidence.desktopEnvironment.machine = { unavailable: true }; }
   if (instance) {
     try {
       const address = new URL(instance.address);
