@@ -623,7 +623,10 @@ internal static class Rele
         string xml = "<?xml version=\"1.0\" encoding=\"UTF-16\"?>" +
             "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">" +
             "<RegistrationInfo><Description>Rele: общий локальный Codex текущего пользователя; независим от gateway.</Description></RegistrationInfo>" +
-            "<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + user + "</UserId></LogonTrigger></Triggers>" +
+            "<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + user + "</UserId></LogonTrigger>" +
+            "<TimeTrigger><Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>" +
+            "<StartBoundary>" + DateTime.UtcNow.AddMinutes(1).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", System.Globalization.CultureInfo.InvariantCulture) +
+            "</StartBoundary><Enabled>true</Enabled></TimeTrigger></Triggers>" +
             "<Principals><Principal id=\"User\"><UserId>" + user + "</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>" +
             "<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" +
             "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><Enabled>true</Enabled>" +
@@ -632,6 +635,19 @@ internal static class Rele
             "</Command><Arguments>" + SecurityElement.Escape("--codex-websocket-owner " + QuoteArgument(Path.Combine(directory, "owner.json"))) +
             "</Arguments><WorkingDirectory>" + SecurityElement.Escape(directory) + "</WorkingDirectory></Exec></Actions></Task>";
         folder.RegisterTask(owner.TaskName, xml, 6, Config.OwnerSid, null, 3, null);
+    }
+
+    private static bool HasCodexRecoveryTrigger(dynamic task)
+    {
+        dynamic definition = task.Definition;
+        if ((int)definition.Settings.MultipleInstances != 2) return false; // IgnoreNew preserves the live owner.
+        foreach (dynamic trigger in definition.Triggers)
+            if ((int)trigger.Type == 1 && (bool)trigger.Enabled &&
+                !String.IsNullOrEmpty((string)trigger.Repetition.Interval) &&
+                System.Xml.XmlConvert.ToTimeSpan((string)trigger.Repetition.Interval) == TimeSpan.FromMinutes(1) &&
+                String.IsNullOrEmpty((string)trigger.Repetition.Duration) && !(bool)trigger.Repetition.StopAtDurationEnd)
+                return true;
+        return false;
     }
 
     [DllImport("advapi32.dll", SetLastError = true)]
@@ -785,7 +801,8 @@ internal static class Rele
                             throw new InvalidOperationException("Общий Codex уже работает с другим backend или профилем; работающие задачи не остановлены.");
                         SaveCodexWebSocketPointer(cache, previous, Config.CodexWebSocketOwnerDirectory);
                         File.WriteAllText(Path.Combine(AppDirectory, "rele-install.json"), Json.Serialize(Config), new UTF8Encoding(false));
-                        if (previousTask == null) RegisterCodexWebSocketTask(previous, Config.CodexWebSocketOwnerDirectory);
+                        if (previousTask == null || !HasCodexRecoveryTrigger(previousTask))
+                            RegisterCodexWebSocketTask(previous, Config.CodexWebSocketOwnerDirectory);
                         return active; // A reinstalled future Task must not launch a second owner.
                     }
                     if (!TaskActive(previousTask)) break;

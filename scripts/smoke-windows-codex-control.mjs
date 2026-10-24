@@ -37,6 +37,10 @@ let foreign;
 let result;
 let failure;
 let cleanupConfirmed = false;
+let recoveryDiagnostics;
+let phase = 'preflight';
+let failurePhase;
+const controllerCalls = [];
 function run(command, args, extra = {}) {
   const output = spawnSync(command, args, { env, windowsHide: true, encoding: 'utf8', timeout: 25_000, maxBuffer: 65536, ...extra });
   if (output.error) throw output.error;
@@ -120,22 +124,33 @@ try {
     Port: 0, OwnerSid: sid, CodexHome: home, DesktopIntegrationOwned: false, DesktopIntegrationRequested: false }));
   let starts = 0;
   let nativeStartCalls = 0;
+  const commandCounts = { 'codex-start': 0, 'codex-status': 0 };
   const controlCommand = async command => {
     if (command === 'codex-start') nativeStartCalls++;
     const errorFile = path.join(data, `control-error-${++starts}.txt`);
-    const output = run(path.join(application, 'Rele.exe'), [command, '--quiet', ...(command === 'codex-start' ? ['--codex-executable', executable] : []),
-      '--codex-home', home, '--error-file', errorFile]);
-    if (output.status !== 0) output.errorReceipt = await readFile(errorFile, 'utf8').catch(() => '');
-    return output;
+    const call = { sequence: controllerCalls.length + 1, command, commandIndex: ++commandCounts[command], phase };
+    controllerCalls.push(call);
+    console.error(JSON.stringify({ type: 'controller-call', ...call }));
+    const began = performance.now();
+    try {
+      const output = run(path.join(application, 'Rele.exe'), [command, '--quiet', ...(command === 'codex-start' ? ['--codex-executable', executable] : []),
+        '--codex-home', home, '--error-file', errorFile], { timeout: 60_000 });
+      call.exitCode = output.status;
+      if (output.status !== 0) output.errorReceipt = await readFile(errorFile, 'utf8').catch(() => '');
+      return output;
+    } catch (error) { call.errorCode = error.code || error.name; throw error; }
+    finally { call.durationMs = Math.ceil(performance.now() - began); }
   };
   const start = () => controlCommand('codex-start');
   const status = () => controlCommand('codex-status');
   const initialSettings = await readFile(target.installSettingsPath);
+  phase = 'status-missing';
   const missing = await status(); assert.equal(missing.status, 0, missing.errorReceipt || missing.stderr);
   assert.deepEqual(JSON.parse(missing.stdout), { status: 'notRunning' });
   assert.deepEqual(await readFile(target.installSettingsPath), initialSettings);
   assert.deepEqual(await readdir(data), []);
   await assert.rejects(access(home), { code: 'ENOENT' });
+  phase = 'start-initial';
   const first = await start();
   assert.equal(first.status, 0, first.errorReceipt || first.stderr);
   const control = JSON.parse(first.stdout);
@@ -157,6 +172,7 @@ try {
     try { $xmlHash=[BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes([string]$task.Xml))) } finally { $hash.Dispose() }
     $xmlHash + '|' + $task.LastRunTime.ToUniversalTime().ToString('o')`, { env: { ...env, RELE_CONTROL_TASK: `${task}-Codex` } });
   const beforeTask = taskSnapshot();
+  phase = 'status-live';
   const live = await status(); assert.equal(live.status, 0, live.errorReceipt || live.stderr);
   const liveControl = JSON.parse(live.stdout);
   assert.equal(liveControl.status, 'alreadyRunning');
@@ -169,24 +185,46 @@ try {
     [pscustomobject]@{ pid=[int]$rows[0].OwningProcess } | ConvertTo-Json -Compress`,
     { env: { ...env, RELE_CONTROL_PORT: new URL(control.endpoint).port } }));
   assert.equal(listeners.pid, control.processId, 'The kernel listener must belong to the receipt PID.');
+  phase = 'native-initialize';
   const call = await connect(control.endpoint);
   const initialized = await call('initialize', { clientInfo: { name: 'rele_control_fixture', version: '1' }, capabilities: { experimentalApi: true } });
   socket.send('{"method":"initialized"}');
   assert.ok(samePath(initialized.codexHome, await realpath(home)));
   assert.equal((await call('server/diagnostics')).process.id, control.processId);
+  // Emulate the prior own Task: a live owner with only its logon trigger.
+  phase = 'legacy-task-fixture';
+  powershell(`$expected=$env:RELE_CONTROL_PROCESS | ConvertFrom-Json;
+    $scheduler=New-Object -ComObject 'Schedule.Service'; $scheduler.Connect(); $folder=$scheduler.GetFolder('\\');
+    $task=$folder.GetTask($expected.taskName); $definition=$task.Definition; $action=$definition.Actions.Item(1);
+    $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;
+    $principalSid=if ($definition.Principal.UserId -like 'S-1-*') { [string]$definition.Principal.UserId } else {
+      ([Security.Principal.NTAccount]::new([string]$definition.Principal.UserId)).Translate([Security.Principal.SecurityIdentifier]).Value };
+    if ($definition.Actions.Count -ne 1 -or $action.Type -ne 0 -or $principalSid -ne $sid -or
+      [int]$definition.Principal.LogonType -ne 3 -or [int]$definition.Principal.RunLevel -ne 0 -or
+      $action.Path -ne (Join-Path $expected.ownerDirectory 'Rele.Process.exe') -or
+      $action.Arguments -ne ('--codex-websocket-owner "' + (Join-Path $expected.ownerDirectory 'owner.json') + '"') -or
+      $action.WorkingDirectory -ne $expected.ownerDirectory) { throw 'Legacy recovery Task fixture identity changed.' }
+    for ($index=$definition.Triggers.Count; $index -ge 1; $index--) {
+      if ([int]$definition.Triggers.Item($index).Type -eq 1) { $definition.Triggers.Remove($index) }
+    }
+    $folder.RegisterTaskDefinition($expected.taskName,$definition,6,$sid,$null,3,$null) | Out-Null;`,
+  { env: { ...env, RELE_CONTROL_PROCESS: JSON.stringify(control) } });
+  phase = 'start-repair-active';
   const repeated = await start(); assert.equal(repeated.status, 0, repeated.errorReceipt || repeated.stderr);
   const second = JSON.parse(repeated.stdout);
   assert.equal(second.status, 'alreadyRunning');
   for (const key of ['endpoint', 'processId', 'processStartTime', 'ownerDirectory']) assert.equal(second[key], control[key]);
   assert.equal((await call('server/diagnostics')).process.id, control.processId);
+  const recoveryTaskSnapshot = taskSnapshot();
   const closed = once(socket, 'close'); socket.close(); await closed; socket = undefined;
   const recoveryStartCalls = nativeStartCalls;
+  phase = 'status-before-native-crash';
   const fresh = await status(); assert.equal(fresh.status, 0, fresh.errorReceipt || fresh.stderr);
   const beforeRecovery = JSON.parse(fresh.stdout);
   assert.equal(beforeRecovery.processId, control.processId);
   await readOwnedState(sid, helperHash);
   const recoveryReceiptHash = digest(await readFile(path.join(target.desktopOwner.directory, 'receipt.json')));
-  const recoveryStartedAt = Date.now();
+  phase = 'crash-own-native';
   const killed = JSON.parse(powershell(`$expected=$env:RELE_CONTROL_PROCESS | ConvertFrom-Json;
     $bytes=[IO.File]::ReadAllBytes((Join-Path $expected.ownerDirectory 'receipt.json'));
     $hash=[Security.Cryptography.SHA256]::Create();
@@ -215,8 +253,13 @@ try {
       $action.Arguments -ne ('--codex-websocket-owner "' + (Join-Path $expected.ownerDirectory 'owner.json') + '"') -or
       $action.WorkingDirectory -ne $expected.ownerDirectory -or $principalSid -ne $sid -or
       [int]$definition.Principal.LogonType -ne 3 -or [int]$definition.Principal.RunLevel -ne 0 -or
-      -not $task.Enabled -or [int]$definition.Settings.RestartCount -lt 1 -or
+      -not $task.Enabled -or [int]$definition.Settings.MultipleInstances -ne 2 -or [int]$definition.Settings.RestartCount -lt 1 -or
       [Xml.XmlConvert]::ToTimeSpan([string]$definition.Settings.RestartInterval).TotalSeconds -ne 60) { throw 'Recovery task identity changed.' }
+    $recurring=@($definition.Triggers | Where-Object { [int]$_.Type -eq 1 -and [bool]$_.Enabled -and
+      -not [string]::IsNullOrEmpty([string]$_.Repetition.Interval) -and
+      [Xml.XmlConvert]::ToTimeSpan([string]$_.Repetition.Interval).TotalSeconds -eq 60 -and
+      [string]::IsNullOrEmpty([string]$_.Repetition.Duration) -and -not [bool]$_.Repetition.StopAtDurationEnd });
+    if ($recurring.Count -ne 1) { throw 'The enabled indefinite recovery trigger is missing.' }
     $native=Get-Process -Id $expected.processId -ErrorAction Stop; $pin=$native.Handle;
     $hostProcess=Get-Process -Id $receipt.hostPid -ErrorAction Stop;
     if ($native.StartTime.ToUniversalTime().Ticks -ne (UtcBirthTicks $expected.processStartTime)) { throw 'Recovery process changed: nativeStartedAt.' }
@@ -233,10 +276,12 @@ try {
     [pscustomobject]@{ nativePid=[int]$native.Id; hostPid=[int]$hostProcess.Id; taskEnabled=[bool]$task.Enabled } | ConvertTo-Json -Compress`,
     { env: { ...env, RELE_CONTROL_PROCESS: JSON.stringify({ ...beforeRecovery, receiptSha256: recoveryReceiptHash }) } }));
   assert.equal(killed.nativePid, control.processId); assert.equal(killed.taskEnabled, true);
+  const recoveryStartedAt = Date.now();
   await exited(killed.nativePid); await exited(killed.hostPid);
   let recovered;
   let recoveryStatusErrors = 0;
   let lastRecoveryError = '';
+  phase = 'wait-task-recovery';
   while (Date.now() - recoveryStartedAt < 90_000) {
     const observed = await status();
     if (observed.status === 0) {
@@ -246,13 +291,81 @@ try {
     } else { recoveryStatusErrors++; lastRecoveryError = observed.errorReceipt || observed.stderr; }
     await delay(1000);
   }
-  assert.ok(recovered, `The enabled owner Task did not recover native within 90 seconds. ${lastRecoveryError}`);
+  if (!recovered) {
+    recoveryDiagnostics = JSON.parse(powershell(`$expected=$env:RELE_CONTROL_PROCESS | ConvertFrom-Json;
+      $facts=[ordered]@{ taskPresent=$false; taskOwnership='absent'; taskState=$null; taskEnabled=$null;
+        lastTaskResult=$null; lastTaskResultHex=$null; lastRunTime=$null; instances=$null; receiptPresent=$false };
+      $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;
+      $scheduler=New-Object -ComObject 'Schedule.Service'; $scheduler.Connect(); $task=$null;
+      try { $task=$scheduler.GetFolder('\\').GetTask($expected.taskName) }
+      catch { if ($_.Exception.HResult -ne -2147024894) { throw } }
+      if ($task) {
+        $facts.taskPresent=$true; $definition=$task.Definition; $action=$definition.Actions.Item(1);
+        $principalSid=if ($definition.Principal.UserId -like 'S-1-*') { [string]$definition.Principal.UserId } else {
+          ([Security.Principal.NTAccount]::new([string]$definition.Principal.UserId)).Translate([Security.Principal.SecurityIdentifier]).Value };
+        $owned=$definition.Actions.Count -eq 1 -and $action.Type -eq 0 -and
+          $action.Path -eq (Join-Path $expected.ownerDirectory 'Rele.Process.exe') -and
+          $action.Arguments -eq ('--codex-websocket-owner "' + (Join-Path $expected.ownerDirectory 'owner.json') + '"') -and
+          $action.WorkingDirectory -eq $expected.ownerDirectory -and $principalSid -eq $sid -and
+          [int]$definition.Principal.LogonType -eq 3 -and [int]$definition.Principal.RunLevel -eq 0;
+        $facts.taskOwnership=if ($owned) { 'matched' } else { 'mismatch' };
+        if ($owned) {
+          $facts.taskState=[int]$task.State; $facts.taskEnabled=[bool]$task.Enabled;
+          $code=[uint32]([int64]$task.LastTaskResult -band 4294967295);
+          $facts.lastTaskResult=[long]$code; $facts.lastTaskResultHex=('0x{0:X8}' -f $code);
+          $facts.lastRunTime=$task.LastRunTime.ToUniversalTime().ToString('o');
+          $facts.instances=[int]$task.GetInstances(0).Count;
+          $facts.restartCount=[int]$definition.Settings.RestartCount;
+          $facts.restartIntervalSeconds=[Xml.XmlConvert]::ToTimeSpan([string]$definition.Settings.RestartInterval).TotalSeconds;
+          $facts.multipleInstances=[int]$definition.Settings.MultipleInstances;
+          $facts.timeTriggerCount=@($definition.Triggers | Where-Object { [int]$_.Type -eq 1 -and [bool]$_.Enabled }).Count;
+        }
+      }
+      function ProcessFact([int]$id,[object]$birth,[string]$executable) {
+        $process=$null;
+        try { $process=[Diagnostics.Process]::GetProcessById($id) }
+        catch [ArgumentException] { return @{ presence='absent'; birthMatches=$false; pathMatches=$null } }
+        try {
+          $date=if ($birth -is [datetime]) { $birth } else {
+            [DateTime]::Parse([string]$birth,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind) };
+          $sameBirth=$process.StartTime.ToUniversalTime().Ticks -eq $date.ToUniversalTime().Ticks;
+          return @{ presence='present'; birthMatches=$sameBirth; pathMatches=$(if ($sameBirth) { $process.Path -eq $executable } else { $null }) };
+        } catch { return @{ presence='unknown'; errorHResult=$_.Exception.HResult } }
+        finally { if ($process) { $process.Dispose() } }
+      }
+      $file=Join-Path $expected.ownerDirectory 'receipt.json';
+      if (Test-Path -LiteralPath $file) {
+        $facts.receiptPresent=$true;
+        try {
+          $receipt=[Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($file)) | ConvertFrom-Json;
+          $facts.receiptIdentityMatches=$receipt.ownerSid -eq $sid -and $receipt.endpoint -eq $expected.endpoint -and
+            $receipt.codexHome -eq $expected.codexHome -and $receipt.executable -eq $expected.executable -and
+            $receipt.executableSha256 -eq $expected.executableSha256;
+          if ($facts.receiptIdentityMatches) {
+            $facts.receiptStatus=[string]$receipt.status; $facts.nativeExitCode=$receipt.exitCode;
+            $facts.hostPid=[int]$receipt.hostPid; $facts.nativePid=[int]$receipt.nativePid;
+            $facts.host=ProcessFact $receipt.hostPid $receipt.hostStartedAt (Join-Path $expected.ownerDirectory 'Rele.Process.exe');
+            $facts.native=ProcessFact $receipt.nativePid $receipt.nativeStartedAt $expected.executable;
+          }
+        } catch { $facts.receiptErrorHResult=$_.Exception.HResult }
+      }
+      $portErrors=@(); $rows=@(Get-NetTCPConnection -LocalPort $env:RELE_CONTROL_PORT -ErrorAction SilentlyContinue -ErrorVariable portErrors);
+      $facts.portQuerySucceeded=$portErrors.Count -eq 0;
+      if ($facts.portQuerySucceeded) {
+        $facts.listenerCount=@($rows | Where-Object { $_.State -eq 'Listen' -and $_.LocalAddress -in @('127.0.0.1','0.0.0.0') }).Count;
+        $facts.timeWaitCount=@($rows | Where-Object { $_.State -eq 'TimeWait' }).Count;
+      }
+      $facts | ConvertTo-Json -Depth 5 -Compress`, { env: { ...env,
+      RELE_CONTROL_PROCESS: JSON.stringify(beforeRecovery), RELE_CONTROL_PORT: new URL(control.endpoint).port } }));
+    throw new Error('The enabled owner Task did not recover native within 90 seconds.');
+  }
   assert.equal(nativeStartCalls, recoveryStartCalls, 'Recovery must not call codex-start.');
   assert.notEqual(recovered.processStartTime, control.processStartTime);
   for (const key of ['endpoint', 'codexHome', 'executable', 'executableSha256', 'ownerSid', 'ownerDirectory', 'taskName']) assert.equal(recovered[key], control[key]);
   const afterRecoveryTask = taskSnapshot();
-  assert.equal(afterRecoveryTask.split('|')[0], beforeTask.split('|')[0], 'Recovery must preserve the Task definition.');
-  assert.ok(Date.parse(afterRecoveryTask.split('|')[1]) > Date.parse(beforeTask.split('|')[1]), 'Task Scheduler must launch the recovery instance.');
+  assert.equal(afterRecoveryTask.split('|')[0], recoveryTaskSnapshot.split('|')[0], 'Recovery must preserve the repaired Task definition.');
+  assert.ok(Date.parse(afterRecoveryTask.split('|')[1]) > Date.parse(recoveryTaskSnapshot.split('|')[1]), 'Task Scheduler must launch the recovery instance.');
+  phase = 'verify-recovered-native';
   const recoveredCall = await connect(recovered.endpoint);
   const recoveredInitialize = await recoveredCall('initialize', { clientInfo: { name: 'rele_control_recovery_fixture', version: '1' }, capabilities: { experimentalApi: true } });
   socket.send('{"method":"initialized"}');
@@ -260,8 +373,10 @@ try {
   assert.equal((await recoveredCall('server/diagnostics')).process.id, recovered.processId);
   const recoveredClosed = once(socket, 'close'); socket.close(); await recoveredClosed; socket = undefined;
   const receipt = JSON.parse(await readFile(path.join(target.desktopOwner.directory, 'receipt.json'), 'utf8'));
+  phase = 'cleanup-after-recovery';
   stopInstallerCodex(target);
   await exited(receipt.hostPid); await exited(recovered.processId);
+  phase = 'status-after-stop';
   const stopped = await status(); assert.equal(stopped.status, 0, stopped.errorReceipt || stopped.stderr);
   assert.deepEqual(JSON.parse(stopped.stdout), { status: 'notRunning' });
   assert.equal(powershell("(@(Get-ScheduledTask -TaskName $env:RELE_CONTROL_TASK -ErrorAction SilentlyContinue)).Count",
@@ -270,6 +385,7 @@ try {
   const address = new URL(control.endpoint);
   foreign = createServer(connection => connection.end());
   foreign.listen(Number(address.port), '127.0.0.1'); await once(foreign, 'listening');
+  phase = 'foreign-port-refusal';
   const blocked = await start(); assert.equal(blocked.status, 1, 'An occupied stable endpoint must be refused.');
   assert.match(blocked.errorReceipt || blocked.stderr, /занят неподтверждённым процессом/u);
   assert.equal(foreign.listening, true, 'The foreign listener must remain alive.');
@@ -277,10 +393,11 @@ try {
   result = { result: 'passed', nativeSha256: nativeHash, originalProfileInitialized: true, utf8Contract: true,
     actualNativeInitialize: true, diagnosticsAndKernelPidMatch: true, idempotentOwnerReuse: true,
     readonlyStatusMissingLiveStopped: true,
-    nativeTaskRecoveryWithoutGateway: true, recoveryStatusErrors,
+    legacyOwnerRecoveryTriggerRepaired: true, nativeTaskRecoveryWithoutGateway: true, recoveryStatusErrors,
     serverSurvivesHelperExit: true, foreignOccupiedEndpointRefused: true, desktopActions: false };
-} catch (error) { failure = error; }
+} catch (error) { failure = error; failurePhase = phase; }
 finally {
+  phase = 'cleanup-final';
   if (socket) { socket.terminate(); socket = undefined; }
   if (foreign?.listening) await new Promise((resolve, reject) => foreign.close(error => error ? reject(error) : resolve()));
   try {
@@ -295,7 +412,9 @@ finally {
 }
 if (failure) {
   console.error(JSON.stringify({ result: 'failed', cleanup: cleanupConfirmed ? 'passed' : 'unconfirmed',
-    error: failure.message, ...(cleanupConfirmed ? {} : { retainedFixture: temporary }) }));
+    phase: failurePhase || phase, controllerCalls, error: failure.message, ...(recoveryDiagnostics ? { recovery: recoveryDiagnostics } : {}),
+    ...(cleanupConfirmed ? {} : { retainedFixture: temporary }) }));
   throw failure;
 }
-console.log(JSON.stringify({ ...result, cleanup: 'passed' }));
+console.log(JSON.stringify({ ...result, cleanup: 'passed', controllerCalls,
+  controllerDeadline20sMet: controllerCalls.every(call => call.durationMs < 20_000) }));
