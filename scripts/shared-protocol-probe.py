@@ -22,6 +22,8 @@ import uuid
 
 from aiohttp import web
 import websockets
+from websockets.exceptions import ConnectionClosedError
+from websockets.protocol import State
 
 VERSIONS = ['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2']
 REPO = Path(__file__).resolve().parent.parent
@@ -151,8 +153,15 @@ class Rpc:
 
     async def close(self):
         if self.ws is not None:
+            locally_open = self.ws.state is State.OPEN and not self.reader.done()
             await self.ws.close()
-            await self.reader
+            try:
+                await self.reader
+            except ConnectionClosedError as error:
+                # Native WS drops its writer on Close instead of echoing the frame.
+                if not (locally_open and error.rcvd is None and error.sent is not None
+                        and error.sent.code == 1000 and error.sent.reason == ''):
+                    raise
             return
         if self.process.returncode is None:
             self.process.stdin.close()
