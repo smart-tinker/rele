@@ -39,7 +39,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install -r scripts/protocol-requirements.txt
-          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11 0.163.0-alpha.11.2; do
+          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11 0.163.0-alpha.11.2 0.164.0-alpha.11.1; do
             npm install --prefix "$RUNNER_TEMP/codex-probe-$version" --ignore-scripts --no-audit --no-fund --no-package-lock "@openai/codex@$version"
             python scripts/shared-protocol-probe.py --codex-prefix "$RUNNER_TEMP/codex-probe-$version" --expected-version "$version" --report "shared-results-$version.json"
           done
@@ -82,7 +82,7 @@ jobs:
       - name: Install the isolated protocol fixture
         run: |
           python -m pip install -r scripts/protocol-requirements.txt
-          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11 0.163.0-alpha.11.2; do
+          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11 0.163.0-alpha.11.2 0.164.0-alpha.11.1; do
             npm install --prefix "$RUNNER_TEMP/codex-probe-$version" --ignore-scripts --no-audit --no-fund --no-package-lock "@openai/codex@$version"
           done
       - name: Build installers and portable runtime, verify the extracted archive
@@ -92,19 +92,21 @@ jobs:
       - name: Verify bounded Windows fixture cleanup with a real file lock
         if: runner.os == 'Windows'
         run: node scripts/probe-installer-cleanup.mjs
-      - name: Verify actual Desktop-only bootstrap without npm Codex or RDP
+      - name: Prepare the signed Desktop backend and verify the noninteractive owner primitive
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $desktopRoot = Join-Path $env:RUNNER_TEMP 'desktop-native-gate'
           & ./scripts/windows/probe-desktop-package.ps1 -OutputDirectory $desktopRoot -PrepareNativeGate
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & ./scripts/windows/ci-standard-user-canary.ps1 -RunGates -Phase Shared -DesktopBundle (Join-Path $desktopRoot 'payload') -DesktopInventory (Join-Path $desktopRoot 'desktop-package-inventory.json')
-          Copy-Item -LiteralPath windows-standard-user-results.json -Destination desktop-standard-user-results.json
+          node scripts/smoke-windows-codex-owner.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify Windows installer and native shared gates as a standard user
         if: runner.os == 'Windows'
         shell: pwsh
-        run: .\scripts\windows\ci-standard-user-canary.ps1 -RunGates
+        run: |
+          $desktopRoot = Join-Path $env:RUNNER_TEMP 'desktop-native-gate'
+          & ./scripts/windows/ci-standard-user-canary.ps1 -RunGates -DesktopBundle (Join-Path $desktopRoot 'payload') -DesktopInventory (Join-Path $desktopRoot 'desktop-package-inventory.json')
       - name: Verify the real Debian package and systemd lifecycle
         if: runner.os == 'Linux'
         env:
@@ -113,18 +115,18 @@ jobs:
         run: node scripts/smoke-linux-installer.mjs
       - name: Verify the actual Codex protocol without credentials or a real model
         run: |
-          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11 0.163.0-alpha.11.2; do
+          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11 0.163.0-alpha.11.2 0.164.0-alpha.11.1; do
             python scripts/protocol-probe.py --codex-prefix "$RUNNER_TEMP/codex-probe-$version" --expected-version "$version" --report "protocol-results-$version.json"
           done
       - name: Verify managed Rele, shared history, ownership and origin delivery
         run: |
-          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11 0.163.0-alpha.11.2; do
+          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11 0.163.0-alpha.11.2 0.164.0-alpha.11.1; do
             python scripts/managed-protocol-probe.py --codex-prefix "$RUNNER_TEMP/codex-probe-$version" --expected-version "$version" --report "managed-results-$version.json"
           done
-      - name: Verify native shared daemon, Desktop stdio shim and Rele recovery
+      - name: Verify the Ubuntu native shared daemon and Rele recovery
         if: runner.os == 'Linux'
         run: |
-          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11 0.163.0-alpha.11.2; do
+          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11 0.163.0-alpha.11.2 0.164.0-alpha.11.1; do
             python scripts/shared-protocol-probe.py --codex-prefix "$RUNNER_TEMP/codex-probe-$version" --expected-version "$version" --report "shared-results-$version.json"
           done
       - name: Install the pinned local speech environment and public fixture
@@ -261,7 +263,7 @@ jobs:
 
           Upgrade from rc.3: saved proxy/WebSocket settings are preserved. Open Codex settings, select Server Rele, choose the recommended installed Codex, check the profile and save. Existing bindings remain. No manual socket or daemon setup is needed for managed mode. External proxy/WebSocket connections remain available under advanced options.
 
-          Exact protocol allowlist: Codex 0.163.0, 0.163.0-alpha.10.2, 0.163.0-alpha.11 and 0.163.0-alpha.11.2. Compatibility evidence for the release commit and artifacts is recorded in these release notes. The Windows and Ubuntu raw, managed and shared protocol gates use isolated profiles, clients of the same native daemon, a local fake model and synthetic Slack/Telegram delivery. They check busy ownership, context handoff, origin routing, recovery and owned process shutdown.
+          Exact protocol allowlist: Codex 0.163.0, 0.163.0-alpha.10.2, 0.163.0-alpha.11, 0.163.0-alpha.11.2 and 0.164.0-alpha.11.1. Compatibility evidence for the release commit and artifacts is recorded in these release notes. The Windows and Ubuntu raw, managed and shared protocol gates use isolated profiles, clients of the same native daemon, a local fake model and synthetic Slack/Telegram delivery. They check busy ownership, context handoff, origin routing, recovery and owned process shutdown.
 
           This is an unsigned prerelease. Shared persisted history does not establish instant Desktop GUI synchronization or release behavior of a particular Desktop build. Real Windows Desktop and authorized messenger acceptance remain open before stable publishing. Rele does not fork or replace a bound thread when resume fails. See docs/RC8.md, docs/RC7.md, docs/RC6.md, docs/RC5.md, docs/RC4.md and docs/ACCEPTANCE.md.
           NOTES

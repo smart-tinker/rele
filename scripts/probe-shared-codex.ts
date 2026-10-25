@@ -2,27 +2,40 @@
 import { parseArgs } from 'node:util';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ConfigStore, defaultConfig, defaultDataDirectory } from '../src/server/config.js';
-import { CodexClient } from '../src/server/codex.js';
-import { Engine } from '../src/server/engine.js';
-import { Store } from '../src/server/store.js';
+import { CodexClient as SourceCodexClient } from '../src/server/codex.js';
+import { Engine as SourceEngine } from '../src/server/engine.js';
+import { Store as SourceStore } from '../src/server/store.js';
+import { ensureWindowsSharedCodex } from '../src/server/codex-shared.js';
 import type { Channel } from '../src/server/channels/common.js';
 import type { Endpoint, Platform, SlackTranscriptMessage } from '../src/shared/types.js';
 
 const { values } = parseArgs({ options: {
   executable: { type: 'string' }, home: { type: 'string' }, directory: { type: 'string' },
   thread: { type: 'string' }, prepare: { type: 'boolean' }, 'profile-socket': { type: 'string' }, 'expect-error': { type: 'string' },
+  'windows-install-dir': { type: 'string' }, 'runtime-directory': { type: 'string' },
 } });
 if (!values.executable || !values.home || !values.directory || !process.env.RELE_DATA_DIR) throw new Error('Missing isolated fixture paths');
-const config = { ...structuredClone(defaultConfig), codex: {
+if ((values['windows-install-dir'] || values['runtime-directory']) && process.platform !== 'win32') throw new Error('Windows fixture options require Windows');
+if (values['windows-install-dir'] && values['runtime-directory']) throw new Error('Choose source installation seam or packaged default location');
+const load = (name: string) => import(pathToFileURL(join(values['runtime-directory']!, 'dist/server', `${name}.js`)).href);
+const { CodexClient } = values['runtime-directory'] ? await load('codex') as typeof import('../src/server/codex.js') : { CodexClient: SourceCodexClient };
+const { Engine } = values['runtime-directory'] ? await load('engine') as typeof import('../src/server/engine.js') : { Engine: SourceEngine };
+const { Store } = values['runtime-directory'] ? await load('store') as typeof import('../src/server/store.js') : { Store: SourceStore };
+const configModule = values['runtime-directory'] ? await load('config') as typeof import('../src/server/config.js') : { ConfigStore, defaultConfig, defaultDataDirectory };
+// Source gates select their disposable installation through the existing production seam.
+// Packaged gates use the compiled module's default installation location, without this seam.
+const options = values['windows-install-dir'] ? { shared: (target: Parameters<typeof ensureWindowsSharedCodex>[0], settings: Parameters<typeof ensureWindowsSharedCodex>[1]) => ensureWindowsSharedCodex(target, settings, values['windows-install-dir']) } : {};
+const config = { ...structuredClone(configModule.defaultConfig), codex: {
   transport: 'shared' as const, executable: values.executable, endpoint: '', codexHome: values.home,
 } };
-const saved = new ConfigStore(defaultDataDirectory());
+const saved = new configModule.ConfigStore(configModule.defaultDataDirectory());
 await saved.load();
 await saved.save(config);
 if (values['expect-error']) {
-  const client = new CodexClient(config.codex);
+  const client = new CodexClient(config.codex, options);
   try { await client.connect(); } catch { /* Assert the exact production fence below. */ }
   const status = client.status();
   await client.close();
@@ -31,7 +44,7 @@ if (values['expect-error']) {
 } else if (values['profile-socket']) {
   // Test-only resolver fault: the real native initialize response must still fence another profile.
   const client = new CodexClient(config.codex, { shared: async target => ({
-    ...target, transport: 'proxy', endpoint: values['profile-socket']!,
+    ...target, transport: values['profile-socket']!.startsWith('ws://') ? 'websocket' : 'proxy', endpoint: values['profile-socket']!,
   }) });
   let rejected = false;
   try { await client.connect(); } catch { rejected = client.status().errorCode === 'shared-profile-mismatch'; }
@@ -55,16 +68,26 @@ if (values['expect-error']) {
     payload: { text: 'shared-passive-agent-context', preserved: { full: true } }, kind: 'message' }];
   const diagnostics: string[] = [];
   const observedTurns: Array<{ method: string; threadId: string; turnId: string }> = [];
-  let codex: CodexClient | undefined, engine: Engine | undefined;
+  const cancellationProcessChecks: Array<{ turnId: string; processAlive: boolean }> = [];
+  let cancellationProcess: { id: number; turnId: string } | undefined;
+  let codex: SourceCodexClient | undefined, engine: SourceEngine | undefined;
   let threadId = values.thread;
   let loseNextQueueAck = false, droppedQueueAcks = 0, catalogValidated = false;
-  const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const alive = (pid: number) => {
+    try { process.kill(pid, 0); return true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false; throw error; }
+  };
   async function start() {
-    codex = new CodexClient(config.codex);
+    codex = new CodexClient(config.codex, options);
     codex.on('notification', (event: { method: string; params: { threadId?: unknown; turn?: { id?: unknown } } }) => {
       if (['turn/started', 'turn/completed'].includes(event.method) && typeof event.params.threadId === 'string' && typeof event.params.turn?.id === 'string') {
         observedTurns.push({ method: event.method, threadId: event.params.threadId, turnId: event.params.turn.id });
         if (observedTurns.length > 100) observedTurns.shift();
+        if (event.method === 'turn/started' && event.params.threadId === threadId
+            && cancellationProcess && event.params.turn.id !== cancellationProcess.turnId) {
+          cancellationProcessChecks.push({ turnId: event.params.turn.id, processAlive: alive(cancellationProcess.id) });
+          cancellationProcess = undefined;
+        }
       }
     });
     await codex.connect();
@@ -102,10 +125,12 @@ if (values['expect-error']) {
     engine.on('diagnostic', message => diagnostics.push(String(message)));
     engine.start();
   }
-  async function snapshot() {
+  async function snapshot(processId?: number) {
     if (!codex) throw new Error('Client is closed');
     return { threadId, configuredExecutable: config.codex.executable, status: codex.status(), runtime: codex.runtimeInfo(), runtimeProcessId: (await codex.diagnostics()).process.id,
-      droppedQueueAcks, catalogValidated, observedTurns, requests: store.listRequests(), deliveries: store.listDeliveries(), approvals: store.listApprovals(), diagnostics };
+      droppedQueueAcks, catalogValidated, observedTurns, cancellationProcessChecks,
+      ...(processId ? { probeProcessAlive: alive(processId) } : {}),
+      requests: store.listRequests(), deliveries: store.listDeliveries(), approvals: store.listApprovals(), diagnostics };
   }
   const input = createInterface({ input: process.stdin });
   try {
@@ -113,7 +138,9 @@ if (values['expect-error']) {
     process.stdout.write(JSON.stringify({ ready: true, ...(await snapshot()) }) + '\n');
     for await (const line of input) {
       const command = JSON.parse(line) as { action: string; platform?: Platform; text?: string; eventId?: string;
-        requestId?: string; approvalId?: string; status?: string; turnId?: string; loseAck?: boolean };
+        requestId?: string; approvalId?: string; status?: string; turnId?: string; loseAck?: boolean;
+        decision?: 'accept' | 'decline'; processId?: number };
+      if (command.processId !== undefined && (!Number.isSafeInteger(command.processId) || command.processId <= 0)) throw new Error('Invalid fixture process ID');
       if (command.action === 'ingest') {
         loseNextQueueAck = command.loseAck === true;
         const platform = command.platform!;
@@ -135,10 +162,16 @@ if (values['expect-error']) {
         if (pending()) throw new Error(`Shared requests did not reach expected state: ${JSON.stringify(store.listRequests())}`);
         await engine!.pump(); await engine!.settled();
       } else if (command.action === 'answer') {
-        await engine!.resolveApproval(command.approvalId!, 'decline');
+        if (command.decision !== undefined && !['accept', 'decline'].includes(command.decision)) throw new Error('Invalid fixture approval decision');
+        await engine!.resolveApproval(command.approvalId!, command.decision ?? 'decline');
       } else if (command.action === 'resume') {
         await engine!.resume(command.requestId!);
       } else if (command.action === 'cancel') {
+        if (command.processId) {
+          const request = store.listRequests().find(request => request.id === command.requestId);
+          if (!request?.turnId) throw new Error('Missing cancellation fixture turn');
+          cancellationProcess = { id: command.processId, turnId: request.turnId };
+        }
         await engine!.cancel(command.requestId!);
       } else if (command.action === 'close') {
         const pid = (await codex!.diagnostics()).process.id;
@@ -146,7 +179,7 @@ if (values['expect-error']) {
         process.stdout.write(JSON.stringify({ stopped: true, runtimeProcessId: pid, backendAlive: alive(pid) }) + '\n');
         break;
       } else if (command.action !== 'snapshot') throw new Error('Unknown shared fixture command');
-      process.stdout.write(JSON.stringify({ action: command.action, ...(await snapshot()) }) + '\n');
+      process.stdout.write(JSON.stringify({ action: command.action, ...(await snapshot(command.processId)) }) + '\n');
     }
   } finally {
     input.close();

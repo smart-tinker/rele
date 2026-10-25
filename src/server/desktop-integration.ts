@@ -9,7 +9,7 @@ const execute = promisify(execFile);
 type Installation = { DesktopIntegrationOwned: boolean; DesktopIntegrationRequested?: boolean | null; DesktopIntegrationWarning?: unknown };
 
 async function runLauncher(executable: string, args: string[]): Promise<void> {
-  await execute(executable, args, { windowsHide: true, timeout: 90_000, maxBuffer: 16 * 1024 });
+  await execute(executable, args, { windowsHide: true, timeout: 180_000, maxBuffer: 16 * 1024 });
 }
 
 /** Installer metadata records intent; it does not prove a running Desktop uses the adapter. */
@@ -47,11 +47,12 @@ export class DesktopIntegration {
     return marker?.DesktopIntegrationRequested === true && !marker.DesktopIntegrationOwned;
   }
 
-  async setEnabled(enabled: boolean): Promise<DesktopIntegrationState> {
+  async setEnabled(enabled: boolean, retry = false): Promise<DesktopIntegrationState> {
     if (!(await this.status()).available) throw new Error('Управление интеграцией доступно в установленном Rele для Windows с этим каталогом данных.');
     try {
       // The native launcher checks the current SID, foreign environment values and Codex readiness.
-      await this.run(path.join(this.root, 'Rele.exe'), [enabled ? 'desktop-integrate' : 'desktop-unintegrate', '--quiet', '--data-dir', this.directory]);
+      await this.run(path.join(this.root, 'Rele.exe'), [enabled ? 'desktop-integrate' : 'desktop-unintegrate', '--quiet', '--data-dir', this.directory,
+        ...(retry ? ['--retry-desktop-integration'] : [])]);
     } catch {
       // Native warnings can contain private paths or settings; never return their raw contents.
       throw new Error(enabled
@@ -59,7 +60,7 @@ export class DesktopIntegration {
         : 'Не удалось отключить интеграцию Desktop. Проверьте установку Rele и повторите попытку.');
     }
     const state = await this.status();
-    if (!state.available || state.enabled !== enabled) throw new Error('Установка Rele не подтвердила изменение интеграции Desktop. Обновите её состояние перед повторной попыткой.');
+    if (!state.available || !retry && state.enabled !== enabled) throw new Error('Установка Rele не подтвердила изменение интеграции Desktop. Обновите её состояние перед повторной попыткой.');
     return state;
   }
 }

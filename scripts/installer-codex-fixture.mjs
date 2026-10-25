@@ -43,7 +43,8 @@ export async function installerCodex(home) {
   assert.equal(candidates.length, 1, 'Expected one isolated native Codex binary.');
   const executable = candidates[0];
   const metadata = JSON.parse(await readFile(path.join(path.dirname(executable), '..', 'codex-package.json'), 'utf8'));
-  assert.equal(metadata.version, '0.163.0');
+  const { SUPPORTED_CODEX_VERSIONS } = await import('../dist/shared/codex-runtime.js');
+  assert.ok(SUPPORTED_CODEX_VERSIONS.includes(metadata.version), 'Expected a supported native Codex version.');
   assert.equal(metadata.entrypoint, `bin/${binary}`);
   const settings = path.join(home, 'app-server-daemon');
   await assert.rejects(access(settings), { code: 'ENOENT' });
@@ -61,10 +62,12 @@ export async function installerCodex(home) {
 
 export async function sharedBackendPid(target, expectedPid) {
   const { CodexClient } = await import('../dist/server/codex.js');
+  await captureInstallerOwner(target);
   const deadline = Date.now() + 45_000;
   let failure = 'no-connection';
   do {
-    const client = new CodexClient({ ...target, transport: 'proxy', endpoint: path.join(target.codexHome, 'app-server-control', 'app-server-control.sock') });
+    const client = new CodexClient({ ...target, transport: target.desktopOwner ? 'websocket' : 'proxy',
+      endpoint: target.desktopOwner ? target.endpoint : path.join(target.codexHome, 'app-server-control', 'app-server-control.sock') });
     try {
       await client.connect();
       const pid = (await client.diagnostics()).process.id;
@@ -81,8 +84,66 @@ export async function sharedBackendPid(target, expectedPid) {
   throw new Error(`The installer did not establish the native shared Codex backend (${failure}).`);
 }
 
+export async function captureInstallerOwner(target) {
+  if (process.platform !== 'win32' || !target?.installSettingsPath) return;
+  let contents;
+  try { contents = await readFile(target.installSettingsPath, 'utf8'); }
+  catch (error) { if (error.code === 'ENOENT' && target.desktopOwner) return; throw error; }
+  const settings = JSON.parse(contents);
+  if (!settings.CodexWebSocketOwnerDirectory) return;
+  assert.match(settings.CodexWebSocketEndpoint, /^ws:\/\/127\.0\.0\.1:[1-9]\d{0,4}$/u);
+  assert.ok(new URL(settings.CodexWebSocketEndpoint).port <= 65535);
+  const cache = path.join(target.fixtureDataDirectory, 'codex-websocket-owners');
+  assert.equal(path.dirname(settings.CodexWebSocketOwnerDirectory).toLowerCase(), cache.toLowerCase());
+  assert.match(path.basename(settings.CodexWebSocketOwnerDirectory), /^[a-f0-9]{64}$/u);
+  assert.equal(settings.CodexWebSocketTaskName, `${target.fixtureTaskName}-Codex`);
+  target.endpoint = settings.CodexWebSocketEndpoint;
+  target.desktopOwner = { directory: settings.CodexWebSocketOwnerDirectory, taskName: settings.CodexWebSocketTaskName, ownerSid: settings.OwnerSid };
+}
+
 export function stopInstallerCodex(target) {
   if (!target) return;
+  if (process.platform === 'win32' && target.installSettingsPath && !target.desktopOwner)
+    throw new Error('The isolated owner state is unconfirmed; preserve its fixture files for inspection.');
+  if (process.platform === 'win32' && target.desktopOwner) {
+    const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `
+      $ErrorActionPreference = 'Stop';
+      $owner = $env:RELE_FIXTURE_OWNER | ConvertFrom-Json;
+      $receipt = Get-Content -LiteralPath (Join-Path $owner.directory 'receipt.json') -Raw | ConvertFrom-Json;
+      $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value;
+      if ($owner.ownerSid -ne $sid -or $receipt.ownerSid -ne $sid) { throw 'Foreign fixture owner.' }
+      $scheduler = New-Object -ComObject 'Schedule.Service'; $scheduler.Connect(); $folder = $scheduler.GetFolder('\\');
+      $task = $null;
+      try { $task = $folder.GetTask($owner.taskName) } catch { if ($_.Exception.HResult -ne -2147024894) { throw } }
+      if ($task) {
+        $definition = $task.Definition; $action = $definition.Actions.Item(1);
+        $principalSid = if ($definition.Principal.UserId -like 'S-1-*') { [string]$definition.Principal.UserId } else {
+          ([Security.Principal.NTAccount]::new([string]$definition.Principal.UserId)).Translate([Security.Principal.SecurityIdentifier]).Value
+        };
+        if ($definition.Actions.Count -ne 1 -or $action.Type -ne 0 -or
+          $action.Path -ne (Join-Path $owner.directory 'Rele.Process.exe') -or
+          $action.Arguments -ne ('--codex-websocket-owner "' + (Join-Path $owner.directory 'owner.json') + '"') -or
+          $action.WorkingDirectory -ne $owner.directory -or $principalSid -ne $sid -or
+          [int]$definition.Principal.LogonType -ne 3 -or [int]$definition.Principal.RunLevel -ne 0) { throw 'Foreign fixture task.' }
+        $task.Enabled = $false;
+      }
+      $hostProcess = Get-Process -Id $receipt.hostPid -ErrorAction SilentlyContinue;
+      if ($hostProcess) {
+        $native = Get-Process -Id $receipt.nativePid -ErrorAction Stop;
+        if ($hostProcess.Path -ne (Join-Path $owner.directory 'Rele.Process.exe') -or
+          $hostProcess.StartTime.ToUniversalTime().ToString('o') -ne [string]$receipt.hostStartedAt -or
+          $native.Path -ne [string]$receipt.executable -or $native.StartTime.ToUniversalTime().ToString('o') -ne [string]$receipt.nativeStartedAt) { throw 'Stale fixture PID.' }
+        $identity = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $hostProcess.Id);
+        if ((Invoke-CimMethod -InputObject $identity -MethodName GetOwnerSid).Sid -ne $sid) { throw 'Foreign fixture process.' }
+        Stop-Process -Id $hostProcess.Id -ErrorAction Stop;
+        if (-not $hostProcess.WaitForExit(10000) -or -not $native.WaitForExit(10000)) { throw 'Fixture Job did not exit.' }
+      }
+      if ($task) { $folder.DeleteTask($owner.taskName, 0) }
+      '{"status":"stopped"}'`], { env: { ...process.env, RELE_FIXTURE_OWNER: JSON.stringify(target.desktopOwner) },
+      encoding: 'utf8', timeout: 30_000, windowsHide: true });
+    assert.equal(result.status, 0, result.stderr || 'The isolated WebSocket owner must stop before its profile is removed.');
+    return JSON.parse(result.stdout);
+  }
   const env = { ...process.env, CODEX_HOME: target.codexHome };
   for (const key of ['OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN']) delete env[key];
   const result = spawnSync(target.executable, ['app-server', 'daemon', 'stop'], { env, encoding: 'utf8', timeout: 30_000, windowsHide: true });
@@ -90,6 +151,14 @@ export function stopInstallerCodex(target) {
   const output = JSON.parse(result.stdout);
   assert.ok(['stopped', 'notRunning'].includes(output.status));
   return output;
+}
+
+// Exercise Desktop's direct protocol without a CLI adapter or an additional native server.
+export async function openInstallerWebSocket(target) {
+  const { CodexClient } = await import('../dist/server/codex.js');
+  const client = new CodexClient({ ...target, transport: 'websocket', endpoint: target.endpoint });
+  await client.connect();
+  return { call: (method, params = {}) => client.call(method, params), close: () => client.close() };
 }
 
 // Keep the installed immutable adapter open as Desktop would, including its executable/file locks.

@@ -18,6 +18,7 @@ async function fixture(enabled = false, requested?: boolean | null) {
   const save = async () => { await writeFile(path.join(root, 'rele-install.json'), JSON.stringify(marker)); };
   await save();
   const run = vi.fn(async (_executable: string, args: string[]) => {
+    if (args.includes('--retry-desktop-integration') && (marker.DesktopIntegrationRequested !== true || marker.DesktopIntegrationOwned)) return;
     marker.DesktopIntegrationOwned = args[0] === 'desktop-integrate';
     marker.DesktopIntegrationRequested = marker.DesktopIntegrationOwned;
     marker.DesktopIntegrationWarning = '';
@@ -80,6 +81,18 @@ describe('installed Desktop integration', () => {
     expect(await f.integration.setEnabled(false)).toEqual({ available: true, enabled: false, lastCheckFailed: false });
     expect(f.run).toHaveBeenLastCalledWith(path.join(f.root, 'Rele.exe'), ['desktop-unintegrate', '--quiet', '--data-dir', f.directory]);
     expect(await readFile(config, 'utf8')).toBe('protected synthetic settings');
+  });
+
+  it('uses a conditional native retry that preserves a later opt-out or completed integration', async () => {
+    for (const [enabled, requested] of [[false, false], [true, true]] as const) {
+      const f = await fixture(enabled, requested);
+      const before = await readFile(path.join(f.root, 'rele-install.json'), 'utf8');
+      expect(await f.integration.setEnabled(true, true)).toEqual({ available: true, enabled, lastCheckFailed: true });
+      expect(f.run).toHaveBeenLastCalledWith(path.join(f.root, 'Rele.exe'), ['desktop-integrate', '--quiet', '--data-dir', f.directory, '--retry-desktop-integration']);
+      expect(await readFile(path.join(f.root, 'rele-install.json'), 'utf8')).toBe(before);
+    }
+    const pending = await fixture(false, true);
+    expect(await pending.integration.setEnabled(true, true)).toEqual({ available: true, enabled: true, lastCheckFailed: false });
   });
 
   it('returns a fixed failure instead of raw launcher output and never reports an unconfirmed success', async () => {

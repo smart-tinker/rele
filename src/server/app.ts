@@ -25,7 +25,7 @@ export interface AppServices {
   desktopIntegration?: {
     status(): Promise<DesktopIntegrationState>;
     shouldRetry(): Promise<boolean>;
-    setEnabled(enabled: boolean): Promise<DesktopIntegrationState>;
+    setEnabled(enabled: boolean, retry?: boolean): Promise<DesktopIntegrationState>;
   };
 }
 
@@ -208,7 +208,7 @@ export function createApp(services: AppServices) {
         const pending = await integration.shouldRetry();
         if (!ready()) return;
         automaticIntegrationChecked = true;
-        if (pending) await integration.setEnabled(true);
+        if (pending) await integration.setEnabled(true, true);
       } catch {
         // The native launcher records a warning; a failed automatic retry must not stop the gateway.
       } finally { configuring = false; automaticIntegration = undefined; }

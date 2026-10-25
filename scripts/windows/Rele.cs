@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Net;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Security.Principal;
@@ -27,6 +29,11 @@ internal static class Rele
         public string PreviousForceCli { get; set; }
         public string DesktopIntegrationWarning { get; set; }
         public string DesktopCliPath { get; set; }
+        public string PreviousCodexWebSocketUrl { get; set; }
+        public string InstalledCodexWebSocketUrl { get; set; }
+        public string CodexWebSocketEndpoint { get; set; }
+        public string CodexWebSocketOwnerDirectory { get; set; }
+        public string CodexWebSocketTaskName { get; set; }
     }
 
     private sealed class LegacyStartup
@@ -48,19 +55,27 @@ internal static class Rele
         var options = new Dictionary<string, string>(StringComparer.Ordinal);
         try
         {
+            if (command == "codex-start" || command == "codex-status")
+            {
+                // This GUI launcher has redirected pipes, not an attached console/code page.
+                Console.SetOut(new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true });
+                Console.SetError(new StreamWriter(Console.OpenStandardError(), new UTF8Encoding(false)) { AutoFlush = true });
+            }
             for (int i = 1; i < args.Length; i++)
             {
-                if (args[i] == "--quiet" || args[i] == "--backup" || args[i] == "--desktop-integration" || args[i] == "--prepare-codex") options.Add(args[i], "true");
-                else if (Array.IndexOf(new[] { "--app-dir", "--data-dir", "--task-name", "--port", "--codex-home", "--error-file", "--warning-file", "--path-file" }, args[i]) >= 0 && i + 1 < args.Length)
+                if (args[i] == "--quiet" || args[i] == "--backup" || args[i] == "--desktop-integration" || args[i] == "--prepare-codex" || args[i] == "--preserve-active" || args[i] == "--retry-desktop-integration") options.Add(args[i], "true");
+                else if (Array.IndexOf(new[] { "--app-dir", "--data-dir", "--task-name", "--port", "--codex-home", "--codex-executable", "--error-file", "--warning-file", "--path-file" }, args[i]) >= 0 && i + 1 < args.Length)
                     options.Add(args[i], args[++i]);
                 else throw new InvalidOperationException("Неизвестный параметр Rele.");
             }
+            if (options.ContainsKey("--retry-desktop-integration") && command != "desktop-integrate")
+                throw new InvalidOperationException("Повтор подключения Desktop допустим только для desktop-integrate.");
             SecurityIdentifier currentUser = WindowsIdentity.GetCurrent().User;
             if (currentUser.IsWellKnown(WellKnownSidType.LocalSystemSid) || currentUser.IsWellKnown(WellKnownSidType.LocalServiceSid) || currentUser.IsWellKnown(WellKnownSidType.NetworkServiceSid))
                 throw new InvalidOperationException("Установите и запускайте Rele из обычной учётной записи владельца Codex, а не SYSTEM или служебной учётной записи Windows.");
             AppDirectory = Path.GetFullPath(Value(options, "--app-dir", AppDomain.CurrentDomain.BaseDirectory));
             string settingsPath = Path.Combine(AppDirectory, "rele-install.json");
-            Config = File.Exists(settingsPath) ? Json.Deserialize<Settings>(File.ReadAllText(settingsPath)) : new Settings
+            Config = File.Exists(settingsPath) ? ReadInstallationSettings() : new Settings
             {
                 DataDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Rele"),
                 TaskName = "Rele-" + WindowsIdentity.GetCurrent().User.Value,
@@ -92,6 +107,20 @@ internal static class Rele
                 return 0;
             }
             if (command == "serve") return RunNode("serve", true);
+            if (command == "codex-status")
+            {
+                if (!options.ContainsKey("--codex-home")) throw new InvalidOperationException("Укажите исходный профиль Codex.");
+                Console.Out.WriteLine(Json.Serialize(File.Exists(settingsPath) ? CodexWebSocketStatus(options["--codex-home"]) :
+                    new Dictionary<string, object> { { "status", "notRunning" } }));
+                return 0;
+            }
+            if (command == "codex-start")
+            {
+                if (!File.Exists(settingsPath) || !options.ContainsKey("--codex-executable") || !options.ContainsKey("--codex-home"))
+                    throw new InvalidOperationException("Запуск общего Codex требует существующую установку, backend и исходный профиль.");
+                Console.Out.WriteLine(Json.Serialize(StartCodexWebSocket(options["--codex-executable"], options["--codex-home"], options.ContainsKey("--preserve-active"))));
+                return 0;
+            }
             if (command == "desktop-check")
             {
                 if (!File.Exists(settingsPath) || !options.ContainsKey("--error-file"))
@@ -104,27 +133,25 @@ internal static class Rele
             if (command == "codex-desktop")
             {
                 ValidateDesktopIntegration();
-                if (String.IsNullOrEmpty(Config.DesktopCliPath) || !OwnedDesktopAdapter(Config.DesktopCliPath) || !File.Exists(Config.DesktopCliPath)) PrepareDesktopAdapter();
-                File.WriteAllText(settingsPath, Json.Serialize(Config), new UTF8Encoding(false));
                 return RunNode("--rele-desktop", false, true);
-            }
-            if (command == "adapter-path")
-            {
-                LegacyStartup legacy = ReadLegacyStartup();
-                if (!File.Exists(settingsPath) && !options.ContainsKey("--codex-home") && legacy != null && legacy.CodexHome != null) Config.CodexHome = legacy.CodexHome;
-                PrepareDesktopAdapter();
-                File.WriteAllText(settingsPath, Json.Serialize(Config), new UTF8Encoding(false));
-                if (!options.ContainsKey("--path-file")) throw new InvalidOperationException("Укажите файл результата adapter-path.");
-                File.WriteAllText(options["--path-file"], Config.DesktopCliPath, new UTF8Encoding(false));
-                return 0;
             }
             if (command == "desktop-integrate" || command == "desktop-unintegrate")
             {
                 if (!File.Exists(settingsPath)) throw new InvalidOperationException("Сначала установите Rele.");
-                Config.DesktopIntegrationRequested = command == "desktop-integrate";
-                try { if (command == "desktop-integrate") InstallDesktopIntegration(false); else RemoveDesktopIntegration(); }
-                catch (Exception error) { Config.DesktopIntegrationWarning = error.Message; throw; }
-                finally { File.WriteAllText(settingsPath, Json.Serialize(Config), new UTF8Encoding(false)); }
+                using (var operation = CodexOperationLock("integration.lock"))
+                {
+                    ReloadOwnedInstallation(options);
+                    if (options.ContainsKey("--retry-desktop-integration") &&
+                        (Config.DesktopIntegrationRequested != true || Config.DesktopIntegrationOwned)) return 0;
+                    bool enabled = command == "desktop-integrate";
+                    try { if (enabled) InstallDesktopIntegration(false); else RemoveDesktopIntegration(); }
+                    catch (Exception error) { Config.DesktopIntegrationWarning = error.Message; throw; }
+                    finally
+                    {
+                        Config.DesktopIntegrationRequested = enabled;
+                        SaveDesktopSettings();
+                    }
+                }
                 return 0;
             }
             if (command == "prepare-update")
@@ -138,26 +165,29 @@ internal static class Rele
             if (command == "install")
             {
                 LegacyStartup legacy = ReadLegacyStartup();
-                if (!File.Exists(settingsPath) && !options.ContainsKey("--codex-home") && legacy != null && legacy.CodexHome != null)
-                    Config.CodexHome = legacy.CodexHome;
                 Directory.CreateDirectory(AppDirectory);
-                Config.DesktopIntegrationRequested = options.ContainsKey("--desktop-integration");
-                PrepareDesktopAdapter();
-                File.WriteAllText(settingsPath, Json.Serialize(Config), new UTF8Encoding(false));
-                if (options.ContainsKey("--backup")) Backup();
-                Config.DesktopIntegrationWarning = null;
-                if (options.ContainsKey("--desktop-integration"))
+                using (var operation = CodexOperationLock("integration.lock"))
                 {
-                    try { InstallDesktopIntegration(true); }
-                    catch (Exception error)
+                    ReloadOwnedInstallation(options, true);
+                    if (!File.Exists(settingsPath) && !options.ContainsKey("--codex-home") && legacy != null && legacy.CodexHome != null)
+                        Config.CodexHome = legacy.CodexHome;
+                    SaveDesktopSettings();
+                    if (options.ContainsKey("--backup")) Backup();
+                    Config.DesktopIntegrationWarning = null;
+                    if (options.ContainsKey("--desktop-integration"))
                     {
-                        Config.DesktopIntegrationWarning = error.Message;
-                        Log("Desktop integration skipped: " + error.Message);
-                        if (options.ContainsKey("--warning-file")) File.WriteAllText(options["--warning-file"], error.Message, new UTF8Encoding(false));
+                        try { InstallDesktopIntegration(true); }
+                        catch (Exception error)
+                        {
+                            Config.DesktopIntegrationWarning = error.Message;
+                            Log("Desktop integration skipped: " + error.Message);
+                            if (options.ContainsKey("--warning-file")) File.WriteAllText(options["--warning-file"], error.Message, new UTF8Encoding(false));
+                        }
                     }
+                    else RemoveDesktopIntegration();
+                    Config.DesktopIntegrationRequested = options.ContainsKey("--desktop-integration");
+                    SaveDesktopSettings();
                 }
-                else RemoveDesktopIntegration();
-                File.WriteAllText(settingsPath, Json.Serialize(Config), new UTF8Encoding(false));
                 RegisterTask();
                 Start();
                 MigrateLegacyStartup(legacy);
@@ -168,7 +198,14 @@ internal static class Rele
                 Stop(true);
                 dynamic folder = TaskFolder();
                 if (OwnedTask(folder) != null) folder.DeleteTask(Config.TaskName, 0);
-                RemoveDesktopIntegration();
+                using (var operation = CodexOperationLock("integration.lock"))
+                {
+                    ReloadOwnedInstallation(options);
+                    RemoveDesktopIntegration();
+                    Config.DesktopIntegrationRequested = false;
+                    SaveDesktopSettings();
+                    RemoveCodexWebSocketStartup();
+                }
                 return 0;
             }
             if (command == "stop") { Stop(false); return 0; }
@@ -186,6 +223,7 @@ internal static class Rele
                 try { File.WriteAllText(options["--error-file"], message, new UTF8Encoding(false)); } catch { }
             }
             if (command == "serve") Log(message);
+            else if (command == "codex-start" || command == "codex-status") Console.Error.WriteLine(message);
             else if (!options.ContainsKey("--quiet")) MessageBox.Show(message, "Rele", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1;
         }
@@ -293,7 +331,7 @@ internal static class Rele
 
     private static bool TaskActive(dynamic task)
     {
-        return task != null && ((int)task.State == 2 || (int)task.GetInstances(0).Count > 0);
+        return task != null && ((int)task.State == 2 || (int)task.State == 4 || (int)task.GetInstances(0).Count > 0);
     }
 
     private static Process OwnInstance()
@@ -429,46 +467,503 @@ internal static class Rele
         catch { return false; }
     }
 
-    private static void PrepareDesktopAdapter()
+    private sealed class CodexWebSocketOwner
     {
-        var files = new SortedDictionary<string, string>(StringComparer.Ordinal);
-        foreach (string file in new[] { "Rele.Codex.exe", "runtime\\node.exe", "dist\\native\\Rele.Process.exe", "package.json" }) files.Add(file, Path.Combine(AppDirectory, file));
-        foreach (string tree in new[] { "dist\\server", "dist\\shared", "node_modules\\ws" })
-            foreach (string file in Directory.GetFiles(Path.Combine(AppDirectory, tree), "*", SearchOption.AllDirectories))
-                files.Add(file.Substring(AppDirectory.TrimEnd('\\').Length + 1), file);
-        string marker = Json.Serialize(new Dictionary<string, object> {
-            { "DesktopAdapterVersion", 1 }, { "OwnerSid", Config.OwnerSid }, { "DataDirectory", Config.DataDirectory }, { "CodexHome", Config.CodexHome }
-        });
-        var identity = new StringBuilder(marker);
+        public int Version { get; set; }
+        public string OwnerSid { get; set; }
+        public string Executable { get; set; }
+        public string ExecutableSha256 { get; set; }
+        public string HostSha256 { get; set; }
+        public string CodexHome { get; set; }
+        public string Endpoint { get; set; }
+        public string TaskName { get; set; }
+    }
+
+    private sealed class CodexWebSocketPointer
+    {
+        public int Version { get; set; }
+        public string OwnerSid { get; set; }
+        public string DataDirectory { get; set; }
+        public string CodexHome { get; set; }
+        public string Endpoint { get; set; }
+        public string OwnerDirectory { get; set; }
+        public string TaskName { get; set; }
+    }
+
+    private static string FileHash(string file)
+    {
+        using (var hash = SHA256.Create()) using (var input = File.OpenRead(file))
+            return BitConverter.ToString(hash.ComputeHash(input)).Replace("-", "").ToLowerInvariant();
+    }
+
+    private static string TextHash(string text)
+    {
         using (var hash = SHA256.Create())
-            foreach (KeyValuePair<string, string> file in files)
-                using (var input = File.OpenRead(file.Value)) identity.Append('\n').Append(file.Key).Append(':').Append(BitConverter.ToString(hash.ComputeHash(input)));
-        string name;
-        using (var hash = SHA256.Create()) name = BitConverter.ToString(hash.ComputeHash(Encoding.UTF8.GetBytes(identity.ToString()))).Replace("-", "").ToLowerInvariant();
-        string cache = Path.Combine(Config.DataDirectory, "codex-adapters");
-        string directory = Path.Combine(cache, name);
+            return BitConverter.ToString(hash.ComputeHash(Encoding.UTF8.GetBytes(text))).Replace("-", "").ToLowerInvariant();
+    }
+
+    private static void AtomicJson(string file, string contents)
+    {
+        string temporary = file + "." + Guid.NewGuid().ToString("N") + ".new";
+        try
+        {
+            File.WriteAllText(temporary, contents, new UTF8Encoding(false));
+            if (File.Exists(file)) File.Replace(temporary, file, null); else File.Move(temporary, file);
+        }
+        finally { if (File.Exists(temporary)) File.Delete(temporary); }
+    }
+
+    private static Settings ReadInstallationSettings()
+    {
+        using (var input = new FileStream(Path.Combine(AppDirectory, "rele-install.json"), FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+        using (var reader = new StreamReader(input, Encoding.UTF8, true))
+            return Json.Deserialize<Settings>(reader.ReadToEnd());
+    }
+
+    private static void ValidateInstallationOwner(Settings current)
+    {
+        if (current == null || (!String.IsNullOrEmpty(current.OwnerSid) && current.OwnerSid != WindowsIdentity.GetCurrent().User.Value) ||
+            !SamePath(current.DataDirectory, Config.DataDirectory) || current.TaskName != Config.TaskName)
+            throw new InvalidOperationException("Владелец или каталог установки Rele изменён; настройки сохранены.");
+    }
+
+    private static void ReloadOwnedInstallation(Dictionary<string, string> options, bool allowMissing = false)
+    {
+        if (!File.Exists(Path.Combine(AppDirectory, "rele-install.json")))
+        {
+            if (allowMissing) return;
+            throw new InvalidOperationException("Установка Rele больше не существует; настройки не изменены.");
+        }
+        Settings current = ReadInstallationSettings();
+        ValidateInstallationOwner(current);
+        Config = current;
+        Config.OwnerSid = WindowsIdentity.GetCurrent().User.Value;
+        Config.CodexHome = Value(options, "--codex-home", Config.CodexHome);
+        Config.Port = Int32.Parse(Value(options, "--port", Config.Port.ToString()));
+        if (Config.Port < 0 || Config.Port > 65535) throw new InvalidOperationException("Недопустимый локальный порт Rele.");
+    }
+
+    private static FileStream CodexOperationLock(string name)
+    {
+        string directory = Path.Combine(Config.DataDirectory, "codex-websocket-owners");
+        PrivateDirectory(directory);
+        string file = Path.Combine(directory, name);
+        if (File.Exists(file) && (File.GetAttributes(file) & FileAttributes.ReparsePoint) != 0)
+            throw new InvalidOperationException("Файл блокировки Rele перенаправлен; настройки сохранены.");
+        int timeoutMs = name == "integration.lock" ? 80000 : 15000;
+        var wait = Stopwatch.StartNew();
+        for (;;)
+        {
+            try { return new FileStream(file, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
+            catch (IOException error)
+            {
+                if ((error.HResult & 0xffff) != 32 || wait.ElapsedMilliseconds >= timeoutMs) throw;
+                Thread.Sleep(50);
+            }
+        }
+    }
+
+    private static void SaveDesktopSettings()
+    {
+        // Preflight's child takes start.lock only; never wait for it while holding this short lock.
+        using (var operation = CodexOperationLock("start.lock"))
+        {
+            string file = Path.Combine(AppDirectory, "rele-install.json");
+            if (File.Exists(file))
+            {
+                Settings current = ReadInstallationSettings();
+                ValidateInstallationOwner(current);
+                Config.CodexWebSocketEndpoint = current.CodexWebSocketEndpoint;
+                Config.CodexWebSocketOwnerDirectory = current.CodexWebSocketOwnerDirectory;
+                Config.CodexWebSocketTaskName = current.CodexWebSocketTaskName;
+            }
+            AtomicJson(file, Json.Serialize(Config));
+        }
+    }
+
+    private static void RestoreCodexWebSocketPointer(string cache, string codexHome)
+    {
+        if (!String.IsNullOrEmpty(Config.CodexWebSocketOwnerDirectory)) return;
+        string file = Path.Combine(cache, "current.json");
+        if (!File.Exists(file)) return;
+        if (new FileInfo(file).Length > 65536) throw new InvalidOperationException("Сохранённое состояние владельца Codex повреждено.");
+        CodexWebSocketPointer pointer = Json.Deserialize<CodexWebSocketPointer>(File.ReadAllText(file));
+        if (pointer == null || pointer.Version != 1 || pointer.OwnerSid != Config.OwnerSid ||
+            !SamePath(pointer.DataDirectory, Config.DataDirectory) || !SamePath(pointer.CodexHome, codexHome) ||
+            pointer.TaskName != Config.TaskName + "-Codex" ||
+            (!String.IsNullOrEmpty(Config.CodexWebSocketEndpoint) && Config.CodexWebSocketEndpoint != pointer.Endpoint))
+            throw new InvalidOperationException("Сохранённый владелец Codex относится к другой установке или профилю.");
+        WebSocketPort(pointer.Endpoint);
+        Config.CodexWebSocketOwnerDirectory = pointer.OwnerDirectory;
+        Config.CodexWebSocketEndpoint = pointer.Endpoint;
+        Config.CodexWebSocketTaskName = pointer.TaskName;
+        CodexWebSocketOwner owner = ReadCodexWebSocketOwner();
+        if (owner == null || !SamePath(owner.CodexHome, pointer.CodexHome)) throw new InvalidOperationException("Профиль сохранённого владельца Codex изменён.");
+    }
+
+    private static void SaveCodexWebSocketPointer(string cache, CodexWebSocketOwner owner, string directory)
+    {
+        string file = Path.Combine(cache, "current.json");
+        if (File.Exists(file))
+        {
+            if (new FileInfo(file).Length > 65536) throw new InvalidOperationException("Состояние владельца Codex повреждено; оно не перезаписано.");
+            CodexWebSocketPointer previous = Json.Deserialize<CodexWebSocketPointer>(File.ReadAllText(file));
+            if (previous == null || previous.Version != 1 || previous.OwnerSid != Config.OwnerSid ||
+                !SamePath(previous.DataDirectory, Config.DataDirectory) || !SamePath(previous.CodexHome, owner.CodexHome) ||
+                previous.TaskName != owner.TaskName || previous.Endpoint != owner.Endpoint)
+                throw new InvalidOperationException("Сохранённое состояние Codex принадлежит другой установке или профилю; оно не перезаписано.");
+        }
+        AtomicJson(file, Json.Serialize(new CodexWebSocketPointer {
+            Version = 1, OwnerSid = Config.OwnerSid, DataDirectory = Config.DataDirectory, CodexHome = owner.CodexHome,
+            Endpoint = owner.Endpoint, OwnerDirectory = directory, TaskName = owner.TaskName
+        }));
+    }
+
+    private static void PrivateDirectory(string directory, bool create = true)
+    {
+        SecurityIdentifier sid = WindowsIdentity.GetCurrent().User;
         if (!Directory.Exists(directory))
         {
-            Directory.CreateDirectory(cache);
-            string temporary = Path.Combine(cache, ".prepare-" + Guid.NewGuid().ToString("N"));
-            Directory.CreateDirectory(temporary);
+            if (!create) throw new InvalidOperationException("Сохранённый каталог владельца Codex не найден.");
+            var permissions = new System.Security.AccessControl.DirectorySecurity();
+            permissions.SetOwner(sid);
+            permissions.SetAccessRuleProtection(true, false);
+            permissions.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(sid,
+                System.Security.AccessControl.FileSystemRights.FullControl,
+                System.Security.AccessControl.InheritanceFlags.ContainerInherit | System.Security.AccessControl.InheritanceFlags.ObjectInherit,
+                System.Security.AccessControl.PropagationFlags.None, System.Security.AccessControl.AccessControlType.Allow));
+            Directory.CreateDirectory(directory, permissions);
+        }
+        if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0)
+            throw new InvalidOperationException("Каталог владельца Codex перенаправлен; запуск отменён.");
+        var actual = Directory.GetAccessControl(directory);
+        if (!actual.GetOwner(typeof(SecurityIdentifier)).Equals(sid) || !actual.AreAccessRulesProtected)
+            throw new InvalidOperationException("Каталог владельца Codex принадлежит другой учётной записи или не защищён.");
+        foreach (System.Security.AccessControl.FileSystemAccessRule rule in actual.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+            if (rule.AccessControlType == System.Security.AccessControl.AccessControlType.Allow && !rule.IdentityReference.Equals(sid))
+                throw new InvalidOperationException("Каталог владельца Codex доступен другой учётной записи.");
+    }
+
+    private static int WebSocketPort(string endpoint)
+    {
+        Uri address;
+        if (!Uri.TryCreate(endpoint, UriKind.Absolute, out address) || address.Scheme != "ws" || address.Host != "127.0.0.1" ||
+            address.Port <= 0 || address.Port > 65535 || address.AbsolutePath != "/" || !String.IsNullOrEmpty(address.Query) ||
+            !String.IsNullOrEmpty(address.Fragment) || !String.IsNullOrEmpty(address.UserInfo))
+            throw new InvalidOperationException("Общий Codex должен слушать только ws://127.0.0.1:PORT.");
+        return address.Port;
+    }
+
+    private static CodexWebSocketOwner ReadCodexWebSocketOwner()
+    {
+        string directory = Config.CodexWebSocketOwnerDirectory;
+        if (String.IsNullOrEmpty(directory)) return null;
+        string cache = Path.Combine(Config.DataDirectory, "codex-websocket-owners");
+        if (!SamePath(Path.GetDirectoryName(directory), cache) || !Regex.IsMatch(Path.GetFileName(directory), "^[a-f0-9]{64}$"))
+            throw new InvalidOperationException("Не удалось подтвердить каталог владельца Codex.");
+        PrivateDirectory(cache, false); PrivateDirectory(directory, false);
+        string markerPath = Path.Combine(directory, "owner.json");
+        if (new FileInfo(markerPath).Length > 65536) throw new InvalidOperationException("Маркер владельца Codex повреждён.");
+        string marker = File.ReadAllText(markerPath);
+        CodexWebSocketOwner owner = Json.Deserialize<CodexWebSocketOwner>(marker);
+        if (owner == null || owner.Version != 1 || TextHash(marker) != Path.GetFileName(directory) ||
+            owner.OwnerSid != Config.OwnerSid || owner.TaskName != Config.CodexWebSocketTaskName ||
+            owner.Endpoint != Config.CodexWebSocketEndpoint || !Path.IsPathRooted(owner.Executable) ||
+            !Path.IsPathRooted(owner.CodexHome) || !Regex.IsMatch(owner.ExecutableSha256 ?? "", "^[a-f0-9]{64}$") ||
+            !Regex.IsMatch(owner.HostSha256 ?? "", "^[a-f0-9]{64}$") ||
+            FileHash(Path.Combine(directory, "Rele.Process.exe")) != owner.HostSha256)
+            throw new InvalidOperationException("Сохранённый владелец Codex изменён; чужие процессы и задачи не затронуты.");
+        WebSocketPort(owner.Endpoint);
+        return owner;
+    }
+
+    private static dynamic OwnedCodexWebSocketTask(dynamic folder, CodexWebSocketOwner owner, string directory)
+    {
+        dynamic task;
+        try { task = folder.GetTask(owner.TaskName); }
+        catch (Exception error) { if (error.HResult == unchecked((int)0x80070002)) return null; throw; }
+        dynamic definition = task.Definition;
+        string arguments = "--codex-websocket-owner " + QuoteArgument(Path.Combine(directory, "owner.json"));
+        if (definition.Actions.Count != 1 || definition.Actions[1].Type != 0 ||
+            !SamePath((string)definition.Actions[1].Path, Path.Combine(directory, "Rele.Process.exe")) ||
+            (string)definition.Actions[1].Arguments != arguments || !SamePath((string)definition.Actions[1].WorkingDirectory, directory) ||
+            !IsCurrentUser((string)definition.Principal.UserId) || (int)definition.Principal.LogonType != 3 || (int)definition.Principal.RunLevel != 0)
+            throw new InvalidOperationException("Задача общего Codex принадлежит другой установке; она не изменена.");
+        return task;
+    }
+
+    private static string QuoteArgument(string value)
+    {
+        var result = new StringBuilder("\"");
+        int slashes = 0;
+        foreach (char character in value)
+        {
+            if (character == '\\') { slashes++; continue; }
+            result.Append('\\', character == '"' ? slashes * 2 + 1 : slashes).Append(character); slashes = 0;
+        }
+        return result.Append('\\', slashes * 2).Append('"').ToString();
+    }
+
+    private static void RegisterCodexWebSocketTask(CodexWebSocketOwner owner, string directory)
+    {
+        dynamic folder = TaskFolder();
+        OwnedCodexWebSocketTask(folder, owner, directory);
+        string user = SecurityElement.Escape(Config.OwnerSid);
+        string xml = "<?xml version=\"1.0\" encoding=\"UTF-16\"?>" +
+            "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">" +
+            "<RegistrationInfo><Description>Rele: общий локальный Codex текущего пользователя; независим от gateway.</Description></RegistrationInfo>" +
+            "<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + user + "</UserId></LogonTrigger>" +
+            "<TimeTrigger><Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>" +
+            "<StartBoundary>" + DateTime.UtcNow.AddMinutes(1).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", System.Globalization.CultureInfo.InvariantCulture) +
+            "</StartBoundary><Enabled>true</Enabled></TimeTrigger></Triggers>" +
+            "<Principals><Principal id=\"User\"><UserId>" + user + "</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>" +
+            "<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" +
+            "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><Enabled>true</Enabled>" +
+            "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings>" +
+            "<Actions Context=\"User\"><Exec><Command>" + SecurityElement.Escape(Path.Combine(directory, "Rele.Process.exe")) +
+            "</Command><Arguments>" + SecurityElement.Escape("--codex-websocket-owner " + QuoteArgument(Path.Combine(directory, "owner.json"))) +
+            "</Arguments><WorkingDirectory>" + SecurityElement.Escape(directory) + "</WorkingDirectory></Exec></Actions></Task>";
+        folder.RegisterTask(owner.TaskName, xml, 6, Config.OwnerSid, null, 3, null);
+    }
+
+    private static bool HasCodexRecoveryTrigger(dynamic task)
+    {
+        dynamic definition = task.Definition;
+        if ((int)definition.Settings.MultipleInstances != 2) return false; // IgnoreNew preserves the live owner.
+        foreach (dynamic trigger in definition.Triggers)
+            if ((int)trigger.Type == 1 && (bool)trigger.Enabled &&
+                !String.IsNullOrEmpty((string)trigger.Repetition.Interval) &&
+                System.Xml.XmlConvert.ToTimeSpan((string)trigger.Repetition.Interval) == TimeSpan.FromMinutes(1) &&
+                String.IsNullOrEmpty((string)trigger.Repetition.Duration) && !(bool)trigger.Repetition.StopAtDurationEnd)
+                return true;
+        return false;
+    }
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr handle);
+
+    private static bool IsOwnProcess(Process process, string executable, string startedAt)
+    {
+        DateTime expected;
+        IntPtr token = IntPtr.Zero;
+        if (!DateTime.TryParse(startedAt, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.RoundtripKind, out expected))
+            throw new InvalidOperationException("Не удалось прочитать время запуска общего Codex.");
+        if (process.StartTime.ToUniversalTime().Ticks != expected.ToUniversalTime().Ticks) return false;
+        if (!SamePath(process.MainModule.FileName, executable) || !OpenProcessToken(process.Handle, 8, out token))
+            throw new InvalidOperationException("Не удалось подтвердить PID и время запуска общего Codex.");
+        try { using (var identity = new WindowsIdentity(token)) if (identity.User.Value != Config.OwnerSid) throw new InvalidOperationException("Процесс общего Codex принадлежит другой учётной записи."); }
+        finally { CloseHandle(token); }
+        return true;
+    }
+
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    private static extern uint GetExtendedTcpTable(IntPtr table, ref int size, bool sorted, int family, int tableClass, uint reserved);
+
+    private static bool OwnCodexListener(string endpoint, int nativePid)
+    {
+        int port = WebSocketPort(endpoint), size = 0;
+        uint result = GetExtendedTcpTable(IntPtr.Zero, ref size, false, 2, 3, 0); // AF_INET, OWNER_PID_LISTENER
+        if (result != 122 || size < 4 || size > 2 * 1024 * 1024) throw new InvalidOperationException("Не удалось проверить владельца локального порта Codex.");
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            int capacity = size;
+            IntPtr table = Marshal.AllocHGlobal(capacity);
             try
             {
-                foreach (KeyValuePair<string, string> file in files)
+                result = GetExtendedTcpTable(table, ref size, false, 2, 3, 0);
+                if (result == 122)
                 {
-                    string destination = Path.Combine(temporary, file.Key);
-                    Directory.CreateDirectory(Path.GetDirectoryName(destination));
-                    File.Copy(file.Value, destination, false);
+                    if (size < 4 || size > 2 * 1024 * 1024) break;
+                    continue;
                 }
-                File.WriteAllText(Path.Combine(temporary, "rele-install.json"), marker, new UTF8Encoding(false));
-                try { Directory.Move(temporary, directory); }
-                catch (IOException) { if (!Directory.Exists(directory)) throw; }
+                if (result != 0 || size < 4 || size > capacity) break;
+                int count = Marshal.ReadInt32(table);
+                if (count < 0 || count > (size - 4) / 24) break;
+                bool found = false;
+                for (int index = 0; index < count; index++)
+                {
+                    IntPtr row = IntPtr.Add(table, 4 + index * 24);
+                    int address = Marshal.ReadInt32(row, 4), networkPort = Marshal.ReadInt32(row, 8);
+                    int localPort = ((networkPort & 255) << 8) | ((networkPort >> 8) & 255);
+                    if (localPort != port || (address != 0x0100007f && address != 0)) continue;
+                    if (address != 0x0100007f || Marshal.ReadInt32(row, 20) != nativePid)
+                        throw new InvalidOperationException("Порт общего Codex принадлежит другому процессу; подключение отменено.");
+                    found = true;
+                }
+                return found;
             }
-            finally { if (Directory.Exists(temporary)) Directory.Delete(temporary, true); }
+            finally { Marshal.FreeHGlobal(table); }
         }
-        if (File.ReadAllText(Path.Combine(directory, "rele-install.json")) != marker || !File.Exists(Path.Combine(directory, "Rele.Codex.exe")))
-            throw new InvalidOperationException("Сохранённый адаптер Codex повреждён. Установка не заменяет его работающие файлы.");
-        Config.DesktopCliPath = Path.Combine(directory, "Rele.Codex.exe");
+        throw new InvalidOperationException("Не удалось подтвердить владельца локального порта Codex.");
+    }
+
+    private static Dictionary<string, object> CodexWebSocketReceipt(CodexWebSocketOwner owner, string directory, string status)
+    {
+        dynamic task = OwnedCodexWebSocketTask(TaskFolder(), owner, directory);
+        string file = Path.Combine(directory, "receipt.json");
+        if (!File.Exists(file)) return null;
+        if (new FileInfo(file).Length > 65536) throw new InvalidOperationException("Результат запуска Codex повреждён.");
+        Dictionary<string, object> receipt;
+        try { receipt = Json.Deserialize<Dictionary<string, object>>(File.ReadAllText(file)); }
+        catch (IOException) { return null; }
+        if ((string)receipt["status"] != "running") return null;
+        if ((string)receipt["ownerSid"] != owner.OwnerSid || (string)receipt["endpoint"] != owner.Endpoint ||
+            !SamePath((string)receipt["codexHome"], owner.CodexHome) || !SamePath((string)receipt["executable"], owner.Executable) ||
+            (string)receipt["executableSha256"] != owner.ExecutableSha256)
+            throw new InvalidOperationException("Результат запуска общего Codex не соответствует установке.");
+        try
+        {
+            using (Process host = Process.GetProcessById(Convert.ToInt32(receipt["hostPid"])))
+            using (Process native = Process.GetProcessById(Convert.ToInt32(receipt["nativePid"])))
+            {
+                if (!IsOwnProcess(host, Path.Combine(directory, "Rele.Process.exe"), (string)receipt["hostStartedAt"]) ||
+                    !IsOwnProcess(native, owner.Executable, (string)receipt["nativeStartedAt"])) return null;
+                if (!OwnCodexListener(owner.Endpoint, native.Id)) return null;
+                if (FileHash(owner.Executable) != owner.ExecutableSha256) throw new InvalidOperationException("Работающий backend Codex изменён.");
+                return new Dictionary<string, object> {
+                    { "status", status }, { "endpoint", owner.Endpoint }, { "codexHome", owner.CodexHome }, { "executable", owner.Executable },
+                    { "executableSha256", owner.ExecutableSha256 }, { "ownerSid", owner.OwnerSid }, { "ownerDirectory", directory },
+                    { "taskName", owner.TaskName }, { "processId", native.Id }, { "processStartTime", native.StartTime.ToUniversalTime().ToString("o") }
+                };
+            }
+        }
+        catch (ArgumentException) { return null; } // An obsolete PID is pending, never proof that a foreign process is ours.
+    }
+
+    private static Dictionary<string, object> CodexWebSocketStatus(string codexHome)
+    {
+        if (!Path.IsPathRooted(codexHome)) throw new InvalidOperationException("Исходный профиль Codex должен быть абсолютным путём.");
+        codexHome = CanonicalPath(codexHome);
+        if (!Regex.IsMatch(codexHome, @"^[A-Za-z]:\\") || codexHome.Length <= 3)
+            throw new InvalidOperationException("Исходный профиль Codex должен находиться на локальном диске.");
+        string cache = Path.Combine(Config.DataDirectory, "codex-websocket-owners");
+        if (!Directory.Exists(cache))
+        {
+            if (!String.IsNullOrEmpty(Config.CodexWebSocketOwnerDirectory)) throw new InvalidOperationException("Сохранённое состояние владельца Codex недоступно.");
+            return new Dictionary<string, object> { { "status", "notRunning" } };
+        }
+        PrivateDirectory(cache, false);
+        RestoreCodexWebSocketPointer(cache, codexHome);
+        CodexWebSocketOwner owner = ReadCodexWebSocketOwner();
+        if (owner == null) return new Dictionary<string, object> { { "status", "notRunning" } };
+        if (!SamePath(owner.CodexHome, codexHome)) throw new InvalidOperationException("Общий Codex использует другой исходный профиль.");
+        return CodexWebSocketReceipt(owner, Config.CodexWebSocketOwnerDirectory, "alreadyRunning") ??
+            new Dictionary<string, object> { { "status", "notRunning" } };
+    }
+
+    private static Dictionary<string, object> StartCodexWebSocket(string executable, string codexHome, bool preserveActive)
+    {
+        if (!Path.IsPathRooted(executable) || !Path.IsPathRooted(codexHome)) throw new InvalidOperationException("Backend и профиль Codex должны быть абсолютными путями.");
+        executable = CanonicalPath(executable); codexHome = CanonicalPath(codexHome);
+        if (!File.Exists(executable)) throw new InvalidOperationException("Не найден штатный backend Codex.");
+        if (!Regex.IsMatch(codexHome, @"^[A-Za-z]:\\") || codexHome.Length <= 3)
+            throw new InvalidOperationException("Исходный профиль Codex должен находиться на локальном диске.");
+        string ancestor = Path.GetPathRoot(codexHome);
+        foreach (string part in codexHome.Substring(ancestor.Length).Split('\\'))
+        {
+            ancestor = Path.Combine(ancestor, part);
+            if ((Directory.Exists(ancestor) || File.Exists(ancestor)) && (File.GetAttributes(ancestor) & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidOperationException("Путь исходного профиля Codex перенаправлен; автоматическое создание отменено.");
+        }
+        // A Desktop-only fresh install may not have opened its original profile yet.
+        Directory.CreateDirectory(codexHome);
+        string cache = Path.Combine(Config.DataDirectory, "codex-websocket-owners"); PrivateDirectory(cache);
+        using (var operation = CodexOperationLock("start.lock"))
+        {
+            // desktop-check can run in another process; merge its endpoint before any settings write.
+            Config = ReadInstallationSettings();
+            if (Config.OwnerSid != WindowsIdentity.GetCurrent().User.Value) throw new InvalidOperationException("Установка принадлежит другой учётной записи.");
+            RestoreCodexWebSocketPointer(cache, codexHome);
+            CodexWebSocketOwner previous = ReadCodexWebSocketOwner();
+            if (previous != null)
+            {
+                dynamic previousTask = OwnedCodexWebSocketTask(TaskFolder(), previous, Config.CodexWebSocketOwnerDirectory);
+                var activeWait = Stopwatch.StartNew();
+                do
+                {
+                    var active = CodexWebSocketReceipt(previous, Config.CodexWebSocketOwnerDirectory, "alreadyRunning");
+                    if (active != null)
+                    {
+                        if ((!preserveActive && !SamePath(previous.Executable, executable)) || !SamePath(previous.CodexHome, codexHome))
+                            throw new InvalidOperationException("Общий Codex уже работает с другим backend или профилем; работающие задачи не остановлены.");
+                        SaveCodexWebSocketPointer(cache, previous, Config.CodexWebSocketOwnerDirectory);
+                        AtomicJson(Path.Combine(AppDirectory, "rele-install.json"), Json.Serialize(Config));
+                        if (previousTask == null || !HasCodexRecoveryTrigger(previousTask))
+                            RegisterCodexWebSocketTask(previous, Config.CodexWebSocketOwnerDirectory);
+                        return active; // A reinstalled future Task must not launch a second owner.
+                    }
+                    if (!TaskActive(previousTask)) break;
+                    Thread.Sleep(100);
+                }
+                while (activeWait.ElapsedMilliseconds < 15000);
+                if (TaskActive(previousTask)) throw new InvalidOperationException("Работающая задача Codex не подтвердила свой PID и порт.");
+            }
+            int port;
+            if (String.IsNullOrEmpty(Config.CodexWebSocketEndpoint))
+            {
+                var listener = new TcpListener(IPAddress.Loopback, 0); listener.ExclusiveAddressUse = true;
+                listener.Start(); port = ((IPEndPoint)listener.LocalEndpoint).Port; listener.Stop();
+                Config.CodexWebSocketEndpoint = "ws://127.0.0.1:" + port;
+            }
+            else port = WebSocketPort(Config.CodexWebSocketEndpoint);
+            var available = new TcpListener(IPAddress.Loopback, port); available.ExclusiveAddressUse = true;
+            try { available.Start(); } catch (SocketException) { throw new InvalidOperationException("Адрес общего Codex занят неподтверждённым процессом; другой порт не выбран."); }
+            finally { available.Stop(); }
+            string source = Path.Combine(AppDirectory, "dist", "native", "Rele.Process.exe");
+            var owner = new CodexWebSocketOwner { Version = 1, OwnerSid = Config.OwnerSid, Executable = executable,
+                ExecutableSha256 = FileHash(executable), HostSha256 = FileHash(source), CodexHome = codexHome,
+                Endpoint = Config.CodexWebSocketEndpoint, TaskName = Config.TaskName + "-Codex" };
+            string marker = Json.Serialize(owner), directory = Path.Combine(cache, TextHash(marker));
+            if (!Directory.Exists(directory))
+            {
+                string temporary = Path.Combine(cache, ".prepare-" + Guid.NewGuid().ToString("N"));
+                PrivateDirectory(temporary);
+                try
+                {
+                    File.Copy(source, Path.Combine(temporary, "Rele.Process.exe"), false);
+                    File.WriteAllText(Path.Combine(temporary, "owner.json"), marker, new UTF8Encoding(false));
+                    Directory.Move(temporary, directory);
+                }
+                finally { if (Directory.Exists(temporary)) Directory.Delete(temporary, true); }
+            }
+            if (previous != null && !SamePath(directory, Config.CodexWebSocketOwnerDirectory))
+            {
+                dynamic old = OwnedCodexWebSocketTask(TaskFolder(), previous, Config.CodexWebSocketOwnerDirectory);
+                if (TaskActive(old)) throw new InvalidOperationException("Прежний владелец Codex ещё работает.");
+                if (old != null) TaskFolder().DeleteTask(previous.TaskName, 0);
+            }
+            Config.CodexWebSocketOwnerDirectory = directory; Config.CodexWebSocketTaskName = owner.TaskName;
+            ReadCodexWebSocketOwner();
+            SaveCodexWebSocketPointer(cache, owner, directory);
+            AtomicJson(Path.Combine(AppDirectory, "rele-install.json"), Json.Serialize(Config));
+            RegisterCodexWebSocketTask(owner, directory);
+            dynamic task = OwnedCodexWebSocketTask(TaskFolder(), owner, directory);
+            string receiptFile = Path.Combine(directory, "receipt.json");
+            if (File.Exists(receiptFile)) File.Delete(receiptFile);
+            task.Run(null);
+            var wait = Stopwatch.StartNew();
+            while (wait.ElapsedMilliseconds < 15000)
+            {
+                var receipt = CodexWebSocketReceipt(owner, directory, "started");
+                if (receipt != null) return receipt;
+                if (!TaskActive(task) && (int)task.LastTaskResult != 0x41303 && (int)task.LastTaskResult != 0x41301)
+                    throw new InvalidOperationException("Штатный backend Codex не запустился (" + (int)task.LastTaskResult + ").");
+                Thread.Sleep(100);
+            }
+            throw new InvalidOperationException("Общий Codex не подтвердил запуск за 15 секунд.");
+        }
+    }
+
+    private static void RemoveCodexWebSocketStartup()
+    {
+        CodexWebSocketOwner owner = ReadCodexWebSocketOwner();
+        if (owner == null) return;
+        dynamic folder = TaskFolder(), task = OwnedCodexWebSocketTask(folder, owner, Config.CodexWebSocketOwnerDirectory);
+        if (task != null) { task.Enabled = false; folder.DeleteTask(owner.TaskName, 0); }
+        // Active native tasks survive uninstall; their immutable host/marker remain in the data directory.
+        Log("Codex startup removed; the current native server and immutable owner files are preserved: " + Config.CodexWebSocketOwnerDirectory);
     }
 
     private static string UserEnvironment(string name)
@@ -478,17 +973,41 @@ internal static class Rele
 
     private static void ValidateDesktopIntegration()
     {
+        string inheritedCli = Environment.GetEnvironmentVariable("CODEX_CLI_PATH");
+        if (!String.IsNullOrEmpty(inheritedCli) && OwnedDesktopAdapter(inheritedCli) && String.IsNullOrEmpty(UserEnvironment("CODEX_CLI_PATH")))
+        {
+            // A still-running gateway can retain the old environment after compare-and-restore.
+            Environment.SetEnvironmentVariable("CODEX_CLI_PATH", null);
+            if (Environment.GetEnvironmentVariable("CODEX_APP_SERVER_FORCE_CLI") == "1" && String.IsNullOrEmpty(UserEnvironment("CODEX_APP_SERVER_FORCE_CLI")))
+                Environment.SetEnvironmentVariable("CODEX_APP_SERVER_FORCE_CLI", null);
+        }
         foreach (EnvironmentVariableTarget scope in new[] { EnvironmentVariableTarget.Process, EnvironmentVariableTarget.User, EnvironmentVariableTarget.Machine })
         {
-            if (!String.IsNullOrEmpty(Environment.GetEnvironmentVariable("CODEX_APP_SERVER_WS_URL", scope)))
-                throw new InvalidOperationException("Подключение Desktop не изменено: задан CODEX_APP_SERVER_WS_URL. Удалите прежнее подключение вручную и повторите подключение Desktop в Rele.");
+            string endpoint = Environment.GetEnvironmentVariable("CODEX_APP_SERVER_WS_URL", scope);
+            if (!String.IsNullOrEmpty(endpoint) && (scope == EnvironmentVariableTarget.Machine || endpoint != Config.InstalledCodexWebSocketUrl ||
+                (scope == EnvironmentVariableTarget.User && !Config.DesktopIntegrationOwned)))
+                throw new InvalidOperationException("Подключение Desktop не изменено: CODEX_APP_SERVER_WS_URL принадлежит другой настройке.");
             string cli = Environment.GetEnvironmentVariable("CODEX_CLI_PATH", scope);
-            if (!String.IsNullOrEmpty(cli) && !OwnedDesktopAdapter(cli))
-                throw new InvalidOperationException("Подключение Desktop не изменено: CODEX_CLI_PATH принадлежит другой программе. Проверьте его вручную перед подключением Desktop в Rele.");
+            if (!String.IsNullOrEmpty(cli))
+                throw new InvalidOperationException("Подключение Desktop не изменено: CODEX_CLI_PATH уже настроен. Штатный backend Desktop не подменяется.");
             string force = Environment.GetEnvironmentVariable("CODEX_APP_SERVER_FORCE_CLI", scope);
-            if (!String.IsNullOrEmpty(force) && force != "1")
+            if (!String.IsNullOrEmpty(force))
                 throw new InvalidOperationException("Подключение Desktop не изменено: CODEX_APP_SERVER_FORCE_CLI уже настроен иначе. Проверьте его вручную.");
         }
+    }
+
+    private static void RemoveLegacyDesktopIntegration()
+    {
+        if (!Config.DesktopIntegrationOwned || !String.IsNullOrEmpty(Config.InstalledCodexWebSocketUrl)) return;
+        string cli = UserEnvironment("CODEX_CLI_PATH");
+        if (!String.IsNullOrEmpty(cli) && OwnedDesktopAdapter(cli))
+        {
+            SetUserEnvironment("CODEX_CLI_PATH", Config.PreviousCodexCliPath);
+            if (UserEnvironment("CODEX_APP_SERVER_FORCE_CLI") == "1") SetUserEnvironment("CODEX_APP_SERVER_FORCE_CLI", Config.PreviousForceCli);
+        }
+        Config.DesktopIntegrationOwned = false;
+        SaveDesktopSettings();
+        BroadcastEnvironment();
     }
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -606,34 +1125,33 @@ internal static class Rele
 
     private static void InstallDesktopIntegration(bool prepareCodex)
     {
+        // Restore only RC19's own adapter before checking a direct native connection.
+        RemoveLegacyDesktopIntegration();
         ValidateDesktopIntegration();
         try { CheckDesktopIntegration(prepareCodex); }
         catch (Exception error)
         {
-            // A failed upgrade must not leave our unusable adapter as Desktop's default.
+            Config = ReadInstallationSettings();
             RemoveDesktopIntegration();
             Config.DesktopIntegrationWarning = error.Message;
             throw;
         }
-        PrepareDesktopAdapter();
+        // The check starts an independent owner and persists its stable endpoint in this file.
+        Config = ReadInstallationSettings();
         ValidateDesktopIntegration();
-        string cli = UserEnvironment("CODEX_CLI_PATH"), force = UserEnvironment("CODEX_APP_SERVER_FORCE_CLI");
-        if (!Config.DesktopIntegrationOwned)
-        {
-            Config.PreviousCodexCliPath = cli;
-            Config.PreviousForceCli = force;
-        }
+        WebSocketPort(Config.CodexWebSocketEndpoint);
+        string previous = UserEnvironment("CODEX_APP_SERVER_WS_URL");
+        if (!Config.DesktopIntegrationOwned) Config.PreviousCodexWebSocketUrl = previous;
         try
         {
-            SetUserEnvironment("CODEX_CLI_PATH", Config.DesktopCliPath);
-            SetUserEnvironment("CODEX_APP_SERVER_FORCE_CLI", "1");
+            Config.InstalledCodexWebSocketUrl = Config.CodexWebSocketEndpoint;
+            SetUserEnvironment("CODEX_APP_SERVER_WS_URL", Config.InstalledCodexWebSocketUrl);
             Config.DesktopIntegrationOwned = true;
             Config.DesktopIntegrationWarning = null;
         }
         catch
         {
-            SetUserEnvironment("CODEX_CLI_PATH", cli);
-            SetUserEnvironment("CODEX_APP_SERVER_FORCE_CLI", force);
+            SetUserEnvironment("CODEX_APP_SERVER_WS_URL", previous);
             throw;
         }
         BroadcastEnvironment();
@@ -641,13 +1159,10 @@ internal static class Rele
 
     private static void RemoveDesktopIntegration()
     {
+        RemoveLegacyDesktopIntegration();
         if (!Config.DesktopIntegrationOwned) return;
-        string cli = UserEnvironment("CODEX_CLI_PATH");
-        if (!String.IsNullOrEmpty(cli) && OwnedDesktopAdapter(cli))
-        {
-            SetUserEnvironment("CODEX_CLI_PATH", Config.PreviousCodexCliPath);
-            if (UserEnvironment("CODEX_APP_SERVER_FORCE_CLI") == "1") SetUserEnvironment("CODEX_APP_SERVER_FORCE_CLI", Config.PreviousForceCli);
-        }
+        if (!String.IsNullOrEmpty(Config.InstalledCodexWebSocketUrl) && UserEnvironment("CODEX_APP_SERVER_WS_URL") == Config.InstalledCodexWebSocketUrl)
+            SetUserEnvironment("CODEX_APP_SERVER_WS_URL", Config.PreviousCodexWebSocketUrl);
         Config.DesktopIntegrationOwned = false;
         Config.DesktopIntegrationWarning = null;
         BroadcastEnvironment();
@@ -679,10 +1194,7 @@ internal static class Rele
         start.EnvironmentVariables["RELE_PORT"] = Config.Port.ToString();
         if (codex)
         {
-            ValidateDesktopIntegration();
-            start.EnvironmentVariables["CODEX_CLI_PATH"] = Config.DesktopCliPath;
-            start.EnvironmentVariables["RELE_DESKTOP_CLI"] = Config.DesktopCliPath;
-            start.EnvironmentVariables["CODEX_APP_SERVER_FORCE_CLI"] = "1";
+            start.EnvironmentVariables.Remove("RELE_DESKTOP_CLI");
         }
         if (!String.IsNullOrEmpty(Config.CodexHome)) start.EnvironmentVariables["CODEX_HOME"] = Config.CodexHome;
         var errors = new StringBuilder();

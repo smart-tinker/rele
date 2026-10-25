@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { readFile, realpath } from 'node:fs/promises';
+import { realpath } from 'node:fs/promises';
 import { Duplex, type Readable, type Writable } from 'node:stream';
 import type { Socket } from 'node:net';
 import path from 'node:path';
@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { ConfigStore, defaultDataDirectory } from './config.js';
 import { codexEnvironment, fileExists, environmentValue, resolveCodexLaunch } from './codex-launch.js';
-import { ensureSharedCodex, SharedCodexError, resolveSharedCodexExecutable } from './codex-shared.js';
+import { ensureSharedCodex, isSharedCodexWebSocket, SharedCodexError, resolveSharedCodexExecutable } from './codex-shared.js';
 import { setupSharedCodex } from './codex-setup.js';
 import { discoverCodex } from './codex-discovery.js';
 import type { CodexConnectionTarget, CodexDiscoveryResult } from '../shared/types.js';
@@ -228,11 +228,31 @@ function sharedProxy(launch: Awaited<ReturnType<typeof resolveCodexLaunch>>, end
   return { socket, stop: () => { socket.terminate(); proxy.kill(); } };
 }
 
-async function verifyDesktopConnection(launch: Awaited<ReturnType<typeof resolveCodexLaunch>>, target: CodexConnectionTarget, env: NodeJS.ProcessEnv): Promise<void> {
+function sharedConnection(launch: Awaited<ReturnType<typeof resolveCodexLaunch>>, target: CodexConnectionTarget, env: NodeJS.ProcessEnv) {
+  if (target.transport !== 'websocket') return sharedProxy(launch, target.endpoint, env);
+  if (!isSharedCodexWebSocket(target.endpoint)) throw new CodexShimError('Desktop принимает только проверенный локальный адрес общего Codex.');
+  const socket = new WebSocket(target.endpoint, { handshakeTimeout: 10_000, maxPayload: MAX_FRAME_BYTES, followRedirects: false });
+  socket.on('error', () => {});
+  return { socket, stop: () => socket.terminate() };
+}
+
+export async function verifyDesktopConnection(launch: Awaited<ReturnType<typeof resolveCodexLaunch>>, target: CodexConnectionTarget, env: NodeJS.ProcessEnv): Promise<void> {
   if (!target.codexHome) throw new CodexShimError('Не подтверждён профиль общего Codex.');
-  const check = sharedProxy(launch, target.endpoint, env);
+  const check = sharedConnection(launch, target, env);
   try { await once(check.socket, 'open'); await verifyDesktopCodeModeHost(check.socket, target.codexHome); }
   finally { check.stop(); }
+}
+
+/** Explicit launch changes only this process's transport address; native Desktop stays untouched. */
+export function desktopConnectionEnvironment(env: NodeJS.ProcessEnv, target: CodexConnectionTarget): NodeJS.ProcessEnv {
+  if (target.transport !== 'websocket' || !isSharedCodexWebSocket(target.endpoint)) throw new CodexShimError('Не подтверждён прямой локальный сервер Desktop.');
+  const current = environmentValue(env, 'CODEX_APP_SERVER_WS_URL');
+  if (current && current !== target.endpoint) throw new CodexShimError('Адрес Desktop принадлежит другому подключению; настройки сохранены.');
+  if (environmentValue(env, 'CODEX_CLI_PATH') || environmentValue(env, 'CODEX_APP_SERVER_FORCE_CLI')) throw new CodexShimError('Прежняя подмена backend Desktop требует штатного восстановления.');
+  const result = { ...env };
+  for (const key of Object.keys(result)) if (key.toUpperCase() === 'CODEX_APP_SERVER_WS_URL') delete result[key];
+  result.CODEX_APP_SERVER_WS_URL = target.endpoint;
+  return result;
 }
 
 async function main(args: string[]): Promise<void> {
@@ -262,35 +282,18 @@ async function main(args: string[]): Promise<void> {
   if (mode === 'daemon') delete env.RELE_CODEX_DAEMON_EXTERNAL;
   if (mode === 'desktop') {
     if (process.platform !== 'win32') throw new CodexShimError('Этот launcher предназначен для Windows Desktop.');
-    if (environmentValue(env, 'CODEX_APP_SERVER_WS_URL')) throw new CodexShimError('Удалите конфликтующий CODEX_APP_SERVER_WS_URL перед подключением Desktop.');
     const discovery = await discoverCodex(config.config.codex.codexHome ? { codexHome: config.config.codex.codexHome } : undefined);
     const executable = await findDesktopExecutable(discovery);
-    const root = fileURLToPath(new URL('../../', import.meta.url));
-    const wrapper = [path.join(root, 'Rele.Codex.exe'), path.join(root, 'dist/native/Rele.Codex.exe')];
-    const snapshot = environmentValue(env, 'RELE_DESKTOP_CLI');
-    if (snapshot) {
-      const relative = path.relative(path.join(config.directory, 'codex-adapters'), snapshot);
-      if (!/^[a-f0-9]{64}[\\/]Rele\.Codex\.exe$/iu.test(relative)) throw new CodexShimError('Не подтверждён каталог установленного адаптера Desktop.');
-      const metadata = JSON.parse(await readFile(path.join(path.dirname(snapshot), 'rele-install.json'), 'utf8')) as { DesktopAdapterVersion?: unknown; DataDirectory?: unknown; OwnerSid?: unknown };
-      if (metadata.DesktopAdapterVersion !== 1 || typeof metadata.OwnerSid !== 'string' || !/^S-1-/u.test(metadata.OwnerSid)) throw new CodexShimError('Не подтверждён владелец установленного адаптера Desktop.');
-      if (typeof metadata.DataDirectory !== 'string' || path.resolve(metadata.DataDirectory).toLowerCase() !== path.resolve(config.directory).toLowerCase()) throw new CodexShimError('Адаптер Desktop относится к другому экземпляру Rele.');
-      wrapper.unshift(snapshot);
-    }
-    const cli = await Promise.all(wrapper.map(file => fileExists(file)));
-    const shim = wrapper.find((_, index) => cli[index]);
-    if (!shim) throw new CodexShimError('Адаптер Desktop не установлен. Переустановите Rele.');
     const target = await ensureSharedCodex(config.config.codex, { env });
     await verifyDesktopConnection(await resolveCodexLaunch(target.executable, { env }), target, env);
-    const desktopEnv = { ...env };
-    for (const key of Object.keys(desktopEnv)) if (['CODEX_CLI_PATH', 'CODEX_APP_SERVER_FORCE_CLI'].includes(key.toUpperCase())) delete desktopEnv[key];
-    desktopEnv.CODEX_CLI_PATH = shim; desktopEnv.CODEX_APP_SERVER_FORCE_CLI = '1';
+    const desktopEnv = desktopConnectionEnvironment(env, target);
     const desktop = spawn(executable, args.slice(1), { env: desktopEnv, cwd: path.dirname(executable), stdio: 'ignore', detached: true, windowsHide: false });
     await once(desktop, 'spawn'); desktop.unref();
     return;
   }
   let target = config.config.codex;
   if (mode !== 'passthrough') {
-    try { target = { ...await ensureSharedCodex(target, { env }), transport: 'shared' }; }
+    try { target = await ensureSharedCodex(target, { env }); }
     catch (error) {
       // Installation may precede the one allowed Quit; the adapter checks again after relaunch.
       if (mode === 'desktop-check' && error instanceof SharedCodexError && error.code === 'shared-desktop-conflict') return;
@@ -303,7 +306,7 @@ async function main(args: string[]): Promise<void> {
   catch { throw new CodexShimError('Выбранный исполняемый файл Codex недоступен. Повторите выбор Codex в Rele; сохранённый профиль не изменён.'); }
   if (mode === 'daemon') return;
   if (mode !== 'stdio' && mode !== 'desktop-check') {
-    const childArgs = mode === 'interactive' ? ['--remote', `unix://${target.endpoint}`, ...args.slice(1)] : args;
+    const childArgs = mode === 'interactive' ? ['--remote', target.transport === 'websocket' ? target.endpoint : `unix://${target.endpoint}`, ...args.slice(1)] : args;
     const child = spawn(launch.command, [...launch.args, ...childArgs], { env, stdio: 'inherit', windowsHide: true });
     child.once('error', () => { process.stderr.write('Rele: не удалось запустить Codex CLI.\n'); process.exitCode = 1; });
     const [code] = await once(child, 'exit') as [number | null];
@@ -312,7 +315,7 @@ async function main(args: string[]): Promise<void> {
   }
   if (requireCodeModeHost) await verifyDesktopConnection(launch, target, env);
   if (mode === 'desktop-check') return;
-  const { socket, stop } = sharedProxy(launch, target.endpoint, env);
+  const { socket, stop } = sharedConnection(launch, target, env);
   process.once('SIGTERM', stop);
   process.once('SIGINT', stop);
   try {

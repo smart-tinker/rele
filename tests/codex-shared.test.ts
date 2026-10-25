@@ -1,14 +1,22 @@
 import { access, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
+import { once } from 'node:events';
+import type { AddressInfo } from 'node:net';
+import { WebSocketServer } from 'ws';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CodexConnectionTarget, CodexDiscoveryResult } from '../src/shared/types.js';
-import { ensureSharedCodex, prepareDesktopCodexPackage, resolveSharedCodexExecutable, type SharedCodexOptions } from '../src/server/codex-shared.js';
+import { ensureSharedCodex, ensureWindowsSharedCodex, isSharedCodexWebSocket, prepareDesktopCodexPackage, resolveSharedCodexExecutable, type SharedCodexOptions } from '../src/server/codex-shared.js';
 import { runCodexProbe } from '../src/server/codex-discovery.js';
 
 const directories: string[] = [];
-afterEach(async () => { for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true }); });
+const servers: WebSocketServer[] = [];
+afterEach(async () => {
+  for (const server of servers.splice(0)) { for (const client of server.clients) client.terminate(); await new Promise<void>(resolve => server.close(() => resolve())); }
+  for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true });
+});
 
 async function fixture() {
   const home = await realpath(await mkdtemp(path.join(tmpdir(), 'rele-shared-test-')));
@@ -49,6 +57,186 @@ async function desktopFixture(root: string): Promise<string> {
   for (const name of desktopFiles) await writeFile(path.join(resources, name), `synthetic-desktop-${name}`);
   return path.join(resources, 'codex.exe');
 }
+
+async function windowsFixture() {
+  const f = await fixture();
+  const executable = await desktopFixture(path.join(f.home, 'desktop'));
+  const installationDirectory = path.join(f.home, 'rele-install');
+  const ownerDirectory = path.join(f.env.RELE_DATA_DIR, 'codex-websocket-owners', 'a'.repeat(64));
+  await mkdir(installationDirectory); await mkdir(ownerDirectory, { recursive: true });
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 }); servers.push(server);
+  await once(server, 'listening');
+  const endpoint = `ws://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const receipt = { status: 'started', endpoint, codexHome: f.home, executable,
+    executableSha256: createHash('sha256').update(await readFile(executable)).digest('hex'), ownerSid: 'S-1-5-21-1001',
+    ownerDirectory, taskName: 'Rele-Test-Codex', processId: 5432, processStartTime: '2026-10-24T05:00:00.0000000Z' };
+  const metadata = { OwnerSid: receipt.ownerSid, DataDirectory: f.env.RELE_DATA_DIR, TaskName: 'Rele-Test', CodexHome: f.home,
+    CodexWebSocketEndpoint: endpoint, CodexWebSocketOwnerDirectory: ownerDirectory, CodexWebSocketTaskName: receipt.taskName };
+  await writeFile(path.join(installationDirectory, 'rele-install.json'), JSON.stringify(metadata));
+  const runtime = { userAgent: 'codex_cli_rs/0.163.0-alpha.11.2 (Windows)', codexHome: f.home, platformFamily: 'windows', platformOs: 'windows' };
+  const diagnostics = { process: { id: receipt.processId } };
+  const owner = { running: false };
+  const calls: string[] = [];
+  server.on('connection', socket => socket.on('message', raw => {
+    const message = JSON.parse(raw.toString()); calls.push(message.method);
+    if (message.method === 'initialize') socket.send(JSON.stringify({ id: message.id, result: runtime }));
+    if (message.method === 'server/diagnostics') socket.send(JSON.stringify({ id: message.id, result: diagnostics }));
+  }));
+  f.discovery.installations.push({ executable, name: 'Desktop', source: 'desktop-install', version: '0.163.0-alpha.11.2', running: false });
+  f.run.mockImplementation(async (_command, args) => ({ code: 0, stdout: args[0] === 'codex-status'
+    ? JSON.stringify(owner.running ? receipt : { status: 'notRunning' })
+    : args.at(-1) === '--version' ? 'codex-cli 0.163.0-alpha.11.2' : JSON.stringify(receipt) }));
+  return { ...f, executable, installationDirectory, receipt, metadata, runtime, diagnostics, owner, calls,
+    target: { ...f.target, executable: 'codex' } };
+}
+
+describe('Windows direct shared Codex', () => {
+  it('starts only the installed owner and uses the original Desktop backend without a CLI snapshot or adapter', async () => {
+    const f = await windowsFixture(), before = structuredClone(f.target);
+    expect(await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).toEqual({ ...f.target, transport: 'websocket', executable: f.executable, endpoint: f.receipt.endpoint });
+    expect(f.run.mock.calls.filter(([, args]) => args[0] === 'codex-start')).toEqual([[path.join(f.installationDirectory, 'Rele.exe'),
+      ['codex-start', '--quiet', '--codex-executable', f.executable, '--codex-home', f.home, '--preserve-active'], 15_000,
+      expect.objectContaining({ CODEX_HOME: f.home, RELE_TEST_MARKER: 'preserved' })]]);
+    expect(f.calls).toEqual(['initialize', 'initialized', 'server/diagnostics']);
+    expect(await readdir(f.env.RELE_DATA_DIR)).toEqual(['codex-websocket-owners']);
+    expect(f.prepareControlDirectory).not.toHaveBeenCalled(); expect(f.target).toEqual(before);
+  });
+
+  it('keeps an explicitly selected native backend and never grants automatic preservation of a different target', async () => {
+    const f = await windowsFixture();
+    const target = { ...f.target, executable: f.executable };
+    await ensureWindowsSharedCodex(target, f.options, f.installationDirectory);
+    expect(f.discover).not.toHaveBeenCalled();
+    expect(f.run.mock.calls.find(([, args]) => args[0] === 'codex-start')?.[1]).not.toContain('--preserve-active');
+    const other = await desktopFixture(path.join(f.home, 'other'));
+    await expect(ensureWindowsSharedCodex({ ...target, executable: other }, f.options, f.installationDirectory)).rejects.toMatchObject({ code: 'shared-daemon-invalid' });
+  });
+
+  it('resolves an explicit official npm wrapper only to its own Windows native package', async () => {
+    const f = await windowsFixture();
+    const root = path.join(f.home, 'node_modules', '@openai', 'codex'), wrapper = path.join(root, 'bin', 'codex.js');
+    const optional = path.join(f.home, 'node_modules', '@openai', `codex-win32-${process.arch}`);
+    const native = path.join(optional, 'vendor', `${process.arch === 'x64' ? 'x86_64' : 'aarch64'}-pc-windows-msvc`, 'bin', 'codex.exe');
+    await mkdir(path.dirname(wrapper), { recursive: true }); await mkdir(path.dirname(native), { recursive: true });
+    await writeFile(wrapper, '// official synthetic wrapper'); await writeFile(path.join(root, 'package.json'), JSON.stringify({ name: '@openai/codex' }));
+    await writeFile(path.join(optional, 'package.json'), JSON.stringify({ name: `@openai/codex-win32-${process.arch}` }));
+    await writeFile(native, 'synthetic-own-npm-native');
+    f.receipt.executable = native; f.receipt.executableSha256 = createHash('sha256').update(await readFile(native)).digest('hex');
+    expect(await ensureWindowsSharedCodex({ ...f.target, executable: wrapper }, f.options, f.installationDirectory)).toMatchObject({ executable: native, transport: 'websocket' });
+    const started = f.run.mock.calls.find(([, args]) => args[0] === 'codex-start')!;
+    expect(started[1]).toContain(native); expect(started[1]).not.toContain('--preserve-active');
+    expect(f.discover).not.toHaveBeenCalled();
+  });
+
+  it('initializes only the original missing profile through the native owner and confirms its physical location', async () => {
+    const f = await windowsFixture(), home = path.join(f.home, 'new-original-profile');
+    f.metadata.CodexHome = home; f.receipt.codexHome = home; f.runtime.codexHome = home;
+    await writeFile(path.join(f.installationDirectory, 'rele-install.json'), JSON.stringify(f.metadata));
+    f.run.mockImplementation(async (_command, args) => {
+      if (args[0] === 'codex-start') await mkdir(home);
+      return { code: 0, stdout: args[0] === 'codex-status' ? JSON.stringify({ status: 'notRunning' })
+        : args.at(-1) === '--version' ? 'codex-cli 0.163.0-alpha.11.2' : JSON.stringify(f.receipt) };
+    });
+    expect(await ensureWindowsSharedCodex({ ...f.target, codexHome: home }, f.options, f.installationDirectory)).toMatchObject({ codexHome: home, transport: 'websocket' });
+    expect(await readdir(home)).toEqual([]);
+    expect(f.run.mock.calls.find(([, args]) => args[0] === 'codex-start')?.[1]).toContain(home);
+  });
+
+  it('bounds listener startup without starting a second owner or sending any model request', async () => {
+    const f = await windowsFixture();
+    const server = servers.at(-1)!;
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await expect(ensureWindowsSharedCodex(f.target, { ...f.options, timeoutMs: 25 }, f.installationDirectory)).rejects.toMatchObject({ code: 'shared-daemon-unavailable' });
+    expect(f.run.mock.calls.filter(([, args]) => args[0] === 'codex-start')).toHaveLength(1);
+    expect(f.calls).toEqual([]);
+  });
+
+  it('preserves a healthy prior supported owner during automatic Desktop upgrade and reports its actual identity', async () => {
+    const f = await windowsFixture(), old = await desktopFixture(path.join(f.home, 'old'));
+    await writeFile(old, 'older-supported-native');
+    f.receipt.status = 'alreadyRunning'; f.receipt.executable = old;
+    f.receipt.executableSha256 = createHash('sha256').update(await readFile(old)).digest('hex');
+    expect(await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).toMatchObject({ transport: 'websocket', executable: old, endpoint: f.receipt.endpoint });
+    expect(f.run.mock.calls.filter(([, args]) => args[0] === 'codex-start')).toHaveLength(1);
+  });
+
+  it('adopts the live owned backend before an update exposes both old running and new installed Desktop paths', async () => {
+    const f = await windowsFixture(), old = await desktopFixture(path.join(f.home, 'old'));
+    await writeFile(old, 'older-supported-native');
+    f.owner.running = true; f.receipt.status = 'alreadyRunning'; f.receipt.executable = old;
+    f.receipt.executableSha256 = createHash('sha256').update(await readFile(old)).digest('hex');
+    f.discovery.installations.push({ executable: old, name: 'Old running Desktop', source: 'desktop-process', version: '0.163.0-alpha.11.2', running: true, processId: f.receipt.processId });
+    expect(await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).toMatchObject({ transport: 'websocket', executable: old, endpoint: f.receipt.endpoint });
+    expect(f.discover).not.toHaveBeenCalled();
+    expect(f.run.mock.calls[0][1]).toEqual(['codex-status', '--quiet', '--codex-home', f.home]);
+    expect(f.run.mock.calls.find(([, args]) => args[0] === 'codex-start')?.[1]).toEqual([
+      'codex-start', '--quiet', '--codex-executable', old, '--codex-home', f.home, '--preserve-active',
+    ]);
+    expect(f.calls).toEqual(['initialize', 'initialized', 'server/diagnostics']);
+  });
+
+  it('keeps ambiguous installations closed when there is no verified live owner', async () => {
+    const f = await windowsFixture(), other = await desktopFixture(path.join(f.home, 'other'));
+    f.discovery.installations.push({ executable: other, name: 'Other Desktop', source: 'desktop-process', version: '0.163.0-alpha.11.2', running: true });
+    await expect(ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).rejects.toMatchObject({ code: 'shared-cli-unavailable' });
+    expect(f.run.mock.calls.map(([, args]) => args[0])).toEqual(['codex-status']);
+    expect(f.calls).toEqual([]);
+  });
+
+  it('adopts a verified owner restored in memory before the start command persists an upgraded installation pointer', async () => {
+    const f = await windowsFixture();
+    f.owner.running = true; f.receipt.status = 'alreadyRunning';
+    const { CodexWebSocketTaskName: _task, CodexWebSocketEndpoint: _endpoint, CodexWebSocketOwnerDirectory: _directory, ...withoutPointer } = f.metadata;
+    await writeFile(path.join(f.installationDirectory, 'rele-install.json'), JSON.stringify(withoutPointer));
+    f.run.mockImplementation(async (_command, args) => {
+      if (args[0] === 'codex-start') await writeFile(path.join(f.installationDirectory, 'rele-install.json'), JSON.stringify(f.metadata));
+      return { code: 0, stdout: args.at(-1) === '--version' ? 'codex-cli 0.163.0-alpha.11.2' : JSON.stringify(f.receipt) };
+    });
+    expect(await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).toMatchObject({ executable: f.executable, transport: 'websocket' });
+    expect(f.discover).not.toHaveBeenCalled();
+    expect(f.run.mock.calls.map(([, args]) => args[0])).toEqual(['codex-status', '--version', 'codex-start', '--version']);
+  });
+
+  it('rejects a foreign active-owner status before discovery or backend execution', async () => {
+    const f = await windowsFixture();
+    f.owner.running = true; f.receipt.status = 'alreadyRunning'; f.receipt.ownerSid = 'S-1-5-21-2002';
+    await expect(ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).rejects.toMatchObject({ code: 'shared-daemon-invalid' });
+    expect(f.discover).not.toHaveBeenCalled();
+    expect(f.run.mock.calls.map(([, args]) => args[0])).toEqual(['codex-status']);
+    expect(f.calls).toEqual([]);
+  });
+
+  it.each(['endpoint', 'ownerSid', 'taskName', 'ownerDirectory', 'executableSha256', 'processId', 'processStartTime', 'codexHome'])('refuses an invalid %s receipt before connecting to native Codex', async field => {
+    const f = await windowsFixture();
+    Object.assign(f.receipt, { [field]: field === 'processId' ? 0 : field === 'codexHome' ? f.installationDirectory : 'foreign' });
+    await expect(ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).rejects.toMatchObject({ code: 'shared-daemon-invalid' });
+    expect(f.calls).toEqual([]);
+  });
+
+  it.each(['profile', 'pid', 'version', 'platform'])('rejects native %s mismatch without thread or model calls', async mismatch => {
+    const f = await windowsFixture();
+    if (mismatch === 'profile') f.runtime.codexHome = f.installationDirectory;
+    if (mismatch === 'pid') f.diagnostics.process.id++;
+    if (mismatch === 'version') f.runtime.userAgent = 'codex_cli_rs/0.164.0';
+    if (mismatch === 'platform') f.runtime.platformOs = 'linux';
+    await expect(ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).rejects.toMatchObject({ code: mismatch === 'profile' ? 'shared-profile-mismatch' : 'shared-daemon-invalid' });
+    expect(f.calls.every(method => ['initialize', 'initialized', 'server/diagnostics'].includes(method))).toBe(true);
+  });
+
+  it('refuses a foreign installation data directory before starting an owner', async () => {
+    const f = await windowsFixture();
+    f.metadata.DataDirectory = f.home;
+    await writeFile(path.join(f.installationDirectory, 'rele-install.json'), JSON.stringify(f.metadata));
+    await expect(ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).rejects.toMatchObject({ code: 'shared-daemon-invalid' });
+    expect(f.run).not.toHaveBeenCalled();
+  });
+
+  it('accepts only a literal IPv4 loopback URL without credentials, query, fragments or paths', () => {
+    expect(isSharedCodexWebSocket('ws://127.0.0.1:54321')).toBe(true);
+    for (const endpoint of ['ws://127.0.0.1:0', 'ws://127.0.0.1:99999', 'ws://localhost:54321', 'ws://[::1]:54321', 'ws://0.0.0.0:54321',
+      'ws://user@127.0.0.1:54321', 'ws://127.0.0.1:54321/path', 'ws://127.0.0.1:54321?token=x', 'ws://127.0.0.1:54321#fragment', 'wss://127.0.0.1:54321']) expect(isSharedCodexWebSocket(endpoint)).toBe(false);
+  });
+});
 
 describe('local Desktop native package preparation', () => {
   it('copies the five same-bundle helpers into the native layout and reuses only a verified immutable snapshot', async () => {
@@ -122,53 +310,7 @@ describe('local Desktop native package preparation', () => {
   });
 });
 
-describe('native shared Codex lifecycle', () => {
-  it.skipIf(process.platform !== 'win32').each(['0.163.0', '0.163.0-alpha.11.2'])('starts from an installed Desktop %s alone using its snapshot and the original profile', async version => {
-    const f = await fixture(), desktop = await desktopFixture(path.join(f.home, 'desktop'));
-    f.discovery.recommendedManaged = { ...f.target, executable: desktop, transport: 'managed' };
-    f.discovery.installations.push({ executable: desktop, name: 'Desktop', source: 'desktop-install', version, running: false });
-    f.run.mockImplementation(async (_command, args) => ({ code: args.at(-1) === 'version' ? 1 : 0,
-      stdout: args.at(-1) === '--version' ? `codex-cli ${version}` : JSON.stringify({ ...f.daemon, managedCodexVersion: version, status: 'started' }) }));
-    const target = { ...f.target, executable: 'codex' }, before = structuredClone(target);
-    expect(await ensureSharedCodex(target, f.options)).toMatchObject({ transport: 'proxy', codexHome: f.home, endpoint: f.socketPath });
-    const starts = f.run.mock.calls.filter(([, args]) => args.at(-1) === 'start');
-    expect(starts).toHaveLength(1);
-    expect(starts[0][0]).not.toBe(desktop);
-    expect(path.relative(f.env.RELE_DATA_DIR, starts[0][0])).not.toMatch(/^\.\./u);
-    expect(starts[0][3]).toMatchObject({ CODEX_HOME: f.home, RELE_TEST_MARKER: 'preserved' });
-    expect(target).toEqual(before);
-  });
-
-  it.skipIf(process.platform !== 'win32').each(['complete', 'partial'])('keeps an explicit %s Desktop bound to only its selected bundle', async completeness => {
-    const f = await fixture(), desktop = await desktopFixture(path.join(f.home, 'selected-desktop'));
-    const alternate = await desktopFixture(path.join(f.home, 'other-desktop'));
-    await writeFile(desktop, 'synthetic-explicit-selected-native');
-    const full = await packageFixture(path.join(f.home, 'other-cli'));
-    f.discovery.recommendedManaged = { ...f.target, executable: full, transport: 'managed' };
-    f.discovery.installations.push(
-      { executable: alternate, name: 'Other Desktop', source: 'desktop-install', version: '0.163.0', running: false },
-      { executable: full, name: 'Other CLI', source: 'path', version: '0.163.0', running: false },
-    );
-    f.run.mockImplementation(async (_command, args) => ({ code: args.at(-1) === 'version' ? 1 : 0,
-      stdout: args.at(-1) === '--version' ? 'codex-cli 0.163.0' : JSON.stringify({ ...f.daemon, status: 'started' }) }));
-    const target = { ...f.target, executable: desktop }, before = structuredClone(target);
-    if (completeness === 'partial') {
-      await rm(path.join(path.dirname(desktop), 'rg.exe'));
-      await expect(ensureSharedCodex(target, f.options)).rejects.toMatchObject({ code: 'shared-package-incomplete' });
-      expect(f.run.mock.calls.some(([, args]) => args.at(-1) === 'start')).toBe(false);
-      await expect(readdir(f.env.RELE_DATA_DIR)).rejects.toMatchObject({ code: 'ENOENT' });
-    } else {
-      expect(await ensureSharedCodex(target, f.options)).toMatchObject({ transport: 'proxy', codexHome: f.home });
-      const starts = f.run.mock.calls.filter(([, args]) => args.at(-1) === 'start');
-      expect(starts).toHaveLength(1);
-      expect(await readFile(starts[0][0], 'utf8')).toBe('synthetic-explicit-selected-native');
-    }
-    expect(f.run.mock.calls.some(([command]) => command === alternate || command === full)).toBe(false);
-    expect(f.discover).toHaveBeenCalledTimes(1);
-    expect(f.discover).toHaveBeenCalledWith(expect.objectContaining({ processesOnly: true }));
-    expect(target).toEqual(before);
-  });
-
+describe.skipIf(process.platform === 'win32')('native shared Codex UDS lifecycle', () => {
   it.each(['read-only', 'healthy'])('keeps Desktop package preparation out of %s resolution', async operation => {
     const f = await fixture(), desktop = await desktopFixture(path.join(f.home, 'desktop'));
     f.discovery.recommendedManaged = { ...f.target, executable: desktop, transport: 'managed' };
