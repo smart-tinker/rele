@@ -1,14 +1,14 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { ConfigStore, mergeConfig } from '../dist/server/config.js';
 import { Store } from '../dist/server/store.js';
-import { installerCodex, sharedBackendPid, stopInstallerCodex } from './installer-codex-fixture.mjs';
+import { installerCodex, sharedBackendPid, stopInstallerCodex, removeInstallerFixture } from './installer-codex-fixture.mjs';
 
 // This test installs a real OS package and unit only on a disposable CI runner.
 if (process.platform !== 'linux' || process.env.CI !== 'true' || !existsSync('/run/systemd/system')) throw new Error('Run the installer smoke only on a disposable Linux CI runner with systemd.');
@@ -125,5 +125,5 @@ try {
 } finally {
   run('/usr/bin/sudo', ['-n', '/usr/bin/dpkg', '--purge', 'rele'], true);
   stopInstallerCodex(codexFixture);
-  await rm(work, { recursive: true, force: true });
+  await removeInstallerFixture(work);
 }
