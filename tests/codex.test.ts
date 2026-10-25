@@ -8,6 +8,10 @@ import type { AddressInfo } from 'node:net';
 import { WebSocket, WebSocketServer } from 'ws';
 import { CodexClient, CodexThreadBusyError, CodexTransportError, classifyCodexConnectionFailure, type CodexNotification } from '../src/server/codex.js';
 import { SharedCodexError } from '../src/server/codex-shared.js';
+import { Engine } from '../src/server/engine.js';
+import { Store } from '../src/server/store.js';
+import { defaultConfig } from '../src/server/config.js';
+import type { Endpoint } from '../src/shared/types.js';
 
 interface Rpc { id?: string | number; method?: string; params: Record<string, unknown>; result?: unknown; error?: { code: number; message: string } }
 type Handler = (message: Rpc, socket: WebSocket) => unknown | Promise<unknown>;
@@ -19,6 +23,7 @@ const cleanup: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
   for (const close of cleanup.splice(0).reverse()) await close();
   vi.unstubAllEnvs();
+  vi.useRealTimers();
 });
 
 async function managedFixture(options: {
@@ -216,6 +221,94 @@ describe('Codex native shared policy', () => {
     expect(f.calls.filter(call => call.method === 'thread/queue/add')).toHaveLength(1);
     expect(f.calls.filter(call => call.method === 'thread/resume').every(call => call.params.threadId === threadId)).toBe(true);
     expect(f.calls.some(call => ['thread/start', 'thread/fork', 'turn/start'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it('automatically retries a startup outage past 15 seconds and refuses a changed profile before recovering', async () => {
+    const f = await sharedFixture();
+    const replacement = await fixture({ initialize: () => ({ userAgent: 'codex/0.163.0-alpha.11 (Fixture)', codexHome: path.join(f.home, 'wrong'),
+      platformFamily: process.platform === 'win32' ? 'windows' : 'unix', platformOs: process.platform === 'win32' ? 'windows' : process.platform }) });
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    const started = Date.now();
+    f.shared.mockRejectedValue(new SharedCodexError('Native is not ready.', 'shared-daemon-unavailable'));
+    await expect(f.client.connect()).rejects.toMatchObject({ code: 'shared-daemon-unavailable' });
+    for (const [delay, count] of [[1_000, 2], [2_000, 3]]) {
+      await vi.advanceTimersByTimeAsync(delay);
+      expect(f.shared).toHaveBeenCalledTimes(count);
+      expect(f.client.status().connected).toBe(false);
+    }
+    f.shared.mockResolvedValue({ ...f.target, transport: 'websocket', endpoint: replacement.endpoint, codexHome: f.home });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await vi.waitFor(() => expect(f.client.status().errorCode).toBe('shared-profile-mismatch'));
+    expect(replacement.calls.map(call => call.method)).toEqual(['initialize', 'initialized']);
+    replacement.handlers.initialize = () => ({ userAgent: 'codex/0.163.0-alpha.11 (Fixture)', codexHome: f.home,
+      platformFamily: process.platform === 'win32' ? 'windows' : 'unix', platformOs: process.platform === 'win32' ? 'windows' : process.platform });
+    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.waitFor(() => expect(f.client.status()).toMatchObject({ connected: true, queueSupported: true, endpoint: replacement.endpoint, errorCode: undefined }));
+    expect(Date.now() - started).toBeGreaterThanOrEqual(18_000);
+    expect(f.shared).toHaveBeenCalledTimes(5);
+    expect(f.calls).toEqual([]);
+    expect((await f.client.listThreads())[0].id).toBe(threadId);
+  });
+
+  it('automatically reconnects Engine to a replacement native target without replaying a lost-ACK request or losing the next queued UUID', async () => {
+    const f = await sharedFixture();
+    const runtime = { userAgent: 'codex/0.163.0-alpha.11 (Fixture)', codexHome: f.home,
+      platformFamily: process.platform === 'win32' ? 'windows' : 'unix', platformOs: process.platform === 'win32' ? 'windows' : process.platform };
+    let acceptedId = '', nextId = '';
+    f.handlers['server/diagnostics'] = () => ({ process: { id: 41 }, gauges: [] });
+    f.handlers['thread/backgroundTerminals/list'] = () => ({ data: [], nextCursor: null });
+    f.handlers['thread/queue/add'] = (message, socket) => { acceptedId = String(message.params.clientUserMessageId); socket.close(); return noResponse; };
+    const replacement = await fixture({ initialize: () => runtime,
+      'server/diagnostics': () => ({ process: { id: 42 }, gauges: [] }),
+      'thread/backgroundTerminals/list': () => ({ data: [], nextCursor: null }),
+      'thread/queue/add': message => { nextId = String(message.params.clientUserMessageId); return { queuedSubmission: { id: 'next-accepted', clientUserMessageId: nextId } }; },
+      'thread/turns/list': () => ({ data: [{ id: 'accepted-turn', status: 'completed', items: [
+        { type: 'userMessage', clientId: acceptedId }, { type: 'agentMessage', phase: 'final_answer', text: 'Recovered answer' },
+      ] }, ...(nextId ? [{ id: 'next-turn', status: 'inProgress', items: [{ type: 'userMessage', clientId: nextId }] }] : [])], nextCursor: null }),
+    }, f.home);
+    const store = new Store(':memory:');
+    cleanup.push(() => store.close());
+    const endpoint: Endpoint = { id: 'retry-telegram', platform: 'telegram', accountId: '999', chatId: '-100123', threadId: '17',
+      title: 'Retry fixture', subtitle: '', people: [{ id: '123', name: 'Fixture' }], updatedAt: new Date().toISOString() };
+    store.upsertEndpoint(endpoint);
+    store.createConversation({ name: 'Original', threadId, cwd: f.home, bindings: [{ platform: 'telegram', endpointId: endpoint.id, allowedSenderIds: ['123'] }] });
+    const config = { ...structuredClone(defaultConfig), codex: f.target, telegram: { enabled: true } };
+    const engine = new Engine(store, f.client, { config: () => config, temporaryRoot: f.home, redact: () => 'Fixture error' });
+    const deliver = vi.fn(async () => 'remote-receipt');
+    engine.channels.telegram = { state: { configured: true, connected: true, accountId: '999' }, start: async () => {}, stop: async () => {}, download: async () => {}, deliver };
+    cleanup.push(() => engine.stop());
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    await f.client.connect();
+    engine.start();
+    await engine.receive({ eventId: 'lost-ack', endpoint, sender: endpoint.people[0], messageId: '1', text: 'First request' });
+    await engine.settled();
+    const first = store.listRequests()[0];
+    expect(first).toMatchObject({ id: acceptedId, status: 'uncertain' });
+    f.shared.mockRejectedValue(new SharedCodexError('Native is not ready.', 'shared-daemon-unavailable'));
+    await engine.receive({ eventId: 'waiting', endpoint, sender: endpoint.people[0], messageId: '2', text: 'Next request' });
+    await engine.settled();
+    const second = store.listRequests().find(request => request.eventId === 'waiting')!;
+    expect(second.status).toBe('queued');
+    for (const delay of [1_000, 2_000, 5_000]) await vi.advanceTimersByTimeAsync(delay);
+    expect(f.client.status().connected).toBe(false);
+    expect(store.getRequest(first.id)?.status).toBe('uncertain');
+    expect(store.getRequest(second.id)?.status).toBe('queued');
+    f.shared.mockResolvedValue({ ...f.target, transport: 'websocket', endpoint: replacement.endpoint, codexHome: f.home });
+    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.waitFor(() => expect(f.client.status()).toMatchObject({ connected: true, queueSupported: true, endpoint: replacement.endpoint }));
+    await engine.settled();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await engine.settled();
+    expect(f.shared).toHaveBeenCalledTimes(5);
+    expect(store.listRequests()).toHaveLength(2);
+    expect(store.getRequest(first.id)).toMatchObject({ id: acceptedId, status: 'completed', turnId: 'accepted-turn' });
+    await vi.waitFor(() => expect(store.getRequest(second.id)).toMatchObject({ id: second.id, status: 'running', turnId: 'next-turn' }));
+    expect(await f.client.backgroundTerminals(threadId)).toEqual({ serverId: 42, terminals: [] });
+    expect(f.calls.filter(call => call.method === 'thread/queue/add').map(call => call.params.clientUserMessageId)).toEqual([first.id]);
+    expect(replacement.calls.filter(call => call.method === 'thread/queue/add').map(call => call.params.clientUserMessageId)).toEqual([second.id]);
+    expect(deliver).toHaveBeenCalledOnce();
+    expect(store.listDeliveries()[0]).toMatchObject({ requestId: first.id, body: 'Recovered answer', status: 'sent' });
+    expect([...f.calls, ...replacement.calls].some(call => ['thread/start', 'thread/fork', 'turn/start'].includes(call.method ?? ''))).toBe(false);
   });
 });
 
