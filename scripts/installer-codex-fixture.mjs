@@ -43,7 +43,8 @@ export async function installerCodex(home) {
   assert.equal(candidates.length, 1, 'Expected one isolated native Codex binary.');
   const executable = candidates[0];
   const metadata = JSON.parse(await readFile(path.join(path.dirname(executable), '..', 'codex-package.json'), 'utf8'));
-  assert.equal(metadata.version, '0.163.0');
+  const { SUPPORTED_CODEX_VERSIONS } = await import('../dist/shared/codex-runtime.js');
+  assert.ok(SUPPORTED_CODEX_VERSIONS.includes(metadata.version), 'Expected a supported native Codex version.');
   assert.equal(metadata.entrypoint, `bin/${binary}`);
   const settings = path.join(home, 'app-server-daemon');
   await assert.rejects(access(settings), { code: 'ENOENT' });
