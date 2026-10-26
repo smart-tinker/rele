@@ -8,6 +8,14 @@ import { expect, test } from 'vitest';
 const helper = fileURLToPath(new URL('../dist/native/Rele.Process.exe', import.meta.url));
 const windowsTest = test.skipIf(process.platform !== 'win32');
 
+windowsTest('the process host is a GUI executable even when Scheduler supplies no hidden-window flags', async () => {
+  const bytes = await readFile(helper);
+  expect(bytes.subarray(0, 2).toString('ascii')).toBe('MZ');
+  const pe = bytes.readUInt32LE(0x3c);
+  expect(bytes.subarray(pe, pe + 4)).toEqual(Buffer.from([0x50, 0x45, 0, 0]));
+  expect(bytes.readUInt16LE(pe + 24 + 68)).toBe(2); // IMAGE_SUBSYSTEM_WINDOWS_GUI; redirected byte handles remain usable.
+});
+
 function isRunning(pid: number): boolean {
   try { process.kill(pid, 0); return true; }
   catch (error) {

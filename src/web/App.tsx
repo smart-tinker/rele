@@ -102,7 +102,7 @@ function Session({ initial }: { initial: InitialSession }) {
   }, []);
   const unauthorized = useCallback(() => {
     signOut();
-    setAuthError('Токен панели не принят. Введите действующий токен.');
+    setAuthError('Токен панели не принят. Откройте Rele через ярлык или получите новую ссылку запуска.');
   }, [signOut]);
   const signIn = (next: string) => {
     saveToken(next);
@@ -141,8 +141,9 @@ function SignIn({
         <div className="wordmark">Rele</div>
         <h1>Вход в панель</h1>
         <p className="muted">
-          Откройте ссылку из запуска Rele или введите токен доступа к локальной
-          панели.
+          В Windows откройте Rele через меню «Пуск» или ярлык Rele. На сервере
+          выполните <code>rele open --print-url</code> и откройте выданную ссылку
+          в браузере. Вводить токен не нужно.
         </p>
         <form className="form-stack" onSubmit={submit}>
           <Field label="Токен панели">
@@ -173,7 +174,9 @@ function SignIn({
           </Button>
         </form>
         <p className="auth-note">
-          Токен действует в этой вкладке и удаляется при выходе из панели.
+          После перезапуска браузера вход в этой вкладке может не сохраниться.
+          Откройте Rele заново указанным выше способом или введите токен панели,
+          если он у вас есть.
         </p>
       </div>
     </main>
