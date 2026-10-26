@@ -455,7 +455,7 @@ function SourceDetails({ endpoint, state, api, refresh, onAccess }: { endpoint: 
       </div>
       <ActionMessages error={action.error} success={action.success} />
     </section>}
-    {conversation && endpoint.platform === 'slack' && <SlackSyncJournal api={api} conversationId={conversation.id} />}
+    {conversation && <SlackSyncJournal api={api} conversationId={conversation.id} platform={endpoint.platform} />}
   </div>;
 }
 

@@ -92,6 +92,29 @@ async function runningInstance(config: ConfigStore, wait: boolean): Promise<Inst
   return current;
 }
 
+export class MessageToolAcknowledgementError extends Error {
+  constructor() { super('Rele не подтвердил результат операции.'); }
+}
+
+/** One authenticated call to the verified local instance; mutating calls are never retried. */
+export async function callLocalMessageTool(config: ConfigStore, body: unknown): Promise<unknown> {
+  const current = await runningInstance(config, false);
+  let response: Response;
+  try {
+    response = await fetch(new URL('/api/tools/call', current.address), {
+      method: 'POST', headers: { authorization: `Bearer ${config.panelToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify(body), redirect: 'error', signal: AbortSignal.timeout(15_000),
+    });
+  } catch { throw new MessageToolAcknowledgementError(); }
+  if (response.status >= 400 && response.status < 500) throw new Error('Rele отклонил вызов: проверьте параметры и доступ к выбранному источнику.');
+  if (!response.ok) throw new MessageToolAcknowledgementError();
+  try {
+    const source = await response.text();
+    if (source.length > 256_000) throw new Error();
+    return JSON.parse(source) as unknown;
+  } catch { throw new MessageToolAcknowledgementError(); }
+}
+
 export async function serverStatus(config: ConfigStore, wait: boolean): Promise<void> {
   const current = await runningInstance(config, wait);
   process.stdout.write(JSON.stringify({ running: true, ...current }) + '\n');

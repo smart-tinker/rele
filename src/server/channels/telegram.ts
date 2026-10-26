@@ -23,9 +23,10 @@ function routingThreadId(message: ObjectValue | undefined): string | undefined {
 function person(value: unknown): Person | undefined {
   const user = object(value);
   const id = numericId(user?.id);
-  if (!user || !id || user.is_bot === true) return undefined;
+  if (!user || !id || Number(id) <= 0 || typeof user.is_bot !== 'boolean') return undefined;
   const name = [user.first_name, user.last_name].filter((part) => typeof part === 'string').join(' ').trim();
-  return { id, name: readableTitle(name || (typeof user.username === 'string' ? `@${user.username}` : ''), 'Участник Telegram') };
+  return { id, name: readableTitle(name || (typeof user.username === 'string' ? `@${user.username}` : ''), 'Участник Telegram'), isBot: user.is_bot,
+    ...(typeof user.username === 'string' && /^[A-Za-z0-9_]{1,32}$/u.test(user.username) ? { username: user.username } : {}) };
 }
 function membership(value: unknown, accountId: string): boolean | undefined {
   const member = object(value);
@@ -46,6 +47,7 @@ function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
 }
 
 export class TelegramChannel implements Channel {
+  identity?: Person;
   state: ConnectionState;
   private readonly fetcher: typeof fetch;
   private readonly endpoints = new Map<string, Endpoint>();
@@ -106,6 +108,7 @@ export class TelegramChannel implements Channel {
       if (!Number.isSafeInteger(offset) || offset < 0) throw new ChannelError('Не удалось прочитать сохранённую позицию Telegram.');
       this.accountId = accountId;
       this.botUsername = typeof me.username === 'string' && /^[A-Za-z0-9_]+$/u.test(me.username) ? me.username : undefined;
+      this.identity = person(me);
       this.startupFailures = 0;
       this.state.accountId = accountId;
       this.state.name = readableTitle(typeof me.username === 'string' ? `@${me.username}` : me.first_name, 'Бот Telegram');
@@ -237,23 +240,25 @@ export class TelegramChannel implements Channel {
     const text = typeof message.text === 'string' ? message.text : typeof message.caption === 'string' ? message.caption : '';
     const command = /^\/(rele_register|rele_chats|start)(?:@([A-Za-z0-9_]+))?(?:\s+([\s\S]*))?$/iu.exec(typeof message.text === 'string' ? message.text.trimEnd() : '');
     const cancelCommand = /^\/rele_cancel(?:@([A-Za-z0-9_]+))?$/iu.exec(text.trim());
-    if (cancelCommand?.[1] && cancelCommand[1].toLowerCase() !== this.botUsername?.toLowerCase()) return;
     const register = command?.[1].toLowerCase() === 'rele_register';
     const picker = command?.[1].toLowerCase() === 'rele_chats' || (command?.[1].toLowerCase() === 'start' && command[3]?.trim() === 'rele_chats');
-    if ((register || picker) && command?.[2] && command[2].toLowerCase() !== this.botUsername?.toLowerCase()) return;
+    const addressedElsewhere = !!(cancelCommand?.[1] && cancelCommand[1].toLowerCase() !== this.botUsername?.toLowerCase()
+      || (register || picker) && command?.[2] && command[2].toLowerCase() !== this.botUsername?.toLowerCase());
+    if (addressedElsewhere && chat.type === 'private') return;
+    const contextOnly = sender?.id === this.accountId || addressedElsewhere || sender?.isBot === true && !!(command || cancelCommand);
     const ownDeparture = numericId(object(message.left_chat_member)?.id) === this.accountId;
     const hasContent = Boolean(text.trim()) || ['photo', 'voice', 'audio', 'video', 'video_note', 'document', 'sticker', 'animation', 'contact', 'location', 'venue', 'poll', 'dice', 'paid_media', 'story', 'checklist'].some(key => message[key] !== undefined);
     const generalTopic = !threadId && this.isForum(chat, chatId, threadId) && Boolean(sender) && !message.sender_chat && hasContent &&
       !ownDeparture && !message.chat_shared && !message.forum_topic_created && !message.forum_topic_edited;
-    if (register && sender && !message.sender_chat && (threadId || generalTopic) && command?.[3]?.trim()) this.topics.set(topicKey, readableTitle(command[3], 'Тема Telegram', 128));
-    const endpoint = this.discover(chat, chatId, threadId, sender, !ownDeparture, generalTopic);
+    if (register && sender?.isBot === false && !contextOnly && !message.sender_chat && (threadId || generalTopic) && command?.[3]?.trim()) this.topics.set(topicKey, readableTitle(command[3], 'Тема Telegram', 128));
+    const endpoint = this.discover(chat, chatId, threadId, sender?.id === this.accountId ? undefined : sender, !ownDeparture, generalTopic);
     if (ownDeparture) return;
     if (message.chat_shared) {
-      if (chat.type === 'private' && sender?.id === chatId && !message.sender_chat) await this.handleSharedChat(message.chat_shared, sender, signal);
+      if (chat.type === 'private' && sender?.isBot === false && sender.id === chatId && !message.sender_chat) await this.handleSharedChat(message.chat_shared, sender, signal);
       return;
     }
-    if (!sender || sender.id === this.accountId || message.sender_chat) return;
-    if (picker || register) {
+    if (!sender || message.sender_chat || chat.type === 'private' && (sender.isBot || sender.id !== chatId)) return;
+    if (!contextOnly && (picker || register)) {
       if (picker && (chat.type !== 'private' || sender.id !== chatId)) return;
       const reply: ObjectValue = { chat_id: chatId,
         text: picker ? 'Выберите группу, в которой уже есть этот бот. Для отдельной темы отправьте команду регистрации внутри неё.' :
@@ -266,7 +271,7 @@ export class TelegramChannel implements Channel {
       await this.replyToCommand(reply, chatId, threadId, signal);
       return;
     }
-    if (command?.[1].toLowerCase() === 'start' || message.forum_topic_created || message.forum_topic_edited) return;
+    if ((!contextOnly && command?.[1].toLowerCase() === 'start') || message.forum_topic_created || message.forum_topic_edited) return;
     const audioSource = object(message.voice) ?? object(message.audio) ??
       (typeof object(message.document)?.mime_type === 'string' && (object(message.document)!.mime_type as string).startsWith('audio/') ? object(message.document) : undefined);
     let audio: AudioAttachment | undefined;
@@ -277,7 +282,7 @@ export class TelegramChannel implements Channel {
         size: typeof audioSource.file_size === 'number' && Number.isSafeInteger(audioSource.file_size) && audioSource.file_size >= 0 ? audioSource.file_size : undefined };
     }
     if (!text.trim() && !audio) return;
-    const inbound: InboundMessage = { eventId: String(update.update_id), endpoint, sender, messageId, text: cancelCommand ? '/rele_cancel' : text, audio,
+    const inbound: InboundMessage = { eventId: String(update.update_id), endpoint, sender, messageId, text, audio, ...(contextOnly ? { contextOnly: true } : {}),
       replyToMessageId: numericId(object(message.reply_to_message)?.message_id),
       directMention: this.hasDirectMention(message, text) };
     await abortable(this.callbacks.message(inbound), signal);
@@ -380,9 +385,9 @@ export class TelegramChannel implements Channel {
     const threadId = routingThreadId(message);
     let accepted = false;
     try {
-      if (match && sender && chatId && threadId !== undefined) {
+      if (match && sender?.isBot === false && chatId && threadId !== undefined) {
         await abortable(this.callbacks.action({ approvalId: match[1], decision: match[2].toLowerCase() as 'accept' | 'decline', platform: 'telegram',
-          accountId: this.accountId, chatId, threadId, senderId: sender.id }), signal);
+          accountId: this.accountId, chatId, threadId, senderId: sender.id, senderIsBot: false }), signal);
         accepted = true;
       }
     } catch (error) {
@@ -395,15 +400,28 @@ export class TelegramChannel implements Channel {
     }
   }
 
+  deliveryText(delivery: Delivery): string {
+    if (delivery.kind !== 'message') return delivery.body;
+    const text = delivery.body.replace(/(?<![\w@])@(?=[A-Za-z0-9_])/gu, '@\u200b');
+    return delivery.mentions?.length ? `${delivery.mentions.map(person => `@${person.username}`).join(' ')}\n\n${text}` : text;
+  }
   async deliver(delivery: Delivery, approval?: Approval): Promise<string> {
     if (!this.accountId || this.controller?.signal.aborted) throw new ChannelError('Telegram ещё не подключён.', true);
     const origin = delivery.origin;
     if (origin.platform !== 'telegram' || origin.accountId !== this.accountId) throw new ChannelError('Получатель относится к другому боту Telegram. Проверьте настройки связки.');
-    if (numericId(Number(origin.chatId)) !== origin.chatId || numericId(Number(origin.messageId)) !== origin.messageId || Number(origin.messageId) < 0 ||
+    if (numericId(Number(origin.chatId)) !== origin.chatId || delivery.kind !== 'message' && (numericId(Number(origin.messageId)) !== origin.messageId || Number(origin.messageId) < 0) ||
       (origin.threadId && (numericId(Number(origin.threadId)) !== origin.threadId || Number(origin.threadId) < 0))) throw new ChannelError('Некорректный адрес ответа Telegram.');
-    if (!delivery.body || [...delivery.body].length > 4096) throw new ChannelError('Текст Telegram должен содержать от 1 до 4096 символов.');
-    const payload: ObjectValue = { chat_id: origin.chatId, text: delivery.body,
-      reply_parameters: { message_id: Number(origin.messageId), allow_sending_without_reply: true }, link_preview_options: { is_disabled: true } };
+    if (delivery.kind === 'message' && (approval || [...delivery.body].length > 3000
+      || delivery.mentions?.some(person => !/^\d+$/u.test(person.id) || !person.username || !/^[A-Za-z0-9_]{1,32}$/u.test(person.username)))) throw new ChannelError('Некорректное сообщение или адрес упоминания Telegram.');
+    const text = this.deliveryText(delivery);
+    if (!text || [...text].length > 4096) throw new ChannelError('Текст Telegram должен содержать от 1 до 4096 символов.');
+    const payload: ObjectValue = { chat_id: origin.chatId, text,
+      ...(delivery.kind !== 'message' ? { reply_parameters: { message_id: Number(origin.messageId), allow_sending_without_reply: true } } : {}), link_preview_options: { is_disabled: true } };
+    if (delivery.kind === 'message' && delivery.mentions?.length) {
+      let offset = 0;
+      payload.entities = delivery.mentions.map(person => { const length = person.username!.length + 1;
+        const entity = { type: 'mention', offset, length }; offset += length + 1; return entity; });
+    }
     if (origin.threadId) payload.message_thread_id = Number(origin.threadId);
     if (approval) {
       if (approval.requestId !== delivery.requestId || approval.id !== delivery.approvalId) throw new ChannelError('Подтверждение не относится к этому сообщению.');

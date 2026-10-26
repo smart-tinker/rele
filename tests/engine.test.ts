@@ -6,10 +6,11 @@ import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Engine, type CodexGateway, type EngineOptions } from '../src/server/engine.js';
 import { Store } from '../src/server/store.js';
+import { requestInput } from '../src/server/inbound-context.js';
 import { defaultConfig } from '../src/server/config.js';
 import { CodexThreadBusyError, CodexTransportError, type CodexNotification, type CodexServerRequest, type RequestLocation } from '../src/server/codex.js';
 import { ChannelError, type ApprovalAction, type Channel } from '../src/server/channels/common.js';
-import type { Approval, CodexConnectionState, Delivery, Endpoint, InboundMessage, Platform, ReleRequest } from '../src/shared/types.js';
+import type { Approval, CodexConnectionState, Delivery, Endpoint, InboundMessage, MessageToolReceipt, Platform, ReleRequest } from '../src/shared/types.js';
 
 const THREAD = 'codex-shared-thread';
 const fixtures: Array<{ engine: Engine; store: Store }> = [];
@@ -153,6 +154,62 @@ afterEach(async () => {
 });
 
 describe('Engine correlation and queue', () => {
+  it('enqueues one attributed multi-party request with the original body and immutable roster', async () => {
+    const f = fixture();
+    const text = '@First @Second check this';
+    await f.engine.receive(f.message('telegram', 'attributed', { text, sender: { id: '123', name: 'Actual author', isBot: false } }));
+    await f.engine.settled();
+    const request = f.store.listRequests()[0];
+    expect(request.text).toBe(text);
+    expect(request.origin.participants).toEqual([{ id: '123', name: 'Actual author', isBot: false }]);
+    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, requestInput(request), request.id);
+    expect(f.codex.enqueue.mock.calls[0][1]).toContain('"type":"human"');
+    expect(f.codex.createThread).not.toHaveBeenCalled();
+  });
+
+  it('persists exact NOREPLY as a successful suppressed final, including repeated reconciliation and restart', async () => {
+    const f = fixture();
+    const request = await acceptRequest(f, 'telegram');
+    await running(f, request);
+    f.codex.complete(request.id, ' \nNOREPLY\n ');
+    await f.engine.settled();
+    await f.engine.reconcile(request.id);
+    await f.engine.pump();
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'completed', suppressedFinal: true });
+    expect(JSON.parse(f.store.getMeta(`suppressed-final:${request.id}`)!)).toMatchObject({ reason: 'NOREPLY', turnId: 'turn-1' });
+    expect(f.store.listDeliveries()).toEqual([]);
+    expect(f.telegram.deliver).not.toHaveBeenCalled();
+    await f.engine.stop();
+    const restarted = fixture({ path: f.path });
+    await restarted.engine.pump();
+    expect(restarted.store.getRequest(request.id)).toMatchObject({ status: 'completed', suppressedFinal: true });
+    expect(restarted.store.listRequests()[0].suppressedFinal).toBe(true);
+    expect(restarted.store.getMeta(`suppressed-final:${request.id}`)).toBe(f.store.getMeta(`suppressed-final:${request.id}`));
+    expect(restarted.codex.enqueue).not.toHaveBeenCalled();
+    expect(restarted.store.listDeliveries()).toEqual([]);
+  });
+
+  it.each(['noreply', '`NOREPLY`', 'NOREPLY because it is complete', 'The word NOREPLY'])('does not suppress ordinary final text: %s', async text => {
+    const f = fixture();
+    const request = await acceptRequest(f, 'telegram');
+    await running(f, request);
+    f.codex.complete(request.id, text);
+    await f.engine.settled(); await f.engine.pump();
+    expect(f.store.listDeliveries()).toEqual([expect.objectContaining({ kind: 'answer', body: text, status: 'sent' })]);
+    expect(f.store.getMeta(`suppressed-final:${request.id}`)).toBeUndefined();
+  });
+
+  it('does not suppress failure notifications even when recovered text is NOREPLY', async () => {
+    const f = fixture();
+    const request = await acceptRequest(f, 'telegram');
+    await running(f, request);
+    f.codex.locations.set(request.id, { state: 'failed', turnId: 'turn-1', text: 'NOREPLY' });
+    await f.engine.reconcile(request.id); await f.engine.pump();
+    expect(f.store.getRequest(request.id)?.status).toBe('failed');
+    expect(f.store.listDeliveries()[0]).toMatchObject({ kind: 'error', status: 'sent' });
+    expect(f.store.getMeta(`suppressed-final:${request.id}`)).toBeUndefined();
+  });
+
   it('keeps a busy original thread queued without delivery or resubmission and retries after ownership becomes available', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     const f = fixture();
@@ -167,7 +224,7 @@ describe('Engine correlation and queue', () => {
     expect(f.codex.subscribe).toHaveBeenCalledTimes(1);
     vi.setSystemTime(Date.now() + 5_001);
     await f.engine.pump();
-    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, request.text, request.id);
+    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, requestInput(request), request.id);
     expect(f.store.getRequest(request.id)).toMatchObject({ status: 'starting', error: undefined });
   });
 
@@ -178,7 +235,7 @@ describe('Engine correlation and queue', () => {
     await f.engine.stop();
     const restarted = fixture({ path: f.path });
     await restarted.engine.pump();
-    expect(restarted.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, request.text, request.id);
+    expect(restarted.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, requestInput(request), request.id);
     expect(restarted.store.listRequests()).toHaveLength(1);
     expect(restarted.store.getRequest(request.id)?.origin).toEqual(request.origin);
   });
@@ -231,7 +288,7 @@ describe('Engine correlation and queue', () => {
     const second = f.store.listRequests().find(row => row.origin.platform === 'telegram')!;
     expect(f.store.listRequests()).toHaveLength(2);
     expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
-    expect(f.codex.enqueue).toHaveBeenLastCalledWith(THREAD, slackMessage.text, first.id);
+    expect(f.codex.enqueue).toHaveBeenLastCalledWith(THREAD, requestInput(first), first.id);
 
     await running(f, first);
     f.codex.complete(first.id, 'Slack answer');
@@ -242,7 +299,7 @@ describe('Engine correlation and queue', () => {
     expect(f.slack.deliver.mock.calls[0][0]).toMatchObject({ requestId: first.id, body: 'Slack answer', origin: first.origin });
     expect(f.telegram.deliver).not.toHaveBeenCalled();
     expect(f.codex.enqueue).toHaveBeenCalledTimes(2);
-    expect(f.codex.enqueue).toHaveBeenLastCalledWith(THREAD, telegramMessage.text, second.id);
+    expect(f.codex.enqueue).toHaveBeenLastCalledWith(THREAD, requestInput(second), second.id);
 
     await running(f, second, 'turn-2');
     f.codex.complete(second.id, 'Telegram answer', 'turn-2');
@@ -260,6 +317,7 @@ describe('Engine correlation and queue', () => {
     const f = fixture();
     const acknowledgement = deferred<{ queuedSubmissionId: string }>();
     f.codex.enqueue.mockImplementationOnce(async (_thread, _text, clientId) => {
+      f.codex.releaseThread.mockClear(); // Exclude the preceding passive-context writer release.
       f.codex.running(clientId);
       f.codex.complete(clientId, 'Fast answer');
       return acknowledgement.promise;
@@ -575,6 +633,7 @@ describe('Engine scoped shell cancellation', () => {
     f.store.removeBinding(f.conversation.id, f.conversation.bindings.find(binding => binding.platform === 'slack')!.id);
     f.codex.terminals = [{ itemId: 'foreign-command', processId: '9876' }];
     const request = await acceptRequest(f, 'telegram', 'cancel-own-shell');
+    f.codex.releaseThread.mockClear();
     await running(f, request, 'shell-turn');
     f.codex.notification({ method: 'item/started', params: { threadId: THREAD, turnId: 'shell-turn',
       item: { type: 'commandExecution', id: 'own-command', processId: null } } });
@@ -606,7 +665,7 @@ describe('Engine scoped shell cancellation', () => {
     expect(f.codex.terminals).toEqual([{ itemId: 'foreign-command', processId: '9876' }]);
     expect(f.diagnostics).toEqual([]);
     expect(f.store.getRequest(next.id)).toMatchObject({ status: 'starting' });
-    expect(f.codex.enqueue).toHaveBeenLastCalledWith(THREAD, next.text, next.id);
+    expect(f.codex.enqueue).toHaveBeenLastCalledWith(THREAD, requestInput(next), next.id);
   });
 
   it.each(['running', 'interrupted'] as const)('reconciles a lost terminate ACK on the same connection from %s without replaying a persisted PID', async state => {
@@ -649,6 +708,7 @@ describe('Engine scoped shell cancellation', () => {
 
   it('does not terminate an unmapped fresh terminal or release the request as stopped', async () => {
     const f = fixture(), request = await acceptRequest(f, 'telegram');
+    f.codex.releaseThread.mockClear();
     await running(f, request, 'shell-turn');
     f.codex.terminals.push({ itemId: 'unmapped-command', processId: '1234' });
     await expect(f.engine.cancel(request.id)).rejects.toThrow('не подтверждены');
@@ -1094,6 +1154,311 @@ function slackInbound(f: ReturnType<typeof fixture>, eventId: string, messageId:
     threadId: value.endpoint.threadId, messageId, text, sender: value.sender, kind: 'message', payload: { text, ts: messageId } } };
 }
 
+describe('Engine durable outgoing tools', () => {
+  function toolsFixture() {
+    const f = fixture(); f.config.slack.enabled = true; f.config.telegram.enabled = true;
+    return f;
+  }
+  async function send(f: ReturnType<typeof fixture>, callId = 'native-call', args: Record<string, unknown> = { endpointId: f.eps.slack.id, text: 'Agent message' }): Promise<MessageToolReceipt> {
+    const result = await f.engine.messageTool({ threadId: THREAD, callId, name: 'send_message', arguments: args });
+    if ('destinations' in result) throw new Error('Unexpected destination response');
+    return result;
+  }
+  it('lists only linked enabled sources and observed thread authors, and accepts a Desktop-origin send with no inbound request', async () => {
+    const f = toolsFixture();
+    f.store.recordInbound(f.message('slack', 'known-peer', { sender: { id: 'UPEER', name: 'Peer agent', isBot: true }, contextOnly: true }));
+    const result = await f.engine.messageTool({ threadId: THREAD, callId: 'list', name: 'list_destinations', arguments: {} });
+    expect(result).toMatchObject({ destinations: [
+      { endpointId: f.eps.slack.id, participants: [{ id: 'UPEER', name: 'Peer agent', isBot: true }] },
+      { endpointId: f.eps.telegram.id, participants: [] },
+    ] });
+    const receipt = await send(f, 'native-call', { endpointId: f.eps.slack.id, text: 'Agent message', mentionIds: ['UPEER'] });
+    await f.engine.settled();
+    expect(f.store.listRequests()).toEqual([]);
+    expect(f.store.getDelivery(receipt.operationId)).toMatchObject({ kind: 'message', status: 'sent', nativeThreadId: THREAD,
+      origin: { senderId: 'bot-user', senderName: 'slack', senderIsBot: true }, mentions: [{ id: 'UPEER', isBot: true }] });
+    expect(f.store.getDelivery(receipt.operationId)?.requestId).toBeUndefined();
+    expect(f.slack.deliver).toHaveBeenCalledOnce();
+    expect(f.telegram.deliver).not.toHaveBeenCalled();
+    expect(f.store.getThreadParticipants(f.eps.slack.id)).toContainEqual({ id: 'bot-user', name: 'slack', isBot: true });
+    expect(f.store.listSlackSyncStreams().filter(stream => stream.endpointId === f.eps.slack.id)
+      .flatMap(stream => f.store.listSlackSyncEntries(stream.id)).some(entry => entry.message.sender.id === 'bot-user')).toBe(false);
+  });
+
+  it('records a confirmed own Telegram post as passive context without a new request', async () => {
+    const f = toolsFixture();
+    const receipt = await send(f, 'telegram-send', { endpointId: f.eps.telegram.id, text: 'Own Telegram report' });
+    await f.engine.settled();
+    expect(f.store.getDelivery(receipt.operationId)?.status).toBe('sent');
+    expect(f.store.listRequests()).toEqual([]);
+    expect(f.store.listSlackSyncStreams().filter(stream => stream.endpointId === f.eps.telegram.id)
+      .flatMap(stream => f.store.listSlackSyncEntries(stream.id)).some(entry => entry.message.sender.id === '999' && entry.message.text === 'Own Telegram report')).toBe(true);
+    await f.engine.pump(); await f.engine.settled();
+    expect(f.codex.enqueue).not.toHaveBeenCalled();
+    expect(f.telegram.deliver).toHaveBeenCalledOnce();
+  });
+
+  it('returns the same durable receipt on duplicate calls, rejects changed arguments, and scopes status to the native thread', async () => {
+    const f = toolsFixture();
+    const receipt = await send(f); await f.engine.settled();
+    expect(await send(f)).toMatchObject({ operationId: receipt.operationId, status: 'sent' });
+    expect(f.slack.deliver).toHaveBeenCalledOnce();
+    await expect(send(f, 'native-call', { endpointId: f.eps.slack.id, text: 'Changed' })).rejects.toThrow(/другими аргументами/);
+    const status = await f.engine.messageTool({ threadId: THREAD, callId: 'status', name: 'get_message_status', arguments: { operationId: receipt.operationId } });
+    expect(status).toMatchObject({ operationId: receipt.operationId, status: 'sent' });
+    await expect(f.engine.messageTool({ threadId: 'foreign-thread', callId: 'status', name: 'get_message_status', arguments: { operationId: receipt.operationId } })).rejects.toThrow(/не найдена/);
+  });
+
+  it('keeps timeout outcomes uncertain without a blind retry or raw channel-error exposure', async () => {
+    const f = toolsFixture();
+    f.slack.deliver.mockRejectedValueOnce(new ChannelError('synthetic-private-channel-error', false, true));
+    const receipt = await send(f); await f.engine.settled();
+    await f.engine.pump(); await f.engine.pump();
+    expect(f.slack.deliver).toHaveBeenCalledOnce();
+    expect(await send(f)).toMatchObject({ operationId: receipt.operationId, status: 'uncertain' });
+    expect(JSON.stringify(await send(f))).not.toContain('synthetic-private');
+    expect(() => f.engine.retryDelivery(receipt.operationId)).toThrow(/Неопределённую/);
+  });
+
+  it.each(['access', 'pause', 'account', 'binding'] as const)('cancels an unsent tool message after %s changes', async reason => {
+    const f = toolsFixture();
+    const gate = deferred<string>(); f.slack.deliver.mockImplementationOnce(() => gate.promise);
+    await send(f, 'first-call');
+    const queued = await send(f, 'queued-call');
+    if (reason === 'access') f.store.setSourceAccess(f.eps.slack.id, { mode: 'off' });
+    if (reason === 'pause') f.store.updateConversation(f.conversation.id, { paused: true });
+    if (reason === 'account') f.slack.state.accountId = 'different:bot';
+    if (reason === 'binding') f.store.removeBinding(f.conversation.id, f.conversation.bindings.find(value => value.platform === 'slack')!.id);
+    gate.resolve('170002.000001'); await f.engine.settled();
+    expect(f.store.getDelivery(queued.operationId)?.status).toBe('cancelled');
+    expect(f.slack.deliver).toHaveBeenCalledOnce();
+  });
+
+  it('rejects implicit or foreign destinations, catalog-only people, malformed calls and Telegram participants without a known username', async () => {
+    const f = toolsFixture();
+    for (const args of [{ text: 'No destination' }, { endpointId: 'foreign', text: 'Work' },
+      { endpointId: f.eps.slack.id, text: 'Work', mentionIds: ['U1'] }, { endpointId: f.eps.slack.id, text: 'Work', author: 'Forged' },
+      { endpointId: f.eps.slack.id, text: 'x'.repeat(3001) }, { endpointId: f.eps.slack.id, text: 'Work', mentionIds: ['U1', 'U1'] }]) {
+      await expect(send(f, 'invalid', args)).rejects.toThrow();
+    }
+    f.store.recordInbound(f.message('telegram', 'known-no-name', { sender: { id: '456', name: 'Peer', isBot: true }, contextOnly: true }));
+    await expect(send(f, 'missing-username', { endpointId: f.eps.telegram.id, text: 'Work', mentionIds: ['456'] })).rejects.toThrow(/проверенного адреса/);
+    expect(f.store.listDeliveries()).toEqual([]);
+  });
+
+  it('does not add a final outbound after an explicit tool send and exact NOREPLY', async () => {
+    const f = toolsFixture();
+    const request = await acceptRequest(f, 'telegram'); await running(f, request);
+    const receipt = await send(f); await f.engine.settled();
+    f.codex.complete(request.id, 'NOREPLY'); await f.engine.settled(); await f.engine.pump();
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'completed', suppressedFinal: true });
+    expect(f.store.listDeliveries()).toEqual([expect.objectContaining({ id: receipt.operationId, kind: 'message', status: 'sent' })]);
+    expect(f.telegram.deliver).not.toHaveBeenCalled();
+    expect(f.slack.deliver).toHaveBeenCalledOnce();
+  });
+});
+
+describe('Engine bot-origin group controls', () => {
+  async function botRequest(f: ReturnType<typeof fixture>) {
+    f.store.setSourceAccess(f.eps.telegram.id, { mode: 'all' });
+    await f.engine.receive(f.message('telegram', 'bot-task', { sender: { id: '777', name: 'Peer agent', isBot: true }, text: 'Check this' }));
+    await f.engine.settled();
+    return f.store.listRequests()[0];
+  }
+  const action = (f: ReturnType<typeof fixture>, approval: Approval, extra: Partial<ApprovalAction> = {}): ApprovalAction => ({
+    approvalId: approval.id, decision: 'accept', platform: 'telegram', accountId: f.eps.telegram.accountId,
+    chatId: f.eps.telegram.chatId, threadId: f.eps.telegram.threadId, senderId: '456', senderIsBot: false, ...extra });
+
+  it.each(['accept', 'decline'] as const)('allows another verified human in the same group to %s an agent request', async decision => {
+    const f = fixture();
+    const request = await botRequest(f);
+    const approval = await requestApproval(f, request);
+    await f.engine.action(action(f, approval, { decision }));
+    expect(f.store.getApproval(approval.id)).toMatchObject({ status: 'answered', decision });
+    expect(f.codex.respond).toHaveBeenCalledWith(approval.rpcId, { decision });
+  });
+
+  it.each([{ senderIsBot: undefined }, { senderIsBot: true }, { senderId: '777', senderIsBot: true },
+    { accountId: 'other' }, { chatId: '-other' }, { threadId: 'other' }, { platform: 'slack' as const }])('denies unverified/bot/foreign actors: %j', async patch => {
+    const f = fixture();
+    const request = await botRequest(f);
+    const approval = await requestApproval(f, request);
+    await expect(f.engine.action(action(f, approval, patch))).rejects.toThrow(/недоступно/);
+    expect(f.store.getApproval(approval.id)?.status).toBe('pending');
+    expect(f.codex.respond).not.toHaveBeenCalled();
+  });
+
+  it('accepts a verified group human clarification and consumes a bot reply without authorizing or queuing it', async () => {
+    const f = fixture();
+    const request = await botRequest(f);
+    const approval = await requestApproval(f, request, true);
+    const delivery = f.store.listDeliveries().find(row => row.approvalId === approval.id)!;
+    await f.engine.receive(f.message('telegram', 'bot-answer', { text: 'main', sender: { id: '777', name: 'Peer agent', isBot: true }, replyToMessageId: delivery.remoteMessageId }));
+    expect(f.store.getApproval(approval.id)?.status).toBe('pending');
+    expect(f.store.listRequests()).toHaveLength(1);
+    await f.engine.receive(f.message('telegram', 'human-answer', { text: 'main', sender: { id: '456', name: 'Another human', isBot: false }, replyToMessageId: delivery.remoteMessageId }));
+    expect(f.codex.respond).toHaveBeenCalledWith(approval.rpcId, { answers: { target: { answers: ['main'] } } });
+  });
+
+  it('keeps a new addressed Slack agent task queued while another agent awaits clarification', async () => {
+    const f = fixture();
+    f.store.setSourceAccess(f.eps.slack.id, { mode: 'mention' });
+    await f.engine.receive(slackInbound(f, 'first-agent', '170001.000001', '<@bot-user> First task', {
+      sender: { id: 'UFIRST', name: 'First agent', isBot: true }, directMention: true,
+    }));
+    await f.engine.settled();
+    const request = f.store.listRequests()[0];
+    const approval = await requestApproval(f, request, true);
+    const text = '<@bot-user> Separate task';
+    await f.engine.receive(slackInbound(f, 'second-agent', '170002.000001', text, {
+      sender: { id: 'USECOND', name: 'Second agent', isBot: true }, directMention: true,
+    }));
+    await f.engine.settled();
+    expect(f.store.getApproval(approval.id)?.status).toBe('pending');
+    expect(f.store.getRequest(request.id)?.status).toBe('waiting_approval');
+    expect(f.codex.respond).not.toHaveBeenCalled();
+    expect(f.store.listRequests()).toHaveLength(2);
+    expect(f.store.listRequests().find(row => row.id !== request.id)).toMatchObject({
+      status: 'queued', text, origin: { senderId: 'USECOND', senderIsBot: true },
+    });
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows only a verified same-group human to cancel an agent request and deduplicates the command', async () => {
+    const f = fixture();
+    const request = await botRequest(f);
+    await running(f, request);
+    for (const sender of [{ id: '777', name: 'Agent', isBot: true }, { id: '456', name: 'Unknown' }]) {
+      await f.engine.receive(f.message('telegram', `denied-${sender.id}`, { text: '/rele_cancel', sender }));
+    }
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+    const command = f.message('telegram', 'human-cancel', { text: '/rele_cancel@TestBot', sender: { id: '456', name: 'Another human', isBot: false } });
+    await f.engine.receive(command); await f.engine.settled();
+    await f.engine.receive(command);
+    expect(f.codex.interrupt).toHaveBeenCalledTimes(1);
+    expect(f.store.getRequest(request.id)?.status).toBe('interrupted');
+  });
+
+  it('retains sender-only controls for human-origin requests', async () => {
+    const f = fixture();
+    const request = await acceptRequest(f, 'telegram');
+    const approval = await requestApproval(f, request);
+    await expect(f.engine.action(action(f, approval))).rejects.toThrow(/недоступно/);
+    expect(f.codex.respond).not.toHaveBeenCalled();
+  });
+
+  it('does not let a repeated or delayed native Stop for an agent request reach the next request', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(200_000);
+    const f = fixture();
+    f.store.setSourceAccess(f.eps.slack.id, { mode: 'all' });
+    const sender = { id: 'UAGENT', name: 'Peer agent', isBot: true };
+    await f.engine.receive(slackInbound(f, 'first-agent', '199.000001', 'First task', { sender }));
+    await f.engine.settled();
+    const request = f.store.listRequests()[0];
+    await running(f, request);
+    const control = f.message('slack', 'agent-stop', { control: 'stop', messageId: '200.500000', text: '', sender: { id: 'UOTHERHUMAN', name: 'Human', isBot: false } });
+    await f.engine.receive(control); await f.engine.settled();
+    expect(f.codex.interrupt).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(203_000);
+    await f.engine.receive(slackInbound(f, 'second-agent', '202.900000', 'Second task', { sender }));
+    await f.engine.settled();
+    const next = f.store.listRequests().find(row => row.id !== request.id)!;
+    await running(f, next, 'turn-2');
+    await f.engine.receive(control);
+    await f.engine.receive({ ...control, eventId: 'delayed-agent-stop' });
+    await f.engine.settled();
+    expect(f.codex.interrupt).toHaveBeenCalledTimes(1);
+    expect(f.store.getRequest(next.id)?.status).toBe('running');
+  });
+});
+
+describe('Engine native Rele MCP message approvals', () => {
+  const params = (f: ReturnType<typeof fixture>, text = 'Send this exact text') => ({
+    threadId: THREAD, turnId: 'turn-1', serverName: 'rele', mode: 'form',
+    message: 'Native approval', requestedSchema: { type: 'object', properties: {} },
+    _meta: { codex_approval_kind: 'mcp_tool_call', tool_params: { endpointId: f.eps.slack.id, text } },
+  });
+  async function prepare(f: ReturnType<typeof fixture>, agent = false) {
+    f.config.slack.enabled = true;
+    f.store.setSourceAccess(f.eps.slack.id, { mode: 'all' });
+    if (agent) {
+      await f.engine.receive(slackInbound(f, 'agent-mcp', '170001.000001', 'Agent task', { sender: { id: 'UAGENT', name: 'Agent', isBot: true } }));
+      await f.engine.settled();
+    } else await acceptRequest(f);
+    const request = f.store.listRequests()[0]; await running(f, request); return request;
+  }
+  const action = (f: ReturnType<typeof fixture>, approval: Approval, decision: 'accept' | 'decline', patch: Partial<ApprovalAction> = {}): ApprovalAction => ({
+    approvalId: approval.id, decision, platform: 'slack', accountId: f.eps.slack.accountId, chatId: f.eps.slack.chatId,
+    threadId: f.eps.slack.threadId, senderId: 'U1', senderIsBot: false, ...patch,
+  });
+
+  it.each(['accept', 'decline'] as const)('forwards only the exact message preview and responds with a one-call MCP %s', async decision => {
+    const f = fixture(); f.codex.transport = 'websocket';
+    const request = await prepare(f);
+    f.codex.request({ id: 'mcp-approval', method: 'mcpServer/elicitation/request', params: {
+      ...params(f, 'Hello @unverified'), message: 'Unrelated native detail not forwarded',
+      _meta: { ...params(f, 'Hello @unverified')._meta, persist: ['session', 'always'], secret: 'unrelated-secret' },
+    } });
+    await f.engine.settled();
+    const approval = f.store.listApprovals()[0];
+    expect(approval).toMatchObject({ method: 'mcpServer/elicitation/request', requestId: request.id, status: 'pending' });
+    expect(approval.details).toContain('Team / Infrastructure');
+    expect(approval.details).toContain('Hello @\u200bunverified');
+    expect(approval.details).not.toMatch(/unrelated|session|always/);
+    expect(f.slack.deliver).toHaveBeenCalledWith(expect.objectContaining({ kind: 'approval', approvalId: approval.id }), approval);
+    await f.engine.action(action(f, approval, decision));
+    expect(f.codex.respond).toHaveBeenCalledExactlyOnceWith('mcp-approval', { action: decision, content: decision === 'accept' ? {} : null, _meta: null });
+    expect(f.store.getApproval(approval.id)).toMatchObject({ status: 'answered', decision });
+    await expect(f.engine.action(action(f, approval, decision))).rejects.toThrow(/завершено/);
+    expect(f.codex.respond).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows a verified group human to approve a bot request while refusing agents, unknown people and other sources', async () => {
+    const f = fixture(); await prepare(f, true);
+    f.codex.request({ id: 'agent-mcp-approval', method: 'mcpServer/elicitation/request', params: params(f) });
+    await f.engine.settled(); const approval = f.store.listApprovals()[0];
+    for (const patch of [{ senderId: 'UAGENT', senderIsBot: true }, { senderId: 'UOTHER', senderIsBot: undefined },
+      { accountId: 'other' }, { chatId: 'COTHER' }, { threadId: 'other-thread' }]) {
+      await expect(f.engine.action(action(f, approval, 'accept', patch))).rejects.toThrow(/недоступно/);
+    }
+    expect(f.codex.respond).not.toHaveBeenCalled();
+    await f.engine.action(action(f, approval, 'accept', { senderId: 'UOTHER', senderIsBot: false }));
+    expect(f.codex.respond).toHaveBeenCalledExactlyOnceWith('agent-mcp-approval', { action: 'accept', content: {}, _meta: null });
+  });
+
+  it('requires the entire long message preview before channel approval and still permits immediate decline', async () => {
+    const f = fixture(); await prepare(f);
+    f.slack.deliver.mockResolvedValueOnce('first-preview').mockRejectedValueOnce(new ChannelError('Temporary outage', true));
+    f.codex.request({ id: 'long-mcp-approval', method: 'mcpServer/elicitation/request', params: params(f, 'x'.repeat(3000)) });
+    await f.engine.settled(); const approval = f.store.listApprovals()[0];
+    expect(f.store.listDeliveries().filter(row => row.approvalId === approval.id)).toHaveLength(2);
+    expect(f.store.approvalDeliveryProgress(approval.id).complete).toBe(false);
+    await expect(f.engine.action(action(f, approval, 'accept'))).rejects.toThrow(/полной доставки/);
+    expect(f.codex.respond).not.toHaveBeenCalled();
+    await f.engine.action(action(f, approval, 'decline'));
+    expect(f.codex.respond).toHaveBeenCalledExactlyOnceWith('long-mcp-approval', { action: 'decline', content: null, _meta: null });
+  });
+
+  it.each([
+    { mode: 'url', url: 'https://private.example/auth' },
+    { serverName: 'another-mcp' },
+    { _meta: { codex_approval_kind: 'browser_auth', tool_params: { endpointId: 'slack-endpoint', text: 'private' } } },
+    { _meta: { codex_approval_kind: 'mcp_tool_call', tool_params: { endpointId: 'slack-endpoint', text: 'private', password: 'secret' } } },
+    { _meta: { codex_approval_kind: 'mcp_tool_call', tool_params: { endpointId: 'slack-endpoint', text: 'private', mentionIds: null } } },
+    { _meta: { codex_approval_kind: 'mcp_tool_call', tool_params: { endpointId: 'slack-endpoint', text: 'private', mentionIds: ['UUNKNOWN'] } } },
+    { requestedSchema: { type: 'object', properties: { password: { type: 'string' } } } },
+    { turnId: null },
+  ])('keeps unsupported, uncorrelated or secret elicitation out of the source: %j', async patch => {
+    const f = fixture(); await prepare(f);
+    f.codex.request({ id: 'unsupported-mcp', method: 'mcpServer/elicitation/request', params: { ...params(f), ...patch } });
+    await f.engine.settled();
+    expect(f.store.listApprovals()).toEqual([]);
+    expect(f.slack.deliver).not.toHaveBeenCalled();
+    expect(f.codex.respond).not.toHaveBeenCalled();
+    expect(f.codex.rejectRequest).toHaveBeenCalledWith('unsupported-mcp', expect.any(String));
+  });
+});
+
 describe('Engine Slack transcript and authorized task boundary', () => {
   it('replaces a stale writer error while a fresh Slack history scan is still paginating', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
@@ -1109,7 +1474,7 @@ describe('Engine Slack transcript and authorized task boundary', () => {
     expect(f.codex.enqueue).not.toHaveBeenCalled();
     vi.setSystemTime(Date.now() + 1501);
     await f.engine.pump(); await f.engine.settled();
-    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, request.text, request.id);
+    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, requestInput(request), request.id);
     expect(f.store.getRequest(request.id)?.error).toBeUndefined();
   });
 
@@ -1144,7 +1509,7 @@ describe('Engine Slack transcript and authorized task boundary', () => {
     expect(f.store.getRequest(request.id)).toMatchObject({ status: 'queued', origin,
       error: 'Источник выключен. Включите его для проверки полного контекста или отмените принятый запрос.' });
     const telegram = await acceptRequest(f, 'telegram', 'later-origin');
-    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, telegram.text, telegram.id);
+    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, requestInput(telegram), telegram.id);
     expect(f.store.getRequest(request.id)?.status).toBe('queued');
     await running(f, telegram);
     f.codex.complete(telegram.id, 'Telegram finished'); await f.engine.settled();
@@ -1157,7 +1522,7 @@ describe('Engine Slack transcript and authorized task boundary', () => {
     expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
     vi.setSystemTime(Date.now() + 1501);
     await f.engine.pump(); await f.engine.settled();
-    expect(f.codex.enqueue.mock.calls.filter(([, , id]) => id === request.id)).toEqual([[THREAD, task.text, request.id]]);
+    expect(f.codex.enqueue.mock.calls.filter(([, , id]) => id === request.id)).toEqual([[THREAD, requestInput(request), request.id]]);
     expect(f.store.getRequest(request.id)).toMatchObject({ status: 'starting', origin, error: undefined });
     const contextIndex = f.codex.injectContext.mock.calls.findIndex(([, , text]) => text.includes(root.text));
     expect(contextIndex).toBeGreaterThanOrEqual(0);
@@ -1178,7 +1543,7 @@ describe('Engine Slack transcript and authorized task boundary', () => {
     await f.engine.pump(); await f.engine.settled();
     expect(f.codex.injectContext).toHaveBeenCalledTimes(3);
     const request = f.store.listRequests()[0];
-    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, task.text, request.id);
+    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, requestInput(request), request.id);
     expect(f.codex.injectContext.mock.invocationCallOrder.every(order => order < f.codex.enqueue.mock.invocationCallOrder[0])).toBe(true);
     const context = f.codex.injectContext.mock.calls.map(([, , text]) => text).join('\n');
     expect(context).toContain('Original Slack root');
@@ -1280,7 +1645,7 @@ describe('Engine Slack transcript and authorized task boundary', () => {
     expect(f.store.getRequest(second.id)?.status).toBe('queued');
     await f.engine.pump(); await f.engine.settled();
     expect(f.codex.injectContext.mock.calls.at(-1)?.[2]).toContain(secondMessage.text);
-    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, secondMessage.text, second.id);
+    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, requestInput(second), second.id);
     expect(f.codex.injectContext.mock.invocationCallOrder.at(-1)!).toBeLessThan(f.codex.enqueue.mock.invocationCallOrder[0]);
   });
 });
@@ -1337,7 +1702,7 @@ describe('automatic native thread creation', () => {
     expect(f.store.listRequests()).toHaveLength(1);
     const request = f.store.listRequests()[0];
     expect(request).toMatchObject({ text: 'authorized task', origin: { endpointId: endpoint.id, senderId: sender.id } });
-    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith('auto-created-thread', request.text, request.id);
+    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith('auto-created-thread', requestInput(request), request.id);
     expect(f.config.autoLinkRules).toEqual([]);
     expect(f.store.getSourceRoute(f.eps.slack.id).mode).toBe('manual');
   });
@@ -1483,7 +1848,7 @@ describe('automatic native thread creation', () => {
       threadId: endpoint.threadId, senderId: human.id, senderName: human.name, messageId: incoming.messageId };
     expect(f.store.listRequests()).toHaveLength(1);
     expect(request).toMatchObject({ conversationId: conversation.id, text: incoming.text, origin });
-    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(nativeId, incoming.text, request.id);
+    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(nativeId, requestInput(request), request.id);
     expect(f.codex.injectContext.mock.calls.some(([threadId, , text]) => threadId === nativeId && text.includes(incoming.text))).toBe(true);
     expect(f.codex.injectContext.mock.invocationCallOrder.at(-1)!).toBeLessThan(f.codex.enqueue.mock.invocationCallOrder[0]);
     f.codex.locations.set(request.id, { state: 'running', turnId: 'dm-turn' });
@@ -1574,7 +1939,7 @@ describe('automatic native thread creation', () => {
     expect(f.store.listRequests()).toHaveLength(1);
     expect(f.store.getAutoLinkIntent(intent.id)?.status).toBe('completed');
     expect(request.origin).toMatchObject({ endpointId: f.endpoint.id, accountId: f.endpoint.accountId, threadId: f.endpoint.threadId });
-    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith('manually-verified-native', request.text, request.id);
+    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith('manually-verified-native', requestInput(request), request.id);
     expect(f.codex.createThread).toHaveBeenCalledOnce();
   });
 

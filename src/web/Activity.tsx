@@ -175,6 +175,7 @@ export function Queue({
                           </summary>
                           <p>{request.text || request.audio?.name}</p>
                         </details>
+                        {request.suppressedFinal && <span className="field-hint">Агент завершил запрос без отправки ответа (NOREPLY).</span>}
                         {request.error && (
                           <span
                             className={
@@ -486,7 +487,7 @@ export function Deliveries({
     <>
       <PageHeading
         title="Доставка"
-        description="Готовые ответы и подтверждение их отправки в исходный разговор."
+        description="Ответы и сообщения агентов, состояние их отправки в мессенджер."
         actions={
           <Button icon="refresh" onClick={() => void refresh()}>
             Обновить
@@ -532,7 +533,7 @@ export function Deliveries({
                     <td data-label="Ответ / связка">
                       <div className="cell-copy">
                         <strong>
-                          {conversationName(
+                          {delivery.kind === 'message' ? state.conversations.find((item) => item.id === delivery.conversationId)?.name ?? 'Разговор недоступен' : conversationName(
                             state,
                             state.requests.find(
                               (request) => request.id === delivery.requestId,
@@ -540,7 +541,7 @@ export function Deliveries({
                           )}
                         </strong>
                         <small>
-                          {delivery.kind === 'approval'
+                          {delivery.kind === 'message' ? 'Сообщение агента' : delivery.kind === 'approval'
                             ? 'Подтверждение'
                             : delivery.kind === 'error'
                               ? 'Сообщение об ошибке'
@@ -550,6 +551,7 @@ export function Deliveries({
                           <summary>{delivery.body}</summary>
                           <p>{delivery.body}</p>
                         </details>
+                        {delivery.mentions?.length ? <small>Упоминания: {delivery.mentions.map((person) => person.name).join(', ')}</small> : null}
                       </div>
                     </td>
                     <td data-label="Получатель">

@@ -3,7 +3,8 @@ import { mkdirSync } from 'node:fs';
 import { dirname, posix, resolve, win32 } from 'node:path';
 import { DatabaseSync, backup as backupDatabase, type SQLOutputValue } from 'node:sqlite';
 import { isLocalWorkspace } from './config.js';
-import type { Approval, AutoLinkIntent, AutoLinkRule, Binding, Conversation, Delivery, Endpoint, InboundMessage, Origin, Platform, ReleRequest, SlackTranscriptMessage, SourceAccess, SourceRoute } from '../shared/types.js';
+import { messageToolOperationId, MessageToolValidationError } from '../shared/message-tool.js';
+import type { Approval, AutoLinkIntent, AutoLinkRule, Binding, Conversation, Delivery, Endpoint, InboundMessage, Origin, Person, Platform, ReleRequest, SlackTranscriptMessage, SourceAccess, SourceRoute } from '../shared/types.js';
 
 type Row = Record<string, SQLOutputValue>;
 type BindingPolicy = Pick<Binding, 'allowAllSenders' | 'requireMention'>;
@@ -11,6 +12,7 @@ type BindingInput = { platform: Platform; endpointId: string; allowedSenderIds: 
 type DeliveryPart = Pick<Delivery, 'key' | 'ordinal' | 'kind' | 'body' | 'approvalId'>;
 type ApprovalInput = Omit<Approval, 'id' | 'status' | 'createdAt' | 'updatedAt'> & Partial<Pick<Approval, 'id' | 'status'>>;
 export interface SlackSyncStream {
+  platform: Platform;
   id: string; endpointId: string; conversationId: string; codexThreadId: string;
   accountId: string; chatId: string; threadId: string; active: boolean; paused: boolean;
   cursor?: string; coveredThrough?: string; scanUntil?: string; scanOldest?: string;
@@ -143,6 +145,17 @@ const MIGRATIONS = [String.raw`
   CREATE INDEX inbound_auto_link ON inbound_events(auto_link_intent_id);
 `, String.raw`
   INSERT OR IGNORE INTO meta(key,value) VALUES ('source-policy-version','1');
+`, String.raw`
+  CREATE TABLE tool_outbox (
+    id TEXT PRIMARY KEY NOT NULL, thread_id TEXT NOT NULL, call_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id), arguments TEXT NOT NULL CHECK(json_valid(arguments)),
+    origin TEXT NOT NULL CHECK(json_valid(origin)), body TEXT NOT NULL CHECK(length(body)>0),
+    mentions TEXT NOT NULL CHECK(json_valid(mentions) AND json_type(mentions)='array'),
+    status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','failed','uncertain','cancelled')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts>=0), remote_message_id TEXT, error TEXT, next_attempt_at TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(thread_id,call_id)
+  ) STRICT;
+  CREATE INDEX tool_outbox_pending ON tool_outbox(status,next_attempt_at);
 `];
 
 function required(value: string, label: string): void {
@@ -192,6 +205,13 @@ function toDelivery(r: Row): Delivery {
     status: r.status as Delivery['status'], attempts: r.attempts as number, remoteMessageId: optional(r.remote_message_id),
     error: optional(r.error), nextAttemptAt: optional(r.next_attempt_at), createdAt: r.created_at as string, updatedAt: r.updated_at as string };
 }
+function toToolDelivery(r: Row): Delivery {
+  return { id: r.id as string, operationId: r.id as string, conversationId: r.conversation_id as string,
+    nativeThreadId: r.thread_id as string, callId: r.call_id as string, mentions: json(r.mentions), origin: json(r.origin),
+    key: 'message', ordinal: 0, kind: 'message', body: r.body as string, status: r.status as Delivery['status'], attempts: r.attempts as number,
+    remoteMessageId: optional(r.remote_message_id), error: optional(r.error), nextAttemptAt: optional(r.next_attempt_at),
+    createdAt: r.created_at as string, updatedAt: r.updated_at as string };
+}
 function stableJson(value: unknown): string {
   return JSON.stringify(value, (_key, item: unknown) => item && typeof item === 'object' && !Array.isArray(item)
     ? Object.fromEntries(Object.keys(item).sort().map(key => [key, (item as Record<string, unknown>)[key]])) : item);
@@ -201,7 +221,7 @@ function slackMessageOrder(value: string): string {
   return match ? `${match[1].padStart(20, '0')}.${match[2].padEnd(12, '0')}` : value;
 }
 function toSlackSyncStream(r: Row): SlackSyncStream {
-  return { id: r.id as string, endpointId: r.endpoint_id as string, conversationId: r.conversation_id as string,
+  return { platform: r.platform as Platform ?? 'slack', id: r.id as string, endpointId: r.endpoint_id as string, conversationId: r.conversation_id as string,
     codexThreadId: r.codex_thread_id as string, accountId: r.account_id as string, chatId: r.chat_id as string,
     threadId: r.thread_id as string, active: !!r.active, paused: !!r.paused, cursor: optional(r.cursor),
     coveredThrough: optional(r.covered_through), scanUntil: optional(r.scan_until), scanOldest: optional(r.scan_oldest), state: r.state as SlackSyncStream['state'],
@@ -490,7 +510,7 @@ export class Store {
   }
   private sourceContextEnabled(endpointId: string): boolean { return this.getSourceAccess(endpointId).mode !== 'off'; }
   private sourceSyncStream(row: Row): SlackSyncStream {
-    const stream = toSlackSyncStream(row);
+    const stream = toSlackSyncStream({ ...row, platform: this.getEndpoint(row.endpoint_id as string)!.platform });
     if (stream.active && !this.sourceContextEnabled(stream.endpointId)) stream.active = false;
     return stream;
   }
@@ -559,7 +579,7 @@ export class Store {
   private ensureSlackSyncStreams(): void {
     const rows = this.db.prepare(`SELECT b.endpoint_id, b.conversation_id, c.thread_id AS codex_thread_id,
       e.account_id, e.chat_id, e.thread_id FROM bindings b JOIN endpoints e ON e.id=b.endpoint_id
-      JOIN conversations c ON c.id=b.conversation_id WHERE b.platform='slack'`).all();
+      JOIN conversations c ON c.id=b.conversation_id`).all();
     for (const row of rows) {
       if (!this.sourceContextEnabled(row.endpoint_id as string)) continue;
       const id = randomUUID();
@@ -568,10 +588,11 @@ export class Store {
         .run(id, row.endpoint_id, row.conversation_id, row.codex_thread_id, row.account_id, row.chat_id, row.thread_id);
       if (!inserted.changes) continue;
       // Existing receipts remain useful when upgrading, even before Slack backfill succeeds.
-      for (const receipt of this.db.prepare('SELECT payload,request_id FROM inbound_events WHERE endpoint_id=? ORDER BY rowid').all(row.endpoint_id)) {
+      for (const receipt of this.db.prepare('SELECT payload,request_id,created_at FROM inbound_events WHERE endpoint_id=? ORDER BY rowid').all(row.endpoint_id)) {
         const inbound = json<InboundMessage>(receipt.payload);
         if (inbound.control) continue;
-        const message = inbound.slack ?? { endpointId: inbound.endpoint.id, accountId: inbound.endpoint.accountId,
+        const message = inbound.slack ?? { platform: inbound.endpoint.platform, receivedAt: receipt.created_at as string | undefined,
+          participants: inbound.participants, endpointId: inbound.endpoint.id, accountId: inbound.endpoint.accountId,
           chatId: inbound.endpoint.chatId, threadId: inbound.endpoint.threadId, messageId: inbound.messageId,
           sender: inbound.sender, text: inbound.text, payload: { text: inbound.text, ...(inbound.audio ? { audio: inbound.audio } : {}) }, kind: 'message' as const };
         const requestId = optional(receipt.request_id);
@@ -584,13 +605,13 @@ export class Store {
     return this.transaction(() => {
       this.ensureSlackSyncStreams();
       return this.db.prepare(`SELECT s.*,c.paused,EXISTS(SELECT 1 FROM bindings b WHERE
-        b.platform='slack' AND b.endpoint_id=s.endpoint_id AND b.conversation_id=s.conversation_id) AS active
+        b.endpoint_id=s.endpoint_id AND b.conversation_id=s.conversation_id) AS active
         FROM slack_sync_streams s JOIN conversations c ON c.id=s.conversation_id ORDER BY s.rowid`).all().map(row => this.sourceSyncStream(row));
     });
   }
   getSlackSyncStream(id: string): SlackSyncStream | undefined {
     const row = this.db.prepare(`SELECT s.*,c.paused,EXISTS(SELECT 1 FROM bindings b WHERE
-      b.platform='slack' AND b.endpoint_id=s.endpoint_id AND b.conversation_id=s.conversation_id) AS active
+      b.endpoint_id=s.endpoint_id AND b.conversation_id=s.conversation_id) AS active
       FROM slack_sync_streams s JOIN conversations c ON c.id=s.conversation_id WHERE s.id=?`).get(id);
     return row ? this.sourceSyncStream(row) : undefined;
   }
@@ -619,13 +640,15 @@ export class Store {
     const id = randomUUID(); const now = new Date().toISOString();
     this.db.prepare(`INSERT INTO slack_sync_entries (id,stream_id,message_id,message_order,revision,message,request_id,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(stream_id,message_id,revision) DO UPDATE SET request_id=COALESCE(slack_sync_entries.request_id,excluded.request_id)`)
-      .run(id, streamId, message.messageId, slackMessageOrder(message.messageId), revision, JSON.stringify(message), requestId ?? null, now, now);
+      .run(id, streamId, message.messageId, slackMessageOrder(message.platform === 'telegram'
+        ? `${Math.floor(Date.parse(message.receivedAt ?? now) / 1000)}.${String(Date.parse(message.receivedAt ?? now) % 1000).padStart(3, '0')}000`
+        : message.messageId), revision, JSON.stringify(message), requestId ?? null, now, now);
     return toSlackSyncEntry(this.db.prepare('SELECT * FROM slack_sync_entries WHERE stream_id=? AND message_id=? AND revision=?').get(streamId, message.messageId, revision)!);
   }
   private recordSlackMessageInside(message: SlackTranscriptMessage, requestId?: string): SlackSyncEntry | undefined {
     this.ensureSlackSyncStreams();
     let row = this.db.prepare(`SELECT s.id,s.conversation_id FROM slack_sync_streams s JOIN bindings b
-      ON b.endpoint_id=s.endpoint_id AND b.conversation_id=s.conversation_id WHERE b.platform='slack' AND s.endpoint_id=?`).get(message.endpointId);
+      ON b.endpoint_id=s.endpoint_id AND b.conversation_id=s.conversation_id WHERE s.endpoint_id=?`).get(message.endpointId);
     if (!row && message.kind === 'deleted') {
       const prior = this.db.prepare(`SELECT s.id,s.conversation_id,e.message FROM slack_sync_entries e
         JOIN slack_sync_streams s ON s.id=e.stream_id JOIN bindings b ON b.endpoint_id=s.endpoint_id AND b.conversation_id=s.conversation_id
@@ -638,6 +661,7 @@ export class Store {
       }
     }
     if (!row || !this.sourceContextEnabled(message.endpointId)) return undefined;
+    if (!message.participants) message = { ...message, participants: this.rememberThreadParticipant(message.endpointId, message.sender, message.messageId) };
     const matchingRequest = requestId && this.getRequest(requestId)?.conversationId === row.conversation_id ? requestId : undefined;
     return this.writeSlackSyncEntry(row.id as string, message, matchingRequest);
   }
@@ -714,10 +738,59 @@ export class Store {
       return { duplicate: true, requestId };
     }
     this.writeEndpoint(endpoint);
+    const now = new Date().toISOString();
+    const participants = message.control ? undefined : this.rememberThreadParticipant(endpoint.id, message.sender, message.messageId);
+    const saved = { ...message, ...(participants ? { participants } : {}),
+      ...(message.slack ? { slack: { ...message.slack, participants } } : {}) };
     this.db.prepare('INSERT INTO inbound_events (platform,account_id,event_id,endpoint_id,payload,created_at) VALUES (?,?,?,?,?,?)')
-      .run(endpoint.platform, endpoint.accountId, message.eventId, endpoint.id, JSON.stringify(message), new Date().toISOString());
-    if (message.slack) this.recordSlackMessageInside(message.slack);
+      .run(endpoint.platform, endpoint.accountId, message.eventId, endpoint.id, JSON.stringify(saved), now);
+    if (!message.control) this.recordSlackMessageInside(saved.slack ?? { platform: endpoint.platform, receivedAt: now,
+      endpointId: endpoint.id, accountId: endpoint.accountId, chatId: endpoint.chatId, threadId: endpoint.threadId,
+      messageId: message.messageId, sender: message.sender, participants, text: message.text,
+      payload: { text: message.text, ...(message.audio ? { audio: message.audio } : {}) }, kind: 'message' });
     return { duplicate: false };
+  }
+
+  /** Only observed authors of this source thread; never the channel-member catalog. */
+  rememberThreadParticipant(endpointId: string, sender: Person, messageId: string): Person[] {
+    const endpoint = this.getEndpoint(endpointId);
+    if (!endpoint) throw new Error('Participant source not found');
+    const order = (id: string) => endpoint.platform === 'telegram' && /^\d+$/u.test(id) ? id.padStart(30, '0') : slackMessageOrder(id);
+    const key = `thread-participants:${endpointId}`;
+    const stored = this.getMeta(key);
+    const people = new Map<string, { person: Person; first: string }>(stored ? JSON.parse(stored) : []);
+    const observe = (person: Person, id: string) => {
+      if (person.id === 'slack:unknown') return;
+      const previous = people.get(person.id);
+      people.set(person.id, { person: { ...person, ...(previous?.person.isBot ? { isBot: true } : {}) },
+        first: previous && previous.first < order(id) ? previous.first : order(id) });
+    };
+    if (!stored) {
+      for (const row of this.db.prepare('SELECT payload FROM inbound_events WHERE endpoint_id=? ORDER BY rowid').all(endpointId)) {
+        const old = json<InboundMessage>(row.payload);
+        if (!old.control) observe(old.sender, old.messageId);
+      }
+      for (const row of this.db.prepare('SELECT message FROM slack_sync_entries WHERE stream_id IN (SELECT id FROM slack_sync_streams WHERE endpoint_id=?) ORDER BY rowid').all(endpointId)) {
+        const old = json<SlackTranscriptMessage>(row.message);
+        if (old.kind !== 'deleted') observe(old.sender, old.messageId);
+      }
+    }
+    observe(sender, messageId);
+    this.setMeta(key, JSON.stringify([...people]));
+    return [...people.values()].filter(person => person.first <= order(messageId)).map(person => ({ ...person.person }));
+  }
+  getThreadParticipants(endpointId: string): Person[] {
+    const stored = this.getMeta(`thread-participants:${endpointId}`);
+    if (stored) return (JSON.parse(stored) as Array<[string, { person: Person }]>).map(([, value]) => ({ ...value.person }));
+    const people = new Map<string, Person>();
+    const observe = (person: Person) => {
+      if (person.id !== 'slack:unknown') people.set(person.id, { ...person, ...(people.get(person.id)?.isBot ? { isBot: true } : {}) });
+    };
+    for (const row of this.db.prepare('SELECT payload FROM inbound_events WHERE endpoint_id=? ORDER BY rowid').all(endpointId)) {
+      const message = json<InboundMessage>(row.payload); if (!message.control) observe(message.sender);
+    }
+    for (const row of this.db.prepare('SELECT message FROM slack_sync_entries WHERE stream_id IN (SELECT id FROM slack_sync_streams WHERE endpoint_id=?) ORDER BY rowid').all(endpointId)) observe(json<SlackTranscriptMessage>(row.message).sender);
+    return [...people.values()];
   }
   recordInbound(message: InboundMessage): { duplicate: boolean } {
     return this.transaction(() => ({ duplicate: this.recordEvent(message).duplicate }));
@@ -735,7 +808,9 @@ export class Store {
     if (message.contextOnly || message.control || message.slack && message.slack.kind !== 'message') return false;
     if (!group && (this.isBotMessage(message) || endpoint.platform === 'telegram' && message.sender.id !== endpoint.chatId)) return false;
     if (all) {
-      const stable = endpoint.platform === 'slack' ? /^[UW][A-Z0-9]+$/u.test(message.sender.id) : /^\d+$/u.test(message.sender.id);
+      const stable = endpoint.platform === 'slack'
+        ? /^[UW][A-Z0-9]+$/u.test(message.sender.id) || message.sender.isBot === true && /^bot:B[A-Z0-9]+$/u.test(message.sender.id)
+        : /^\d+$/u.test(message.sender.id);
       const self = message.sender.id === (endpoint.platform === 'slack' ? endpoint.accountId.split(':').at(-1) : endpoint.accountId);
       return stable && !self && message.sender.id !== 'USLACKBOT' && (!policy.requireMention || message.directMention === true);
     }
@@ -754,12 +829,18 @@ export class Store {
   private writeRequest(message: InboundMessage, binding: Binding): ReleRequest {
     const endpoint = message.endpoint;
     const now = new Date().toISOString();
+    const receipt = this.db.prepare('SELECT payload FROM inbound_events WHERE platform=? AND account_id=? AND event_id=?')
+      .get(endpoint.platform, endpoint.accountId, message.eventId)!;
+    const saved = json<InboundMessage>(receipt.payload);
     const origin: Origin = { platform: endpoint.platform, accountId: endpoint.accountId, endpointId: endpoint.id,
-      chatId: endpoint.chatId, threadId: endpoint.threadId, senderId: message.sender.id, senderName: message.sender.name, messageId: message.messageId };
+      chatId: endpoint.chatId, threadId: endpoint.threadId, senderId: saved.sender.id, senderName: saved.sender.name,
+      senderIsBot: saved.sender.isBot, participants: saved.participants, messageId: message.messageId };
     const id = randomUUID();
     this.db.prepare(`INSERT INTO requests (id,conversation_id,event_id,origin,text,audio,status,created_at,updated_at) VALUES (?,?,?,?,?,?,'queued',?,?)`)
       .run(id, binding.conversationId, message.eventId, JSON.stringify(origin), message.text, message.audio ? JSON.stringify(message.audio) : null, now, now);
     if (message.slack) this.recordSlackMessageInside(message.slack, id);
+    else this.db.prepare(`UPDATE slack_sync_entries SET request_id=? WHERE message_id=? AND stream_id IN
+      (SELECT id FROM slack_sync_streams WHERE endpoint_id=? AND conversation_id=?)`).run(id, message.messageId, endpoint.id, binding.conversationId);
     this.db.prepare('UPDATE inbound_events SET request_id=? WHERE platform=? AND account_id=? AND event_id=?').run(id, endpoint.platform, endpoint.accountId, message.eventId);
     return this.getRequest(id)!;
   }
@@ -883,12 +964,16 @@ export class Store {
 
   getRequest(id: string): ReleRequest | undefined {
     const row = this.db.prepare('SELECT * FROM requests WHERE id=?').get(id);
-    return row ? toRequest(row) : undefined;
+    return row ? this.requestFromRow(row) : undefined;
   }
-  listRequests(limit = 100): ReleRequest[] { return this.db.prepare('SELECT * FROM requests ORDER BY rowid DESC LIMIT ?').all(limitValue(limit)).map(toRequest); }
-  listPendingRequests(): ReleRequest[] { return this.db.prepare("SELECT * FROM requests WHERE status='queued' ORDER BY rowid").all().map(toRequest); }
+  private requestFromRow(row: Row): ReleRequest {
+    const request = toRequest(row);
+    return this.getMeta(`suppressed-final:${request.id}`) ? { ...request, suppressedFinal: true } : request;
+  }
+  listRequests(limit = 100): ReleRequest[] { return this.db.prepare('SELECT * FROM requests ORDER BY rowid DESC LIMIT ?').all(limitValue(limit)).map(row => this.requestFromRow(row)); }
+  listPendingRequests(): ReleRequest[] { return this.db.prepare("SELECT * FROM requests WHERE status='queued' ORDER BY rowid").all().map(row => this.requestFromRow(row)); }
   activeRequests(): ReleRequest[] {
-    return this.db.prepare(`SELECT * FROM requests WHERE status IN ('queued',${BLOCKING_REQUESTS}) ORDER BY rowid`).all().map(toRequest);
+    return this.db.prepare(`SELECT * FROM requests WHERE status IN ('queued',${BLOCKING_REQUESTS}) ORDER BY rowid`).all().map(row => this.requestFromRow(row));
   }
   claimNextRequest(conversationId: string, requestId?: string): ReleRequest | undefined {
     return this.transaction(() => {
@@ -940,7 +1025,7 @@ export class Store {
       }
       return result;
   }
-  finishRequest(id: string, patch: { status: 'completed' | 'failed' | 'interrupted' | 'cancelled'; error?: string; turnId?: string }, parts: DeliveryPart[]): ReleRequest {
+  finishRequest(id: string, patch: { status: 'completed' | 'failed' | 'interrupted' | 'cancelled'; error?: string; turnId?: string }, parts: DeliveryPart[], suppressedFinal = false): ReleRequest {
     allowedPatch(patch, ['status', 'error', 'turnId']);
     if (!['completed', 'failed', 'interrupted', 'cancelled'].includes(patch.status)) throw new Error('Finishing a request requires a terminal status');
     return this.transaction(() => {
@@ -948,6 +1033,10 @@ export class Store {
       if (!current) throw new Error('Request not found');
       const next = { ...current, ...patch };
       const now = new Date().toISOString();
+      if (suppressedFinal) {
+        if (next.status !== 'completed' || parts.length) throw new Error('Only a successful final reply may be suppressed');
+        this.setMeta(`suppressed-final:${id}`, JSON.stringify({ reason: 'NOREPLY', turnId: next.turnId, at: now }));
+      }
       this.db.prepare('UPDATE requests SET status=?,turn_id=?,error=?,updated_at=? WHERE id=?').run(next.status, next.turnId ?? null, next.error ?? null, now, id);
       this.db.prepare("UPDATE approvals SET status='expired',updated_at=? WHERE request_id=? AND status='pending'").run(now, id);
       this.db.prepare("UPDATE deliveries SET status='cancelled',updated_at=? WHERE request_id=? AND kind='approval' AND status IN ('pending','failed')").run(now, id);
@@ -957,9 +1046,42 @@ export class Store {
   }
   getDelivery(id: string): Delivery | undefined {
     const row = this.db.prepare('SELECT * FROM deliveries WHERE id=?').get(id);
-    return row ? toDelivery(row) : undefined;
+    if (row) return toDelivery(row);
+    const tool = this.db.prepare('SELECT * FROM tool_outbox WHERE id=?').get(id);
+    return tool ? toToolDelivery(tool) : undefined;
   }
-  listDeliveries(limit = 100): Delivery[] { return this.db.prepare('SELECT * FROM deliveries ORDER BY rowid DESC LIMIT ?').all(limitValue(limit)).map(toDelivery); }
+  listDeliveries(limit = 100): Delivery[] {
+    const count = limitValue(limit);
+    return [...this.db.prepare('SELECT * FROM deliveries ORDER BY rowid DESC LIMIT ?').all(count).map(toDelivery),
+      ...this.db.prepare('SELECT * FROM tool_outbox ORDER BY rowid DESC LIMIT ?').all(count).map(toToolDelivery)]
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt)).slice(0, count);
+  }
+  toolMessageForCall(threadId: string, callId: string, args: unknown): Delivery | undefined {
+    const row = this.db.prepare('SELECT * FROM tool_outbox WHERE thread_id=? AND call_id=?').get(threadId, callId);
+    if (!row) return undefined;
+    if (row.arguments !== stableJson(args)) throw new MessageToolValidationError('call_conflict');
+    return toToolDelivery(row);
+  }
+  toolMessageStatus(threadId: string, operationId: string): Delivery | undefined {
+    const row = this.db.prepare('SELECT * FROM tool_outbox WHERE thread_id=? AND id=?').get(threadId, operationId);
+    return row ? toToolDelivery(row) : undefined;
+  }
+  addToolMessage(input: { threadId: string; callId: string; conversationId: string; origin: Origin; arguments: unknown; text: string; mentions: Person[] }): Delivery {
+    return this.transaction(() => {
+      const existing = this.toolMessageForCall(input.threadId, input.callId, input.arguments);
+      if (existing) return existing;
+      required(input.threadId, 'Native thread'); required(input.callId, 'Tool call'); required(input.text, 'Message text');
+      if ([...input.text].length > 3000 || this.getConversation(input.conversationId)?.threadId !== input.threadId) throw new Error('Invalid tool message target or text');
+      const endpoint = this.getEndpoint(input.origin.endpointId);
+      if (!endpoint || endpoint.platform !== input.origin.platform || endpoint.accountId !== input.origin.accountId
+        || endpoint.chatId !== input.origin.chatId || endpoint.threadId !== input.origin.threadId) throw new Error('Invalid tool message origin');
+      const id = messageToolOperationId(input.threadId, input.callId), now = new Date().toISOString();
+      this.db.prepare(`INSERT INTO tool_outbox (id,thread_id,call_id,conversation_id,arguments,origin,body,mentions,status,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,'pending',?,?)`).run(id, input.threadId, input.callId, input.conversationId, stableJson(input.arguments),
+          JSON.stringify(input.origin), input.text, JSON.stringify(input.mentions), now, now);
+      return this.getDelivery(id)!;
+    });
+  }
   findReplyApproval(origin: Pick<Origin, 'platform' | 'accountId' | 'chatId' | 'threadId'>, remoteMessageId: string): Approval | undefined {
     const row = this.db.prepare(`SELECT a.* FROM deliveries d JOIN approvals a ON a.id=d.approval_id
       WHERE d.kind='approval' AND d.status='sent' AND d.remote_message_id=?
@@ -980,25 +1102,32 @@ export class Store {
   claimDelivery(now: string | number | Date = new Date()): Delivery | undefined {
     const timestamp = new Date(now).toISOString();
     return this.transaction(() => {
-      const row = this.db.prepare(`SELECT d.id FROM deliveries d WHERE d.status='pending'
+      const row = this.db.prepare(`SELECT d.id,d.created_at FROM deliveries d WHERE d.status='pending'
         AND (d.next_attempt_at IS NULL OR d.next_attempt_at<=?)
         AND NOT EXISTS(SELECT 1 FROM deliveries earlier WHERE earlier.request_id=d.request_id AND earlier.rowid<d.rowid AND earlier.status NOT IN ('sent','cancelled'))
         ORDER BY d.rowid LIMIT 1`).get(timestamp);
-      if (!row) return undefined;
-      const id = row.id as string;
-      this.db.prepare("UPDATE deliveries SET status='sending',attempts=attempts+1,updated_at=? WHERE id=?").run(timestamp, id);
+      const tool = this.db.prepare("SELECT id,created_at FROM tool_outbox WHERE status='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?) ORDER BY rowid LIMIT 1").get(timestamp);
+      if (!row && !tool) return undefined;
+      const useTool = !!tool && (!row || String(tool.created_at) < String(row.created_at));
+      const id = (useTool ? tool! : row!).id as string;
+      this.db.prepare(`UPDATE ${useTool ? 'tool_outbox' : 'deliveries'} SET status='sending',attempts=attempts+1,updated_at=? WHERE id=?`).run(timestamp, id);
       return this.getDelivery(id)!;
     });
   }
-  updateDelivery(id: string, patch: Partial<Pick<Delivery, 'status' | 'remoteMessageId' | 'error' | 'nextAttemptAt'>>): Delivery {
+  updateDelivery(id: string, patch: Partial<Pick<Delivery, 'status' | 'remoteMessageId' | 'error' | 'nextAttemptAt'>>, ownReceipt?: InboundMessage): Delivery {
     allowedPatch(patch, ['status', 'remoteMessageId', 'error', 'nextAttemptAt']);
     return this.transaction(() => {
       const current = this.getDelivery(id);
       if (!current) throw new Error('Delivery not found');
       const next = { ...current, ...patch };
       const nextAttemptAt = next.nextAttemptAt === undefined ? null : new Date(next.nextAttemptAt).toISOString();
-      this.db.prepare('UPDATE deliveries SET status=?,remote_message_id=?,error=?,next_attempt_at=?,updated_at=? WHERE id=?')
+      this.db.prepare(`UPDATE ${current.kind === 'message' ? 'tool_outbox' : 'deliveries'} SET status=?,remote_message_id=?,error=?,next_attempt_at=?,updated_at=? WHERE id=?`)
         .run(next.status, next.remoteMessageId ?? null, next.error ?? null, nextAttemptAt, new Date().toISOString(), id);
+      if (ownReceipt) {
+        if (current.kind !== 'message' || next.status !== 'sent' || !ownReceipt.contextOnly || ownReceipt.sender.id !== current.origin.senderId
+          || ownReceipt.endpoint.id !== current.origin.endpointId || ownReceipt.messageId !== next.remoteMessageId) throw new Error('Invalid own delivery receipt');
+        this.recordEvent(ownReceipt);
+      }
       return this.getDelivery(id)!;
     });
   }
@@ -1047,7 +1176,8 @@ export class Store {
       const execution = this.db.prepare("UPDATE requests SET status='uncertain',error=COALESCE(error,'Execution interrupted; reconcile with Codex before retrying'),updated_at=? WHERE status IN ('starting','running')").run(now);
       const transcription = this.db.prepare("UPDATE requests SET status='queued',updated_at=? WHERE status='transcribing'").run(now);
       const deliveries = this.db.prepare("UPDATE deliveries SET status='uncertain',error=COALESCE(error,'Delivery interrupted; verify receipt before retrying'),updated_at=? WHERE status='sending'").run(now);
-      return { requests: Number(execution.changes) + Number(transcription.changes), deliveries: Number(deliveries.changes) };
+      const tool = this.db.prepare("UPDATE tool_outbox SET status='uncertain',error=COALESCE(error,'Delivery interrupted; verify receipt before retrying'),updated_at=? WHERE status='sending'").run(now);
+      return { requests: Number(execution.changes) + Number(transcription.changes), deliveries: Number(deliveries.changes) + Number(tool.changes) };
     });
   }
   getMeta(key: string): string | undefined {

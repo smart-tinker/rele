@@ -32,6 +32,27 @@ function fixture() {
 }
 
 describe('durable Slack passive sync', () => {
+  it('projects observed Telegram context with attribution and no history fetch or model task', async () => {
+    const f = fixture();
+    await f.sync.backfill();
+    const endpoint: Endpoint = { ...f.endpoint, id: 'telegram-topic', platform: 'telegram', accountId: '99', chatId: '-100', threadId: '7', people: [] };
+    f.store.upsertEndpoint(endpoint);
+    f.store.addBinding(f.conversation.id, 'telegram', endpoint.id, ['1']);
+    const sender = { id: '2', name: 'Other agent', isBot: true };
+    f.store.ingest({ eventId: 'tg-passive', endpoint, sender, messageId: '20', text: '@One @Two original body', contextOnly: true });
+    expect(f.store.listRequests()).toEqual([]);
+    const reads = f.readThreadPage.mock.calls.length;
+    expect(await f.sync.drain(f.conversation.id)).toBe(true);
+    expect(f.readThreadPage).toHaveBeenCalledTimes(reads);
+    expect(f.codex.injectContext).toHaveBeenCalledOnce();
+    const text = f.codex.injectContext.mock.calls[0][2];
+    expect(text).toContain('Источник Rele: {"platform":"telegram"');
+    expect(text).toContain('"id":"2","name":"Other agent","type":"bot"');
+    expect(text).toContain('@One @Two original body');
+    expect(text).toContain('не новый запрос');
+    expect(f.store.listRequests()).toEqual([]);
+  });
+
   it('never imports a native Stop receipt as a phantom message when binding a new stream', async () => {
     const f = fixture();
     f.trigger(f.message('110.000000', 'Real Slack message'));

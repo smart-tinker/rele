@@ -66,7 +66,7 @@ describe('multiple origin bindings and v5 migration', () => {
     const entries = store.listSlackSyncEntries(streams[0].id);
     store.close();
     const old = new DatabaseSync(file);
-    old.exec(`CREATE TABLE bindings_v4 (
+    old.exec(`DROP TABLE tool_outbox; CREATE TABLE bindings_v4 (
       id TEXT PRIMARY KEY NOT NULL, conversation_id TEXT NOT NULL REFERENCES conversations(id),
       platform TEXT NOT NULL CHECK(platform IN ('slack','telegram')), endpoint_id TEXT NOT NULL UNIQUE,
       allowed_sender_ids TEXT NOT NULL CHECK(json_valid(allowed_sender_ids) AND json_type(allowed_sender_ids)='array'),
@@ -91,7 +91,7 @@ describe('multiple origin bindings and v5 migration', () => {
     expect(upgraded.getConversation(original.id)?.bindings).toHaveLength(4);
     expect(upgraded.getConversation(original.id)?.threadId).toBe('native-original');
     const check = new DatabaseSync(file);
-    expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(6);
+    expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(7);
     expect(check.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(check.prepare('PRAGMA quick_check').get()?.quick_check).toBe('ok');
     check.close();
@@ -381,14 +381,14 @@ describe('source access and routing', () => {
     const access = store.getSourceAccess(ep.id);
     store.close();
     const old = new DatabaseSync(file);
-    old.exec("DELETE FROM meta WHERE key='source-policy-version'; PRAGMA user_version=5;"); old.close();
+    old.exec("DROP TABLE tool_outbox; DELETE FROM meta WHERE key='source-policy-version'; PRAGMA user_version=5;"); old.close();
     const upgraded = open(file);
     expect(upgraded.getConversation(conversation.id)).toEqual(conversation);
     expect(upgraded.getRequest(accepted.id)).toEqual(accepted);
     expect(upgraded.getSourceAccess(ep.id)).toEqual(access);
     expect(upgraded.getMeta('source-policy-version')).toBe('1');
     const check = new DatabaseSync(file);
-    expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(6);
+    expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(7);
     expect(check.prepare('PRAGMA foreign_key_check').all()).toEqual([]); check.close();
     expect(upgraded.ingest(message(ep, 'still-off')).request).toBeNull();
   });

@@ -32,6 +32,7 @@ internal sealed class ProcessHost : IDisposable
     private readonly ManualResetEvent stopRequested = new ManualResetEvent(false);
     private string relayFailure;
     private bool websocketOwner;
+    private DesktopToolsPipe desktopTools;
     private uint childPid;
     private string childStartedAt;
 
@@ -112,6 +113,8 @@ internal sealed class ProcessHost : IDisposable
                 using (var hash = SHA256.Create())
                     if (BitConverter.ToString(hash.ComputeHash(native)).Replace("-", "").ToLowerInvariant() != owner.ExecutableSha256)
                         throw new InvalidOperationException("native executable changed before launch");
+                try { host.desktopTools = new DesktopToolsPipe(Path.GetFileName(directory), host.IsNativeChild); }
+                catch { Report("Desktop app-tools relay unavailable"); }
                 host.Start(new[] { "--", owner.Executable, "-c", "features.code_mode_host=true", "app-server", "--listen", owner.Endpoint });
                 WriteOwnerReceipt(json, directory, owner, host.childPid, host.childStartedAt, null);
                 host.WaitForStop();
@@ -180,6 +183,7 @@ internal sealed class ProcessHost : IDisposable
         IntPtr errorOutput = IntPtr.Zero;
         IntPtr attributeList = IntPtr.Zero;
         IntPtr handleList = IntPtr.Zero;
+        IntPtr environment = IntPtr.Zero;
         bool attributeListInitialized = false;
         try
         {
@@ -229,9 +233,10 @@ internal sealed class ProcessHost : IDisposable
             }
             if (commandLine.Length >= 32767) throw new InvalidOperationException("child command line is too long");
             ProcessInformation created;
-            // Inherit the environment and working directory unchanged. No shell is involved.
+            // Only the independent native child receives the stable relay address; Desktop and this owner keep their environment.
+            if (websocketOwner) environment = NativeEnvironment(desktopTools == null ? null : desktopTools.PipePath);
             if (!CreateProcess(null, commandLine, IntPtr.Zero, IntPtr.Zero, true,
-                CreateSuspended | ExtendedStartupInfoPresent | CreateNoWindow, IntPtr.Zero, null, ref startup, out created))
+                CreateSuspended | ExtendedStartupInfoPresent | CreateNoWindow | (environment == IntPtr.Zero ? 0u : 0x400u), environment, null, ref startup, out created))
                 throw Failure("create suspended child");
             process = created.Process;
             primaryThread = created.Thread;
@@ -247,6 +252,7 @@ internal sealed class ProcessHost : IDisposable
             if (attributeListInitialized) DeleteProcThreadAttributeList(attributeList);
             if (attributeList != IntPtr.Zero) Marshal.FreeHGlobal(attributeList);
             if (handleList != IntPtr.Zero) Marshal.FreeHGlobal(handleList);
+            if (environment != IntPtr.Zero) Marshal.FreeHGlobal(environment);
             Close(ref inputRead);
             Close(ref inputWrite);
             Close(ref output);
@@ -366,7 +372,26 @@ internal sealed class ProcessHost : IDisposable
         Close(ref process);
         Close(ref job);
         if (childInput != null) childInput.Dispose();
+        if (desktopTools != null) desktopTools.Dispose();
         // A background relay may be blocked reading the parent's pipe. Process exit closes it without waiting.
+    }
+
+    private bool IsNativeChild(SafeFileHandle candidate)
+    {
+        bool member;
+        return job != IntPtr.Zero && IsProcessInJob(candidate, job, out member) && member;
+    }
+
+    private static IntPtr NativeEnvironment(string pipe)
+    {
+        var values = new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (System.Collections.DictionaryEntry entry in Environment.GetEnvironmentVariables()) values[(string)entry.Key] = (string)entry.Value;
+        values.Remove("CODEX_APP_TOOLS_PIPE_PATH");
+        if (pipe != null) values.Add("CODEX_APP_TOOLS_PIPE_PATH", pipe);
+        var block = new StringBuilder();
+        foreach (var entry in values) block.Append(entry.Key).Append('=').Append(entry.Value).Append('\0');
+        block.Append('\0');
+        return Marshal.StringToHGlobalUni(block.ToString());
     }
 
     private static IntPtr InheritableStandardHandle(int kind)
@@ -459,6 +484,7 @@ internal sealed class ProcessHost : IDisposable
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern IntPtr CreateJobObject(IntPtr attributes, string name);
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool SetInformationJobObject(IntPtr job, int type, ref ExtendedLimits info, uint size);
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool IsProcessInJob(SafeFileHandle process, IntPtr job, out bool member);
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool QueryInformationJobObject(IntPtr job, int type, out BasicAccounting info, uint size, IntPtr returnedLength);
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool CreatePipe(out IntPtr read, out IntPtr write, ref SecurityAttributes attributes, uint size);

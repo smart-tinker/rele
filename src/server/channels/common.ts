@@ -12,6 +12,7 @@ export interface ApprovalAction {
   chatId: string;
   threadId?: string;
   senderId: string;
+  senderIsBot?: boolean;
 }
 
 export interface ChannelCallbacks {
@@ -23,9 +24,11 @@ export interface ChannelCallbacks {
 
 export interface Channel {
   state: ConnectionState;
+  identity?: Person;
   start(): Promise<void>;
   stop(): Promise<void>;
   deliver(delivery: Delivery, approval?: Approval): Promise<string>;
+  deliveryText?(delivery: Delivery): string;
   download(audio: AudioAttachment, file: string): Promise<void>;
   listChats?(cursor?: string): Promise<CatalogPage<CatalogChat>>;
   listThreads?(chatId: string, cursor?: string): Promise<CatalogPage<Endpoint>>;

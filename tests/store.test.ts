@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
 import { Store } from '../src/server/store.js';
+import { messageToolOperationId } from '../src/shared/message-tool.js';
 import type { Approval, Delivery, Endpoint, InboundMessage, ReleRequest, SlackTranscriptMessage } from '../src/shared/types.js';
 
 const directories: string[] = [];
@@ -47,6 +48,32 @@ afterEach(() => {
 });
 
 describe('Store inbox and bindings', () => {
+  it('snapshots only observed authors of this thread, preserving old snapshots across replay and restart', () => {
+    const path = join(directory(), 'participants.sqlite');
+    const store = open(path);
+    const ep = endpoint({ people: [{ id: 'CHANNEL', name: 'Channel member' }] });
+    conversation(store, ep);
+    const first = store.ingest(message(ep, 'first', { messageId: '10.000001', text: '<@BOT> original', sender: { id: 'user-1', name: 'Alex', isBot: false } })).request!;
+    expect(first.origin.participants).toEqual([{ id: 'user-1', name: 'Alex', isBot: false }]);
+    store.recordInbound(message(ep, 'later', { messageId: '30.000001', sender: { id: 'BOT', name: 'Agent', isBot: true } }));
+    const second = store.ingest(message(ep, 'second', { messageId: '40.000001' })).request!;
+    expect(second.origin.participants?.map(person => person.id)).toEqual(['user-1', 'BOT']);
+    store.recordSlackMessage({ endpointId: ep.id, accountId: ep.accountId, chatId: ep.chatId, threadId: ep.threadId,
+      messageId: '5.000001', sender: { id: 'OLD', name: 'Old participant', isBot: true }, text: 'backfill', payload: {}, kind: 'message' });
+    expect(store.getRequest(first.id)?.origin.participants).toEqual(first.origin.participants);
+    expect(store.getRequest(first.id)?.text).toBe('<@BOT> original');
+    const stream = store.listSlackSyncStreams()[0];
+    expect(store.listSlackSyncEntries(stream.id).find(entry => entry.messageId === '5.000001')?.message.participants?.map(person => person.id)).toEqual(['OLD']);
+    store.upsertEndpoint({ ...ep, people: [{ id: 'OTHER', name: 'Another channel member' }] });
+    expect(store.ingest(message(ep, 'first', { sender: { id: 'FORGED', name: 'Changed replay', isBot: true } })).request?.origin).toEqual(first.origin);
+    const another = { ...ep, id: 'another-thread', threadId: 'different' };
+    store.recordInbound(message(another, 'other-thread', { sender: { id: 'STRANGER', name: 'Other thread' } }));
+    expect(store.rememberThreadParticipant(ep.id, { id: 'user-1', name: 'Alex' }, '50.000001').map(person => person.id)).toEqual(['user-1', 'BOT', 'OLD']);
+    expect(store.rememberThreadParticipant(ep.id, { id: 'slack:unknown', name: 'Unknown sender' }, '60.000001').map(person => person.id)).toEqual(['user-1', 'BOT', 'OLD']);
+    store.close();
+    expect(open(path).getRequest(first.id)?.origin).toEqual(first.origin);
+  });
+
   it('deduplicates by platform, account and event, preserving the original request', () => {
     const store = open();
     const slack = endpoint();
@@ -153,6 +180,47 @@ describe('Store inbox and bindings', () => {
 });
 
 describe('Store queues and approvals', () => {
+  it('keeps tool messages independent, deduplicated and scoped across a crash without replaying an uncertain send', () => {
+    const path = join(directory(), 'tool-outbox.sqlite'), store = open(path), ep = endpoint();
+    const conv = conversation(store, ep);
+    const input = { threadId: conv.threadId, callId: 'native-call', conversationId: conv.id,
+      origin: { platform: ep.platform, accountId: ep.accountId, endpointId: ep.id, chatId: ep.chatId, threadId: ep.threadId,
+        senderId: 'OWNBOT', senderName: 'Own agent', senderIsBot: true, messageId: '' }, arguments: { endpointId: ep.id, text: 'Work', mentionIds: [] }, text: 'Work', mentions: [] };
+    const message = store.addToolMessage(input);
+    expect(message).toMatchObject({ id: messageToolOperationId(conv.threadId, 'native-call'), kind: 'message', status: 'pending', operationId: message.id });
+    expect(message.requestId).toBeUndefined();
+    expect(store.listRequests()).toEqual([]);
+    expect(store.addToolMessage({ ...input, arguments: { mentionIds: [], text: 'Work', endpointId: ep.id } }).id).toBe(message.id);
+    expect(() => store.addToolMessage({ ...input, arguments: { ...input.arguments, text: 'Different' }, text: 'Different' })).toThrow(/другими аргументами/);
+    expect(store.toolMessageStatus('foreign-thread', message.id)).toBeUndefined();
+    expect(store.claimDelivery()).toMatchObject({ id: message.id, kind: 'message', status: 'sending', attempts: 1 });
+    store.close();
+    const restarted = open(path);
+    expect(restarted.recoverInterrupted()).toEqual({ requests: 0, deliveries: 1 });
+    expect(restarted.claimDelivery()).toBeUndefined();
+    expect(restarted.addToolMessage(input)).toMatchObject({ id: message.id, status: 'uncertain', attempts: 1 });
+    expect(restarted.listDeliveries()).toHaveLength(1);
+  });
+
+  it('commits a confirmed own Telegram post and its passive receipt atomically', () => {
+    const store = open(), ep = endpoint({ id: 'telegram-own', platform: 'telegram', accountId: '999', chatId: '-100', threadId: '7' });
+    const conv = conversation(store, ep), sender = { id: '999', name: 'Own agent', isBot: true };
+    const operation = store.addToolMessage({ threadId: conv.threadId, callId: 'own-post', conversationId: conv.id,
+      origin: { platform: 'telegram', accountId: ep.accountId, endpointId: ep.id, chatId: ep.chatId, threadId: ep.threadId,
+        senderId: sender.id, senderName: sender.name, senderIsBot: true, messageId: '' }, arguments: {}, text: 'Report', mentions: [] });
+    store.claimDelivery();
+    const ownReceipt: InboundMessage = { eventId: `tool-outgoing:${operation.id}`, endpoint: ep, sender, messageId: '500', text: 'Report', contextOnly: true };
+    expect(() => store.updateDelivery(operation.id, { status: 'sent', remoteMessageId: '500' }, { ...ownReceipt, text: undefined as unknown as string })).toThrow();
+    expect(store.getDelivery(operation.id)?.status).toBe('sending');
+    expect(store.listSlackSyncStreams().flatMap(stream => store.listSlackSyncEntries(stream.id))).toEqual([]);
+    store.updateDelivery(operation.id, { status: 'sent', remoteMessageId: '500' }, ownReceipt);
+    expect(store.getDelivery(operation.id)?.status).toBe('sent');
+    expect(store.listRequests()).toEqual([]);
+    expect(store.listSlackSyncStreams().flatMap(stream => store.listSlackSyncEntries(stream.id))).toEqual([
+      expect.objectContaining({ message: expect.objectContaining({ text: 'Report', sender }), state: 'pending' }),
+    ]);
+  });
+
   it('claims requests in FIFO order across connections and only blocks the affected conversation', () => {
     const path = join(directory(), 'rele.sqlite');
     const store = open(path);
@@ -374,7 +442,7 @@ describe('Store durability and recovery', () => {
     const check = new DatabaseSync(path);
     try {
       expect(check.prepare('PRAGMA journal_mode').get()?.journal_mode).toBe('wal');
-      expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(6);
+      expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(7);
       expect(check.prepare('PRAGMA quick_check').get()?.quick_check).toBe('ok');
       expect(check.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     } finally { check.close(); }
@@ -388,7 +456,7 @@ describe('Store durability and recovery', () => {
     original.setMeta('endpoint-alias:slack-1', 'Мой разговор');
     original.close();
     const old = new DatabaseSync(path);
-    old.exec('DROP INDEX inbound_auto_link; ALTER TABLE inbound_events DROP COLUMN auto_link_intent_id; DROP TABLE auto_link_intents; DROP TABLE slack_sync_entries; DROP TABLE slack_sync_streams; ALTER TABLE endpoints DROP COLUMN catalog; PRAGMA user_version = 2;');
+    old.exec('DROP TABLE tool_outbox; DROP INDEX inbound_auto_link; ALTER TABLE inbound_events DROP COLUMN auto_link_intent_id; DROP TABLE auto_link_intents; DROP TABLE slack_sync_entries; DROP TABLE slack_sync_streams; ALTER TABLE endpoints DROP COLUMN catalog; PRAGMA user_version = 2;');
     old.close();
     const upgraded = open(path);
     expect(upgraded.getConversation(conv.id)).toEqual(conv);
@@ -446,7 +514,7 @@ describe('durable Slack transcript sync', () => {
     const original = request(oldStore);
     oldStore.close();
     const old = new DatabaseSync(path);
-    old.exec('DROP INDEX inbound_auto_link; ALTER TABLE inbound_events DROP COLUMN auto_link_intent_id; DROP TABLE auto_link_intents; DROP TABLE slack_sync_entries; DROP TABLE slack_sync_streams; PRAGMA user_version = 3;');
+    old.exec('DROP TABLE tool_outbox; DROP INDEX inbound_auto_link; ALTER TABLE inbound_events DROP COLUMN auto_link_intent_id; DROP TABLE auto_link_intents; DROP TABLE slack_sync_entries; DROP TABLE slack_sync_streams; PRAGMA user_version = 3;');
     old.close();
     const upgraded = open(path);
     const [stream] = upgraded.listSlackSyncStreams();
@@ -468,7 +536,7 @@ describe('durable Slack transcript sync', () => {
     const [stream] = store.listSlackSyncStreams();
     const [entry] = store.listSlackSyncEntries(stream.id);
     expect(entry.requestId).toBe(first.request!.id);
-    expect(entry.message).toEqual(slack);
+    expect(entry.message).toEqual({ ...slack, participants: [slack.sender] });
     expect(store.listSlackSyncEntries(stream.id)).toHaveLength(1);
     expect(stream.coveredThrough).toBeUndefined();
     const next = transcript(endpoint(), '1770000000.000002');

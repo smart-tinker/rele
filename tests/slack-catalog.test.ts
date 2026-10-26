@@ -361,8 +361,8 @@ describe('Slack bot conversation catalog', () => {
       } }),
     });
     const first = await channel.listPeople('CONE');
-    expect(first).toEqual({ items: [{ id: 'UANNA', name: 'Анна' }, { id: 'UOTHERBOT', name: 'Борис', isBot: true }, { id: 'UAPP', name: 'Борис', isBot: true }], nextCursor: 'people-page-2' });
-    expect(await channel.listPeople('CONE', first.nextCursor)).toEqual({ items: [{ id: 'UBORIS', name: 'Борис' }], nextCursor: undefined });
+    expect(first).toEqual({ items: [{ id: 'UANNA', name: 'Анна', isBot: false }, { id: 'UOTHERBOT', name: 'Борис', isBot: true }, { id: 'UAPP', name: 'Борис', isBot: true }], nextCursor: 'people-page-2' });
+    expect(await channel.listPeople('CONE', first.nextCursor)).toEqual({ items: [{ id: 'UBORIS', name: 'Борис', isBot: false }], nextCursor: undefined });
     expect(callsFor('conversations.members').map(call => call.body)).toEqual([
       { channel: 'CONE', limit: '20' }, { channel: 'CONE', limit: '20', cursor: 'people-page-2' },
     ]);

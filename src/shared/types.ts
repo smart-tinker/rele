@@ -1,5 +1,5 @@
 export type Platform = 'telegram' | 'slack';
-export interface Person { id: string; name: string; isBot?: boolean }
+export interface Person { id: string; name: string; isBot?: boolean; username?: string }
 
 export interface CatalogPage<T> { items: T[]; nextCursor?: string; warning?: string }
 export interface CatalogChat {
@@ -96,6 +96,8 @@ export interface Origin {
   threadId: string;
   senderId: string;
   senderName: string;
+  senderIsBot?: boolean;
+  participants?: Person[];
   messageId: string;
 }
 
@@ -109,12 +111,15 @@ export interface AudioAttachment {
 }
 
 export interface SlackTranscriptMessage {
+  platform?: Platform;
+  receivedAt?: string;
   endpointId: string;
   accountId: string;
   chatId: string;
   threadId: string;
   messageId: string;
   sender: Person;
+  participants?: Person[];
   text: string;
   payload: Record<string, unknown>;
   kind: 'message' | 'edit' | 'deleted';
@@ -126,6 +131,7 @@ export interface InboundMessage {
   eventId: string;
   endpoint: Endpoint;
   sender: Person;
+  participants?: Person[];
   messageId: string;
   text: string;
   audio?: AudioAttachment;
@@ -146,6 +152,7 @@ export interface ReleRequest {
   status: RequestStatus;
   queuedSubmissionId?: string;
   turnId?: string;
+  suppressedFinal?: boolean;
   error?: string;
   createdAt: string;
   updatedAt: string;
@@ -154,11 +161,16 @@ export interface ReleRequest {
 export type DeliveryStatus = 'pending' | 'sending' | 'sent' | 'failed' | 'uncertain' | 'cancelled';
 export interface Delivery {
   id: string;
-  requestId: string;
+  requestId?: string;
+  operationId?: string;
+  conversationId?: string;
+  nativeThreadId?: string;
+  callId?: string;
+  mentions?: Person[];
   origin: Origin;
   key: string;
   ordinal: number;
-  kind: 'answer' | 'error' | 'approval';
+  kind: 'answer' | 'error' | 'approval' | 'message';
   body: string;
   approvalId?: string;
   status: DeliveryStatus;
@@ -169,6 +181,16 @@ export interface Delivery {
   createdAt: string;
   updatedAt: string;
 }
+
+export interface MessageToolCall { threadId: string; callId: string; name: string; arguments: unknown }
+export interface MessageToolReceipt {
+  operationId: string;
+  endpointId: string;
+  status: DeliveryStatus;
+  remoteMessageId?: string;
+  error?: string;
+}
+export interface MessageDestination { endpointId: string; platform: Platform; title: string; participants: Person[] }
 
 export interface ApprovalQuestion {
   id: string;
@@ -288,6 +310,7 @@ export type SlackSyncEntryState = 'pending' | 'applying' | 'applied' | 'uncertai
 export interface SlackSyncJournal {
   streams: Array<{
     id: string;
+    platform: Platform;
     endpointId: string;
     title: string;
     active: boolean;

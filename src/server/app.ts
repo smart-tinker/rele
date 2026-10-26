@@ -11,6 +11,7 @@ import type { CodexClient } from './codex.js';
 import type { DashboardState, DesktopIntegrationState, Endpoint, Platform, SlackSyncJournal } from '../shared/types.js';
 import { ChannelError } from './channels/common.js';
 import { discoverCodex } from './codex-discovery.js';
+import { MessageToolValidationError } from '../shared/message-tool.js';
 
 export interface AppServices {
   store: Store;
@@ -80,6 +81,20 @@ export function createApp(services: AppServices) {
 
   app.get('/api/health', async () => ({ ok: true, version: services.version }));
   app.get('/api/instance', async () => ({ pid: process.pid, version: services.version }));
+  app.post('/api/tools/call', async request => {
+    const body = object(request.body);
+    fields(body, ['threadId', 'callId', 'name', 'arguments']);
+    const name = body.name;
+    if (name !== 'list_destinations' && name !== 'send_message' && name !== 'get_message_status') throw new ApiError(400, 'Неизвестный инструмент Rele.');
+    const call = { threadId: string(body.threadId, 'разговор Codex', 200),
+      callId: string(body.callId, 'вызов Codex', 300), name, arguments: object(body.arguments) };
+    try {
+      return await engine.messageTool(call);
+    } catch (error) {
+      if (error instanceof MessageToolValidationError) return { isError: true, error: error.message, code: error.code };
+      throw new ApiError(500, 'Результат вызова Rele неизвестен. Проверьте состояние операции перед повтором.');
+    }
+  });
   app.post('/api/session/launch-token', async () => {
     const now = Date.now();
     for (const [token, expires] of launchTokens) if (expires <= now) launchTokens.delete(token);
@@ -423,21 +438,21 @@ export function createApp(services: AppServices) {
     const conversationId = string(request.params.id, 'связка', 200);
     if (!store.getConversation(conversationId)) throw new ApiError(404, 'Связка не найдена.');
     const query = object(request.query); fields(query, ['streamId', 'offset', 'limit']);
-    const streamId = query.streamId === undefined ? undefined : string(query.streamId, 'журнал Slack', 200);
+    const streamId = query.streamId === undefined ? undefined : string(query.streamId, 'журнал контекста', 200);
     const integer = (value: unknown, fallback: number, minimum: number, maximum: number): number => {
       if (value === undefined) return fallback;
-      if (typeof value !== 'string' || !/^\d+$/u.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) < minimum || Number(value) > maximum) throw new ApiError(400, 'Некорректная страница журнала Slack.');
+      if (typeof value !== 'string' || !/^\d+$/u.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) < minimum || Number(value) > maximum) throw new ApiError(400, 'Некорректная страница журнала контекста.');
       return Number(value);
     };
     const offset = integer(query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
     const limit = integer(query.limit, 50, 1, 100);
     const streams = store.listSlackSyncStreams().filter(stream => stream.conversationId === conversationId);
     const selected = streamId === undefined ? streams[0] : streams.find(stream => stream.id === streamId);
-    if (streamId !== undefined && !selected) throw new ApiError(404, 'Журнал Slack не относится к этой связке.');
+    if (streamId !== undefined && !selected) throw new ApiError(404, 'Журнал не относится к этой связке.');
     const page = selected ? store.listSlackSyncEntries(selected.id, { offset, limit: limit + 1 }) : [];
     return {
-      streams: streams.map(stream => ({ id: stream.id, endpointId: stream.endpointId,
-        title: store.getMeta(`endpoint-alias:${stream.endpointId}`) || store.getEndpoint(stream.endpointId)?.title || 'Обсуждение Slack',
+      streams: streams.map(stream => ({ id: stream.id, platform: stream.platform, endpointId: stream.endpointId,
+        title: store.getMeta(`endpoint-alias:${stream.endpointId}`) || store.getEndpoint(stream.endpointId)?.title || 'Обсуждение',
         active: stream.active, paused: stream.paused, state: stream.state, coveredThrough: stream.coveredThrough,
         error: stream.error, counts: store.getSlackSyncCounts(stream.id) })),
       ...(selected ? { streamId: selected.id } : {}),

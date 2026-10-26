@@ -130,7 +130,8 @@ export class CodexClient extends EventEmitter {
   private state: CodexConnectionState;
   private discovery?: { at: number; result: CodexDiscoveryResult };
 
-  constructor(private readonly config: CodexConfig, private readonly options: { discover?: typeof discoverCodex; shared?: typeof ensureSharedCodex; releaseTimeoutMs?: number } = {}) {
+  constructor(private readonly config: CodexConfig, private readonly options: { discover?: typeof discoverCodex; shared?: typeof ensureSharedCodex; releaseTimeoutMs?: number;
+    setupPlugin?: (rpc: (method: string, params: Record<string, unknown>) => Promise<unknown>, runtime: CodexRuntime) => Promise<void> } = {}) {
     super();
     this.state = {
       configured: config.transport !== 'websocket' ? !!config.executable : isLocalEndpoint(config.endpoint ?? ''),
@@ -620,7 +621,13 @@ export class CodexClient extends EventEmitter {
     if (!this.isVerifiedVersion()) {
       this.setState({ error: `Запись доступна для проверенного Codex ${SUPPORTED_CODEX_VERSIONS.join(' или ')}; подключён ${this.version || 'неизвестный runtime'}.` });
     } else {
+      let pluginError = false;
+      if (this.options.setupPlugin) {
+        try { await this.options.setupPlugin((method, params) => this.call(method, params), this.runtime); }
+        catch { pluginError = true; }
+      }
       await this.probeQueue();
+      if (pluginError) this.setState({ error: 'Инструменты Rele не подключены: Codex не подтвердил установку собственного плагина. Настройки модели и чужие плагины сохранены.' });
     }
     for (const threadId of this.config.transport === 'managed' ? [] : this.subscriptions) {
       try { await this.subscribe(threadId); }
