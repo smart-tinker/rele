@@ -49,11 +49,11 @@ export async function exchangeLaunchToken(token: string): Promise<string> {
     if (!response.ok) {
       if ([400, 401, 403, 410].includes(response.status))
         throw new ApiError(
-          'Ссылка для входа истекла или уже использована. Откройте Rele ещё раз ярлыком или командой запуска либо введите токен панели.',
+          'Ссылка для входа истекла или уже использована. Откройте Rele через ярлык или получите новую ссылку запуска.',
           response.status,
         );
       throw new ApiError(
-        'Не удалось открыть Rele по ссылке. Запустите приложение ещё раз либо введите токен панели.',
+        'Не удалось открыть Rele по ссылке. Откройте Rele через ярлык или получите новую ссылку запуска.',
         response.status,
       );
     }
@@ -66,7 +66,7 @@ export async function exchangeLaunchToken(token: string): Promise<string> {
   } catch (error) {
     if (error instanceof ApiError) throw error;
     throw new ApiError(
-      'Нет связи с Rele. Проверьте, что приложение запущено, и откройте его ещё раз либо введите токен панели.',
+      'Нет связи с Rele. Проверьте, что приложение запущено. Откройте Rele через ярлык или получите новую ссылку запуска.',
       0,
     );
   } finally {
@@ -133,7 +133,7 @@ export class ReleApi {
       if (response.status === 401) this.onUnauthorized();
       const message =
         response.status === 401
-          ? 'Токен панели не принят. Введите действующий токен.'
+          ? 'Токен панели не принят. Откройте Rele через ярлык или получите новую ссылку запуска.'
           : typeof payload?.message === 'string'
             ? payload.message
             : typeof payload?.error === 'string'

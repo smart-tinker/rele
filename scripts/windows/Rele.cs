@@ -654,9 +654,9 @@ internal static class Rele
         return address.Port;
     }
 
-    private static CodexWebSocketOwner ReadCodexWebSocketOwner()
+    private static CodexWebSocketOwner ReadCodexWebSocketOwner(string directory = null)
     {
-        string directory = Config.CodexWebSocketOwnerDirectory;
+        directory = directory ?? Config.CodexWebSocketOwnerDirectory;
         if (String.IsNullOrEmpty(directory)) return null;
         string cache = Path.Combine(Config.DataDirectory, "codex-websocket-owners");
         if (!SamePath(Path.GetDirectoryName(directory), cache) || !Regex.IsMatch(Path.GetFileName(directory), "^[a-f0-9]{64}$"))
@@ -667,7 +667,8 @@ internal static class Rele
         string marker = File.ReadAllText(markerPath);
         CodexWebSocketOwner owner = Json.Deserialize<CodexWebSocketOwner>(marker);
         if (owner == null || owner.Version != 1 || TextHash(marker) != Path.GetFileName(directory) ||
-            owner.OwnerSid != Config.OwnerSid || owner.TaskName != Config.CodexWebSocketTaskName ||
+            owner.OwnerSid != Config.OwnerSid || owner.TaskName != Config.TaskName + "-Codex" ||
+            (!String.IsNullOrEmpty(Config.CodexWebSocketTaskName) && owner.TaskName != Config.CodexWebSocketTaskName) ||
             owner.Endpoint != Config.CodexWebSocketEndpoint || !Path.IsPathRooted(owner.Executable) ||
             !Path.IsPathRooted(owner.CodexHome) || !Regex.IsMatch(owner.ExecutableSha256 ?? "", "^[a-f0-9]{64}$") ||
             !Regex.IsMatch(owner.HostSha256 ?? "", "^[a-f0-9]{64}$") ||
@@ -677,19 +678,64 @@ internal static class Rele
         return owner;
     }
 
+    private static bool SameCodexWebSocketScope(CodexWebSocketOwner first, CodexWebSocketOwner second)
+    {
+        return first.OwnerSid == second.OwnerSid && first.TaskName == second.TaskName && first.Endpoint == second.Endpoint &&
+            SamePath(first.Executable, second.Executable) && first.ExecutableSha256 == second.ExecutableSha256 && SamePath(first.CodexHome, second.CodexHome);
+    }
+
     private static dynamic OwnedCodexWebSocketTask(dynamic folder, CodexWebSocketOwner owner, string directory)
     {
+        string scheduledDirectory;
+        return OwnedCodexWebSocketTask(folder, owner, directory, out scheduledDirectory);
+    }
+
+    private static dynamic OwnedCodexWebSocketTask(dynamic folder, CodexWebSocketOwner owner, string directory, out string scheduledDirectory)
+    {
+        scheduledDirectory = directory;
         dynamic task;
         try { task = folder.GetTask(owner.TaskName); }
         catch (Exception error) { if (error.HResult == unchecked((int)0x80070002)) return null; throw; }
         dynamic definition = task.Definition;
-        string arguments = "--codex-websocket-owner " + QuoteArgument(Path.Combine(directory, "owner.json"));
         if (definition.Actions.Count != 1 || definition.Actions[1].Type != 0 ||
-            !SamePath((string)definition.Actions[1].Path, Path.Combine(directory, "Rele.Process.exe")) ||
-            (string)definition.Actions[1].Arguments != arguments || !SamePath((string)definition.Actions[1].WorkingDirectory, directory) ||
             !IsCurrentUser((string)definition.Principal.UserId) || (int)definition.Principal.LogonType != 3 || (int)definition.Principal.RunLevel != 0)
             throw new InvalidOperationException("Задача общего Codex принадлежит другой установке; она не изменена.");
+        scheduledDirectory = Path.GetDirectoryName((string)definition.Actions[1].Path);
+        CodexWebSocketOwner scheduled = ReadCodexWebSocketOwner(scheduledDirectory);
+        if (scheduled == null || !SameCodexWebSocketScope(owner, scheduled) ||
+            (!SamePath(directory, scheduledDirectory) && (int)definition.Settings.MultipleInstances != 2) ||
+            !SamePath((string)definition.Actions[1].Path, Path.Combine(scheduledDirectory, "Rele.Process.exe")) ||
+            (string)definition.Actions[1].Arguments != "--codex-websocket-owner " + QuoteArgument(Path.Combine(scheduledDirectory, "owner.json")) ||
+            !SamePath((string)definition.Actions[1].WorkingDirectory, scheduledDirectory))
+            throw new InvalidOperationException("Задача общего Codex принадлежит другой установке; она не изменена.");
         return task;
+    }
+
+    private static string StageCodexWebSocketOwner(CodexWebSocketOwner owner, string source)
+    {
+        string cache = Path.Combine(Config.DataDirectory, "codex-websocket-owners");
+        string marker = Json.Serialize(owner), directory = Path.Combine(cache, TextHash(marker));
+        if (!Directory.Exists(directory))
+        {
+            string temporary = Path.Combine(cache, ".prepare-" + Guid.NewGuid().ToString("N"));
+            PrivateDirectory(temporary);
+            try
+            {
+                File.Copy(source, Path.Combine(temporary, "Rele.Process.exe"), false);
+                File.WriteAllText(Path.Combine(temporary, "owner.json"), marker, new UTF8Encoding(false));
+                Directory.Move(temporary, directory);
+            }
+            finally { if (Directory.Exists(temporary)) Directory.Delete(temporary, true); }
+        }
+        ReadCodexWebSocketOwner(directory);
+        return directory;
+    }
+
+    private static void SaveCodexWebSocketOwner(CodexWebSocketOwner owner, string directory)
+    {
+        Config.CodexWebSocketOwnerDirectory = directory; Config.CodexWebSocketTaskName = owner.TaskName;
+        SaveCodexWebSocketPointer(Path.Combine(Config.DataDirectory, "codex-websocket-owners"), owner, directory);
+        AtomicJson(Path.Combine(AppDirectory, "rele-install.json"), Json.Serialize(Config));
     }
 
     private static string QuoteArgument(string value)
@@ -707,7 +753,17 @@ internal static class Rele
     private static void RegisterCodexWebSocketTask(CodexWebSocketOwner owner, string directory)
     {
         dynamic folder = TaskFolder();
-        OwnedCodexWebSocketTask(folder, owner, directory);
+        dynamic previous = OwnedCodexWebSocketTask(folder, owner, directory);
+        bool enabled = previous == null || (bool)previous.Enabled;
+        if (previous != null && HasCodexRecoveryTrigger(previous))
+        {
+            dynamic definition = previous.Definition;
+            definition.Actions[1].Path = Path.Combine(directory, "Rele.Process.exe");
+            definition.Actions[1].Arguments = "--codex-websocket-owner " + QuoteArgument(Path.Combine(directory, "owner.json"));
+            definition.Actions[1].WorkingDirectory = directory;
+            folder.RegisterTaskDefinition(owner.TaskName, definition, 6, Config.OwnerSid, null, 3, null);
+            return;
+        }
         string user = SecurityElement.Escape(Config.OwnerSid);
         string xml = "<?xml version=\"1.0\" encoding=\"UTF-16\"?>" +
             "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">" +
@@ -718,7 +774,7 @@ internal static class Rele
             "</StartBoundary><Enabled>true</Enabled></TimeTrigger></Triggers>" +
             "<Principals><Principal id=\"User\"><UserId>" + user + "</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>" +
             "<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" +
-            "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><Enabled>true</Enabled>" +
+            "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><Enabled>" + (enabled ? "true" : "false") + "</Enabled>" +
             "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings>" +
             "<Actions Context=\"User\"><Exec><Command>" + SecurityElement.Escape(Path.Combine(directory, "Rele.Process.exe")) +
             "</Command><Arguments>" + SecurityElement.Escape("--codex-websocket-owner " + QuoteArgument(Path.Combine(directory, "owner.json"))) +
@@ -801,7 +857,17 @@ internal static class Rele
 
     private static Dictionary<string, object> CodexWebSocketReceipt(CodexWebSocketOwner owner, string directory, string status)
     {
-        dynamic task = OwnedCodexWebSocketTask(TaskFolder(), owner, directory);
+        string scheduledDirectory;
+        OwnedCodexWebSocketTask(TaskFolder(), owner, directory, out scheduledDirectory);
+        var active = ReadCodexWebSocketReceipt(owner, directory, status);
+        if (active != null || SamePath(directory, scheduledDirectory)) return active;
+        CodexWebSocketOwner scheduled = ReadCodexWebSocketOwner(scheduledDirectory);
+        active = ReadCodexWebSocketReceipt(scheduled, scheduledDirectory, status);
+        return active;
+    }
+
+    private static Dictionary<string, object> ReadCodexWebSocketReceipt(CodexWebSocketOwner owner, string directory, string status)
+    {
         string file = Path.Combine(directory, "receipt.json");
         if (!File.Exists(file)) return null;
         if (new FileInfo(file).Length > 65536) throw new InvalidOperationException("Результат запуска Codex повреждён.");
@@ -888,11 +954,27 @@ internal static class Rele
                     {
                         if ((!preserveActive && !SamePath(previous.Executable, executable)) || !SamePath(previous.CodexHome, codexHome))
                             throw new InvalidOperationException("Общий Codex уже работает с другим backend или профилем; работающие задачи не остановлены.");
-                        SaveCodexWebSocketPointer(cache, previous, Config.CodexWebSocketOwnerDirectory);
-                        AtomicJson(Path.Combine(AppDirectory, "rele-install.json"), Json.Serialize(Config));
-                        if (previousTask == null || !HasCodexRecoveryTrigger(previousTask))
+                        string activeDirectory = (string)active["ownerDirectory"];
+                        previous = ReadCodexWebSocketOwner(activeDirectory);
+                        SaveCodexWebSocketOwner(previous, activeDirectory);
+                        string hostSource = Path.Combine(AppDirectory, "dist", "native", "Rele.Process.exe");
+                        string sourceHash = FileHash(hostSource);
+                        if (sourceHash != previous.HostSha256 && previousTask != null && (int)previousTask.State == 4 &&
+                            (int)previousTask.Definition.Settings.MultipleInstances == 2)
+                        {
+                            // Replace only the future action of this same running Task; IgnoreNew preserves its live owner.
+                            var successor = new CodexWebSocketOwner { Version = 1, OwnerSid = previous.OwnerSid, Executable = previous.Executable,
+                                ExecutableSha256 = previous.ExecutableSha256, HostSha256 = sourceHash, CodexHome = previous.CodexHome,
+                                Endpoint = previous.Endpoint, TaskName = previous.TaskName };
+                            string successorDirectory = StageCodexWebSocketOwner(successor, hostSource), scheduledDirectory;
+                            OwnedCodexWebSocketTask(TaskFolder(), previous, Config.CodexWebSocketOwnerDirectory, out scheduledDirectory);
+                            if (!SamePath(successorDirectory, scheduledDirectory) || !HasCodexRecoveryTrigger(previousTask))
+                                RegisterCodexWebSocketTask(successor, successorDirectory);
+                        }
+                        // A missing/non-running Task cannot exclude a second owner in a different cache; retain the old owner.lock until cold start.
+                        else if (previousTask == null || !HasCodexRecoveryTrigger(previousTask))
                             RegisterCodexWebSocketTask(previous, Config.CodexWebSocketOwnerDirectory);
-                        return active; // A reinstalled future Task must not launch a second owner.
+                        return active; // Never Run or Stop a Task while its verified native server is active.
                     }
                     if (!TaskActive(previousTask)) break;
                     Thread.Sleep(100);
@@ -915,29 +997,14 @@ internal static class Rele
             var owner = new CodexWebSocketOwner { Version = 1, OwnerSid = Config.OwnerSid, Executable = executable,
                 ExecutableSha256 = FileHash(executable), HostSha256 = FileHash(source), CodexHome = codexHome,
                 Endpoint = Config.CodexWebSocketEndpoint, TaskName = Config.TaskName + "-Codex" };
-            string marker = Json.Serialize(owner), directory = Path.Combine(cache, TextHash(marker));
-            if (!Directory.Exists(directory))
-            {
-                string temporary = Path.Combine(cache, ".prepare-" + Guid.NewGuid().ToString("N"));
-                PrivateDirectory(temporary);
-                try
-                {
-                    File.Copy(source, Path.Combine(temporary, "Rele.Process.exe"), false);
-                    File.WriteAllText(Path.Combine(temporary, "owner.json"), marker, new UTF8Encoding(false));
-                    Directory.Move(temporary, directory);
-                }
-                finally { if (Directory.Exists(temporary)) Directory.Delete(temporary, true); }
-            }
+            string directory = StageCodexWebSocketOwner(owner, source);
             if (previous != null && !SamePath(directory, Config.CodexWebSocketOwnerDirectory))
             {
                 dynamic old = OwnedCodexWebSocketTask(TaskFolder(), previous, Config.CodexWebSocketOwnerDirectory);
                 if (TaskActive(old)) throw new InvalidOperationException("Прежний владелец Codex ещё работает.");
                 if (old != null) TaskFolder().DeleteTask(previous.TaskName, 0);
             }
-            Config.CodexWebSocketOwnerDirectory = directory; Config.CodexWebSocketTaskName = owner.TaskName;
-            ReadCodexWebSocketOwner();
-            SaveCodexWebSocketPointer(cache, owner, directory);
-            AtomicJson(Path.Combine(AppDirectory, "rele-install.json"), Json.Serialize(Config));
+            SaveCodexWebSocketOwner(owner, directory);
             RegisterCodexWebSocketTask(owner, directory);
             dynamic task = OwnedCodexWebSocketTask(TaskFolder(), owner, directory);
             string receiptFile = Path.Combine(directory, "receipt.json");
@@ -958,12 +1025,26 @@ internal static class Rele
 
     private static void RemoveCodexWebSocketStartup()
     {
-        CodexWebSocketOwner owner = ReadCodexWebSocketOwner();
-        if (owner == null) return;
-        dynamic folder = TaskFolder(), task = OwnedCodexWebSocketTask(folder, owner, Config.CodexWebSocketOwnerDirectory);
-        if (task != null) { task.Enabled = false; folder.DeleteTask(owner.TaskName, 0); }
-        // Active native tasks survive uninstall; their immutable host/marker remain in the data directory.
-        Log("Codex startup removed; the current native server and immutable owner files are preserved: " + Config.CodexWebSocketOwnerDirectory);
+        if (String.IsNullOrEmpty(Config.CodexWebSocketOwnerDirectory)) return;
+        using (var operation = CodexOperationLock("start.lock"))
+        {
+            Settings current = ReadInstallationSettings(); ValidateInstallationOwner(current); Config = current;
+            CodexWebSocketOwner owner = ReadCodexWebSocketOwner();
+            if (owner == null) return;
+            var active = CodexWebSocketReceipt(owner, Config.CodexWebSocketOwnerDirectory, "alreadyRunning");
+            if (active != null && !SamePath((string)active["ownerDirectory"], Config.CodexWebSocketOwnerDirectory))
+            {
+                owner = ReadCodexWebSocketOwner((string)active["ownerDirectory"]);
+                SaveCodexWebSocketOwner(owner, (string)active["ownerDirectory"]); // Preserve the live successor route before deleting its Task.
+            }
+            string scheduledDirectory;
+            dynamic folder = TaskFolder(), task = OwnedCodexWebSocketTask(folder, owner, Config.CodexWebSocketOwnerDirectory, out scheduledDirectory);
+            if (active == null && !SamePath(scheduledDirectory, Config.CodexWebSocketOwnerDirectory) && TaskActive(task))
+                throw new InvalidOperationException("Новый владелец Codex ещё не подтвердил запуск; фоновая задача сохранена. Повторите удаление после завершения запуска.");
+            if (task != null) { task.Enabled = false; folder.DeleteTask(owner.TaskName, 0); }
+            // Active native tasks survive uninstall; their immutable host/marker remain in the data directory.
+            Log("Codex startup removed; the current native server and immutable owner files are preserved: " + Config.CodexWebSocketOwnerDirectory);
+        }
     }
 
     private static string UserEnvironment(string name)

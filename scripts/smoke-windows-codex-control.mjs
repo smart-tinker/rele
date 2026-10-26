@@ -47,7 +47,7 @@ function run(command, args, extra = {}) {
   return output;
 }
 function powershell(code, extra = {}) {
-  const output = run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `$ErrorActionPreference='Stop'; ${code}`], extra);
+  const output = run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); ${code}`], extra);
   assert.equal(output.status, 0, output.stderr || output.stdout);
   return output.stdout.trim();
 }
@@ -110,6 +110,9 @@ async function connect(endpoint) {
 }
 let sid;
 let helperHash;
+let successorDirectory;
+let initialOwner;
+const knownHelperHashes = new Set();
 try {
   sid = powershell('[Security.Principal.WindowsIdentity]::GetCurrent().User.Value');
   assert.equal(powershell("(@(Get-ScheduledTask -TaskName $env:RELE_CONTROL_TASK -ErrorAction SilentlyContinue)).Count",
@@ -118,8 +121,16 @@ try {
   await mkdir(data);
   await assert.rejects(access(home), { code: 'ENOENT' });
   await copyFile(path.join(stage, 'Rele.exe'), path.join(application, 'Rele.exe'));
-  await copyFile(path.join(stage, 'dist/native/Rele.Process.exe'), path.join(application, 'dist/native/Rele.Process.exe'));
-  helperHash = digest(await readFile(path.join(application, 'dist/native/Rele.Process.exe')));
+  const guiHelper = await readFile(path.join(stage, 'dist/native/Rele.Process.exe'));
+  assert.equal(guiHelper.subarray(0, 2).toString('ascii'), 'MZ');
+  const pe = guiHelper.readUInt32LE(0x3c), subsystem = pe + 24 + 68;
+  assert.equal(guiHelper.readUInt32LE(pe), 0x4550); assert.equal(guiHelper.readUInt16LE(subsystem), 2);
+  // Only this private fixture emulates the previous console-subsystem build; published bytes stay unchanged.
+  const legacyHelper = Buffer.from(guiHelper); legacyHelper.writeUInt16LE(3, subsystem);
+  await writeFile(path.join(application, 'dist/native/Rele.Process.exe'), legacyHelper);
+  const legacyHelperHash = digest(legacyHelper), guiHelperHash = digest(guiHelper);
+  knownHelperHashes.add(legacyHelperHash); knownHelperHashes.add(guiHelperHash);
+  helperHash = legacyHelperHash;
   await writeFile(target.installSettingsPath, JSON.stringify({ DataDirectory: data, TaskName: task,
     Port: 0, OwnerSid: sid, CodexHome: home, DesktopIntegrationOwned: false, DesktopIntegrationRequested: false }));
   let starts = 0;
@@ -163,6 +174,7 @@ try {
   assert.ok(Number.isSafeInteger(control.processId) && control.processId > 0);
   assert.ok(Number.isFinite(Date.parse(control.processStartTime)));
   await readOwnedState(sid, helperHash);
+  initialOwner = { ...target.desktopOwner };
   assert.ok(samePath(control.ownerDirectory, target.desktopOwner.directory));
   const currentPointer = path.join(data, 'codex-websocket-owners/current.json');
   const beforeStatus = await Promise.all([readFile(target.installSettingsPath), readFile(currentPointer)]);
@@ -215,6 +227,54 @@ try {
   assert.equal(second.status, 'alreadyRunning');
   for (const key of ['endpoint', 'processId', 'processStartTime', 'ownerDirectory']) assert.equal(second[key], control[key]);
   assert.equal((await call('server/diagnostics')).process.id, control.processId);
+  phase = 'stage-gui-successor';
+  const oldMarkerBytes = await readFile(path.join(control.ownerDirectory, 'owner.json'));
+  const oldReceiptBytes = await readFile(path.join(control.ownerDirectory, 'receipt.json'));
+  await writeFile(path.join(application, 'dist/native/Rele.Process.exe'), guiHelper);
+  const scheduledUpgrade = await start(); assert.equal(scheduledUpgrade.status, 0, scheduledUpgrade.errorReceipt || scheduledUpgrade.stderr);
+  const activeUpgrade = JSON.parse(scheduledUpgrade.stdout);
+  for (const key of ['processId', 'processStartTime', 'ownerDirectory', 'endpoint', 'codexHome', 'executable', 'executableSha256']) assert.equal(activeUpgrade[key], control[key]);
+  successorDirectory = powershell(`$scheduler=New-Object -ComObject 'Schedule.Service'; $scheduler.Connect();
+    $task=$scheduler.GetFolder('\\').GetTask($env:RELE_CONTROL_TASK); $definition=$task.Definition;
+    if ($task.State -ne 4 -or [int]$definition.Settings.MultipleInstances -ne 2) { throw 'The same running IgnoreNew Task must survive upgrade.' }
+    Split-Path -Parent $definition.Actions.Item(1).Path`, { env: { ...env, RELE_CONTROL_TASK: `${task}-Codex` } });
+  assert.notEqual(successorDirectory, control.ownerDirectory);
+  const successor = JSON.parse(await readFile(path.join(successorDirectory, 'owner.json'), 'utf8'));
+  assert.equal(digest(await readFile(path.join(successorDirectory, 'owner.json'))), path.basename(successorDirectory));
+  assert.equal(successor.HostSha256, guiHelperHash);
+  assert.equal(digest(await readFile(path.join(successorDirectory, 'Rele.Process.exe'))), guiHelperHash);
+  const oldMarker = JSON.parse(oldMarkerBytes);
+  for (const key of ['OwnerSid', 'TaskName', 'Endpoint', 'CodexHome', 'Executable', 'ExecutableSha256']) assert.equal(successor[key], oldMarker[key]);
+  assert.deepEqual(await readFile(path.join(control.ownerDirectory, 'owner.json')), oldMarkerBytes);
+  assert.deepEqual(await readFile(path.join(control.ownerDirectory, 'receipt.json')), oldReceiptBytes);
+  assert.equal(digest(await readFile(path.join(control.ownerDirectory, 'Rele.Process.exe'))), legacyHelperHash);
+  await readOwnedState(sid, legacyHelperHash);
+  assert.deepEqual(await Promise.all([readFile(target.installSettingsPath), readFile(currentPointer)]), beforeStatus);
+  assert.equal((await call('server/diagnostics')).process.id, control.processId);
+  const successorTaskSnapshot = taskSnapshot();
+  const alterSuccessorArgument = bad => powershell(`$scheduler=New-Object -ComObject 'Schedule.Service'; $scheduler.Connect();
+    $folder=$scheduler.GetFolder('\\'); $task=$folder.GetTask($env:RELE_CONTROL_TASK); $definition=$task.Definition; $action=$definition.Actions.Item(1);
+    $expected='--codex-websocket-owner "' + (Join-Path $env:RELE_CONTROL_SUCCESSOR 'owner.json') + '"';
+    $from=if($env:RELE_CONTROL_BAD -eq '1'){$expected}else{$expected+' --foreign-fixture'};
+    if ($definition.Actions.Count -ne 1 -or $action.Type -ne 0 -or $action.Path -ne (Join-Path $env:RELE_CONTROL_SUCCESSOR 'Rele.Process.exe') -or
+      $action.Arguments -ne $from -or $action.WorkingDirectory -ne $env:RELE_CONTROL_SUCCESSOR -or
+      [int]$definition.Principal.LogonType -ne 3 -or [int]$definition.Principal.RunLevel -ne 0) { throw 'The private successor fixture Task changed.' }
+    $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;
+    $principalSid=if($definition.Principal.UserId -like 'S-1-*'){[string]$definition.Principal.UserId}else{([Security.Principal.NTAccount]::new([string]$definition.Principal.UserId)).Translate([Security.Principal.SecurityIdentifier]).Value};
+    if($principalSid -ne $sid){throw 'The private fixture owner changed.'}
+    $action.Arguments=if($env:RELE_CONTROL_BAD -eq '1'){$expected+' --foreign-fixture'}else{$expected};
+    $folder.RegisterTaskDefinition($env:RELE_CONTROL_TASK,$definition,6,$sid,$null,3,$null) | Out-Null`,
+  { env: { ...env, RELE_CONTROL_TASK: `${task}-Codex`, RELE_CONTROL_SUCCESSOR: successorDirectory, RELE_CONTROL_BAD: bad ? '1' : '0' } });
+  phase = 'reject-unknown-successor-action';
+  alterSuccessorArgument(true);
+  try {
+    const unknownSnapshot = taskSnapshot();
+    const refused = await status(); assert.equal(refused.status, 1, 'An unknown successor action must fail closed.');
+    assert.equal(taskSnapshot(), unknownSnapshot, 'Refusal must leave the Task unchanged.');
+    assert.deepEqual(await Promise.all([readFile(target.installSettingsPath), readFile(currentPointer)]), beforeStatus);
+    assert.equal((await call('server/diagnostics')).process.id, control.processId);
+  } finally { alterSuccessorArgument(false); }
+  assert.equal(taskSnapshot(), successorTaskSnapshot);
   const recoveryTaskSnapshot = taskSnapshot();
   const closed = once(socket, 'close'); socket.close(); await closed; socket = undefined;
   const recoveryStartCalls = nativeStartCalls;
@@ -249,9 +309,9 @@ try {
       ([Security.Principal.NTAccount]::new([string]$definition.Principal.UserId)).Translate([Security.Principal.SecurityIdentifier]).Value };
     $action=$definition.Actions.Item(1);
     if ($definition.Actions.Count -ne 1 -or $action.Type -ne 0 -or
-      $action.Path -ne (Join-Path $expected.ownerDirectory 'Rele.Process.exe') -or
-      $action.Arguments -ne ('--codex-websocket-owner "' + (Join-Path $expected.ownerDirectory 'owner.json') + '"') -or
-      $action.WorkingDirectory -ne $expected.ownerDirectory -or $principalSid -ne $sid -or
+      $action.Path -ne (Join-Path $expected.scheduledOwnerDirectory 'Rele.Process.exe') -or
+      $action.Arguments -ne ('--codex-websocket-owner "' + (Join-Path $expected.scheduledOwnerDirectory 'owner.json') + '"') -or
+      $action.WorkingDirectory -ne $expected.scheduledOwnerDirectory -or $principalSid -ne $sid -or
       [int]$definition.Principal.LogonType -ne 3 -or [int]$definition.Principal.RunLevel -ne 0 -or
       -not $task.Enabled -or [int]$definition.Settings.MultipleInstances -ne 2 -or [int]$definition.Settings.RestartCount -lt 1 -or
       [Xml.XmlConvert]::ToTimeSpan([string]$definition.Settings.RestartInterval).TotalSeconds -ne 60) { throw 'Recovery task identity changed.' }
@@ -274,7 +334,7 @@ try {
       (Invoke-CimMethod -InputObject $hostInfo -MethodName GetOwnerSid).Sid -ne $sid) { throw 'Recovery process owner changed.' }
     $native.Kill(); if (-not $native.WaitForExit(10000)) { throw 'The exact owned native process did not exit.' }
     [pscustomobject]@{ nativePid=[int]$native.Id; hostPid=[int]$hostProcess.Id; taskEnabled=[bool]$task.Enabled } | ConvertTo-Json -Compress`,
-    { env: { ...env, RELE_CONTROL_PROCESS: JSON.stringify({ ...beforeRecovery, receiptSha256: recoveryReceiptHash }) } }));
+    { env: { ...env, RELE_CONTROL_PROCESS: JSON.stringify({ ...beforeRecovery, scheduledOwnerDirectory: successorDirectory, receiptSha256: recoveryReceiptHash }) } }));
   assert.equal(killed.nativePid, control.processId); assert.equal(killed.taskEnabled, true);
   const recoveryStartedAt = Date.now();
   await exited(killed.nativePid); await exited(killed.hostPid);
@@ -304,9 +364,9 @@ try {
         $principalSid=if ($definition.Principal.UserId -like 'S-1-*') { [string]$definition.Principal.UserId } else {
           ([Security.Principal.NTAccount]::new([string]$definition.Principal.UserId)).Translate([Security.Principal.SecurityIdentifier]).Value };
         $owned=$definition.Actions.Count -eq 1 -and $action.Type -eq 0 -and
-          $action.Path -eq (Join-Path $expected.ownerDirectory 'Rele.Process.exe') -and
-          $action.Arguments -eq ('--codex-websocket-owner "' + (Join-Path $expected.ownerDirectory 'owner.json') + '"') -and
-          $action.WorkingDirectory -eq $expected.ownerDirectory -and $principalSid -eq $sid -and
+          $action.Path -eq (Join-Path $expected.scheduledOwnerDirectory 'Rele.Process.exe') -and
+          $action.Arguments -eq ('--codex-websocket-owner "' + (Join-Path $expected.scheduledOwnerDirectory 'owner.json') + '"') -and
+          $action.WorkingDirectory -eq $expected.scheduledOwnerDirectory -and $principalSid -eq $sid -and
           [int]$definition.Principal.LogonType -eq 3 -and [int]$definition.Principal.RunLevel -eq 0;
         $facts.taskOwnership=if ($owned) { 'matched' } else { 'mismatch' };
         if ($owned) {
@@ -356,12 +416,22 @@ try {
         $facts.timeWaitCount=@($rows | Where-Object { $_.State -eq 'TimeWait' }).Count;
       }
       $facts | ConvertTo-Json -Depth 5 -Compress`, { env: { ...env,
-      RELE_CONTROL_PROCESS: JSON.stringify(beforeRecovery), RELE_CONTROL_PORT: new URL(control.endpoint).port } }));
+      RELE_CONTROL_PROCESS: JSON.stringify({ ...beforeRecovery, scheduledOwnerDirectory: successorDirectory }), RELE_CONTROL_PORT: new URL(control.endpoint).port } }));
     throw new Error('The enabled owner Task did not recover native within 90 seconds.');
   }
   assert.equal(nativeStartCalls, recoveryStartCalls, 'Recovery must not call codex-start.');
   assert.notEqual(recovered.processStartTime, control.processStartTime);
-  for (const key of ['endpoint', 'codexHome', 'executable', 'executableSha256', 'ownerSid', 'ownerDirectory', 'taskName']) assert.equal(recovered[key], control[key]);
+  for (const key of ['endpoint', 'codexHome', 'executable', 'executableSha256', 'ownerSid', 'taskName']) assert.equal(recovered[key], control[key]);
+  assert.ok(samePath(recovered.ownerDirectory, successorDirectory));
+  assert.deepEqual(await Promise.all([readFile(target.installSettingsPath), readFile(currentPointer)]), beforeStatus, 'Status must not promote or write the cold successor.');
+  phase = 'promote-cold-successor';
+  const promoted = await start(); assert.equal(promoted.status, 0, promoted.errorReceipt || promoted.stderr);
+  assert.deepEqual(JSON.parse(promoted.stdout), recovered);
+  helperHash = guiHelperHash;
+  await readOwnedState(sid, helperHash);
+  const promotedState = await Promise.all([readFile(target.installSettingsPath), readFile(currentPointer)]);
+  assert.ok(samePath(JSON.parse(promotedState[0]).CodexWebSocketOwnerDirectory, successorDirectory));
+  assert.ok(samePath(JSON.parse(promotedState[1]).OwnerDirectory, successorDirectory));
   const afterRecoveryTask = taskSnapshot();
   assert.equal(afterRecoveryTask.split('|')[0], recoveryTaskSnapshot.split('|')[0], 'Recovery must preserve the repaired Task definition.');
   assert.ok(Date.parse(afterRecoveryTask.split('|')[1]) > Date.parse(recoveryTaskSnapshot.split('|')[1]), 'Task Scheduler must launch the recovery instance.');
@@ -381,7 +451,7 @@ try {
   assert.deepEqual(JSON.parse(stopped.stdout), { status: 'notRunning' });
   assert.equal(powershell("(@(Get-ScheduledTask -TaskName $env:RELE_CONTROL_TASK -ErrorAction SilentlyContinue)).Count",
     { env: { ...env, RELE_CONTROL_TASK: `${task}-Codex` } }), '0');
-  assert.deepEqual(await Promise.all([readFile(target.installSettingsPath), readFile(currentPointer)]), beforeStatus);
+  assert.deepEqual(await Promise.all([readFile(target.installSettingsPath), readFile(currentPointer)]), promotedState);
   const address = new URL(control.endpoint);
   foreign = createServer(connection => connection.end());
   foreign.listen(Number(address.port), '127.0.0.1'); await once(foreign, 'listening');
@@ -394,6 +464,8 @@ try {
     actualNativeInitialize: true, diagnosticsAndKernelPidMatch: true, idempotentOwnerReuse: true,
     readonlyStatusMissingLiveStopped: true,
     legacyOwnerRecoveryTriggerRepaired: true, nativeTaskRecoveryWithoutGateway: true, recoveryStatusErrors,
+    liveOwnerPreservedDuringGuiUpgrade: true, sameTaskGuiSuccessorStaged: true, coldSuccessorPromoted: true,
+    unknownSuccessorActionRefusedWithoutMutation: true,
     serverSurvivesHelperExit: true, foreignOccupiedEndpointRefused: true, desktopActions: false };
 } catch (error) { failure = error; failurePhase = phase; }
 finally {
@@ -401,8 +473,15 @@ finally {
   if (socket) { socket.terminate(); socket = undefined; }
   if (foreign?.listening) await new Promise((resolve, reject) => foreign.close(error => error ? reject(error) : resolve()));
   try {
-    if (sid && helperHash) await readOwnedState(sid, helperHash);
-    if (target.desktopOwner) stopInstallerCodex(target);
+    if (sid && helperHash) {
+      const settings = JSON.parse(await readFile(target.installSettingsPath, 'utf8'));
+      if (settings.CodexWebSocketOwnerDirectory) {
+        const marker = JSON.parse(await readFile(path.join(settings.CodexWebSocketOwnerDirectory, 'owner.json'), 'utf8'));
+        assert.ok(knownHelperHashes.has(marker.HostSha256), "Cleanup must use one of this fixture's exact host builds.");
+        await readOwnedState(sid, marker.HostSha256);
+      }
+    }
+    if (target.desktopOwner) stopInstallerCodex(initialOwner ? { ...target, desktopOwner: initialOwner } : target, successorDirectory);
     cleanupConfirmed = true;
   } catch (error) { if (!failure) failure = error; }
   if (cleanupConfirmed) {
