@@ -10,8 +10,8 @@ test('automatic conversation creation is explicit, named, editable, and leaves e
   page.on('pageerror', error => consoleErrors.push(error.message));
   page.on('console', message => { if (['error', 'warning'].includes(message.type())) consoleErrors.push(message.text()); });
   await openPanel(page);
-  await page.getByRole('button', { name: 'Доступ', exact: true }).click();
-  await expect(page).toHaveTitle('Rele — Доступ');
+  await page.getByRole('button', { name: 'Связи', exact: true }).click();
+  await expect(page).toHaveTitle('Rele — Связи');
   await expect(page.getByRole('heading', { name: 'Новые разговоры из мессенджера' })).toBeVisible();
   await page.getByRole('button', { name: 'Добавить правило', exact: true }).click();
   const dialog = page.getByRole('dialog');
@@ -52,7 +52,7 @@ test('private automatic rules require selected humans and uncertain creation sta
   state.endpoints.push(direct);
   const api = await installApi(page, state);
   await openPanel(page);
-  await page.getByRole('button', { name: 'Доступ', exact: true }).click();
+  await page.getByRole('button', { name: 'Связи', exact: true }).click();
   await page.getByRole('button', { name: 'Добавить правило', exact: true }).click();
   const dialog = page.getByRole('dialog');
   await dialog.getByLabel('Чат для новых разговоров').selectOption('DPRIVATE');
@@ -70,7 +70,7 @@ test('private automatic rules require selected humans and uncertain creation sta
   state.autoLinks = [{ id: 'uncertain-example', endpointId: direct.id, rule, targetFingerprint: 'synthetic-hash', status: 'uncertain', error: 'Подтверждение создания не получено.', createdAt: '', updatedAt: '' }];
   await page.getByRole('button', { name: 'Связи', exact: true }).click();
   await page.getByRole('button', { name: 'Обновить', exact: true }).click();
-  await page.getByRole('button', { name: 'Доступ', exact: true }).click();
+  await page.getByRole('button', { name: 'Связи', exact: true }).click();
   const journal = page.getByLabel('Журнал автосоздания');
   await expect(journal).toContainText('Нужно проверить');
   await expect(journal).toContainText('Повторное создание автоматически не выполняется.');
@@ -97,7 +97,7 @@ test('fresh partial Slack catalog makes an unavailable cached DM selectable with
   page.on('pageerror', error => consoleErrors.push(error.message));
   page.on('console', message => { if (['error', 'warning'].includes(message.type())) consoleErrors.push(message.text()); });
   await openPanel(page);
-  await page.getByRole('button', { name: 'Доступ', exact: true }).click();
+  await page.getByRole('button', { name: 'Связи', exact: true }).click();
   await page.getByRole('button', { name: 'Добавить правило', exact: true }).click();
   const dialog = page.getByRole('dialog');
   const chat = dialog.getByLabel('Чат для новых разговоров');

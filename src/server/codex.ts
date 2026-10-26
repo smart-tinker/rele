@@ -35,6 +35,7 @@ export interface RequestLocation {
   soleQueuedSubmission?: boolean;
   turnId?: string;
   text?: string;
+  failureReason?: 'serverOverloaded';
   mixed?: boolean;
   commandItems?: CodexCommandItem[];
 }
@@ -54,7 +55,7 @@ export function codexCommandItem(value: unknown): CodexCommandItem | undefined {
 export interface CodexRuntime { userAgent: string; codexHome: string; platformFamily: string; platformOs: string }
 interface QueueEntry { id: string; clientUserMessageId: string }
 interface HistoryItem { type: string; clientId?: string | null; text?: string; phase?: string | null }
-interface HistoryTurn { id: string; status: string; completedAt?: number | null; items: HistoryItem[] }
+interface HistoryTurn { id: string; status: string; completedAt?: number | null; items: HistoryItem[]; error?: { codexErrorInfo?: unknown } | null }
 interface Page<T> { data: T[]; nextCursor: string | null }
 interface RawThread {
   id: string; name?: string | null; cwd: string; preview: string; updatedAt: number;
@@ -460,6 +461,7 @@ export class CodexClient extends EventEmitter {
           state: state as RequestLocation['state'], turnId: turn.id,
           ...(mixed ? { mixed: true } : {
             text: answers.length ? answers.map(item => item.text || '').join('\n\n') : legacy.at(-1)?.text,
+            ...(state === 'failed' && turn.error?.codexErrorInfo === 'serverOverloaded' ? { failureReason: 'serverOverloaded' as const } : {}),
             ...(turn.items.some(item => codexCommandItem(item)) ? { commandItems: turn.items.flatMap(item => { const command = codexCommandItem(item); return command ? [command] : []; }) } : {}),
           }),
         };

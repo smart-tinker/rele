@@ -659,6 +659,24 @@ describe('Codex shared-runtime adapter', () => {
     expect(f.calls.some(call => ['turn/interrupt', 'thread/queue/add'].includes(call.method ?? ''))).toBe(false);
   });
 
+  it.each([
+    ['failed', 'serverOverloaded', 'serverOverloaded'],
+    ['failed', 'unknown-synthetic-secret', undefined],
+    ['failed', { serverOverloaded: 'synthetic-secret' }, undefined],
+    ['completed', 'serverOverloaded', undefined],
+    ['interrupted', 'serverOverloaded', undefined],
+  ])('exposes only a known safe cause from %s history with error info %s', async (status, codexErrorInfo, failureReason) => {
+    const clientId = randomUUID();
+    const f = await fixture({ 'thread/turns/list': () => ({ data: [{ id: 'own-turn', status, completedAt: 1792486920,
+      error: { codexErrorInfo, message: 'synthetic-secret', additionalDetails: 'private-synthetic-secret' },
+      items: [{ type: 'userMessage', clientId }] }], nextCursor: null }) });
+    await f.client.connect();
+    const found = await f.client.findRequest(threadId, clientId);
+    expect(found).toEqual({ state: status, turnId: 'own-turn', text: undefined, ...(failureReason ? { failureReason } : {}) });
+    expect(JSON.stringify(found)).not.toContain('synthetic-secret');
+    expect(f.calls.some(call => ['turn/interrupt', 'thread/queue/add', 'thread/queue/start'].includes(call.method ?? ''))).toBe(false);
+  });
+
   it('recovers an accepted request from queue or paginated completed history without resending', async () => {
     const clientId = randomUUID();
     const f = await fixture({
@@ -677,14 +695,14 @@ describe('Codex shared-runtime adapter', () => {
     expect(f.calls.some(call => call.method === 'thread/queue/add')).toBe(false);
   });
 
-  it('does not recover a mixed Desktop/Rele turn as a routable answer', async () => {
+  it.each(['completed', 'failed'])('does not recover a mixed Desktop/Rele %s turn as a routable answer or cause', async status => {
     const clientId = randomUUID();
-    const f = await fixture({ 'thread/turns/list': () => ({ data: [{ id: 'mixed', status: 'completed', items: [
+    const f = await fixture({ 'thread/turns/list': () => ({ data: [{ id: 'mixed', status, error: { codexErrorInfo: 'serverOverloaded' }, items: [
       { type: 'userMessage', clientId }, { type: 'userMessage', clientId: null },
       { type: 'agentMessage', phase: 'final_answer', text: 'Ответ на два запроса' },
     ] }], nextCursor: null }) });
     await f.client.connect();
-    expect(await f.client.findRequest(threadId, clientId)).toEqual({ state: 'completed', turnId: 'mixed', mixed: true });
+    expect(await f.client.findRequest(threadId, clientId)).toEqual({ state: status, turnId: 'mixed', mixed: true });
   });
 
   it('rejects duplicate queued identifiers instead of treating queue/add as idempotent', async () => {

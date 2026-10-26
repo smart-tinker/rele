@@ -812,7 +812,9 @@ export class Engine extends EventEmitter {
     if (found.state === 'completed') {
       this.store.finishRequest(request.id, { status: 'completed', turnId: found.turnId, error: undefined }, (request.origin.platform === 'slack' ? splitSlackReply(found.text ?? '') : splitReply(found.text ?? '')).map((body, ordinal) => ({ key: `answer:${ordinal}`, ordinal, kind: 'answer' as const, body })));
     } else if (found.state === 'failed' || found.state === 'interrupted') {
-      const error = found.state === 'interrupted' ? 'Выполнение запроса остановлено в Codex.' : 'Codex завершил запрос с ошибкой. Подробности доступны в Codex.';
+      const error = found.state === 'interrupted' ? 'Выполнение запроса остановлено в Codex.'
+        : found.failureReason === 'serverOverloaded' ? 'Сервис Codex временно перегружен. Запрос завершился с ошибкой. Rele не повторяет его автоматически.'
+          : 'Codex завершил запрос с ошибкой. Подробности доступны в Codex.';
       this.store.finishRequest(request.id, { status: found.state, turnId: found.turnId, error }, [{ key: 'terminal:error', ordinal: 0, kind: 'error', body: error }]);
     }
   }

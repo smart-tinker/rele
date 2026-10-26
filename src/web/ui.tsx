@@ -5,6 +5,7 @@ import {
   useId,
   useRef,
   type ButtonHTMLAttributes,
+  type InputHTMLAttributes,
   type ReactElement,
   type ReactNode,
 } from 'react';
@@ -173,6 +174,14 @@ export function Button({
       <span>{children}</span>
     </button>
   );
+}
+
+export function ClearableInput({ value, onClear, clearLabel, ...props }: InputHTMLAttributes<HTMLInputElement> & { value: string; onClear: () => void; clearLabel: string }) {
+  const input = useRef<HTMLInputElement>(null);
+  return <div className="clearable-input">
+    <input {...props} ref={input} value={value} />
+    {value && <button type="button" className="clear-search" aria-label={clearLabel} disabled={props.disabled} onClick={() => { onClear(); input.current?.focus(); }}><Icon name="close" /></button>}
+  </div>;
 }
 
 export function PageHeading({

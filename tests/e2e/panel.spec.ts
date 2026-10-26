@@ -257,7 +257,8 @@ test('lists unbound and unavailable discovered sources and searches their group 
   await page.getByLabel('Найти группу или тред', { exact: true }).fill('Документация');
   await expect(page.getByRole('table')).toContainText('Документация');
   await expect(page.getByRole('table')).not.toContainText('Команда Альфа');
-  await page.getByLabel('Найти группу или тред', { exact: true }).clear();
+  await page.getByRole('button', { name: 'Очистить поиск источников', exact: true }).click();
+  await expect(page.getByLabel('Найти группу или тред', { exact: true })).toBeFocused();
   await page.getByRole('tab', { name: 'Slack', exact: true }).click();
   await expect(page.getByRole('table')).toContainText('#example-new');
   await expect(page.getByRole('table')).not.toContainText('Команда Альфа');
@@ -375,4 +376,50 @@ test('Telegram forum rows distinguish group and topic while a local alias keeps 
   await expect(rows.nth(1).getByRole('cell').nth(1)).toContainText('Поставки');
   await expect(rows.nth(1).getByRole('cell').nth(1)).not.toContainText('Команда /');
   await expect(rows.nth(2).getByRole('cell').nth(1)).toContainText('Особое локальное имя');
+});
+
+
+test('unified source table and every catalog filter clear without mutations and keep focus', async ({ page }) => {
+  const state = fixtureState();
+  const api = await installApi(page, state);
+  const errors: string[] = [];
+  page.on('pageerror', error => errors.push(error.message));
+  page.on('console', message => { if (['error', 'warning'].includes(message.type())) errors.push(message.text()); });
+  await openPanel(page);
+  await expect(page).toHaveTitle('Rele — Связи');
+  await expect(page.getByRole('navigation').getByRole('button', { name: 'Доступ', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('table').getByRole('columnheader')).toHaveText(['Группа / чат', 'Тема / обсуждение', 'Разговор Codex', 'Доступ']);
+  const clear = async (label: string, button: string) => {
+    const input = page.getByLabel(label, { exact: true });
+    await input.fill('нет совпадений');
+    await page.getByRole('button', { name: button, exact: true }).click();
+    await expect(input).toHaveValue('');
+    await expect(input).toBeFocused();
+    await expect(page.getByRole('button', { name: button, exact: true })).toHaveCount(0);
+  };
+  await clear('Найти группу или тред', 'Очистить поиск источников');
+  await page.screenshot({ path: test.info().outputPath('unified-telegram-desktop.png') });
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: test.info().outputPath('unified-telegram-mobile.png') });
+  await page.setViewportSize({ width: 1536, height: 1024 });
+  await page.getByRole('button', { name: 'Найти источники', exact: true }).click();
+  await clear('Поиск в обнаруженных чатах Telegram', 'Очистить поиск чатов Telegram');
+  await page.keyboard.press('Escape');
+  await page.getByRole('tab', { name: 'Slack', exact: true }).click();
+  await page.screenshot({ path: test.info().outputPath('unified-slack-desktop.png') });
+  await page.getByRole('button', { name: 'Найти источники', exact: true }).click();
+  await clear('Поиск каналов и личных чатов Slack', 'Очистить поиск чатов Slack');
+  await page.getByRole('dialog').getByLabel('Чат Slack', { exact: true }).selectOption('sl-alpha-chat');
+  await clear('Поиск тредов Slack', 'Очистить поиск тредов Slack');
+  await page.keyboard.press('Escape');
+  await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  await clear('Найти разговор Codex', 'Очистить поиск разговоров Codex');
+  await page.getByRole('navigation').getByRole('button', { name: 'Связи', exact: true }).click();
+  await page.getByRole('tab', { name: 'Slack', exact: true }).click();
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: test.info().outputPath('unified-slack-mobile.png') });
+  expect(api.mutations).toEqual([]);
+  expect(errors).toEqual([]);
 });

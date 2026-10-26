@@ -4,8 +4,8 @@
 
 | Система | Файл | Файлы программы | Фоновый запуск |
 | --- | --- | --- | --- |
-| Windows x64 | `rele-0.1.0-rc.20-windows-x64-setup.exe` | `%LOCALAPPDATA%\Programs\Rele` | Задача текущего пользователя при входе Windows |
-| Ubuntu Server x64 | `rele-0.1.0-rc.20-linux-x64.deb` | `/opt/rele`, команда `/usr/bin/rele` | Служба systemd `rele.service` под владельцем Codex |
+| Windows x64 | `rele-0.1.0-rc.21-windows-x64-setup.exe` | `%LOCALAPPDATA%\Programs\Rele` | Задача текущего пользователя при входе Windows |
+| Ubuntu Server x64 | `rele-0.1.0-rc.21-linux-x64.deb` | `/opt/rele`, команда `/usr/bin/rele` | Служба systemd `rele.service` под владельцем Codex |
 
 Пакеты включают Node.js 24.19.0 и зависимости Rele. Пользователю не нужен npm. Codex устанавливается отдельно; Windows Rele использует доступный установленный backend Desktop или CLI. Для локальных голосовых отдельно нужны Python и модель. WSL не используется.
 
@@ -50,7 +50,7 @@ Windows → «Установленные приложения» → Rele → «�
 Из сессии владельца Codex:
 
 ```bash
-sudo apt install ./rele-0.1.0-rc.20-linux-x64.deb
+sudo apt install ./rele-0.1.0-rc.21-linux-x64.deb
 rele service status
 ```
 

@@ -290,7 +290,7 @@ describe('Engine correlation and queue', () => {
     expect(f.telegram.deliver).not.toHaveBeenCalled();
   });
 
-  it('never publishes a mixed Desktop/Rele answer, including after reconnect and an incomplete history snapshot', async () => {
+  it.each(['completed', 'failed'] as const)('never publishes a mixed Desktop/Rele %s result, including after reconnect and an incomplete history snapshot', async state => {
     const f = fixture();
     const request = await acceptRequest(f);
     await running(f, request);
@@ -298,7 +298,7 @@ describe('Engine correlation and queue', () => {
     await f.engine.settled();
     expect(f.store.getRequest(request.id)?.status).toBe('uncertain');
     f.codex.connection(false);
-    f.codex.locations.set(request.id, { state: 'completed', turnId: 'turn-1', text: 'Contains Desktop-only context', mixed: false });
+    f.codex.locations.set(request.id, { state, turnId: 'turn-1', text: 'Contains Desktop-only context', failureReason: 'serverOverloaded', mixed: false });
     f.codex.connection(true);
     await f.engine.settled();
     await f.engine.pump();
@@ -306,6 +306,38 @@ describe('Engine correlation and queue', () => {
     expect(f.store.listDeliveries()).toEqual([]);
     expect(f.slack.deliver).not.toHaveBeenCalled();
     expect(f.telegram.deliver).not.toHaveBeenCalled();
+  });
+
+  it.each(['slack', 'telegram'] as const)('reports a confirmed overload to its %s source once without retrying the request', async platform => {
+    const f = fixture();
+    const request = await acceptRequest(f, platform);
+    await running(f, request);
+    f.codex.locations.set(request.id, { state: 'failed', turnId: 'turn-1', failureReason: 'serverOverloaded' });
+    await f.engine.reconcile(request.id);
+    await f.engine.pump();
+    await f.engine.reconcile(request.id);
+    await f.engine.pump();
+    const error = 'Сервис Codex временно перегружен. Запрос завершился с ошибкой. Rele не повторяет его автоматически.';
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'failed', turnId: 'turn-1', error });
+    expect(f.store.listDeliveries()).toMatchObject([{ kind: 'error', body: error, status: 'sent', attempts: 1 }]);
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+    expect(f[platform].deliver).toHaveBeenCalledTimes(1);
+    expect(f[platform === 'slack' ? 'telegram' : 'slack'].deliver).not.toHaveBeenCalled();
+  });
+
+  it('keeps an unknown native failure generic without publishing raw error details', async () => {
+    const f = fixture();
+    const request = await acceptRequest(f);
+    await running(f, request);
+    f.codex.locations.set(request.id, { state: 'failed', turnId: 'turn-1',
+      ...{ error: { message: 'synthetic-secret', additionalDetails: 'private-synthetic-secret' } } });
+    await f.engine.reconcile(request.id);
+    await f.engine.pump();
+    const error = 'Codex завершил запрос с ошибкой. Подробности доступны в Codex.';
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'failed', error });
+    expect(f.store.listDeliveries()).toMatchObject([{ kind: 'error', body: error }]);
+    expect(JSON.stringify(f.store.listDeliveries())).not.toContain('synthetic-secret');
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
   });
 
   it('never enqueues again after a lost acknowledgement and recovers accepted work by its UUID', async () => {

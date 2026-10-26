@@ -1741,16 +1741,16 @@ tbody tr:hover {
 .source-tab { display: flex; align-items: center; gap: 9px; padding: 12px 18px; border: 0; border-bottom: 3px solid transparent; background: transparent; color: var(--muted); cursor: pointer; font: inherit; font-weight: 600; }
 .source-tab.active { color: var(--text); border-bottom-color: var(--accent); }
 .source-tab .platform-icon { width: 25px; height: 25px; }
-.source-table th:nth-child(1) { width: 22%; }
-.source-table th:nth-child(2) { width: 27%; }
-.source-table th:nth-child(3) { width: 39%; }
-.source-table th:nth-child(4) { width: 12%; }
+.source-table th:nth-child(1) { width: 20%; }
+.source-table th:nth-child(2) { width: 25%; }
+.source-table th:nth-child(3) { width: 33%; }
+.source-table th:nth-child(4) { width: 22%; }
 .source-table select { min-width: 0; width: 100%; }
 .source-table .cell-copy small { white-space: normal; }
 .source-routing { gap: 8px; }
 .source-routing .field-hint { margin: 0; }
 .source-table .row-action { padding-inline: 12px; text-align: center; }
-#access-panel + .settings-section { margin-top: 40px; }
+#links-panel + .settings-section { margin-top: 40px; }
 @media (max-width: 1020px) { .source-table { min-width: 760px; } }
 @media (max-width: 760px) {
   #links-panel > .toolbar { align-items: stretch; flex-direction: column; }
@@ -1774,3 +1774,11 @@ tbody tr:hover {
 
 .binding-cells { display: grid; gap: 12px; }
 .binding-draft + .binding-draft { border-top: 1px solid var(--border); padding-top: 16px; }
+
+.clearable-input { position: relative; min-width: 0; width: 100%; }
+.clearable-input input { padding-right: 44px; }
+.clearable-input input::-webkit-search-cancel-button { display: none; }
+.clear-search { position: absolute; right: 0; top: 50%; transform: translateY(-50%); display: grid; place-items: center; width: 40px; height: 40px; padding: 0; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
+.clear-search:hover { color: var(--text); }
+.source-access { gap: 8px; }
+.source-access .button, .source-table .cell-copy > .button { align-self: flex-start; }

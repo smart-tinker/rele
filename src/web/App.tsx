@@ -17,15 +17,13 @@ import {
 } from './client';
 import { useDashboard } from './hooks';
 import { Conversations } from './Conversations';
-import { Access } from './Access';
 import { Deliveries, Queue } from './Activity';
 import { CodexSettings, Connections } from './Settings';
 import { Button, Field, Icon, Notice, Status, type IconName } from './ui';
 
-type View = 'conversations' | 'access' | 'queue' | 'deliveries' | 'connections' | 'codex';
+type View = 'conversations' | 'queue' | 'deliveries' | 'connections' | 'codex';
 const navigation: Array<{ id: View; label: string; icon: IconName }> = [
   { id: 'conversations', label: 'Связи', icon: 'link' },
-  { id: 'access', label: 'Доступ', icon: 'check' },
   { id: 'queue', label: 'Очередь', icon: 'clock' },
   { id: 'deliveries', label: 'Доставка', icon: 'send' },
   { id: 'connections', label: 'Подключения', icon: 'plug' },
@@ -275,7 +273,6 @@ function Dashboard({
                 onNavigate={setView}
               />
             )}{' '}
-            {view === 'access' && <Access state={state} api={api} refresh={refresh} />}
             {view === 'queue' && (
               <Queue state={state} api={api} refresh={refresh} />
             )}{' '}

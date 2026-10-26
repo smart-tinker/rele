@@ -16,6 +16,7 @@ import {
 import {
   ActionMessages,
   Button,
+  ClearableInput,
   EmptyState,
   Field,
   Notice,
@@ -770,14 +771,16 @@ export function CodexSettings({
         </div>
         {threadsError && <Notice>{threadsError}</Notice>}
         {threads.length > 0 && (
-          <label className="search-field thread-search">
-            <input
+          <div className="search-field thread-search">
+            <ClearableInput
+              clearLabel="Очистить поиск разговоров Codex"
+              onClear={() => setThreadQuery('')}
               value={threadQuery}
               onChange={(event) => setThreadQuery(event.target.value)}
               aria-label="Найти разговор Codex"
               placeholder="Найти разговор Codex"
             />
-          </label>
+          </div>
         )}
         <div className="table-panel">
           {filtered.length ? (
