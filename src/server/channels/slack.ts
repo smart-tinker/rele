@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import WebSocket from 'ws';
 import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionState, Delivery, Endpoint, InboundMessage, Origin, Person, SlackTranscriptMessage } from '../../shared/types.js';
-import { ChannelError, downloadBounded, endpointId, readableTitle, type Channel, type ChannelCallbacks, type SlackSessionStatus } from './common.js';
+import { ChannelError, downloadBounded, endpointId, readableTitle, splitReply, type Channel, type ChannelCallbacks, type SlackSessionStatus } from './common.js';
 import { escapeSlackText, formatSlackReply } from './slack-format.js';
 
 type Json = Record<string, any>;
@@ -414,7 +414,8 @@ export class SlackChannel implements Channel {
       body.blocks.unshift({ type: 'section', text: { type: 'mrkdwn', text: mentions, verbatim: true } });
     }
     if (approval && !approval.questions?.length) body.blocks = [
-      { type: 'section', text: { type: 'plain_text', text: delivery.body.slice(0, 2900) } },
+      // 1450 code points fit within 2900 UTF-16 units even when every character is an emoji.
+      ...splitReply(delivery.body, 1450).map(text => ({ type: 'section', text: { type: 'plain_text', text } })),
       { type: 'actions', elements: ['accept', 'decline'].map(decision => ({
         type: 'button', action_id: `rele_${decision}`, text: { type: 'plain_text', text: decision === 'accept' ? 'Разрешить' : 'Отклонить' }, value: `rele:${approval.id}:${decision}`,
       })) },

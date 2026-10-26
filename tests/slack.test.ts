@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type WebSocket from 'ws';
-import type { Delivery, Endpoint, InboundMessage } from '../src/shared/types.js';
+import type { Approval, Delivery, Endpoint, InboundMessage } from '../src/shared/types.js';
 import { SlackChannel } from '../src/server/channels/slack.js';
 import { Store } from '../src/server/store.js';
 import {
@@ -463,6 +463,33 @@ describe('Slack origin-bound delivery', () => {
     expect(posts[0].blocks).toEqual([{ type: 'markdown', text: text.replace(':codex-file-citation{path="C:/Отчёт.md" purpose="source"}', '`C:/Отчёт.md`') }]);
     expect(posts[1].blocks).toBeUndefined();
     expect(posts[1].text).toBe(text);
+  });
+
+  it.each([
+    ['long text and mentions', `${'a'.repeat(2898)}<@UPEER> @everyone\n${'b'.repeat(350)}`],
+    ['emoji and mentions', `Сообщение:\n${'🙂'.repeat(3000)} <@UPEER> & @everyone — конец`],
+  ])('preserves the entire approval preview in bounded plain-text sections: %s', async (_name, body) => {
+    const { channel, calls } = await makeChannel();
+    const approval: Approval = { id: 'approval-example', requestId: 'request-example', turnId: 'turn-example',
+      itemId: 'mcp-example', rpcId: 'rpc-example', method: 'mcpServer/elicitation/request', title: 'Разрешить сообщение',
+      details: body, status: 'pending', createdAt: '2026-10-26T00:00:00Z', updatedAt: '2026-10-26T00:00:00Z' };
+    await channel.deliver({ ...delivery(), kind: 'approval', approvalId: approval.id, body }, approval);
+    const posts = calls.filter(call => call.url.endsWith('/chat.postMessage'));
+    expect(posts).toHaveLength(1);
+    const post = JSON.parse(String(posts[0].init?.body));
+    const sections = post.blocks.filter((block: { type: string }) => block.type === 'section');
+    expect(sections.length).toBeGreaterThan(1);
+    expect(sections.map((block: { text: { text: string } }) => block.text.text).join('')).toBe(body);
+    for (const section of sections) {
+      expect(section.text.type).toBe('plain_text');
+      expect(section.text.text.length).toBeLessThanOrEqual(2900);
+      expect(section.text.text).not.toMatch(/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/u);
+    }
+    expect(post).toMatchObject({ channel: 'CEXAMPLE', thread_ts: '1000.1000', mrkdwn: false, parse: 'none', link_names: false });
+    expect(post.blocks.at(-1)).toEqual({ type: 'actions', elements: ['accept', 'decline'].map(decision => ({
+      type: 'button', action_id: `rele_${decision}`, text: { type: 'plain_text', text: decision === 'accept' ? 'Разрешить' : 'Отклонить' },
+      value: `rele:${approval.id}:${decision}`,
+    })) });
   });
 
   it('sets and clears only the original account/thread status without a status callback loop', async () => {

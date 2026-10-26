@@ -1372,6 +1372,93 @@ describe('Engine bot-origin group controls', () => {
   });
 });
 
+describe('Engine native Rele MCP message approvals', () => {
+  const params = (f: ReturnType<typeof fixture>, text = 'Send this exact text') => ({
+    threadId: THREAD, turnId: 'turn-1', serverName: 'rele', mode: 'form',
+    message: 'Native approval', requestedSchema: { type: 'object', properties: {} },
+    _meta: { codex_approval_kind: 'mcp_tool_call', tool_params: { endpointId: f.eps.slack.id, text } },
+  });
+  async function prepare(f: ReturnType<typeof fixture>, agent = false) {
+    f.config.slack.enabled = true;
+    f.store.setSourceAccess(f.eps.slack.id, { mode: 'all' });
+    if (agent) {
+      await f.engine.receive(slackInbound(f, 'agent-mcp', '170001.000001', 'Agent task', { sender: { id: 'UAGENT', name: 'Agent', isBot: true } }));
+      await f.engine.settled();
+    } else await acceptRequest(f);
+    const request = f.store.listRequests()[0]; await running(f, request); return request;
+  }
+  const action = (f: ReturnType<typeof fixture>, approval: Approval, decision: 'accept' | 'decline', patch: Partial<ApprovalAction> = {}): ApprovalAction => ({
+    approvalId: approval.id, decision, platform: 'slack', accountId: f.eps.slack.accountId, chatId: f.eps.slack.chatId,
+    threadId: f.eps.slack.threadId, senderId: 'U1', senderIsBot: false, ...patch,
+  });
+
+  it.each(['accept', 'decline'] as const)('forwards only the exact message preview and responds with a one-call MCP %s', async decision => {
+    const f = fixture(); f.codex.transport = 'websocket';
+    const request = await prepare(f);
+    f.codex.request({ id: 'mcp-approval', method: 'mcpServer/elicitation/request', params: {
+      ...params(f, 'Hello @unverified'), message: 'Unrelated native detail not forwarded',
+      _meta: { ...params(f, 'Hello @unverified')._meta, persist: ['session', 'always'], secret: 'unrelated-secret' },
+    } });
+    await f.engine.settled();
+    const approval = f.store.listApprovals()[0];
+    expect(approval).toMatchObject({ method: 'mcpServer/elicitation/request', requestId: request.id, status: 'pending' });
+    expect(approval.details).toContain('Team / Infrastructure');
+    expect(approval.details).toContain('Hello @\u200bunverified');
+    expect(approval.details).not.toMatch(/unrelated|session|always/);
+    expect(f.slack.deliver).toHaveBeenCalledWith(expect.objectContaining({ kind: 'approval', approvalId: approval.id }), approval);
+    await f.engine.action(action(f, approval, decision));
+    expect(f.codex.respond).toHaveBeenCalledExactlyOnceWith('mcp-approval', { action: decision, content: decision === 'accept' ? {} : null, _meta: null });
+    expect(f.store.getApproval(approval.id)).toMatchObject({ status: 'answered', decision });
+    await expect(f.engine.action(action(f, approval, decision))).rejects.toThrow(/завершено/);
+    expect(f.codex.respond).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows a verified group human to approve a bot request while refusing agents, unknown people and other sources', async () => {
+    const f = fixture(); await prepare(f, true);
+    f.codex.request({ id: 'agent-mcp-approval', method: 'mcpServer/elicitation/request', params: params(f) });
+    await f.engine.settled(); const approval = f.store.listApprovals()[0];
+    for (const patch of [{ senderId: 'UAGENT', senderIsBot: true }, { senderId: 'UOTHER', senderIsBot: undefined },
+      { accountId: 'other' }, { chatId: 'COTHER' }, { threadId: 'other-thread' }]) {
+      await expect(f.engine.action(action(f, approval, 'accept', patch))).rejects.toThrow(/недоступно/);
+    }
+    expect(f.codex.respond).not.toHaveBeenCalled();
+    await f.engine.action(action(f, approval, 'accept', { senderId: 'UOTHER', senderIsBot: false }));
+    expect(f.codex.respond).toHaveBeenCalledExactlyOnceWith('agent-mcp-approval', { action: 'accept', content: {}, _meta: null });
+  });
+
+  it('requires the entire long message preview before channel approval and still permits immediate decline', async () => {
+    const f = fixture(); await prepare(f);
+    f.slack.deliver.mockResolvedValueOnce('first-preview').mockRejectedValueOnce(new ChannelError('Temporary outage', true));
+    f.codex.request({ id: 'long-mcp-approval', method: 'mcpServer/elicitation/request', params: params(f, 'x'.repeat(3000)) });
+    await f.engine.settled(); const approval = f.store.listApprovals()[0];
+    expect(f.store.listDeliveries().filter(row => row.approvalId === approval.id)).toHaveLength(2);
+    expect(f.store.approvalDeliveryProgress(approval.id).complete).toBe(false);
+    await expect(f.engine.action(action(f, approval, 'accept'))).rejects.toThrow(/полной доставки/);
+    expect(f.codex.respond).not.toHaveBeenCalled();
+    await f.engine.action(action(f, approval, 'decline'));
+    expect(f.codex.respond).toHaveBeenCalledExactlyOnceWith('long-mcp-approval', { action: 'decline', content: null, _meta: null });
+  });
+
+  it.each([
+    { mode: 'url', url: 'https://private.example/auth' },
+    { serverName: 'another-mcp' },
+    { _meta: { codex_approval_kind: 'browser_auth', tool_params: { endpointId: 'slack-endpoint', text: 'private' } } },
+    { _meta: { codex_approval_kind: 'mcp_tool_call', tool_params: { endpointId: 'slack-endpoint', text: 'private', password: 'secret' } } },
+    { _meta: { codex_approval_kind: 'mcp_tool_call', tool_params: { endpointId: 'slack-endpoint', text: 'private', mentionIds: null } } },
+    { _meta: { codex_approval_kind: 'mcp_tool_call', tool_params: { endpointId: 'slack-endpoint', text: 'private', mentionIds: ['UUNKNOWN'] } } },
+    { requestedSchema: { type: 'object', properties: { password: { type: 'string' } } } },
+    { turnId: null },
+  ])('keeps unsupported, uncorrelated or secret elicitation out of the source: %j', async patch => {
+    const f = fixture(); await prepare(f);
+    f.codex.request({ id: 'unsupported-mcp', method: 'mcpServer/elicitation/request', params: { ...params(f), ...patch } });
+    await f.engine.settled();
+    expect(f.store.listApprovals()).toEqual([]);
+    expect(f.slack.deliver).not.toHaveBeenCalled();
+    expect(f.codex.respond).not.toHaveBeenCalled();
+    expect(f.codex.rejectRequest).toHaveBeenCalledWith('unsupported-mcp', expect.any(String));
+  });
+});
+
 describe('Engine Slack transcript and authorized task boundary', () => {
   it('replaces a stale writer error while a fresh Slack history scan is still paginating', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });

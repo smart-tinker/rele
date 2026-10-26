@@ -187,6 +187,9 @@ export class Engine extends EventEmitter {
     const origin = request?.origin;
     if (!request || !this.sameOrigin(request, { endpoint: { platform: action.platform, accountId: action.accountId, chatId: action.chatId,
       threadId: action.threadId ?? '' }, sender: { id: action.senderId, isBot: action.senderIsBot } })) throw new Error('Это подтверждение недоступно этому участнику источника.');
+    if (approval?.method === 'mcpServer/elicitation/request' && action.decision === 'accept' && !this.store.approvalDeliveryProgress(approval.id).complete) {
+      throw new Error('Дождитесь полной доставки запроса подтверждения.');
+    }
     await this.resolveApproval(action.approvalId, action.decision);
   }
 
@@ -209,7 +212,9 @@ export class Engine extends EventEmitter {
     } else {
       const capability = this.approvals.get(id);
       if (!capability || (decision === 'accept' && !capability.accept)) throw new Error('Это подтверждение нужно выполнить в Codex.');
-      result = { decision: decision === 'accept' ? 'accept' : capability.decline };
+      result = approval.method === 'mcpServer/elicitation/request'
+        ? { action: decision, content: decision === 'accept' ? {} : null, _meta: null }
+        : { decision: decision === 'accept' ? 'accept' : capability.decline };
     }
     this.resolutions.add(id);
     // Persist intent before the wire write. On a crash or disconnect this is not replayed.
@@ -689,6 +694,27 @@ export class Engine extends EventEmitter {
       ...(delivery.error ? { error: delivery.kind === 'message' && delivery.status === 'cancelled' ? 'Связь или доступ к источнику изменились. Сообщение не отправлено.'
         : delivery.status === 'uncertain' ? 'Результат отправки неизвестен. Проверьте исходный чат; не повторяйте отправку.' : 'Сообщение пока не доставлено. Проверьте состояние в Rele.' } : {}) };
   }
+  /** Only our native send approval is forwarded; generic MCP forms may contain secrets. */
+  private mcpMessageApproval(p: Record<string, any>): string | undefined {
+    const object = (value: unknown): value is Record<string, any> => !!value && typeof value === 'object' && !Array.isArray(value);
+    const schema = p.requestedSchema, meta = p._meta, args = meta?.tool_params;
+    if (p.serverName !== 'rele' || p.mode !== 'form' || !object(meta) || meta.codex_approval_kind !== 'mcp_tool_call'
+      || !object(schema) || schema.type !== 'object' || !object(schema.properties) || Object.keys(schema.properties).length
+      || Object.keys(schema).some(key => !['type', 'properties', 'required'].includes(key))
+      || schema.required !== undefined && (!Array.isArray(schema.required) || schema.required.length)
+      || !object(args) || Object.keys(args).some(key => !['endpointId', 'text', 'mentionIds'].includes(key))
+      || typeof args.endpointId !== 'string' || typeof args.text !== 'string' || !args.text.trim() || [...args.text].length > 3000
+      || /[\x00-\x08\x0b-\x1f\x7f]/u.test(args.text)) return;
+    const target = this.toolDestinations(p.threadId, false).find(value => value.endpointId === args.endpointId);
+    const ids = args.mentionIds === undefined ? [] : args.mentionIds;
+    if (!target || !Array.isArray(ids) || ids.some(id => typeof id !== 'string') || new Set(ids).size !== ids.length) return;
+    const people = ids.map(id => target.participants.find(person => person.id === id));
+    if (people.some(person => !person)) return;
+    // Approval previews describe the intended pings without issuing those pings themselves.
+    return [`Инструмент: Rele · send_message`, `Адресат: ${target.platform} · ${target.title}`,
+      ...(people.length ? [`Упоминания: ${people.map(person => `${person!.name} (${person!.id})`).join(', ')}`] : []),
+      `Сообщение:\n${args.text}`].join('\n\n').replaceAll('@', '@\u200b');
+  }
   private ownIdentity(channel: Channel, platform: Platform): Person {
     return channel.identity ?? { id: platform === 'slack' ? channel.state.accountId!.split(':').at(-1)! : channel.state.accountId!,
       name: channel.state.name ?? 'Подключённый агент', isBot: true };
@@ -866,7 +892,8 @@ export class Engine extends EventEmitter {
     const question = event.method === 'item/tool/requestUserInput';
     const command = event.method === 'item/commandExecution/requestApproval';
     const files = event.method === 'item/fileChange/requestApproval';
-    if (!question && !command && !files) {
+    const mcp = event.method === 'mcpServer/elicitation/request' ? this.mcpMessageApproval(p) : undefined;
+    if (!question && !command && !files && !mcp) {
       if (this.codex.status().transport === 'managed') {
         await this.codex.rejectRequest(event.id, 'This Codex interaction is not supported by Rele.');
         this.store.updateRequest(request.id, { error: 'Codex запросил действие, которое Rele пока не поддерживает. Действие отклонено; выполнение можно отменить в панели.' });
@@ -874,11 +901,11 @@ export class Engine extends EventEmitter {
       this.changed(); return;
     }
     const questions: ApprovalQuestion[] | undefined = question && Array.isArray(p.questions) ? p.questions.map((entry: Record<string, any>) => ({ id: String(entry.id), header: String(entry.header ?? ''), question: String(entry.question ?? ''), isSecret: !!entry.isSecret, ...(Array.isArray(entry.options) ? { options: entry.options.map((option: Record<string, any>) => ({ label: String(option.label), description: String(option.description ?? '') })) } : {}) })) : undefined;
-    const title = question ? 'Codex ждёт уточнения' : command ? 'Codex запрашивает выполнение команды' : 'Codex запрашивает изменение файлов';
-    const metadata = [p.reason, p.command, p.cwd ? `Каталог: ${p.cwd}` : '', p.grantRoot ? `Доступ на запись: ${p.grantRoot}` : '', p.additionalPermissions ? JSON.stringify(p.additionalPermissions) : '', files ? this.fileChanges.get(String(p.itemId)) : ''].filter(Boolean).join('\n\n').slice(0, 16_000);
+    const title = mcp ? 'Codex запрашивает отправку сообщения' : question ? 'Codex ждёт уточнения' : command ? 'Codex запрашивает выполнение команды' : 'Codex запрашивает изменение файлов';
+    const metadata = mcp ?? [p.reason, p.command, p.cwd ? `Каталог: ${p.cwd}` : '', p.grantRoot ? `Доступ на запись: ${p.grantRoot}` : '', p.additionalPermissions ? JSON.stringify(p.additionalPermissions) : '', files ? this.fileChanges.get(String(p.itemId)) : ''].filter(Boolean).join('\n\n').slice(0, 16_000);
     const questionDetails = questions?.map((value, index) => `${questions.length > 1 ? `${index + 1}. ` : ''}${value.header}: ${value.question}${value.options?.length ? '\n' + value.options.map(option => `${option.label} — ${option.description}`).join('\n') : ''}`).join('\n\n');
     const details = [metadata, questionDetails].filter(Boolean).join('\n\n');
-    const approval = this.store.addApproval({ requestId: request.id, turnId: p.turnId, itemId: `${p.itemId}:${p.approvalId ?? event.id}:${this.epoch}`, rpcId: event.id, method: event.method, title, details, questions });
+    const approval = this.store.addApproval({ requestId: request.id, turnId: p.turnId, itemId: `${mcp ? 'mcp' : p.itemId}:${p.approvalId ?? event.id}:${this.epoch}`, rpcId: event.id, method: event.method, title, details, questions });
     const choices: unknown[] | undefined = Array.isArray(p.availableDecisions) ? p.availableDecisions : undefined;
     this.approvals.set(approval.id, { accept: !choices || choices.includes('accept'), decline: choices?.includes('cancel') && !choices.includes('decline') ? 'cancel' : 'decline' });
     this.store.updateRequest(request.id, { status: 'waiting_approval' });
@@ -886,7 +913,7 @@ export class Engine extends EventEmitter {
       ? questions.length === 1 ? '\n\nОтветьте на это сообщение.' : '\n\nОтветьте на это сообщение: по строке на каждый вопрос, по порядку — 1. ответ, затем с новой строки 2. ответ.'
       : questions?.length ? '\n\nСекретные ответы вводятся только в локальной панели Rele.' : '';
     // Nonsecret questions must be visible in full before the origin can answer them.
-    const bodies = questions?.length && !questions.some(value => value.isSecret)
+    const bodies = mcp ? splitReply(`${title}\n\n${details}`, 3000) : questions?.length && !questions.some(value => value.isSecret)
       ? splitReply(`${title}\n\n${details}${guidance}`, 3000)
       : [`${title}\n\n${details.slice(0, 2400)}${details.length > 2400 ? '\n… Полный запрос доступен в панели Rele.' : ''}${guidance}`];
     this.store.addDeliveries(request.id, bodies.map((body, ordinal) => ({ key: ordinal ? `approval:${approval.id}:${ordinal}` : `approval:${approval.id}`, ordinal, kind: 'approval' as const, body, approvalId: approval.id })));
