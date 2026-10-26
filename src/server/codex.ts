@@ -341,7 +341,18 @@ export class CodexClient extends EventEmitter {
     if (pending.data.length || pending.nextCursor) throw new CodexThreadBusyError(threadId, 'queued_input');
     await this.subscribe(threadId);
     const thread = await read();
-    if (thread.status?.type !== 'idle') throw new CodexThreadBusyError(threadId, 'non_idle');
+    if (thread.status?.type === 'systemError') {
+      // Native keeps this error flag until the next turn; require actual completion first.
+      const page = await this.call<Page<HistoryTurn>>('thread/turns/list', { threadId, limit: 1, itemsView: 'summary', sortDirection: 'desc' });
+      current();
+      const latest = Array.isArray(page?.data) && page.data.length === 1 ? page.data[0] : undefined;
+      if (typeof latest?.id !== 'string' || !latest.id.trim() || !['completed', 'failed', 'interrupted'].includes(latest.status)
+        || typeof latest.completedAt !== 'number' || !Number.isFinite(latest.completedAt)) {
+        throw new CodexThreadBusyError(threadId, 'non_idle');
+      }
+      const confirmed = await read();
+      if (!['idle', 'systemError'].includes(confirmed.status?.type ?? '')) throw new CodexThreadBusyError(threadId, 'non_idle');
+    } else if (thread.status?.type !== 'idle') throw new CodexThreadBusyError(threadId, 'non_idle');
     const queue = await this.call<Page<QueueEntry>>('thread/queue/list', { threadId, limit: 1 });
     if (!Array.isArray(queue?.data)) throw new CodexTransportError('Codex вернул некорректную очередь фонового контекста.', 'invalid-protocol');
     if (queue.data.length || queue.nextCursor) throw new CodexThreadBusyError(threadId, 'queued_input');

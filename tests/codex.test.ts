@@ -990,13 +990,72 @@ describe('Codex shared passive context receipts', () => {
     expect(f.calls.some(call => ['thread/resume', 'thread/inject_items', 'turn/start', 'thread/queue/add'].includes(call.method ?? ''))).toBe(false);
   });
 
-  it.each(['queue', 'active'] as const)('preserves the shared %s readiness guard', async condition => {
+  it.each(['queue', 'active', 'notLoaded', 'unknown'] as const)('preserves the shared %s readiness guard', async condition => {
     const f = await sharedContextFixture();
     if (condition === 'queue') f.handlers['thread/queue/list'] = () => ({ data: [{ id: 'other', clientUserMessageId: 'other' }], nextCursor: null });
-    else f.thread.status.type = 'active';
+    else f.thread.status.type = condition;
     await f.client.connect();
     await expect(f.client.injectContext(threadId, 'entry', 'Context')).rejects.toMatchObject({ name: 'CodexThreadBusyError', reason: condition === 'queue' ? 'queued_input' : 'non_idle' });
     expect(f.calls.some(call => call.method === 'thread/inject_items')).toBe(false);
+  });
+
+  it.each(['failed', 'completed', 'interrupted'])('appends passive context after a confirmed %s turn leaves systemError without replaying that turn', async status => {
+    const f = await sharedContextFixture();
+    const previous = { id: 'previous-turn', status, completedAt: 1793004647, error: { codexErrorInfo: 'serverOverloaded' } };
+    f.thread.status.type = 'systemError';
+    f.handlers['thread/turns/list'] = () => ({ data: [previous], nextCursor: 'older-turns' });
+    await f.client.connect();
+    await f.client.injectContext(threadId, 'new-slack-entry', 'New agent context');
+    expect(f.calls.find(call => call.method === 'thread/turns/list')?.params).toEqual({ threadId, limit: 1, itemsView: 'summary', sortDirection: 'desc' });
+    expect(f.calls.filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
+    expect(await readFile(f.rolloutPath, 'utf8')).toContain('rele_slack_new-slack-entry');
+    expect(previous).toEqual({ id: 'previous-turn', status, completedAt: 1793004647, error: { codexErrorInfo: 'serverOverloaded' } });
+    expect(f.calls.some(call => ['thread/start', 'thread/fork', 'turn/start', 'turn/interrupt', 'thread/queue/add', 'thread/queue/start', 'thread/queue/delete'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it.each([
+    [],
+    [{ id: 'current', status: 'inProgress', completedAt: null }],
+    [{ id: 'current', status: 'interrupted', completedAt: null }],
+    [{ id: 'current', status: 'failed' }],
+    [{ id: 'current', status: 'failed', completedAt: '1793004647' }],
+    [{ id: 'current', status: 'unknown', completedAt: 1793004647 }],
+    [{ status: 'failed', completedAt: 1793004647 }],
+    [{ id: 1, status: 'failed', completedAt: 1793004647 }],
+  ])('keeps systemError blocked without a confirmed terminal latest turn: %j', async (...data) => {
+    const f = await sharedContextFixture();
+    f.thread.status.type = 'systemError';
+    f.handlers['thread/turns/list'] = () => ({ data, nextCursor: null });
+    await f.client.connect();
+    await expect(f.client.injectContext(threadId, 'entry', 'Context')).rejects.toMatchObject({ name: 'CodexThreadBusyError', reason: 'non_idle' });
+    expect(f.calls.some(call => call.method === 'thread/inject_items')).toBe(false);
+    expect(await readFile(f.rolloutPath, 'utf8')).toBe(f.meta);
+  });
+
+  it.each(['active', 'notLoaded', 'unknown'])('blocks passive context if terminal systemError changes to %s during verification', async status => {
+    const f = await sharedContextFixture();
+    f.thread.status.type = 'systemError';
+    f.handlers['thread/turns/list'] = () => {
+      f.thread.status.type = status;
+      return { data: [{ id: 'old', status: 'failed', completedAt: 1793004647 }], nextCursor: null };
+    };
+    await f.client.connect();
+    await expect(f.client.injectContext(threadId, 'entry', 'Context')).rejects.toMatchObject({ name: 'CodexThreadBusyError', reason: 'non_idle' });
+    expect(f.calls.some(call => call.method === 'thread/inject_items')).toBe(false);
+  });
+
+  it('preserves a native message queued while terminal systemError is being verified', async () => {
+    const f = await sharedContextFixture();
+    let queued = false;
+    f.thread.status.type = 'systemError';
+    f.handlers['thread/turns/list'] = () => {
+      queued = true;
+      return { data: [{ id: 'old', status: 'failed', completedAt: 1793004647 }], nextCursor: null };
+    };
+    f.handlers['thread/queue/list'] = () => ({ data: queued ? [{ id: 'other', clientUserMessageId: 'other' }] : [], nextCursor: null });
+    await f.client.connect();
+    await expect(f.client.injectContext(threadId, 'entry', 'Context')).rejects.toMatchObject({ name: 'CodexThreadBusyError', reason: 'queued_input' });
+    expect(f.calls.some(call => ['thread/inject_items', 'thread/queue/add', 'thread/queue/delete'].includes(call.method ?? ''))).toBe(false);
   });
 
   it('re-reads the exact native rollout path after ACK when the thread was archived', async () => {
