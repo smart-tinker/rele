@@ -197,6 +197,46 @@ describe('Windows direct shared Codex', () => {
     expect(f.run.mock.calls.map(([, args]) => args[0])).toEqual(['codex-status', '--version', 'codex-start', '--version']);
   });
 
+  it('accepts read-only successor status but requires codex-start to persist the new owner pointer', async () => {
+    const f = await windowsFixture();
+    f.owner.running = true; f.receipt.status = 'alreadyRunning';
+    const metadataPath = path.join(f.installationDirectory, 'rele-install.json');
+    const before = await readFile(metadataPath, 'utf8');
+    f.receipt.ownerDirectory = path.join(path.dirname(f.receipt.ownerDirectory), 'b'.repeat(64));
+    await mkdir(f.receipt.ownerDirectory);
+    f.run.mockImplementation(async (_command, args) => {
+      if (args[0] === 'codex-start') {
+        expect(await readFile(metadataPath, 'utf8')).toBe(before);
+        await writeFile(metadataPath, JSON.stringify({ ...f.metadata, CodexWebSocketOwnerDirectory: f.receipt.ownerDirectory }));
+      }
+      return { code: 0, stdout: args.at(-1) === '--version' ? 'codex-cli 0.163.0-alpha.11.2' : JSON.stringify(f.receipt) };
+    });
+    expect(await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).toMatchObject({ executable: f.executable, transport: 'websocket' });
+    expect(f.discover).not.toHaveBeenCalled();
+    expect(f.run.mock.calls.map(([, args]) => args[0])).toEqual(['codex-status', '--version', 'codex-start', '--version']);
+    expect(f.calls).toEqual(['initialize', 'initialized', 'server/diagnostics']);
+  });
+
+  it('still rejects a full start receipt whose same-cache owner pointer was not persisted', async () => {
+    const f = await windowsFixture();
+    f.receipt.ownerDirectory = path.join(path.dirname(f.receipt.ownerDirectory), 'b'.repeat(64));
+    await mkdir(f.receipt.ownerDirectory);
+    await expect(ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).rejects.toMatchObject({ code: 'shared-daemon-invalid' });
+    expect(f.calls).toEqual([]);
+  });
+
+  it('rejects successor status outside the owned cache without changing metadata or starting Codex', async () => {
+    const f = await windowsFixture();
+    const metadataPath = path.join(f.installationDirectory, 'rele-install.json'), before = await readFile(metadataPath, 'utf8');
+    f.owner.running = true; f.receipt.status = 'alreadyRunning';
+    f.receipt.ownerDirectory = path.join(f.home, 'foreign-cache', 'b'.repeat(64));
+    await mkdir(f.receipt.ownerDirectory, { recursive: true });
+    await expect(ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).rejects.toMatchObject({ code: 'shared-daemon-invalid' });
+    expect(f.run.mock.calls.map(([, args]) => args[0])).toEqual(['codex-status']);
+    expect(await readFile(metadataPath, 'utf8')).toBe(before);
+    expect(f.calls).toEqual([]);
+  });
+
   it('rejects a foreign active-owner status before discovery or backend execution', async () => {
     const f = await windowsFixture();
     f.owner.running = true; f.receipt.status = 'alreadyRunning'; f.receipt.ownerSid = 'S-1-5-21-2002';

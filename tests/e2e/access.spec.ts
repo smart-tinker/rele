@@ -5,8 +5,10 @@ const navigation = (page: import('@playwright/test').Page, name: string) => page
 
 test('all discovered unconfigured sources start off and viewing access never changes permissions', async ({ page }) => {
   const state = fixtureState(true); const api = await installApi(page, state);
-  await openPanel(page); await navigation(page, 'Доступ').click();
-  await expect(page).toHaveTitle('Rele — Доступ');
+  await openPanel(page); await navigation(page, 'Связи').click();
+  await expect(page).toHaveTitle('Rele — Связи');
+  await expect(navigation(page, 'Доступ')).toHaveCount(0);
+  await expect(page.getByRole('table').getByRole('columnheader')).toHaveText(['Группа / чат', 'Тема / обсуждение', 'Разговор Codex', 'Доступ']);
   await expect(page.getByLabel('Режим для Команда Альфа', { exact: true })).toHaveValue('off');
   await page.getByRole('tab', { name: 'Slack', exact: true }).click();
   await expect(page.getByLabel('Режим для #alpha-dev', { exact: true })).toHaveValue('off');
@@ -16,7 +18,7 @@ test('all discovered unconfigured sources start off and viewing access never cha
 test('saving mention mode changes only access for that source and leaves shared routing intact', async ({ page }) => {
   const state = fixtureState(); const original = structuredClone(state.conversations);
   const api = await installApi(page, state); await openPanel(page);
-  await navigation(page, 'Доступ').click();
+  await navigation(page, 'Связи').click();
   await page.getByLabel('Режим для Пример: новый чат', { exact: true }).selectOption('mention');
   const dialog = page.getByRole('dialog');
   await expect(dialog.getByLabel('Режим реакции')).toHaveValue('mention');
@@ -34,13 +36,19 @@ test('DM access requires selected humans and never offers other agents as sender
   state.endpoints.push({ ...fixtureEndpoint('direct-source', 'slack', 'Личная задача', 'Личные сообщения'), chatId: 'DPRIVATE', chatTitle: 'Анна (пример)',
     people: [{ id: 'person-anna', name: 'Анна (пример)' }, { id: 'OTHERBOT', name: 'Другой агент', isBot: true }] });
   const api = await installApi(page, state); await openPanel(page);
-  await navigation(page, 'Доступ').click(); await page.getByRole('tab', { name: 'Slack', exact: true }).click();
+  await navigation(page, 'Связи').click(); await page.getByRole('tab', { name: 'Slack', exact: true }).click();
   await page.getByLabel('Режим для Личная задача', { exact: true }).selectOption('all');
   const dialog = page.getByRole('dialog');
   await expect(dialog.getByRole('checkbox', { name: /Другой агент/ })).toHaveCount(0);
   await dialog.getByRole('button', { name: 'Сохранить доступ', exact: true }).click();
   await expect(dialog.getByRole('alert')).toContainText('хотя бы одного человека');
   expect(api.mutations).toEqual([]);
+  const peopleSearch = dialog.getByLabel('Поиск участников Slack', { exact: true });
+  await peopleSearch.fill('никого');
+  await expect(dialog.getByRole('checkbox', { name: 'Анна (пример)', exact: true })).toHaveCount(0);
+  await dialog.getByRole('button', { name: 'Очистить поиск участников Slack', exact: true }).click();
+  await expect(peopleSearch).toHaveValue('');
+  await expect(peopleSearch).toBeFocused();
   await dialog.getByRole('checkbox', { name: 'Анна (пример)', exact: true }).check();
   await dialog.getByRole('button', { name: 'Сохранить доступ', exact: true }).click();
   await expect(dialog).toHaveCount(0);
@@ -50,7 +58,7 @@ test('DM access requires selected humans and never offers other agents as sender
 
 test('legacy sender restrictions survive viewing, cancelling and disabling without an implicit access expansion', async ({ page }) => {
   const state = fixtureState(); const original = structuredClone(state.conversations[0]);
-  const api = await installApi(page, state); await openPanel(page); await navigation(page, 'Доступ').click();
+  const api = await installApi(page, state); await openPanel(page); await navigation(page, 'Связи').click();
   await page.getByRole('button', { name: 'Изменить доступ Команда Альфа', exact: true }).click();
   await expect(page.getByRole('dialog')).toContainText('Сохранение заменит прежний доступ');
   await page.keyboard.press('Escape');
@@ -83,7 +91,7 @@ test('an unavailable saved source can be disabled and unlinked without reconnect
   const api = await installApi(page, state); await openPanel(page);
   await page.getByLabel('Разговор Codex для Команда Альфа', { exact: true }).selectOption('');
   await expect.poll(() => state.conversations[0].bindings.some(item => item.endpointId === 'tg-alpha')).toBe(false);
-  await navigation(page, 'Доступ').click();
+  await navigation(page, 'Связи').click();
   await page.getByLabel('Режим для Команда Альфа', { exact: true }).selectOption('off');
   await page.getByRole('dialog').getByRole('button', { name: 'Сохранить доступ', exact: true }).click();
   await expect(page.getByRole('dialog')).toHaveCount(0);

@@ -101,7 +101,7 @@ export async function captureInstallerOwner(target) {
   target.desktopOwner = { directory: settings.CodexWebSocketOwnerDirectory, taskName: settings.CodexWebSocketTaskName, ownerSid: settings.OwnerSid };
 }
 
-export function stopInstallerCodex(target) {
+export function stopInstallerCodex(target, scheduledDirectory) {
   if (!target) return;
   if (process.platform === 'win32' && target.installSettingsPath && !target.desktopOwner)
     throw new Error('The isolated owner state is unconfirmed; preserve its fixture files for inspection.');
@@ -109,9 +109,29 @@ export function stopInstallerCodex(target) {
     const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `
       $ErrorActionPreference = 'Stop';
       $owner = $env:RELE_FIXTURE_OWNER | ConvertFrom-Json;
-      $receipt = Get-Content -LiteralPath (Join-Path $owner.directory 'receipt.json') -Raw | ConvertFrom-Json;
       $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value;
-      if ($owner.ownerSid -ne $sid -or $receipt.ownerSid -ne $sid) { throw 'Foreign fixture owner.' }
+      if ($owner.ownerSid -ne $sid) { throw 'Foreign fixture owner.' }
+      $scheduled = if ($owner.scheduledDirectory) { [string]$owner.scheduledDirectory } else { [string]$owner.directory };
+      $directories = @([string]$owner.directory);
+      function Read-FixtureMarker([string]$directory) {
+        if ((Split-Path -Parent $directory) -ne (Split-Path -Parent $owner.directory) -or
+          (Split-Path -Leaf $directory) -notmatch '^[a-f0-9]{64}$' -or
+          ((Get-Item -LiteralPath $directory).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Foreign fixture directory.' }
+        $file=Join-Path $directory 'owner.json';
+        if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant() -ne (Split-Path -Leaf $directory)) { throw 'Fixture marker changed.' }
+        $marker=Get-Content -LiteralPath $file -Raw | ConvertFrom-Json;
+        if ($marker.Version -ne 1 -or $marker.OwnerSid -ne $sid -or $marker.TaskName -ne $owner.taskName -or
+          (Get-FileHash -LiteralPath (Join-Path $directory 'Rele.Process.exe') -Algorithm SHA256).Hash.ToLowerInvariant() -ne $marker.HostSha256) { throw 'Foreign fixture marker.' }
+        return $marker;
+      }
+      $marker = Read-FixtureMarker $owner.directory;
+      if ($scheduled -ne $owner.directory) {
+        $next = Read-FixtureMarker $scheduled;
+        foreach($field in @('OwnerSid','TaskName','Endpoint','CodexHome','Executable','ExecutableSha256')) {
+          if($marker.$field -ne $next.$field) { throw 'Foreign fixture successor scope.' }
+        }
+        $directories += $scheduled;
+      }
       $scheduler = New-Object -ComObject 'Schedule.Service'; $scheduler.Connect(); $folder = $scheduler.GetFolder('\\');
       $task = $null;
       try { $task = $folder.GetTask($owner.taskName) } catch { if ($_.Exception.HResult -ne -2147024894) { throw } }
@@ -121,26 +141,61 @@ export function stopInstallerCodex(target) {
           ([Security.Principal.NTAccount]::new([string]$definition.Principal.UserId)).Translate([Security.Principal.SecurityIdentifier]).Value
         };
         if ($definition.Actions.Count -ne 1 -or $action.Type -ne 0 -or
-          $action.Path -ne (Join-Path $owner.directory 'Rele.Process.exe') -or
-          $action.Arguments -ne ('--codex-websocket-owner "' + (Join-Path $owner.directory 'owner.json') + '"') -or
-          $action.WorkingDirectory -ne $owner.directory -or $principalSid -ne $sid -or
+          $action.Path -ne (Join-Path $scheduled 'Rele.Process.exe') -or
+          $action.Arguments -ne ('--codex-websocket-owner "' + (Join-Path $scheduled 'owner.json') + '"') -or
+          $action.WorkingDirectory -ne $scheduled -or $principalSid -ne $sid -or
           [int]$definition.Principal.LogonType -ne 3 -or [int]$definition.Principal.RunLevel -ne 0) { throw 'Foreign fixture task.' }
         $task.Enabled = $false;
       }
-      $hostProcess = Get-Process -Id $receipt.hostPid -ErrorAction SilentlyContinue;
-      if ($hostProcess) {
-        $native = Get-Process -Id $receipt.nativePid -ErrorAction Stop;
-        if ($hostProcess.Path -ne (Join-Path $owner.directory 'Rele.Process.exe') -or
-          $hostProcess.StartTime.ToUniversalTime().ToString('o') -ne [string]$receipt.hostStartedAt -or
-          $native.Path -ne [string]$receipt.executable -or $native.StartTime.ToUniversalTime().ToString('o') -ne [string]$receipt.nativeStartedAt) { throw 'Stale fixture PID.' }
+      if ($task -and $task.State -in @(2,4) -and -not (Test-Path -LiteralPath (Join-Path $scheduled 'receipt.json'))) {
+        $oldStillRunning=$false;
+        if($scheduled -ne $owner.directory) {
+          $prior=Get-Content -LiteralPath (Join-Path $owner.directory 'receipt.json') -Raw | ConvertFrom-Json;
+          $priorHost=Get-Process -Id $prior.hostPid -ErrorAction SilentlyContinue;
+          $oldStillRunning=$priorHost -and $priorHost.Path -eq (Join-Path $owner.directory 'Rele.Process.exe') -and
+            $priorHost.StartTime.ToUniversalTime().ToString('o') -eq [string]$prior.hostStartedAt;
+        }
+        if(-not $oldStillRunning) {
+          $wait=[Diagnostics.Stopwatch]::StartNew();
+          while($task.State -in @(2,4) -and -not (Test-Path -LiteralPath (Join-Path $scheduled 'receipt.json')) -and $wait.ElapsedMilliseconds -lt 15000) { Start-Sleep -Milliseconds 100 }
+          if($task.State -in @(2,4) -and -not (Test-Path -LiteralPath (Join-Path $scheduled 'receipt.json'))) { throw 'Successor receipt is unconfirmed; retain the fixture.' }
+        }
+      }
+      foreach($directory in $directories) {
+        $receiptFile=Join-Path $directory 'receipt.json';
+        if(-not (Test-Path -LiteralPath $receiptFile)) {
+          if($directory -eq $owner.directory) { throw 'The original fixture receipt is missing; retain the fixture.' }
+          continue;
+        }
+        $receipt=Get-Content -LiteralPath $receiptFile -Raw | ConvertFrom-Json;
+        if($receipt.ownerSid -ne $sid -or $receipt.endpoint -ne $marker.Endpoint -or $receipt.codexHome -ne $marker.CodexHome -or
+          $receipt.executable -ne $marker.Executable -or $receipt.executableSha256 -ne $marker.ExecutableSha256) { throw 'Foreign fixture receipt.' }
+        $hostProcess = Get-Process -Id $receipt.hostPid -ErrorAction SilentlyContinue;
+        if (-not $hostProcess) { continue }
+        $hostPin=$hostProcess.Handle;
+        if ($hostProcess.Path -ne (Join-Path $directory 'Rele.Process.exe') -or
+          $hostProcess.StartTime.ToUniversalTime().ToString('o') -ne [string]$receipt.hostStartedAt) { throw 'Stale fixture host PID.' }
         $identity = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $hostProcess.Id);
         if ((Invoke-CimMethod -InputObject $identity -MethodName GetOwnerSid).Sid -ne $sid) { throw 'Foreign fixture process.' }
-        Stop-Process -Id $hostProcess.Id -ErrorAction Stop;
-        if (-not $hostProcess.WaitForExit(10000) -or -not $native.WaitForExit(10000)) { throw 'Fixture Job did not exit.' }
+        $native = Get-Process -Id $receipt.nativePid -ErrorAction SilentlyContinue;
+        if($native) {
+          $nativePin=$native.Handle;
+          $nativeIdentity=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $native.Id);
+          if($native.Path -ne [string]$receipt.executable -or $native.StartTime.ToUniversalTime().ToString('o') -ne [string]$receipt.nativeStartedAt -or
+            $nativeIdentity.ParentProcessId -ne $hostProcess.Id -or (Invoke-CimMethod -InputObject $nativeIdentity -MethodName GetOwnerSid).Sid -ne $sid -or
+            (Get-FileHash -LiteralPath $native.Path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $marker.ExecutableSha256) { throw 'Stale fixture native PID.' }
+        }
+        $hostProcess.Kill();
+        if (-not $hostProcess.WaitForExit(10000) -or ($native -and -not $native.WaitForExit(10000))) { throw 'Fixture Job did not exit.' }
       }
-      if ($task) { $folder.DeleteTask($owner.taskName, 0) }
-      '{"status":"stopped"}'`], { env: { ...process.env, RELE_FIXTURE_OWNER: JSON.stringify(target.desktopOwner) },
-      encoding: 'utf8', timeout: 30_000, windowsHide: true });
+      if ($task) {
+        $drain=[Diagnostics.Stopwatch]::StartNew();
+        while (($task.State -in @(2,4) -or $task.GetInstances(0).Count -gt 0) -and $drain.ElapsedMilliseconds -lt 10000) { Start-Sleep -Milliseconds 100 }
+        if ($task.State -notin @(1,3) -or $task.GetInstances(0).Count -ne 0) { throw 'The disabled fixture Task still has an unconfirmed instance; retain it and the fixture.' }
+        $folder.DeleteTask($owner.taskName, 0);
+      }
+      '{"status":"stopped"}'`], { env: { ...process.env, RELE_FIXTURE_OWNER: JSON.stringify({ ...target.desktopOwner, ...(scheduledDirectory ? { scheduledDirectory } : {}) }) },
+      encoding: 'utf8', timeout: scheduledDirectory ? 75_000 : 45_000, windowsHide: true });
     assert.equal(result.status, 0, result.stderr || 'The isolated WebSocket owner must stop before its profile is removed.');
     return JSON.parse(result.stdout);
   }

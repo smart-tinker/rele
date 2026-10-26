@@ -1272,7 +1272,7 @@ describe('source access and native thread routing', () => {
     expect(f.store.listConversations()).toHaveLength(1);
     expect(f.store.getConversation(original.id)).toMatchObject({ name: 'Мой alias', threadId: 'thread-example', cwd: '/work/example' });
     expect(f.store.getConversation(original.id)?.bindings).toHaveLength(4);
-    expect(f.codex.listThreads).toHaveBeenCalledWith({ refresh: true });
+    expect(f.codex.listThreads.mock.calls).toEqual(Array.from({ length: 8 }, () => []));
     expect(createNative).not.toHaveBeenCalled();
     expect(f.store.listRequests()).toEqual([]);
   });
@@ -1298,6 +1298,48 @@ describe('source access and native thread routing', () => {
     const next = f.store.ingest({ ...message, eventId: 'accepted-after-move', messageId: 'message-2' }).request!;
     expect(next.conversationId).not.toBe(queued.conversationId);
     expect(f.store.getConversation(next.conversationId)?.threadId).toBe('thread-other');
+  });
+
+  it.each([false, true])('assigns an indexed thread when a full scan is unavailable (recovery: %s)', async recovery => {
+    const f = makeApp(); const { endpoint } = attachSource(f);
+    const catalog = (await f.app.inject({ url: '/api/threads', headers })).json().threads;
+    const intent = recovery ? autoIntent(f, endpoint) : undefined;
+    f.codex.listThreads.mockClear();
+    f.codex.listThreads.mockImplementation(async (options?: { refresh?: boolean }) => {
+      if (options?.refresh) throw new Error('Synthetic full catalog timeout');
+      return catalog;
+    });
+    const response = await put(f, endpoint, 'route', { threadId: 'thread-example', ...(intent ? { resolveAutoLinkId: intent.id } : {}) });
+    expect(response.statusCode, response.body).toBe(200);
+    expect(f.codex.listThreads).toHaveBeenCalledExactlyOnceWith();
+    expect(f.store.listConversations()).toHaveLength(1);
+    expect(f.store.listConversations()[0]).toMatchObject({ threadId: 'thread-example', cwd: '/work/example' });
+  });
+
+  it.each(['missing', 'archived'])('preserves the previous route when a displayed thread becomes %s before selection', async kind => {
+    const f = makeApp(); const { endpoint } = attachSource(f);
+    expect((await put(f, endpoint, 'route', { threadId: 'thread-other' })).statusCode).toBe(200);
+    const displayed = (await f.app.inject({ url: '/api/threads', headers })).json().threads;
+    expect(displayed.some((thread: { id: string }) => thread.id === 'thread-example')).toBe(true);
+    const before = f.store.listConversations();
+    f.codex.listThreads.mockClear();
+    f.codex.listThreads.mockResolvedValue(kind === 'missing' ? [] : [{ ...displayed[0], archived: true }]);
+    expect((await put(f, endpoint, 'route', { threadId: 'thread-example' })).statusCode).toBe(400);
+    expect(f.codex.listThreads.mock.calls).toEqual(kind === 'missing' ? [[], [{ refresh: true }]] : [[]]);
+    expect(f.store.listConversations()).toEqual(before);
+    expect(f.store.listRequests()).toEqual([]);
+  });
+
+  it('preserves assignment of older conversations found only by an explicit full catalog refresh', async () => {
+    const f = makeApp(); const { endpoint } = attachSource(f);
+    const legacy = [{ id: 'legacy-thread', name: 'Legacy', cwd: '/work/legacy', preview: '', updatedAt: 0 }];
+    f.codex.listThreads.mockImplementation(async (options?: { refresh?: boolean }) => options?.refresh ? legacy : []);
+    const catalog = await f.app.inject({ url: '/api/threads?refresh=true', headers });
+    expect(catalog.json().threads).toEqual(legacy);
+    f.codex.listThreads.mockClear();
+    expect((await put(f, endpoint, 'route', { threadId: 'legacy-thread' })).statusCode).toBe(200);
+    expect(f.codex.listThreads.mock.calls).toEqual([[], [{ refresh: true }]]);
+    expect(f.store.listConversations()[0]).toMatchObject({ threadId: 'legacy-thread', cwd: '/work/legacy' });
   });
 
   it.each([{}, { threadId: 'thread-example', autoCreateCwd: '/work' }, { threadId: 'thread-example', cwd: '/work' }, { threadId: 42 }, { autoCreateCwd: 'relative' }, { autoCreateCwd: '\\\\server\\share' }, { autoCreateCwd: 'C:\\work' }])('rejects malformed or wrong-platform routes without local or native creation: %j', async payload => {
@@ -1433,7 +1475,7 @@ describe('source access and native thread routing', () => {
     expect(f.store.listConversations()[0]).toMatchObject({ threadId: 'thread-example', cwd: intent.rule.cwd });
     expect(f.store.bindingForEndpoint(endpoint.id)?.conversationId).toBe(f.store.listConversations()[0].id);
     expect(createNative).not.toHaveBeenCalled();
-    expect(f.codex.listThreads).toHaveBeenCalledWith({ refresh: true });
+    expect(f.codex.listThreads).toHaveBeenCalledExactlyOnceWith();
   });
 
   it('rechecks the original recovery profile after awaiting the native catalog', async () => {

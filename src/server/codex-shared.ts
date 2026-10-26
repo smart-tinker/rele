@@ -343,7 +343,8 @@ export async function ensureWindowsSharedCodex(target: CodexConnectionTarget, op
       const after = await installation();
       const currentPointer = [
         [after.CodexWebSocketTaskName, receipt?.taskName], [after.CodexWebSocketEndpoint, receipt?.endpoint],
-        [after.CodexWebSocketOwnerDirectory, receipt?.ownerDirectory],
+        // Read-only status can report the Task's verified successor before codex-start promotes its saved pointer.
+        ...(!existingOnly ? [[after.CodexWebSocketOwnerDirectory, receipt?.ownerDirectory]] : []),
       ];
       if (result.code !== 0 || !receipt || !(existingOnly ? ['alreadyRunning'] : ['started', 'alreadyRunning']).includes(receipt.status)
         || typeof receipt.endpoint !== 'string' || !isSharedCodexWebSocket(receipt.endpoint)

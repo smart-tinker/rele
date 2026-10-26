@@ -1,11 +1,14 @@
 import { useState, type FormEvent, type KeyboardEvent } from 'react';
-import type { AutoLinkIntent, CodexThread, Conversation, DashboardState, Endpoint, Platform, SourceAccess } from '../shared/types';
+import type { AutoLinkIntent, CodexThread, Conversation, DashboardState, Endpoint, Platform, ReactionMode, SourceAccess } from '../shared/types';
 import { ReleApi, safeHref } from './client';
 import { useAction } from './hooks';
 import { useCodexThreads } from './useCodexThreads';
 import { SlackSyncJournal } from './SlackSyncJournal';
-import { SlackCatalogPicker, TelegramCatalogPicker } from './CatalogPicker';
-import { ActionMessages, Button, Drawer, EmptyState, Field, Icon, Notice, PageHeading, PlatformIcon, Status } from './ui';
+import { AllowedSenders, SlackCatalogPicker, TelegramCatalogPicker } from './CatalogPicker';
+import { AutoLinks } from './AutoLinks';
+import { ActionMessages, Button, ClearableInput, Drawer, EmptyState, Field, Icon, Notice, PageHeading, PlatformIcon, Status } from './ui';
+const modes: Record<ReactionMode, string> = { off: 'Выключено', mention: 'По упоминанию', all: 'Все сообщения' };
+
 export const platformLabel = (platform: Platform) => platform === 'telegram' ? 'Telegram' : 'Slack';
 export const sourceIsDirect = (endpoint: Endpoint) => endpoint.platform === 'slack' ? endpoint.chatId.startsWith('D') : /^\d+$/u.test(endpoint.chatId);
 export const sourceConversation = (state: DashboardState, endpointId: string) => state.conversations.find(conversation => conversation.bindings.some(binding => binding.endpointId === endpointId));
@@ -53,11 +56,12 @@ export function SourceTabs({ platform, onChange, id }: { platform: Platform; onC
 }
 
 export function Conversations({ state, api, refresh, onNavigate }: {
-  state: DashboardState; api: ReleApi; refresh: () => Promise<void>; onNavigate: (view: 'connections' | 'codex' | 'access') => void;
+  state: DashboardState; api: ReleApi; refresh: () => Promise<void>; onNavigate: (view: 'connections' | 'codex') => void;
 }) {
   const [platform, setPlatform] = useState<Platform>('telegram');
   const [query, setQuery] = useState('');
   const [editing, setEditing] = useState<string | null>(null);
+  const [accessEditing, setAccessEditing] = useState<{ endpointId: string; mode: ReactionMode } | null>(null);
   const [discovering, setDiscovering] = useState(false);
   const [automatic, setAutomatic] = useState<Endpoint | null>(null);
   const [recovery, setRecovery] = useState<{ endpoint: Endpoint; intent: AutoLinkIntent; thread: CodexThread } | null>(null);
@@ -69,8 +73,9 @@ export function Conversations({ state, api, refresh, onNavigate }: {
     return sourceMatches(endpoint, query, `${conversation?.name ?? ''} ${conversation?.cwd ?? ''}`);
   });
   const current = state.endpoints.find(endpoint => endpoint.id === editing);
+  const accessCurrent = state.endpoints.find(endpoint => endpoint.id === accessEditing?.endpointId);
   return <>
-    <PageHeading title="Связи" description="Назначьте разговор Codex каждому источнику. Несколько чатов могут использовать общий контекст." />
+    <PageHeading title="Связи" description="Назначьте разговор Codex и доступ каждому источнику. Несколько чатов могут использовать общий контекст." />
     <SourceTabs
       platform={platform}
       onChange={setPlatform}
@@ -82,15 +87,17 @@ export function Conversations({ state, api, refresh, onNavigate }: {
       aria-labelledby={`links-${platform}`}
     >
       <div className="toolbar">
-        <label className="search-field">
+        <div className="search-field">
           <Icon name="search" />
-          <input
+          <ClearableInput
+            clearLabel="Очистить поиск источников"
+            onClear={() => setQuery('')}
             aria-label="Найти группу или тред"
             placeholder="Название чата или темы"
             value={query}
             onChange={event => setQuery(event.target.value)}
           />
-        </label>
+        </div>
         <div className="inline-controls">
           <Button
             icon="refresh"
@@ -124,9 +131,7 @@ export function Conversations({ state, api, refresh, onNavigate }: {
                 <th scope="col">Группа / чат</th>
                 <th scope="col">Тема / обсуждение</th>
                 <th scope="col">Разговор Codex</th>
-                <th scope="col">
-                  <span className="sr-only">Сведения</span>
-                </th>
+                <th scope="col">Доступ</th>
               </tr>
             </thead>
             <tbody>
@@ -138,6 +143,7 @@ export function Conversations({ state, api, refresh, onNavigate }: {
                 refresh={refresh}
                 catalog={catalog}
                 onDetails={() => setEditing(endpoint.id)}
+                onAccess={mode => setAccessEditing({ endpointId: endpoint.id, mode })}
                 onAutomatic={() => setAutomatic(endpoint)}
                 onRecovery={(intent, thread) => setRecovery({ endpoint, intent, thread })}
               />)}
@@ -158,10 +164,21 @@ export function Conversations({ state, api, refresh, onNavigate }: {
         </footer>
       </div>
       <p className="field-hint">
-        Назначение Codex и право запуска задаются отдельно. У новых источников доступ выключен.{' '}
-        <button className="text-button" onClick={() => onNavigate('access')}>Настроить доступ</button>
+        У новых источников доступ выключен. Назначение Codex и доступ можно менять независимо в этой таблице.
       </p>
     </section>
+    <AutoLinks state={state} api={api} refresh={refresh} />
+    {accessCurrent && <Drawer title={`Доступ: ${sourceTitle(accessCurrent)}`} onClose={() => setAccessEditing(null)}>
+      <SourceAccessEditor
+        key={accessCurrent.id}
+        endpoint={accessCurrent}
+        state={state}
+        api={api}
+        refresh={refresh}
+        initialMode={accessEditing!.mode}
+        onSaved={() => setAccessEditing(null)}
+      />
+    </Drawer>}
     {discovering && <Drawer title={`Источники ${platformLabel(platform)}`} onClose={() => setDiscovering(false)}>
       <p className="muted">Выберите реальный чат и обсуждение из каталога. Найденные обсуждения появятся в таблице.</p>
       {platform === 'slack' ? <SlackCatalogPicker
@@ -199,7 +216,7 @@ export function Conversations({ state, api, refresh, onNavigate }: {
         state={state}
         api={api}
         refresh={refresh}
-        onAccess={() => onNavigate('access')}
+        onAccess={() => { setEditing(null); setAccessEditing({ endpointId: current.id, mode: sourceAccess(state, current).mode }); }}
       />
     </Drawer>}
     {recovery && <Drawer title="Продолжение сохранённых запросов" onClose={() => setRecovery(null)}>
@@ -223,8 +240,8 @@ export function Conversations({ state, api, refresh, onNavigate }: {
   </>;
 }
 
-function SourceRow({ endpoint, state, api, refresh, catalog, onDetails, onAutomatic, onRecovery }: {
-  endpoint: Endpoint; state: DashboardState; api: ReleApi; refresh: () => Promise<void>; catalog: ReturnType<typeof useCodexThreads>; onDetails: () => void; onAutomatic: () => void; onRecovery: (intent: AutoLinkIntent, thread: CodexThread) => void;
+function SourceRow({ endpoint, state, api, refresh, catalog, onDetails, onAccess, onAutomatic, onRecovery }: {
+  endpoint: Endpoint; state: DashboardState; api: ReleApi; refresh: () => Promise<void>; catalog: ReturnType<typeof useCodexThreads>; onDetails: () => void; onAccess: (mode: ReactionMode) => void; onAutomatic: () => void; onRecovery: (intent: AutoLinkIntent, thread: CodexThread) => void;
 }) {
   const action = useAction();
   const conversation = sourceConversation(state, endpoint.id);
@@ -279,9 +296,7 @@ function SourceRow({ endpoint, state, api, refresh, catalog, onDetails, onAutoma
         <small>
           {endpoint.subtitle}
         </small>
-        <Status tone={access.mode === 'off' ? 'muted' : 'good'}>
-          {access.mode === 'off' ? 'Доступ выключен' : access.mode === 'mention' ? 'По упоминанию' : 'Все сообщения'}
-        </Status>
+        <Button aria-label={`Настройки источника ${endpoint.title}`} onClick={onDetails}>Сведения</Button>
       </div>
     </td>
     <td data-label="Разговор Codex">
@@ -318,8 +333,18 @@ function SourceRow({ endpoint, state, api, refresh, catalog, onDetails, onAutoma
         <ActionMessages error={action.error} success={action.success} />
       </div>
     </td>
-    <td className="row-action">
-      <Button aria-label={`Настройки источника ${endpoint.title}`} onClick={onDetails}>Сведения</Button>
+    <td data-label="Доступ">
+      <div className="cell-copy source-access">
+        <select
+          aria-label={`Режим для ${endpoint.title}`}
+          value={access.mode}
+          onChange={event => onAccess(event.target.value as ReactionMode)}
+        >
+          {Object.entries(modes).map(([mode, label]) => <option key={mode} value={mode} disabled={mode !== 'off' && !connected}>{label}</option>)}
+        </select>
+        <small>{access.mode === 'off' ? 'Доступ выключен' : sourceIsDirect(endpoint) ? `Разрешённых людей: ${access.allowedSenderIds.length}` : access.legacy ? 'Ранее сохранённый доступ' : 'Все участники, включая агентов'}</small>
+        <Button aria-label={`Изменить доступ ${endpoint.title}`} onClick={() => onAccess(access.mode)}>Изменить</Button>
+      </div>
     </td>
   </tr>;
 }
@@ -360,7 +385,7 @@ function AutomaticSource({ endpoint, api, refresh, onSaved }: { endpoint: Endpoi
     <p className="muted">
       Первый разрешённый запрос из «
       {sourceTitle(endpoint)}
-      » создаст отдельный разговор Codex. Доступ к запуску задаётся на странице «Доступ».
+      » создаст отдельный разговор Codex. Доступ к запуску задаётся в колонке «Доступ».
     </p>
     <Field label="Рабочая папка нового разговора" hint="Абсолютный путь на компьютере, где работает Codex.">
       <input
@@ -485,4 +510,74 @@ function EndpointNameEditor({ endpoint, api, refresh, disabled }: { endpoint: En
         }}
       >Изменить название только в Rele</button>}
   </div>;
+}
+
+function SourceAccessEditor({ endpoint, state, api, refresh, initialMode, onSaved }: { endpoint: Endpoint; state: DashboardState; api: ReleApi; refresh: () => Promise<void>; initialMode: ReactionMode; onSaved: () => void }) {
+  const policy = sourceAccess(state, endpoint);
+  const [mode, setMode] = useState<ReactionMode>(initialMode);
+  const [people, setPeople] = useState(policy.allowedSenderIds);
+  const action = useAction();
+  const direct = sourceIsDirect(endpoint);
+  const connected = sourceConnected(state, endpoint);
+  const save = async (event: FormEvent) => {
+    event.preventDefault();
+    if (direct && mode !== 'off' && !people.length) {
+      action.setError('Разрешите хотя бы одного человека для личного чата.');
+      return;
+    }
+    const result = await action.run(() => api.request(`/api/endpoints/${encodeURIComponent(endpoint.id)}/access`, 'PUT', { mode, ...(direct && mode !== 'off' ? { allowedSenderIds: people } : {}) }));
+    if (result.ok) {
+      await refresh();
+      onSaved();
+    }
+  };
+  return <form className="form-stack" onSubmit={save}>
+    <p className="muted">
+      {sourceChat(endpoint)}
+      {' · '}
+      {sourceTitle(endpoint)}
+    </p>
+    <Field label="Режим реакции">
+      <select
+        value={mode}
+        disabled={action.busy}
+        onChange={event => setMode(event.target.value as ReactionMode)}
+      >
+        {Object.entries(modes).map(([value, label]) => <option
+          key={value}
+          value={value}
+          disabled={value !== 'off' && !connected}
+        >
+          {label}
+        </option>)}
+      </select>
+    </Field>
+    {!connected && <Notice tone="warning">Для включения доступа нужен доступный источник текущего подключённого бота. Выключить доступ можно сейчас.</Notice>}
+    {mode === 'off' ? <p className="field-hint">Новые сообщения этого источника не запускают запросы и не передаются как контекст. Уже принятые задачи сохраняются.</p> : <>
+      <p className="field-hint">
+        {mode === 'mention' ? 'Новый запрос запускается по настоящему упоминанию подключённого агента.' : 'Каждое разрешённое новое сообщение запускает запрос.'}{' '}
+        Назначение разговора Codex задаётся в этой же таблице.
+      </p>
+      {direct ? <AllowedSenders
+        endpoint={endpoint}
+        accountId={state.connections[endpoint.platform].accountId}
+        api={api}
+        refresh={refresh}
+        value={people}
+        onChange={setPeople}
+        disabled={action.busy || !connected}
+        humansOnly
+      /> : <Notice tone="info">Все участники этой группы или канала, включая агентов, смогут запускать запросы в выбранном режиме.</Notice>}
+      {!direct && policy.legacy && <Notice tone="warning">Сохранение заменит прежний доступ выбранным режимом для всех участников этого источника.</Notice>}
+    </>}
+    <ActionMessages error={action.error} success={action.success} />
+    <div>
+      <Button
+        type="submit"
+        variant="primary"
+        busy={action.busy}
+        disabled={mode !== 'off' && !connected}
+      >Сохранить доступ</Button>
+    </div>
+  </form>;
 }

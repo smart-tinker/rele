@@ -14,7 +14,7 @@ import type {
   Platform,
 } from '../shared/types';
 import { errorText, ReleApi, safeHref } from './client';
-import { Button, Field, Notice } from './ui';
+import { Button, ClearableInput, Field, Notice } from './ui';
 
 function mergeItems<T extends { id: string }>(before: T[], after: T[]): T[] {
   return [
@@ -298,7 +298,9 @@ export function TelegramCatalogPicker({
         темы, которые уже стали доступны боту.
       </p>
       <Field label="Поиск в обнаруженных чатах Telegram">
-        <input
+        <ClearableInput
+          clearLabel="Очистить поиск чатов Telegram"
+          onClear={() => setQuery('')}
           type="search"
           onKeyDown={preventSearchSubmit}
           value={query}
@@ -499,7 +501,9 @@ export function SlackCatalogPicker({
         label="Поиск каналов и личных чатов Slack"
         hint="Поиск по уже загруженным чатам. Для продолжения каталога нажмите «Загрузить ещё»."
       >
-        <input
+        <ClearableInput
+          clearLabel="Очистить поиск чатов Slack"
+          onClear={() => setChatQuery('')}
           type="search"
           onKeyDown={preventSearchSubmit}
           value={chatQuery}
@@ -543,7 +547,9 @@ export function SlackCatalogPicker({
             label="Поиск тредов Slack"
             hint="Поиск по уже загруженным тредам выбранного чата."
           >
-            <input
+            <ClearableInput
+              clearLabel="Очистить поиск тредов Slack"
+              onClear={() => setThreadQuery('')}
               type="search"
               onKeyDown={preventSearchSubmit}
               value={threadQuery}
@@ -653,7 +659,9 @@ export function AllowedSenders({
             label="Поиск участников Slack"
             hint="Поиск по загруженным участникам и ботам. Запуск разрешён только отмеченным отправителям."
           >
-            <input
+            <ClearableInput
+              clearLabel="Очистить поиск участников Slack"
+              onClear={() => setQuery('')}
               type="search"
               onKeyDown={preventSearchSubmit}
               value={query}
