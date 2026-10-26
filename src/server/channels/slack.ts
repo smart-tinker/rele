@@ -7,6 +7,7 @@ import { escapeSlackText, formatSlackReply } from './slack-format.js';
 type Json = Record<string, any>;
 const SLACK_TS = /^\d+\.\d+$/u;
 const SLACK_USER = /^[UW][A-Z0-9]+$/u;
+const SLACK_BOT = /^B[A-Z0-9]+$/u;
 const CONVERSATION_TYPES = [
   ['public_channel', 'channels:read'], ['private_channel', 'groups:read'], ['im', 'im:read'], ['mpim', 'mpim:read'],
 ] as const;
@@ -59,6 +60,7 @@ export interface SlackOptions {
 
 /** Socket Mode needs outbound connections only. ACK follows the durable inbox write. */
 export class SlackChannel implements Channel {
+  identity?: Person;
   state: ConnectionState = { configured: true, connected: false };
   private readonly fetcher: typeof fetch;
   private socket?: WebSocket;
@@ -69,6 +71,7 @@ export class SlackChannel implements Channel {
   private alive = true;
   private teamId = '';
   private botUserId = '';
+  private botId = '';
   private accountId = '';
   private teamName = 'Slack';
   private processing: Promise<void> = Promise.resolve();
@@ -98,6 +101,8 @@ export class SlackChannel implements Channel {
       if (this.stopped) return;
       this.teamId = identity.team_id;
       this.botUserId = identity.user_id;
+      this.botId = typeof identity.bot_id === 'string' && SLACK_BOT.test(identity.bot_id) ? identity.bot_id : '';
+      this.identity = { id: this.botUserId, name: readableTitle(identity.user, 'Подключённый агент Slack'), isBot: true };
       const accountId = `${this.teamId}:${this.botUserId}`;
       if (this.accountId !== accountId) {
         this.endpoints = new Map([...this.endpoints].filter(([, endpoint]) => endpoint.accountId === accountId));
@@ -339,7 +344,8 @@ export class SlackChannel implements Channel {
       this.profiles.set(userId, user);
     }
     if (user.deleted) return;
-    const person: Person = { id: userId, name: readableTitle(user.profile?.display_name || user.profile?.real_name || user.real_name || user.name, 'Участник Slack'), ...(user.is_bot || user.is_app_user || this.people.get(userId)?.isBot ? { isBot: true } : {}) };
+    const person: Person = { id: userId, name: readableTitle(user.profile?.display_name || user.profile?.real_name || user.real_name || user.name, 'Участник Slack'),
+      ...(user.is_bot || user.is_app_user || this.people.get(userId)?.isBot ? { isBot: true } : user.is_bot === false ? { isBot: false } : {}) };
     this.people.set(userId, person);
     return person;
   }
@@ -386,16 +392,27 @@ export class SlackChannel implements Channel {
     return name;
   }
 
+  deliveryText(delivery: Delivery): string {
+    const text = formatSlackReply(delivery.body);
+    return delivery.kind === 'message' && delivery.mentions?.length ? `${delivery.mentions.map(person => `<@${person.id}>`).join(' ')}\n\n${text}` : text;
+  }
   async deliver(delivery: Delivery, approval?: Approval): Promise<string> {
     if (!this.accountId || delivery.origin.accountId !== this.accountId) throw new ChannelError('Учётная запись Slack изменилась. Доставка через другого бота запрещена.');
-    const formatted = delivery.kind === 'answer' && !approval ? formatSlackReply(delivery.body) : delivery.body;
+    const rich = (delivery.kind === 'answer' || delivery.kind === 'message') && !approval;
+    const formatted = rich ? formatSlackReply(delivery.body) : delivery.body;
+    if (delivery.kind === 'message' && (approval || [...delivery.body].length > 3000 || delivery.mentions?.some(person => !SLACK_USER.test(person.id)))) throw new ChannelError('Некорректное сообщение или адрес упоминания Slack.');
     const body: Json = {
       channel: delivery.origin.chatId, thread_ts: delivery.origin.threadId,
       text: escapeSlackText(formatted),
       mrkdwn: false, parse: 'none', link_names: false, unfurl_links: false, unfurl_media: false,
     };
     // Native Markdown blocks preserve tables; the escaped text remains the notification fallback.
-    if (delivery.kind === 'answer' && !approval) body.blocks = [{ type: 'markdown', text: formatted }];
+    if (rich) body.blocks = [{ type: 'markdown', text: formatted }];
+    if (delivery.kind === 'message' && delivery.mentions?.length) {
+      const mentions = delivery.mentions.map(person => `<@${person.id}>`).join(' ');
+      if (mentions.length > 3000) throw new ChannelError('Список упоминаний превышает размер блока Slack.');
+      body.blocks.unshift({ type: 'section', text: { type: 'mrkdwn', text: mentions, verbatim: true } });
+    }
     if (approval && !approval.questions?.length) body.blocks = [
       { type: 'section', text: { type: 'plain_text', text: delivery.body.slice(0, 2900) } },
       { type: 'actions', elements: ['accept', 'decline'].map(decision => ({
@@ -434,9 +451,10 @@ export class SlackChannel implements Channel {
             && typeof event.event_ts === 'string' && SLACK_TS.test(event.event_ts)
             && typeof event.user === 'string' && SLACK_USER.test(event.user)) {
           const endpoint = this.endpoints.get(endpointId('slack', this.accountId, event.channel, event.thread_ts));
-          if (endpoint) await this.callbacks.message({
+          const actor = await this.person(event.user).catch(() => undefined);
+          if (endpoint && actor?.isBot !== true) await this.callbacks.message({
             control: 'stop', eventId: `agent-session-stopped:${payload.event_id}`, endpoint,
-            sender: endpoint.people.find(person => person.id === event.user) ?? { id: event.user, name: 'Участник Slack' },
+            sender: actor ?? { id: event.user, name: 'Участник Slack' },
             messageId: event.event_ts, text: '',
           });
         }
@@ -445,6 +463,7 @@ export class SlackChannel implements Channel {
       }
       const source = event && ['message', 'app_mention'].includes(event.type) ? this.messageSource(event, event.channel) : undefined;
       if (source) {
+        if (typeof source.message.user === 'string' && SLACK_USER.test(source.message.user)) await this.person(source.message.user).catch(() => undefined);
         const message = this.normalize(source.message, source.kind);
         await this.callbacks.message(message);
         this.ack(socket, envelope.envelope_id);
@@ -457,7 +476,9 @@ export class SlackChannel implements Channel {
       const match = typeof value === 'string' ? /^rele:([a-f0-9-]{36}):(accept|decline)$/u.exec(value) : null;
       if (match && payload.user?.id && payload.channel?.id && (!payload.team?.id || payload.team.id === this.teamId)) {
         try {
-          await this.callbacks.action({ approvalId: match[1], decision: match[2] as 'accept' | 'decline', platform: 'slack', accountId: this.accountId, chatId: payload.channel.id, threadId: payload.message?.thread_ts ?? payload.message?.ts, senderId: payload.user.id });
+          const actor = await this.person(payload.user.id);
+          if (actor?.isBot !== true) await this.callbacks.action({ approvalId: match[1], decision: match[2] as 'accept' | 'decline', platform: 'slack', accountId: this.accountId, chatId: payload.channel.id, threadId: payload.message?.thread_ts ?? payload.message?.ts, senderId: payload.user.id,
+            ...(actor?.isBot === false ? { senderIsBot: false } : {}) });
         } catch (error) { if (error instanceof ChannelError && error.retryable) throw error; }
       }
     }
@@ -480,7 +501,8 @@ export class SlackChannel implements Channel {
     const remembered = this.endpoints.get(id)?.people.find(person => person.id === userId);
     const profile = this.profiles.get(userId);
     const isBot = userId === this.botUserId || !!(event.bot_id || event.app_id || event.subtype === 'bot_message' || cached?.isBot || remembered?.isBot || profile?.is_bot || profile?.is_app_user);
-    const sender: Person = { id: userId || (typeof event.bot_id === 'string' && event.bot_id ? `bot:${event.bot_id}` : 'slack:unknown'), name: cached?.name || remembered?.name || readableTitle(event.username, isBot ? 'Бот Slack' : 'Участник Slack'), ...(isBot ? { isBot: true } : {}) };
+    const sender: Person = { id: userId || (typeof event.bot_id === 'string' && SLACK_BOT.test(event.bot_id) ? `bot:${event.bot_id}` : 'slack:unknown'), name: cached?.name || remembered?.name || readableTitle(event.username, isBot ? 'Бот Slack' : 'Участник Slack'),
+      ...(isBot ? { isBot: true } : cached?.isBot === false || profile?.is_bot === false ? { isBot: false } : {}) };
     return { endpointId: id, accountId: this.accountId, chatId: event.channel, threadId: event.thread_ts || event.ts, messageId: event.ts, sender, text: messageText(event), payload: transcriptPayload(event), kind };
   }
 
@@ -490,14 +512,16 @@ export class SlackChannel implements Channel {
     const previous = this.endpoints.get(id);
     const slack = this.transcript(event, kind, id);
     const person = slack.sender;
-    const text = slack.text.replaceAll(`<@${this.botUserId}>`, '').trim();
+    const text = slack.text;
     const directMention = typeof event.text === 'string' && hasDirectMention(event.text, this.botUserId) || hasBlockMention(event.blocks, this.botUserId);
     const stableUser = typeof event.user === 'string' && SLACK_USER.test(event.user);
+    const stableBot = typeof event.bot_id === 'string' && SLACK_BOT.test(event.bot_id);
+    const self = person.id === this.botUserId || stableBot && event.bot_id === this.botId;
     if (stableUser && person.isBot) this.people.set(person.id, person);
     const endpoint: Endpoint = {
       ...previous,
       id, platform: 'slack', accountId: this.accountId, chatId: event.channel, threadId,
-      title: previous?.title ?? readableTitle(text, 'Обсуждение Slack'),
+      title: previous?.title ?? readableTitle(text.replaceAll(`<@${this.botUserId}>`, '').trim(), 'Обсуждение Slack'),
       subtitle: previous?.subtitle ?? `${this.teamName} · ${this.channelNames.get(event.channel) ?? 'Канал Slack'}`,
       url: `slack://channel?team=${encodeURIComponent(this.teamId)}&id=${encodeURIComponent(event.channel)}&message=${encodeURIComponent(threadId)}`,
       people: [...new Map([...(previous?.people ?? []), ...(stableUser ? [person] : [])].filter(value => SLACK_USER.test(value.id) && value.id !== this.botUserId && value.id !== 'USLACKBOT').map(value => [value.id, value])).values()], updatedAt: new Date().toISOString(),
@@ -507,7 +531,8 @@ export class SlackChannel implements Channel {
     return {
       // app_mention and message may describe the same message with distinct envelope/event IDs.
       eventId: `message:${event.channel}:${event.ts}${kind === 'message' ? '' : `:${kind}:${createHash('sha256').update(JSON.stringify(slack.payload)).digest('hex').slice(0, 16)}`}`, endpoint, sender: person, messageId: event.ts, text, slack, directMention,
-      contextOnly: kind !== 'message' || !!event.subtype && !['file_share', 'bot_message', 'me_message', 'thread_broadcast'].includes(event.subtype) || !stableUser || person.id === this.botUserId || person.id === 'USLACKBOT' || !text && !file,
+      contextOnly: kind !== 'message' || !!event.subtype && !['file_share', 'bot_message', 'me_message', 'thread_broadcast'].includes(event.subtype)
+        || !(stableUser || stableBot && !!this.botId) || self || person.id === 'USLACKBOT' || !text && !file,
       ...(file ? { audio: { platform: 'slack' as const, fileId: String(file.id), url: file.url_private_download, name: readableTitle(file.name, 'audio'), mimeType: file.mimetype, size: file.size } } : {}),
     };
   }

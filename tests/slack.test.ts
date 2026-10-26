@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type WebSocket from 'ws';
 import type { Delivery, Endpoint, InboundMessage } from '../src/shared/types.js';
 import { SlackChannel } from '../src/server/channels/slack.js';
+import { Store } from '../src/server/store.js';
 import {
   ChannelError,
   endpointId,
@@ -72,6 +73,7 @@ async function makeChannel(
           ok: true,
           team_id: 'TEXAMPLE',
           user_id: 'UBOT',
+          bot_id: 'BSELF',
           team: 'Пример команды',
         });
       if (url === 'https://slack.com/api/apps.connections.open')
@@ -82,7 +84,7 @@ async function makeChannel(
       if (url === 'https://slack.com/api/users.info')
         return Response.json({
           ok: true,
-          user: { id: 'UANNA', profile: { display_name: 'Анна (пример)' } },
+          user: { id: 'UANNA', is_bot: false, profile: { display_name: 'Анна (пример)' } },
         });
       if (url === 'https://slack.com/api/conversations.info')
         return Response.json({
@@ -221,7 +223,7 @@ describe('Slack Socket Mode durability and identity', () => {
     expect(socket.sent).toEqual([]);
     socket.receive(stop);
     await vi.waitFor(() => expect(message).toHaveBeenCalledTimes(2));
-    expect(message.mock.calls[1][0]).toEqual({ control: 'stop', eventId: 'agent-session-stopped:outer-native-stop', endpoint: known, sender: known.people[0], messageId: '1000.2000', text: '' });
+    expect(message.mock.calls[1][0]).toEqual({ control: 'stop', eventId: 'agent-session-stopped:outer-native-stop', endpoint: known, sender: { id: 'UANNA', name: 'Анна (пример)', isBot: false }, messageId: '1000.2000', text: '' });
     expect(socket.sent).toEqual([]);
     commit();
     await vi.waitFor(() => expect(socket.sent).toEqual([JSON.stringify({ envelope_id: 'native-stop' })]));
@@ -252,12 +254,12 @@ describe('Slack Socket Mode durability and identity', () => {
     expect(received[0].eventId).toBe(received[1].eventId);
     expect(received[0].endpoint.id).toBe(received[1].endpoint.id);
     expect(received[0].endpoint.accountId).toBe('TEXAMPLE:UBOT');
-    expect(received[0].text).toBe('Пример сообщения');
+    expect(received[0].text).toBe('<@UBOT> Пример сообщения');
     await vi.waitFor(() => expect(endpoints).toHaveBeenCalled());
     const named = endpoints.mock.calls.at(-1)![0];
     expect(named.title).toBe('Пример сообщения');
     expect(named.subtitle).toBe('Пример команды · #example');
-    expect(named.people).toContainEqual({ id: 'UANNA', name: 'Анна (пример)' });
+    expect(named.people).toContainEqual({ id: 'UANNA', name: 'Анна (пример)', isBot: false });
   });
 
   it('persists self and peer bot messages while rejecting another workspace', async () => {
@@ -335,9 +337,73 @@ describe('Slack Socket Mode durability and identity', () => {
     socket.receive(envelope('file-only', 'message', { user: undefined, text: '', subtype: 'file_share', ts: '1000.1002', files: [{ id: 'FONE', title: 'Схема', mimetype: 'image/png' }] }));
     await vi.waitFor(() => expect(message).toHaveBeenCalledTimes(2));
     const received = vi.mocked(message).mock.calls.map(([value]) => value);
-    expect(received[0]).toMatchObject({ sender: { id: 'bot:BHOOK', isBot: true }, text: 'CI завершён', contextOnly: true });
+    expect(received[0]).toMatchObject({ sender: { id: 'bot:BHOOK', isBot: true }, text: 'CI завершён', contextOnly: false });
     expect(received[1]).toMatchObject({ sender: { id: 'slack:unknown' }, text: '', contextOnly: true, slack: { payload: { files: [{ title: 'Схема' }] } } });
     expect(received.every(value => value.endpoint.people.length === 0)).toBe(true);
+  });
+
+  it('admits bot_id-only agents in an open group, while preserving selected-sender and own-bot guards', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'rele-slack-bot-only-')); files.push(dir);
+    const store = new Store(join(dir, 'test.sqlite'));
+    const source = (threadId: string): Endpoint => ({ id: endpointId('slack', 'TEXAMPLE:UBOT', 'CEXAMPLE', threadId),
+      platform: 'slack', accountId: 'TEXAMPLE:UBOT', chatId: 'CEXAMPLE', threadId, title: 'Thread', subtitle: 'Slack', people: [], updatedAt: new Date().toISOString() });
+    const open = source('1000.1000'), selected = source('1000.2000');
+    store.upsertEndpoint(open); store.upsertEndpoint(selected);
+    const conversation = store.createConversation({ name: 'Codex', threadId: 'codex-thread', cwd: '/project',
+      bindings: [{ platform: 'slack', endpointId: open.id, allowedSenderIds: [] }, { platform: 'slack', endpointId: selected.id, allowedSenderIds: ['UHUMAN'] }] });
+    store.setSourceAccess(open.id, { mode: 'all' });
+    const received: InboundMessage[] = [];
+    try {
+      const { socket } = await makeChannel({ knownEndpoints: [open, selected], message: async value => { received.push(value); store.ingest(value); } });
+      socket.receive(envelope('bot-only-open', 'message', { user: undefined, bot_id: 'BPEER', username: 'Peer agent', subtype: 'bot_message', text: 'Unmentioned work', ts: '1000.1001' }));
+      socket.receive(envelope('bot-only-selected', 'message', { user: undefined, bot_id: 'BPEER', username: 'Peer agent', text: '<@UBOT> Work', thread_ts: selected.threadId, ts: '1000.2001' }));
+      socket.receive(envelope('bot-only-self', 'message', { user: undefined, bot_id: 'BSELF', username: 'Peer agent', text: '<@UBOT> Echo', ts: '1000.1002' }));
+      socket.receive(envelope('bot-only-invalid', 'message', { user: undefined, bot_id: 'invalid:BPEER', username: 'Peer agent', text: '<@UBOT> Work', ts: '1000.1003' }));
+      await vi.waitFor(() => expect(received).toHaveLength(4));
+      expect(received[0]).toMatchObject({ contextOnly: false, directMention: false, sender: { id: 'bot:BPEER', name: 'Peer agent', isBot: true } });
+      expect(received[2]).toMatchObject({ contextOnly: true, sender: { id: 'bot:BSELF', isBot: true } });
+      expect(received[3]).toMatchObject({ contextOnly: true, sender: { id: 'slack:unknown' } });
+      expect(store.listRequests()).toEqual([expect.objectContaining({ origin: expect.objectContaining({ endpointId: open.id, senderId: 'bot:BPEER', senderIsBot: true }) })]);
+      const binding = store.getConversation(conversation.id)!.bindings.find(value => value.endpointId === selected.id)!;
+      store.updateBinding(conversation.id, binding.id, selected.id, ['bot:BPEER']);
+      socket.receive(envelope('bot-only-chosen', 'message', { user: undefined, bot_id: 'BPEER', text: '<@UBOT> Explicitly selected work', thread_ts: selected.threadId, ts: '1000.2002' }));
+      await vi.waitFor(() => expect(store.listRequests()).toHaveLength(2));
+      store.setSourceAccess(open.id, { mode: 'mention' });
+      socket.receive(envelope('bot-only-unmentioned', 'message', { user: undefined, bot_id: 'BPEER', text: 'No mention', ts: '1000.1004' }));
+      socket.receive(envelope('bot-only-mentioned', 'message', { user: undefined, bot_id: 'BPEER', text: '<@UBOT> Mentioned', ts: '1000.1005' }));
+      await vi.waitFor(() => expect(received).toHaveLength(7));
+      expect(store.listRequests()).toHaveLength(3);
+      expect(store.listRequests()[0].text).toBe('<@UBOT> Mentioned');
+    } finally { store.close(); }
+  });
+
+  it('keeps bot-only posts passive if Slack did not provide the connected bot identity', async () => {
+    const { socket, message } = await makeChannel({ api: method => method === 'auth.test'
+      ? Response.json({ ok: true, team_id: 'TEXAMPLE', user_id: 'UBOT', team: 'Team' }) : undefined });
+    socket.receive(envelope('bot-unresolved-owner', 'message', { user: undefined, bot_id: 'BPEER', text: '<@UBOT> Work' }));
+    await vi.waitFor(() => expect(message).toHaveBeenCalledOnce());
+    expect(vi.mocked(message).mock.calls[0][0]).toMatchObject({ sender: { id: 'bot:BPEER', isBot: true }, contextOnly: true });
+  });
+
+  it('sends only verified tool mentions in a separate mrkdwn section and keeps the body rich', async () => {
+    const { channel, calls } = await makeChannel();
+    const tool: Delivery = { ...delivery(), kind: 'message', requestId: undefined, operationId: 'operation',
+      body: '**Result** <@UUNVALIDATED> @everyone', mentions: [{ id: 'UPEER', name: 'Untrusted caption', isBot: true }],
+      origin: { ...delivery().origin, senderId: 'UBOT', senderName: 'Own agent', messageId: '' } };
+    await channel.deliver(tool);
+    const post = JSON.parse(String(calls.find(call => call.url.endsWith('/chat.postMessage'))!.init!.body));
+    expect(post.blocks).toEqual([
+      { type: 'section', text: { type: 'mrkdwn', text: '<@UPEER>', verbatim: true } },
+      { type: 'markdown', text: '**Result** @\u200bUUNVALIDATED @\u200beveryone' },
+    ]);
+    expect(post.text).not.toContain('<@UPEER>');
+    expect(post.link_names).toBe(false);
+    expect(channel.deliveryText(tool)).toBe('<@UPEER>\n\n**Result** @\u200bUUNVALIDATED @\u200beveryone');
+    await expect(channel.deliver({ ...tool, mentions: [{ id: 'bot:BPEER', name: 'Agent', isBot: true }] })).rejects.toThrow(/адрес упоминания/);
+    await channel.deliver({ ...tool, mentions: [] });
+    const posts = calls.filter(call => call.url.endsWith('/chat.postMessage'));
+    expect(posts).toHaveLength(2);
+    expect(JSON.parse(String(posts[1].init!.body)).blocks).toEqual([{ type: 'markdown', text: '**Result** @\u200bUUNVALIDATED @\u200beveryone' }]);
   });
 
   it('keeps non-audio uploads as context while allowing a human voice task', async () => {

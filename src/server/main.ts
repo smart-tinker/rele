@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { acquireGatewayLock } from './gateway-lock.js';
 import { ConfigStore, defaultDataDirectory, type AppConfig } from './config.js';
 import { Store } from './store.js';
-import { CodexClient } from './codex.js';
+import { CodexClient, type CodexRuntime } from './codex.js';
 import { Engine } from './engine.js';
 import { SlackActivity } from './slack-activity.js';
 import { createApp } from './app.js';
@@ -13,6 +13,8 @@ import { SlackChannel } from './channels/slack.js';
 import type { ChannelCallbacks } from './channels/common.js';
 import { instanceDiagnostics, openPanel, serverStatus, stopServer } from './lifecycle.js';
 import { DesktopIntegration } from './desktop-integration.js';
+import { runReleMcp } from './rele-mcp.js';
+import { registerRelePlugin } from './rele-plugin.js';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const version = (JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')) as { version: string }).version;
@@ -20,6 +22,10 @@ const command = process.argv[2] ?? 'serve';
 
 async function main(): Promise<void> {
   if (['--version', 'version'].includes(command)) { process.stdout.write(`${version}\n`); return; }
+  if (command === 'mcp') {
+    if (process.argv.length !== 5 || process.argv[3] !== '--data-dir' || !path.isAbsolute(process.argv[4] ?? '')) throw new Error('MCP Rele требует каталог установленного экземпляра.');
+    await runReleMcp(path.resolve(process.argv[4])); return;
+  }
   if (['--help', 'help'].includes(command)) {
     process.stdout.write('Rele — локальный gateway Codex\n\nserve (по умолчанию)  запустить на 127.0.0.1\nopen [--print-url]   открыть панель работающего Rele\nstatus [--wait]      проверить готовность своего Rele\nstop                 штатно остановить свой Rele\ntoken                показать ключ локальной панели\nbackup [каталог]     создать снимок базы и настроек\ndiagnostics          показать состояние без секретов\n\nRELE_DATA_DIR — каталог данных; RELE_PORT — локальный порт (по умолчанию 3210).\n'); return;
   }
@@ -65,7 +71,9 @@ async function main(): Promise<void> {
       process.stderr.write('Rele: временный аудиофайл занят; очистка будет повторена при следующем запуске.\n');
     });
   }
-  let codex = new CodexClient(config.config.codex);
+  const codexOptions = { setupPlugin: (rpc: (method: string, params: Record<string, unknown>) => Promise<unknown>, runtime: CodexRuntime) =>
+    registerRelePlugin(rpc, { dataDirectory: config.directory, applicationRoot: root, version, codexHome: runtime.codexHome }) };
+  let codex = new CodexClient(config.config.codex, codexOptions);
   const engine = new Engine(store, codex, { config: () => config.config, temporaryRoot, redact: value => config.redact(value) });
   const activity = new SlackActivity(() => store.activeRequests(), async (origin, status) => {
     const channel = engine.channels.slack;
@@ -112,7 +120,7 @@ async function main(): Promise<void> {
       if (codexChanged) {
         const old = codex;
         await old.close();
-        codex = new CodexClient(next.codex);
+        codex = new CodexClient(next.codex, codexOptions);
         engine.replaceCodex(codex);
         void codex.connect().catch(() => {});
       }

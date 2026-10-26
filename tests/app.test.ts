@@ -9,6 +9,7 @@ import {
 import { Store } from '../src/server/store.js';
 import type { Engine } from '../src/server/engine.js';
 import type { Endpoint } from '../src/shared/types.js';
+import { MessageToolValidationError } from '../src/shared/message-tool.js';
 import { ChannelError, type Channel } from '../src/server/channels/common.js';
 
 const panelToken = 'a'.repeat(64);
@@ -45,6 +46,7 @@ function makeApp() {
     resume: vi.fn().mockResolvedValue(undefined),
     reconcile: vi.fn().mockResolvedValue(undefined),
     retryDelivery: vi.fn(),
+    messageTool: vi.fn().mockResolvedValue({ operationId: 'synthetic-operation', status: 'pending' }),
     resolveApproval: vi.fn().mockResolvedValue(undefined),
   });
   const codex = {
@@ -955,7 +957,7 @@ describe('authenticated Slack sync journal API', () => {
     expect(body.streamId).toBe(f.entries[0].streamId);
     expect(body.nextOffset).toBe(2);
     expect(body.entries).toHaveLength(2);
-    expect(body.streams).toEqual([{ id: f.entries[0].streamId, endpointId: f.endpoint.id, title: 'Local journal title',
+    expect(body.streams).toEqual([{ id: f.entries[0].streamId, platform: 'slack', endpointId: f.endpoint.id, title: 'Local journal title',
       active: true, paused: false, state: 'blocked', coveredThrough: '200.000000', error: 'Slack rate limited',
       counts: { pending: 103, applying: 0, applied: 1, uncertain: 1 } }]);
     expect(body.entries[0]).toEqual({ id: f.entries[0].id, message: f.entries[0].message, state: 'uncertain', error: 'Lost passive append ACK', createdAt: f.entries[0].createdAt });
@@ -1556,4 +1558,33 @@ describe('source access and native thread routing', () => {
     expect((await state()).sourceRoutes.find((item: { endpointId: string }) => item.endpointId === endpoint.id)).toMatchObject({ mode: 'none' });
     expect(f.config.config.autoLinkRules[0].enabled).toBe(true);
   });
+});
+
+it('protects message tools with panel authentication and accepts only the explicit call envelope', async () => {
+  const f = makeApp();
+  const payload = { threadId: 'native-thread', callId: 'native-call', name: 'send_message',
+    arguments: { endpointId: 'linked-source', text: 'Synthetic message', mentionIds: [] } };
+  expect((await f.app.inject({ method: 'POST', url: '/api/tools/call', headers: { host: headers.host }, payload })).statusCode).toBe(401);
+  expect((await f.app.inject({ method: 'POST', url: '/api/tools/call', headers: { ...headers, origin: 'https://foreign.example' }, payload })).statusCode).toBe(403);
+  for (const invalid of [{ ...payload, extra: true }, { ...payload, name: 'arbitrary_send' }, { ...payload, threadId: '' }, { ...payload, callId: [] }, { ...payload, arguments: null }]) {
+    expect((await f.app.inject({ method: 'POST', url: '/api/tools/call', headers, payload: invalid })).statusCode).toBe(400);
+  }
+  expect(f.engine.messageTool).not.toHaveBeenCalled();
+  const response = await f.app.inject({ method: 'POST', url: '/api/tools/call', headers, payload });
+  expect(response.statusCode).toBe(200);
+  expect(f.engine.messageTool).toHaveBeenCalledExactlyOnceWith(payload);
+  expect(response.json()).toEqual({ operationId: 'synthetic-operation', status: 'pending' });
+});
+
+it('returns only fixed message tool validation errors and hides unexpected engine details', async () => {
+  const f = makeApp();
+  const payload = { threadId: 'native-thread', callId: 'native-call', name: 'list_destinations', arguments: {} };
+  f.engine.messageTool.mockRejectedValueOnce(new MessageToolValidationError('destination_unavailable'));
+  const rejected = await f.app.inject({ method: 'POST', url: '/api/tools/call', headers, payload });
+  expect(rejected.statusCode).toBe(200);
+  expect(rejected.json()).toEqual({ isError: true, code: 'destination_unavailable', error: 'Источник недоступен этому разговору Codex. Обновите list_destinations.' });
+  f.engine.messageTool.mockRejectedValueOnce(new Error('synthetic-private-engine-detail'));
+  const failed = await f.app.inject({ method: 'POST', url: '/api/tools/call', headers, payload });
+  expect(failed.statusCode).toBe(500);
+  expect(failed.body).not.toContain('synthetic-private-engine-detail');
 });

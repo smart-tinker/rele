@@ -56,7 +56,8 @@ internal static class Native { static int Main(string[] args) {
     File.WriteAllText(Path.Combine(directory, "started.json"), new JavaScriptSerializer().Serialize(new {
       pid = Process.GetCurrentProcess().Id, descendant = descendant.Id, args = args,
       home = Environment.GetEnvironmentVariable("CODEX_HOME"), cli = Environment.GetEnvironmentVariable("CODEX_CLI_PATH"),
-      force = Environment.GetEnvironmentVariable("CODEX_APP_SERVER_FORCE_CLI"), ws = Environment.GetEnvironmentVariable("CODEX_APP_SERVER_WS_URL") }));
+      force = Environment.GetEnvironmentVariable("CODEX_APP_SERVER_FORCE_CLI"), ws = Environment.GetEnvironmentVariable("CODEX_APP_SERVER_WS_URL"),
+      tools = Environment.GetEnvironmentVariable("CODEX_APP_TOOLS_PIPE_PATH") }));
     while (!File.Exists(Path.Combine(directory, "finish"))) Thread.Sleep(20);
     return 37;
   }
@@ -79,11 +80,12 @@ internal static class Native { static int Main(string[] args) {
   const markerPath = path.join(directory, 'owner.json'); await writeFile(markerPath, serialized);
   const sentinel = child(native, ['--descendant']);
   const first = child(copiedHost, ['--codex-websocket-owner', markerPath], { env: { ...env,
-    CODEX_CLI_PATH: 'foreign-fixture', CODEX_APP_SERVER_FORCE_CLI: '1', CODEX_APP_SERVER_WS_URL: 'ws://127.0.0.1:1' } });
+    CODEX_CLI_PATH: 'foreign-fixture', CODEX_APP_SERVER_FORCE_CLI: '1', CODEX_APP_SERVER_WS_URL: 'ws://127.0.0.1:1', CODEX_APP_TOOLS_PIPE_PATH: 'foreign-fixture-pipe' } });
   first.process.stdin.end();
   const started = await waitFile(path.join(temporary, 'started.json'));
   assert.deepEqual(started.args, ['-c', 'features.code_mode_host=true', 'app-server', '--listen', marker.Endpoint]);
   assert.equal(started.home, home);
+  assert.equal(started.tools, `\\\\.\\pipe\\rele-codex-app-tools-${digest(serialized)}`);
   for (const key of ['cli', 'force', 'ws']) assert.equal(started[key], null);
   await delay(200); assert.equal(first.process.exitCode, null, 'Owner must ignore stdin EOF.');
   const receipt = await waitFile(path.join(directory, 'receipt.json'));
@@ -111,7 +113,7 @@ internal static class Native { static int Main(string[] args) {
   sentinel.process.kill(); await sentinel.closed;
   console.log(JSON.stringify({ result: 'passed', ownerIgnoresStdinEof: true, nativeExitCode: true,
     fixedNativeArgvAndProfile: true, inheritedAdapterRemoved: true, privateJobCleanup: true,
-    foreignProcessPreserved: true, stdioEofUnchanged: true, immutableMarkerChecked: true }));
+    foreignProcessPreserved: true, stdioEofUnchanged: true, immutableMarkerChecked: true, nativeOnlyAppToolsPipe: true }));
 } finally {
   for (const process of children.keys()) if (process.exitCode === null && process.signalCode === null) process.kill();
   await Promise.all([...children.values()].map(closed => Promise.race([closed.catch(() => {}), delay(3000)])));

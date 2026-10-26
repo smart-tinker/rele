@@ -16,7 +16,7 @@ function entry(index: number, state: SlackSyncEntryState = 'applied'): SlackSync
 
 function stream(extra: Partial<SlackSyncJournal['streams'][number]> = {}): SlackSyncJournal['streams'][number] {
   return {
-    id: 'stream-active', endpointId: 'sl-alpha', title: '#alpha-dev · Обсуждение API', active: true, paused: false, state: 'ready',
+    id: 'stream-active', platform: 'slack', endpointId: 'sl-alpha', title: '#alpha-dev · Обсуждение API', active: true, paused: false, state: 'ready',
     counts: { pending: 0, applying: 0, applied: 1, uncertain: 0 }, ...extra,
   };
 }
@@ -90,7 +90,7 @@ test('paginates source messages and opens blocked detached streams using escaped
   await expect(journal).toContainText('Пример сообщения 51');
   await expect(journal.getByRole('button', { name: 'Показать ещё', exact: true })).toHaveCount(0);
   expect(reads.some(read => read.url.searchParams.get('offset') === '50')).toBe(true);
-  await journal.getByLabel('Источник журнала Slack').selectOption(oldStreamId);
+  await journal.getByLabel('Источник журнала').selectOption(oldStreamId);
   await expect(journal.getByRole('article')).toHaveCount(1);
   await expect(journal).toContainText('Синхронизация заблокирована.');
   await expect(journal).toContainText('Нет доступа к старому треду');
@@ -142,9 +142,9 @@ test('shows read errors, refreshes explicitly and keeps block-only payloads boun
   const journal = await openJournal(page);
   await expect(journal.getByRole('alert')).toContainText('Журнал временно недоступен');
   failed = false;
-  await journal.getByRole('button', { name: 'Обновить журнал Slack' }).click();
+  await journal.getByRole('button', { name: 'Обновить журнал контекста' }).click();
   await expect(journal.getByRole('alert')).toHaveCount(0);
-  await expect(journal).toContainText('Сообщение без текстового поля. Полные данные Slack доступны ниже.');
+  await expect(journal).toContainText('Сообщение без текстового поля. Полные данные доступны ниже.');
   await journal.getByText('Данные Slack (JSON)', { exact: true }).click();
   const raw = journal.locator('pre');
   await expect(raw).toContainText('"received": true');
@@ -183,5 +183,23 @@ test('shows captured detached context without claiming its unfinished history sc
   await expect(journal).toContainText('Получено: 2 · В контексте Codex: 1 · Ожидают: 1');
   await expect(journal).toContainText('История не была загружена полностью до отвязки.');
   expect(reads.length).toBeGreaterThan(0);
+  expect(api.mutations).toEqual([]);
+});
+
+test('shows observed Telegram context with receipt dates and no historical-backfill claim', async ({ page }) => {
+  const api = await installApi(page);
+  const message = entry(0);
+  message.message = { ...message.message, platform: 'telegram', messageId: '42', text: 'Telegram context from another agent' };
+  await page.route(journalRoute, route => route.fulfill({ json: {
+    streamId: 'telegram-stream', streams: [stream({ id: 'telegram-stream', platform: 'telegram', endpointId: 'tg-alpha', title: 'Команда Альфа' })], entries: [message],
+  } satisfies SlackSyncJournal }));
+  await openPanel(page);
+  await page.getByRole('button', { name: 'Настройки источника Команда Альфа', exact: true }).click();
+  const journal = page.getByRole('region', { name: 'Журнал контекста Telegram' });
+  await expect(journal).toContainText('История до подключения не загружается');
+  await expect(journal).toContainText('Telegram context from another agent');
+  await expect(journal.locator('time')).toHaveAttribute('datetime', message.createdAt);
+  await journal.getByText('Данные Telegram (JSON)', { exact: true }).click();
+  await expect(journal.locator('pre')).toContainText('blocks');
   expect(api.mutations).toEqual([]);
 });

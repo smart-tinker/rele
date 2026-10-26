@@ -95,7 +95,9 @@ describe('Telegram connection and incoming events', () => {
     const h = harness(); await h.channel.start();
     h.push(['/rele_cancel', '/rele_cancel@RELE_TEST_BOT', '/rele_cancel@other_bot'].map((text, index) => ({ update_id: index + 1, message: telegramMessage({ text }) })));
     await vi.waitFor(() => expect(h.offset).toBe(4));
-    expect(vi.mocked(h.callbacks.message).mock.calls.map(([message]) => message.text)).toEqual(['/rele_cancel', '/rele_cancel']);
+    const messages = vi.mocked(h.callbacks.message).mock.calls.map(([message]) => message);
+    expect(messages.map(message => message.text)).toEqual(['/rele_cancel', '/rele_cancel@RELE_TEST_BOT', '/rele_cancel@other_bot']);
+    expect(messages.map(message => message.contextOnly === true)).toEqual([false, false, true]);
     expect(h.calls.some(call => call.method === 'sendMessage')).toBe(false);
   });
 
@@ -198,7 +200,7 @@ describe('Telegram connection and incoming events', () => {
     persisted.resolve();
   });
 
-  it('discovers topic names and people while ignoring edits, service requests and bot messages', async () => {
+  it('discovers topic names and people while ignoring edits/service requests and retaining self posts only as context', async () => {
     const h = harness();
     await h.channel.start();
     h.push([
@@ -208,14 +210,15 @@ describe('Telegram connection and incoming events', () => {
       { update_id: 4, message: telegramMessage({ from: { id: 999, is_bot: true, first_name: 'Rele' }, text: 'Own reply' }) },
       { update_id: 5, message: telegramMessage({ text: undefined, new_chat_members: [{ id: 456, first_name: 'Colleague' }] }) },
       { update_id: 6, message: telegramMessage({ text: undefined, forum_topic_edited: { name: 'Recovery' } }) },
-      { update_id: 7, message: telegramMessage({ message_id: 25, text: 'Another task', from: { id: 456, first_name: 'Colleague' } }) },
+      { update_id: 7, message: telegramMessage({ message_id: 25, text: 'Another task', from: { id: 456, is_bot: false, first_name: 'Colleague' } }) },
     ]);
     await vi.waitFor(() => expect(h.offset).toBe(8));
-    expect(h.callbacks.message).toHaveBeenCalledTimes(2);
+    expect(h.callbacks.message).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(h.callbacks.message).mock.calls[1][0]).toMatchObject({ sender: { id: '999', isBot: true }, text: 'Own reply', contextOnly: true });
     const discovered = vi.mocked(h.callbacks.endpoint).mock.calls.at(-1)![0];
     expect(discovered).toMatchObject({ title: 'Infrastructure / Recovery', chatTitle: 'Infrastructure', topicTitle: 'Recovery',
       accountId: '999', chatId: '-100123', threadId: '17', available: true, isForum: true });
-    expect(discovered.people).toEqual([{ id: '123', name: 'Alex' }, { id: '456', name: 'Colleague' }]);
+    expect(discovered.people).toEqual([{ id: '123', name: 'Alex', isBot: false }, { id: '456', name: 'Colleague', isBot: false }]);
     expect(discovered.title).not.toMatch(/123|17|999/u);
     expect(vi.mocked(h.callbacks.endpoint).mock.calls.find(([endpoint]) => !endpoint.threadId)?.[0]).toMatchObject({
       title: 'Infrastructure', chatTitle: 'Infrastructure', threadId: '', available: true, isForum: true,
@@ -234,6 +237,106 @@ describe('Telegram connection and incoming events', () => {
     h.push([{ update_id: 41, message: privateMessage({ chat: { id: 123, type: 'private', first_name: 'Alex', last_name: 'Example' } }) }]);
     await vi.waitFor(() => expect(h.offset).toBe(42));
     expect(vi.mocked(h.callbacks.message).mock.calls[1][0].endpoint).toMatchObject({ title: 'Alex', threadId: '' });
+  });
+
+  it.each([
+    { mode: 'off' as const, requests: 0 },
+    { mode: 'mention' as const, requests: 1 },
+    { mode: 'all' as const, requests: 2 },
+  ])('keeps observed agent messages intact and applies group access $mode', async ({ mode, requests }) => {
+    const directory = mkdtempSync(join(tmpdir(), 'rele-telegram-bots-'));
+    directories.push(directory);
+    const store = new Store(join(directory, 'rele.sqlite')); stores.push(store);
+    const endpoint: Endpoint = { id: endpointId('telegram', '999', '-100123', '17'), platform: 'telegram', accountId: '999',
+      chatId: '-100123', threadId: '17', title: 'Infrastructure / Agents', subtitle: 'Тема · Telegram', people: [], updatedAt: new Date().toISOString() };
+    store.upsertEndpoint(endpoint);
+    store.createConversation({ name: 'Shared agents', threadId: 'codex-thread', cwd: '/project',
+      bindings: [{ platform: 'telegram', endpointId: endpoint.id, allowedSenderIds: ['123'] }] });
+    store.setSourceAccess(endpoint.id, { mode });
+    const h = harness({ knownEndpoints: [endpoint], callbacks: { endpoint: value => store.upsertEndpoint(value),
+      message: vi.fn(async value => { store.ingest(value); }) } });
+    await h.channel.start();
+    const text = '@rele_test_bot @another_bot\nПроверь результат без потери адресатов.';
+    const from = { id: 456, is_bot: true, first_name: 'Oscar' };
+    h.push([
+      { update_id: 1, message: telegramMessage({ from, text, entities: [{ type: 'mention', offset: 0, length: 14 }] }) },
+      { update_id: 2, message: telegramMessage({ message_id: 21, from, text: undefined, caption: '@another_bot Информация для треда', caption_entities: [{ type: 'mention', offset: 0, length: 12 }] }) },
+    ]);
+    await vi.waitFor(() => expect(h.offset).toBe(3));
+    const observed = vi.mocked(h.callbacks.message).mock.calls.map(([message]) => message);
+    expect(observed).toHaveLength(2);
+    expect(observed[0]).toMatchObject({ sender: { id: '456', name: 'Oscar', isBot: true }, text, directMention: true });
+    expect(observed[1]).toMatchObject({ sender: { id: '456', isBot: true }, text: '@another_bot Информация для треда', directMention: false });
+    expect(store.listRequests()).toHaveLength(requests);
+    for (const request of store.listRequests()) expect(request.origin).toMatchObject({ senderId: '456', senderName: 'Oscar', senderIsBot: true });
+    expect(h.calls.some(call => call.method === 'sendMessage')).toBe(false);
+    expect(h.calls.every(call => ['getMe', 'getWebhookInfo', 'getUpdates'].includes(call.method))).toBe(true);
+  });
+
+  it.each([
+    { id: 123, first_name: 'Missing bot flag' },
+    { id: 123, is_bot: 'false', first_name: 'Invalid bot flag' },
+    { id: -123, is_bot: false, first_name: 'Negative user ID' },
+    { id: '123', is_bot: false, first_name: 'String user ID' },
+    { id: Number.MAX_SAFE_INTEGER + 1, is_bot: true, first_name: 'Unsafe bot ID' },
+  ])('does not infer a trusted human or bot from an invalid User: $first_name', async from => {
+    const h = harness(); await h.channel.start();
+    h.push([{ update_id: 1, message: telegramMessage({ from }) }]);
+    await vi.waitFor(() => expect(h.offset).toBe(2));
+    expect(h.callbacks.message).not.toHaveBeenCalled();
+    expect(h.callbacks.action).not.toHaveBeenCalled();
+  });
+
+  it('retains group self/admin posts only as context and rejects bot DMs and sender_chat identities', async () => {
+    const h = harness(); await h.channel.start();
+    const from = { id: 456, is_bot: true, first_name: 'Oscar' };
+    h.push([
+      { update_id: 1, message: telegramMessage({ from: { id: 999, is_bot: true, first_name: 'Theresa' }, text: '@rele_test_bot Own reply', entities: [{ type: 'mention', offset: 0, length: 14 }] }) },
+      { update_id: 2, message: telegramMessage({ from, text: '/rele_register@rele_test_bot Must not rename' }) },
+      { update_id: 3, message: telegramMessage({ from, text: '/rele_cancel@rele_test_bot' }) },
+      { update_id: 4, message: privateMessage({ chat: { id: 456, type: 'private' }, from }) },
+      { update_id: 5, message: telegramMessage({ from, sender_chat: { id: -100456, type: 'channel' } }) },
+      { update_id: 6, message: privateMessage({ from: { id: 456, is_bot: false, first_name: 'Another human' } }) },
+    ]);
+    await vi.waitFor(() => expect(h.offset).toBe(7));
+    const observed = vi.mocked(h.callbacks.message).mock.calls.map(([message]) => message);
+    expect(observed.map(message => [message.text, message.contextOnly])).toEqual([
+      ['@rele_test_bot Own reply', true], ['/rele_register@rele_test_bot Must not rename', true], ['/rele_cancel@rele_test_bot', true],
+    ]);
+    expect(observed.every(message => message.sender.isBot === true)).toBe(true);
+    expect(observed[0].directMention).toBe(true);
+    expect(observed[1].endpoint.title).not.toContain('Must not rename');
+    expect(observed[1].endpoint.people.some(person => person.id === '999')).toBe(false);
+    expect(h.calls.some(call => call.method === 'sendMessage')).toBe(false);
+  });
+
+  it('captures only previously observed authors of the exact topic at each message', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'rele-telegram-topic-roster-'));
+    directories.push(directory);
+    const store = new Store(join(directory, 'rele.sqlite')); stores.push(store);
+    const endpoints: Endpoint[] = ['17', '18'].map(threadId => ({ id: endpointId('telegram', '999', '-100123', threadId), platform: 'telegram', accountId: '999',
+      chatId: '-100123', threadId, title: `Topic ${threadId}`, subtitle: 'Тема · Telegram', people: [{ id: '777', name: 'Catalog-only person', isBot: false }], updatedAt: new Date().toISOString() }));
+    for (const endpoint of endpoints) store.upsertEndpoint(endpoint);
+    store.createConversation({ name: 'One Codex', threadId: 'same-codex', cwd: '/project',
+      bindings: endpoints.map(endpoint => ({ platform: 'telegram' as const, endpointId: endpoint.id, allowedSenderIds: ['123'] })) });
+    for (const endpoint of endpoints) store.setSourceAccess(endpoint.id, { mode: 'all' });
+    const h = harness({ knownEndpoints: endpoints, callbacks: { endpoint: value => store.upsertEndpoint(value),
+      message: vi.fn(async value => { store.ingest(value); }) } });
+    await h.channel.start();
+    h.push([
+      { update_id: 1, message: telegramMessage({ message_id: 20, from: { id: 456, is_bot: true, first_name: 'Oscar' }, text: 'First topic request' }) },
+      { update_id: 2, message: telegramMessage({ message_id: 21, message_thread_id: 18, from: { id: 888, is_bot: false, first_name: 'Other topic author' }, text: 'Other topic request' }) },
+      { update_id: 3, message: telegramMessage({ message_id: 22, from: { id: 999, is_bot: true, first_name: 'Theresa' }, text: 'Observed own post' }) },
+      { update_id: 4, message: telegramMessage({ message_id: 23, text: 'Later human request' }) },
+    ]);
+    await vi.waitFor(() => expect(h.offset).toBe(5));
+    const requests = store.listRequests();
+    expect(requests).toHaveLength(3);
+    expect(requests.find(request => request.text === 'First topic request')?.origin.participants).toEqual([{ id: '456', name: 'Oscar', isBot: true }]);
+    expect(requests.find(request => request.text === 'Other topic request')?.origin.participants).toEqual([{ id: '888', name: 'Other topic author', isBot: false }]);
+    expect(requests.find(request => request.text === 'Later human request')?.origin.participants).toEqual([
+      { id: '456', name: 'Oscar', isBot: true }, { id: '999', name: 'Theresa', isBot: true }, { id: '123', name: 'Alex', isBot: false },
+    ]);
   });
 });
 
@@ -259,7 +362,7 @@ describe('Telegram chat discovery', () => {
     const endpoints = new Map([known, other].map(endpoint => [endpoint.id, endpoint]));
     const h = harness({ knownEndpoints: [known, other], callbacks: { endpoint: vi.fn(endpoint => { endpoints.set(endpoint.id, endpoint); }) } });
     const changed = (status: string, overrides: Record<string, unknown> = {}) => ({
-      chat: { id: -100123, type: 'supergroup', title: 'Infrastructure', is_forum: true }, from: { id: 123, first_name: 'Alex' },
+      chat: { id: -100123, type: 'supergroup', title: 'Infrastructure', is_forum: true }, from: { id: 123, is_bot: false, first_name: 'Alex' },
       new_chat_member: { status, user: { id: 999, is_bot: true }, ...overrides },
     });
     await h.channel.start();
@@ -292,7 +395,7 @@ describe('Telegram chat discovery', () => {
     await h.channel.start();
     h.push([{ update_id: 1, message: privateMessage({ message_thread_id: 17, text: undefined, forum_topic_created: { name: 'Planning' } }) }]);
     await vi.waitFor(() => expect(h.offset).toBe(2));
-    const changed = (status: string) => ({ chat: { id: 123, type: 'private', first_name: 'Alex' }, from: { id: 123, first_name: 'Alex' },
+    const changed = (status: string) => ({ chat: { id: 123, type: 'private', first_name: 'Alex' }, from: { id: 123, is_bot: false, first_name: 'Alex' },
       new_chat_member: { status, user: { id: 999, is_bot: true } } });
     h.push([{ update_id: 2, my_chat_member: changed('kicked') }]);
     await vi.waitFor(() => expect(h.offset).toBe(3));
@@ -410,7 +513,7 @@ describe('Telegram chat discovery', () => {
     ]);
     await vi.waitFor(() => expect(h.offset).toBe(5));
     expect(store.listRequests()).toEqual([]);
-    expect(message).not.toHaveBeenCalled();
+    expect(message).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ text: '/rele_register@some_other_bot Must not rename', contextOnly: true }));
     expect(store.getEndpoint(known.id)).toMatchObject({ title: 'Infrastructure / Release planning', chatTitle: 'Infrastructure', topicTitle: 'Release planning', isForum: true, available: true });
     expect(store.getEndpoint(endpointId('telegram', '999', '-100123', ''))).toMatchObject({ title: 'Infrastructure', isForum: true });
     expect(store.getEndpoint(endpointId('telegram', '999', '-100456', ''))).toMatchObject({ title: 'Operations', isForum: false });
@@ -567,9 +670,9 @@ describe('Telegram General routing', () => {
     expect(h.calls.find(call => call.method === 'sendMessage')?.body).not.toHaveProperty('message_thread_id');
     const data = `rele:${APPROVAL_ID}:accept`;
     h.push([
-      { update_id: 1, callback_query: { id: 'general-1', from: { id: 123, first_name: 'Alex' }, data, message: generalMessage({ message_id: 500 }) } },
-      { update_id: 2, callback_query: { id: 'general-2', from: { id: 123, first_name: 'Alex' }, data, message: generalMessage({ message_id: 500, message_thread_id: 20 }) } },
-      { update_id: 3, callback_query: { id: 'private-topic', from: { id: 123, first_name: 'Alex' }, data, message: privateMessage({ message_id: 500, message_thread_id: 17 }) } },
+      { update_id: 1, callback_query: { id: 'general-1', from: { id: 123, is_bot: false, first_name: 'Alex' }, data, message: generalMessage({ message_id: 500 }) } },
+      { update_id: 2, callback_query: { id: 'general-2', from: { id: 123, is_bot: false, first_name: 'Alex' }, data, message: generalMessage({ message_id: 500, message_thread_id: 20 }) } },
+      { update_id: 3, callback_query: { id: 'private-topic', from: { id: 123, is_bot: false, first_name: 'Alex' }, data, message: privateMessage({ message_id: 500, message_thread_id: 17 }) } },
     ]);
     await vi.waitFor(() => expect(h.offset).toBe(4));
     const sources = vi.mocked(h.callbacks.action).mock.calls.map(([action]) => ({ chatId: action.chatId, threadId: action.threadId }));
@@ -628,11 +731,23 @@ describe('Telegram delivery and approvals', () => {
     const callbackData = sent.inline_keyboard[0][0].callback_data;
     expect(callbackData).toBe(`rele:${APPROVAL_ID}:accept`);
     expect(Buffer.byteLength(callbackData)).toBeLessThanOrEqual(64);
-    const callback = { id: 'callback-1', from: { id: 123, first_name: 'Alex' }, data: callbackData, message: telegramMessage({ message_id: 500 }) };
-    h.push([{ update_id: 50, callback_query: callback }, { update_id: 51, callback_query: { ...callback, id: 'callback-2', from: { id: 456, first_name: 'Other' } } }]);
+    const callback = { id: 'callback-1', from: { id: 123, is_bot: false, first_name: 'Alex' }, data: callbackData, message: telegramMessage({ message_id: 500 }) };
+    h.push([{ update_id: 50, callback_query: callback }, { update_id: 51, callback_query: { ...callback, id: 'callback-2', from: { id: 456, is_bot: false, first_name: 'Other' } } }]);
     await vi.waitFor(() => expect(h.offset).toBe(52));
-    expect(action.mock.calls[0][0]).toEqual({ approvalId: APPROVAL_ID, decision: 'accept', platform: 'telegram', accountId: '999', chatId: '-100123', threadId: '17', senderId: '123' });
+    expect(action.mock.calls[0][0]).toEqual({ approvalId: APPROVAL_ID, decision: 'accept', platform: 'telegram', accountId: '999', chatId: '-100123', threadId: '17', senderId: '123', senderIsBot: false });
     expect(h.calls.filter((call) => call.method === 'answerCallbackQuery').map((call) => call.body.text)).toEqual(['Ответ принят.', 'Действие недоступно.']);
+  });
+
+  it.each([
+    { id: 456, is_bot: true, first_name: 'Agent' },
+    { id: 456, first_name: 'Unverified actor' },
+    { id: 456, is_bot: 'false', first_name: 'Invalid actor' },
+  ])('does not authorize a callback without a verified human User: $first_name', async from => {
+    const h = harness(); await h.channel.start();
+    h.push([{ update_id: 1, callback_query: { id: 'bot-action', from, data: `rele:${APPROVAL_ID}:accept`, message: telegramMessage({ message_id: 500 }) } }]);
+    await vi.waitFor(() => expect(h.offset).toBe(2));
+    expect(h.callbacks.action).not.toHaveBeenCalled();
+    expect(h.calls.find(call => call.method === 'answerCallbackQuery')?.body).toMatchObject({ text: 'Действие недоступно.', show_alert: true });
   });
 
   it('uses a selective ForceReply for questions and leaves retryable approval actions unacknowledged in the checkpoint', async () => {
@@ -640,9 +755,41 @@ describe('Telegram delivery and approvals', () => {
     await h.channel.start();
     await h.channel.deliver(delivery({ kind: 'approval', approvalId: APPROVAL_ID }), approval({ questions: [{ id: 'q1', header: 'Target', question: 'Which branch?' }] }));
     expect(h.calls.find((call) => call.method === 'sendMessage')?.body.reply_markup).toMatchObject({ force_reply: true, selective: true });
-    h.push([{ update_id: 60, callback_query: { id: 'callback-3', from: { id: 123, first_name: 'Alex' }, data: `rele:${APPROVAL_ID}:accept`, message: telegramMessage({ message_id: 500 }) } }]);
+    h.push([{ update_id: 60, callback_query: { id: 'callback-3', from: { id: 123, is_bot: false, first_name: 'Alex' }, data: `rele:${APPROVAL_ID}:accept`, message: telegramMessage({ message_id: 500 }) } }]);
     await vi.waitFor(() => expect(h.channel.state.connected).toBe(false));
     expect(h.offset).toBe(0);
+  });
+});
+
+describe('Telegram tool messages', () => {
+  it('retains only platform-validated usernames from observed participants', async () => {
+    const h = harness(); await h.channel.start();
+    h.push([{ update_id: 1, message: telegramMessage({ from: { id: 456, is_bot: true, first_name: 'Agent', username: 'peer_agent' } }) },
+      { update_id: 2, message: telegramMessage({ from: { id: 123, is_bot: false, first_name: 'Human', username: 'bad name@fake' } }) }]);
+    await vi.waitFor(() => expect(h.offset).toBe(3));
+    expect(vi.mocked(h.callbacks.message).mock.calls[0][0].sender).toEqual({ id: '456', name: 'Agent', isBot: true, username: 'peer_agent' });
+    expect(vi.mocked(h.callbacks.message).mock.calls[1][0].sender.username).toBeUndefined();
+  });
+
+  it('posts to the topic without a fabricated reply, using explicit mention entities and neutralized model handles', async () => {
+    const h = harness(); await h.channel.start();
+    const tool: Delivery = { ...delivery(), requestId: undefined, operationId: 'operation', kind: 'message',
+      body: 'Check @unvalidated and @everyone', mentions: [{ id: '456', name: 'Agent', isBot: true, username: 'peer_agent' }, { id: '123', name: 'Human', username: 'known_human' }],
+      origin: { ...delivery().origin, senderId: '999', senderName: 'Rele', messageId: '' } };
+    await h.channel.deliver(tool);
+    const sent = h.calls.find(call => call.method === 'sendMessage')!.body;
+    expect(sent).toMatchObject({ chat_id: '-100123', message_thread_id: 17,
+      text: '@peer_agent @known_human\n\nCheck @\u200bunvalidated and @\u200beveryone',
+      entities: [{ type: 'mention', offset: 0, length: 11 }, { type: 'mention', offset: 12, length: 12 }] });
+    expect(sent).not.toHaveProperty('reply_parameters');
+    expect(sent).not.toHaveProperty('parse_mode');
+    expect(h.channel.deliveryText(tool)).toBe(sent.text);
+    await expect(h.channel.deliver({ ...tool, mentions: [{ id: '456', name: 'No username' }] })).rejects.toThrow(/адрес упоминания/);
+    await h.channel.deliver({ ...tool, mentions: [] });
+    const posts = h.calls.filter(call => call.method === 'sendMessage');
+    expect(posts).toHaveLength(2);
+    expect(posts[1].body).toMatchObject({ text: 'Check @\u200bunvalidated and @\u200beveryone' });
+    expect(posts[1].body).not.toHaveProperty('entities');
   });
 });
 

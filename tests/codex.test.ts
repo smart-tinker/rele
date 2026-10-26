@@ -254,11 +254,23 @@ describe('Codex native shared policy', () => {
     const f = await sharedFixture();
     const runtime = { userAgent: 'codex/0.163.0-alpha.11 (Fixture)', codexHome: f.home,
       platformFamily: process.platform === 'win32' ? 'windows' : 'unix', platformOs: process.platform === 'win32' ? 'windows' : process.platform };
+    const sessions = path.join(f.home, 'sessions'); await mkdir(sessions);
+    const rollout = path.join(sessions, 'synthetic-context.jsonl');
+    await writeFile(rollout, JSON.stringify({ type: 'session_meta', payload: { id: threadId } }) + '\n');
+    const contextHandlers: Record<string, Handler> = {
+      'thread/read': () => ({ thread: { ...rawThread, path: rollout } }),
+      'thread/inject_items': async message => {
+        for (const item of message.params.items as unknown[]) await appendFile(rollout, JSON.stringify({ type: 'response_item', payload: item }) + '\n');
+        return {};
+      },
+      'thread/unsubscribe': () => ({ status: 'notLoaded' }),
+    };
+    Object.assign(f.handlers, contextHandlers);
     let acceptedId = '', nextId = '';
     f.handlers['server/diagnostics'] = () => ({ process: { id: 41 }, gauges: [] });
     f.handlers['thread/backgroundTerminals/list'] = () => ({ data: [], nextCursor: null });
     f.handlers['thread/queue/add'] = (message, socket) => { acceptedId = String(message.params.clientUserMessageId); socket.close(); return noResponse; };
-    const replacement = await fixture({ initialize: () => runtime,
+    const replacement = await fixture({ ...contextHandlers, initialize: () => runtime,
       'server/diagnostics': () => ({ process: { id: 42 }, gauges: [] }),
       'thread/backgroundTerminals/list': () => ({ data: [], nextCursor: null }),
       'thread/queue/add': message => { nextId = String(message.params.clientUserMessageId); return { queuedSubmission: { id: 'next-accepted', clientUserMessageId: nextId } }; },

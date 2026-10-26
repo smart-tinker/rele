@@ -423,3 +423,38 @@ test('unified source table and every catalog filter clear without mutations and 
   expect(api.mutations).toEqual([]);
   expect(errors).toEqual([]);
 });
+
+test('completed NOREPLY is visible in the queue without creating a delivery', async ({ page }) => {
+  const state = fixtureState();
+  state.requests = [{ ...fixtureRequest('silent-request', 'completed'), suppressedFinal: true }];
+  state.deliveries = [];
+  const api = await installApi(page, state);
+  await openPanel(page);
+  await page.getByRole('navigation').getByRole('button', { name: 'Очередь', exact: true }).click();
+  await page.getByRole('button', { name: 'Все запросы' }).click();
+  await expect(page.getByText('Агент завершил запрос без отправки ответа (NOREPLY).')).toBeVisible();
+  await expect(page.getByRole('row').filter({ hasText: 'NOREPLY' })).toContainText('Завершён');
+  expect(api.mutations).toEqual([]);
+});
+
+test('an agent tool message has its conversation and mentions without inventing an inbound request', async ({ page }, testInfo) => {
+  const state = fixtureState();
+  const endpoint = state.endpoints.find((item) => item.id === 'tg-alpha')!;
+  const origin = { ...fixtureRequest('unused').origin, endpointId: endpoint.id, chatId: endpoint.chatId,
+    threadId: endpoint.threadId, senderId: 'connected-agent', senderName: 'Тереза (пример)', senderIsBot: true, messageId: '' };
+  state.requests = [];
+  state.deliveries = [{ id: 'tool-delivery', operationId: 'tool-operation', conversationId: state.conversations[0].id,
+    nativeThreadId: 'thread-alpha', callId: 'native-call', origin, key: 'tool-operation', ordinal: 0,
+    kind: 'message', body: 'Синтетическое сообщение агенту', mentions: [{ id: 'known-agent', name: 'Оскар (пример)', isBot: true }],
+    status: 'uncertain', attempts: 1, createdAt: '2026-10-26T12:00:00Z', updatedAt: '2026-10-26T12:00:00Z' }];
+  const api = await installApi(page, state);
+  await openPanel(page);
+  await page.getByRole('navigation').getByRole('button', { name: 'Доставка', exact: true }).click();
+  const row = page.getByRole('row').filter({ hasText: 'Сообщение агента' });
+  await expect(row).toContainText(state.conversations[0].name);
+  await expect(row).toContainText('Упоминания: Оскар (пример)');
+  await expect(row).toContainText('Повторная отправка заблокирована');
+  await expect(row.getByRole('button', { name: 'Повторить' })).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath('agent-message-delivery.png'), fullPage: true });
+  expect(api.mutations).toEqual([]);
+});

@@ -600,6 +600,7 @@ export function CodexSettings({
             <div className="codex-mode-copy">
               <p>Rele подключается к общему Codex или запускает его. Сервер восстанавливается после перезапусков и работает без открытого Desktop.</p>
               <p className="field-hint">Для совместной работы подключите обычный запуск Desktop ниже. Существующие разговоры и профиль сохраняются.</p>
+              <p className="field-hint">На Windows после обновления Rele исправления инструментов Desktop вступают при следующем запуске общего сервера или перезагрузке Windows. Работающие задачи сохраняются; перезапуска одного Desktop недостаточно.</p>
             </div>
           ) : transport === 'managed' ? (
             <div className="codex-mode-copy">

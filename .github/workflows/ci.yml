@@ -101,6 +101,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node scripts/smoke-windows-codex-owner.mjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/smoke-windows-desktop-tools-pipe.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify Windows installer and native shared gates as a standard user
         if: runner.os == 'Windows'
         shell: pwsh

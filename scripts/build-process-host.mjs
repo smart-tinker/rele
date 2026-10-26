@@ -29,7 +29,7 @@ export async function buildProcessHost(output = path.join(root, 'dist', 'native'
     const compiled = path.join(temporary, 'Rele.Process.exe');
     const result = spawnSync(compiler, ['/nologo', '/target:winexe', '/platform:x64', '/optimize+', '/codepage:65001',
       '/r:System.Web.Extensions.dll', `/out:${compiled}`, path.join(root, 'scripts', 'windows', 'ProcessHost.cs'),
-      path.join(root, 'scripts', 'windows', 'CodexControlDirectory.cs'), assembly], { stdio: 'inherit', windowsHide: true });
+      path.join(root, 'scripts', 'windows', 'CodexControlDirectory.cs'), path.join(root, 'scripts', 'windows', 'DesktopToolsPipe.cs'), assembly], { stdio: 'inherit', windowsHide: true });
     if (result.error) throw result.error;
     if (result.status !== 0) throw new Error(`Native process host compilation exited ${result.status}.`);
     await mkdir(path.dirname(output), { recursive: true });

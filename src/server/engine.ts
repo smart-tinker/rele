@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import type { Approval, ApprovalQuestion, AutoLinkIntent, InboundMessage, Platform, ReleRequest } from '../shared/types.js';
+import type { Approval, ApprovalQuestion, AutoLinkIntent, Delivery, Endpoint, InboundMessage, MessageDestination, MessageToolCall, MessageToolReceipt, Person, Platform, ReleRequest } from '../shared/types.js';
 import { CodexClient, CodexRpcError, CodexThreadBusyError, codexCommandItem, type CodexCommandItem, type CodexNotification, type CodexServerRequest, type CodexTerminal, type CodexTerminalSnapshot, type RequestLocation } from './codex.js';
 import { Store } from './store.js';
 import type { AppConfig } from './config.js';
@@ -10,6 +10,8 @@ import { transcribeAudio } from './voice.js';
 import { SlackSync } from './slack-sync.js';
 import { splitSlackReply } from './channels/slack-format.js';
 import { effectiveSharedCodexHome } from './codex-shared.js';
+import { requestInput } from './inbound-context.js';
+import { MessageToolValidationError } from '../shared/message-tool.js';
 
 export type CodexGateway = Pick<CodexClient, 'status' | 'isVerifiedVersion' | 'createThread' | 'setThreadName' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'interrupt' | 'backgroundTerminals' | 'terminateBackgroundTerminal' | 'findRequest' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Pick<EventEmitter, 'on' | 'off'>;
 export interface EngineOptions {
@@ -63,7 +65,7 @@ export class Engine extends EventEmitter {
 
   constructor(readonly store: Store, public codex: CodexGateway, private readonly options: EngineOptions) {
     super();
-    this.slackSync = new SlackSync(store, () => this.channels.slack, () => this.codex);
+    this.slackSync = new SlackSync(store, platform => this.channels[platform ?? 'slack'], () => this.codex);
     codex.on('notification', this.notification);
     codex.on('request', this.serverRequest);
     codex.on('status', this.connection);
@@ -110,7 +112,9 @@ export class Engine extends EventEmitter {
 
   async receive(message: InboundMessage): Promise<void> {
     if (this.stopped) throw new ChannelError('Rele завершает работу; событие будет доставлено повторно.', true);
-    if (message.control === 'stop' || !message.contextOnly && !message.audio && /^(?:rele:cancel|\/rele_cancel)$/iu.test(message.text.trim())) {
+    const controlText = message.endpoint.platform === 'slack'
+      ? message.text.replaceAll(`<@${message.endpoint.accountId.split(':').at(-1)}>`, '').trim() : message.text.trim();
+    if (message.control === 'stop' || !message.contextOnly && !message.audio && /^(?:rele:cancel|\/rele_cancel(?:@[A-Za-z0-9_]+)?)$/iu.test(controlText)) {
       if (this.store.recordInbound(message).duplicate) return;
       const requests = this.store.activeRequests().filter(request => this.sameOrigin(request, message)
         // A delayed native Stop must not reach the next run, even if it was queued before the click.
@@ -133,7 +137,8 @@ export class Engine extends EventEmitter {
       : this.store.listApprovals(1000).find(candidate => {
         if (candidate.status !== 'pending' || !candidate.questions?.length || candidate.questions.some(question => question.isSecret)) return false;
         const request = this.store.getRequest(candidate.requestId);
-        return !!request && this.sameOrigin(request, message) && this.store.approvalDeliveryProgress(candidate.id).sent;
+        return !!request && this.sameOrigin(request, message)
+          && this.store.approvalDeliveryProgress(candidate.id).sent;
       });
     if (approval && (message.endpoint.platform === 'telegram' || (message.text.trim() && !message.audio))) {
       // Record first: after any crash this event cannot become a fresh Codex turn.
@@ -180,7 +185,8 @@ export class Engine extends EventEmitter {
     const approval = this.store.getApproval(action.approvalId);
     const request = approval && this.store.getRequest(approval.requestId);
     const origin = request?.origin;
-    if (!origin || origin.platform !== action.platform || origin.accountId !== action.accountId || origin.chatId !== action.chatId || origin.senderId !== action.senderId || origin.threadId !== (action.threadId ?? '')) throw new Error('Это подтверждение доступно только отправителю исходного запроса.');
+    if (!request || !this.sameOrigin(request, { endpoint: { platform: action.platform, accountId: action.accountId, chatId: action.chatId,
+      threadId: action.threadId ?? '' }, sender: { id: action.senderId, isBot: action.senderIsBot } })) throw new Error('Это подтверждение недоступно этому участнику источника.');
     await this.resolveApproval(action.approvalId, action.decision);
   }
 
@@ -621,7 +627,7 @@ export class Engine extends EventEmitter {
       }
       this.store.setMeta(`request-terminal-baseline:${request.id}`, JSON.stringify({ ...baseline, epoch, target: this.targetFingerprint() } satisfies TerminalBaseline));
       attempted = true;
-      const result = await client.enqueue(conversation.threadId, request.text, request.id);
+      const result = await client.enqueue(conversation.threadId, requestInput(request), request.id);
       // The userMessage and completion notifications may arrive before this ACK.
       this.store.updateRequest(request.id, { queuedSubmissionId: result.queuedSubmissionId });
       this.track(this.reconcile(request.id));
@@ -664,6 +670,76 @@ export class Engine extends EventEmitter {
     return release;
   }
 
+  private toolDestinations(threadId: string, requireConnected = true): Array<MessageDestination & { conversationId: string; endpoint: Endpoint; channel: Channel }> {
+    const conversation = this.store.listConversations().find(row => row.threadId === threadId);
+    if (!conversation || conversation.paused) return [];
+    return conversation.bindings.flatMap(binding => {
+      const endpoint = this.store.getEndpoint(binding.endpointId), channel = this.channels[binding.platform];
+      if (!endpoint || endpoint.available === false || this.store.getSourceAccess(endpoint.id).mode === 'off'
+        || !this.options.config()[binding.platform].enabled || !channel || channel.state.accountId !== endpoint.accountId
+        || requireConnected && !channel.state.connected) return [];
+      return [{ endpointId: endpoint.id, platform: endpoint.platform,
+        title: this.store.getMeta(`endpoint-alias:${endpoint.id}`) || endpoint.title,
+        participants: this.store.getThreadParticipants(endpoint.id), conversationId: conversation.id, endpoint, channel }];
+    });
+  }
+  private toolReceipt(delivery: Delivery): MessageToolReceipt {
+    return { operationId: delivery.id, endpointId: delivery.origin.endpointId, status: delivery.status,
+      ...(delivery.remoteMessageId ? { remoteMessageId: delivery.remoteMessageId } : {}),
+      ...(delivery.error ? { error: delivery.kind === 'message' && delivery.status === 'cancelled' ? 'Связь или доступ к источнику изменились. Сообщение не отправлено.'
+        : delivery.status === 'uncertain' ? 'Результат отправки неизвестен. Проверьте исходный чат; не повторяйте отправку.' : 'Сообщение пока не доставлено. Проверьте состояние в Rele.' } : {}) };
+  }
+  private ownIdentity(channel: Channel, platform: Platform): Person {
+    return channel.identity ?? { id: platform === 'slack' ? channel.state.accountId!.split(':').at(-1)! : channel.state.accountId!,
+      name: channel.state.name ?? 'Подключённый агент', isBot: true };
+  }
+
+  async messageTool(call: MessageToolCall): Promise<{ destinations: MessageDestination[] } | MessageToolReceipt> {
+    if (this.stopped) throw new MessageToolValidationError('stopping');
+    if (typeof call.threadId !== 'string' || !call.threadId.trim() || call.threadId.length > 200
+      || typeof call.callId !== 'string' || !call.callId.trim() || call.callId.length > 300) throw new MessageToolValidationError('invalid_call');
+    if (!call.arguments || typeof call.arguments !== 'object' || Array.isArray(call.arguments)) throw new MessageToolValidationError('invalid_arguments');
+    const args = call.arguments as Record<string, unknown>;
+    const fields = (allowed: string[]) => { if (Object.keys(args).some(key => !allowed.includes(key))) throw new MessageToolValidationError('unknown_arguments'); };
+    if (call.name === 'list_destinations') {
+      fields([]);
+      return { destinations: this.toolDestinations(call.threadId).map(({ endpointId, platform, title, participants }) => ({ endpointId, platform, title, participants })) };
+    }
+    if (call.name === 'get_message_status') {
+      fields(['operationId']);
+      if (typeof args.operationId !== 'string' || args.operationId.length > 100) throw new MessageToolValidationError('operation_required');
+      const delivery = this.store.toolMessageStatus(call.threadId, args.operationId);
+      if (!delivery) throw new MessageToolValidationError('operation_unknown');
+      return this.toolReceipt(delivery);
+    }
+    if (call.name !== 'send_message') throw new MessageToolValidationError('unknown_tool');
+    fields(['endpointId', 'text', 'mentionIds']);
+    if (typeof args.endpointId !== 'string' || !args.endpointId || args.endpointId.length > 200) throw new MessageToolValidationError('destination_required');
+    if (typeof args.text !== 'string' || !args.text.trim() || [...args.text].length > 3000) throw new MessageToolValidationError('text_invalid');
+    const mentionIds = args.mentionIds === undefined ? [] : args.mentionIds;
+    if (!Array.isArray(mentionIds) || mentionIds.some(id => typeof id !== 'string' || !id || id.length > 200)
+      || new Set(mentionIds).size !== mentionIds.length) throw new MessageToolValidationError('mentions_invalid');
+    const canonical = { endpointId: args.endpointId, text: args.text, mentionIds };
+    const existing = this.store.toolMessageForCall(call.threadId, call.callId, canonical);
+    if (existing) return this.toolReceipt(existing);
+    const target = this.toolDestinations(call.threadId).find(destination => destination.endpointId === args.endpointId);
+    if (!target) throw new MessageToolValidationError('destination_unavailable');
+    const mentions = (mentionIds as string[]).map(id => {
+      const person = target.participants.find(value => value.id === id);
+      if (!person) throw new MessageToolValidationError('participant_unknown');
+      if (target.platform === 'slack' ? !/^[UW][A-Z0-9]+$/u.test(person.id) : !person.username || !/^[A-Za-z0-9_]{1,32}$/u.test(person.username)) {
+        throw new MessageToolValidationError('mention_unavailable');
+      }
+      return { ...person };
+    });
+    const sender = this.ownIdentity(target.channel, target.platform), endpoint = target.endpoint;
+    const delivery = this.store.addToolMessage({ threadId: call.threadId, callId: call.callId, conversationId: target.conversationId,
+      arguments: canonical, text: args.text, mentions, origin: { platform: target.platform, accountId: endpoint.accountId, endpointId: endpoint.id,
+        chatId: endpoint.chatId, threadId: endpoint.threadId, senderId: sender.id, senderName: sender.name, senderIsBot: true, messageId: '' } });
+    this.changed(); this.track(this.deliver());
+    return this.toolReceipt(this.store.getDelivery(delivery.id)!);
+  }
+
   private async deliver(): Promise<void> {
     if (this.sending || this.stopped) return;
     this.sending = true;
@@ -676,12 +752,28 @@ export class Engine extends EventEmitter {
           this.store.updateDelivery(delivery.id, { status: 'cancelled', error: 'Подтверждение уже завершено.' }); continue;
         }
         const channel = this.channels[delivery.origin.platform];
+        if (delivery.kind === 'message') {
+          const target = this.toolDestinations(delivery.nativeThreadId!, false).find(value => value.endpointId === delivery.origin.endpointId);
+          if (!target || target.conversationId !== delivery.conversationId || target.endpoint.accountId !== delivery.origin.accountId
+            || delivery.mentions?.some(person => !target.participants.some(known => known.id === person.id && known.username === person.username))) {
+            this.store.updateDelivery(delivery.id, { status: 'cancelled', error: 'Tool message source access changed.' }); continue;
+          }
+        }
         if (!channel?.state.connected) {
           this.store.updateDelivery(delivery.id, { status: 'pending', nextAttemptAt: new Date(Date.now() + 5000).toISOString() }); continue;
         }
         try {
           const remoteMessageId = await channel.deliver(delivery, approval);
-          this.store.updateDelivery(delivery.id, { status: 'sent', remoteMessageId, error: undefined });
+          const sender = this.ownIdentity(channel, delivery.origin.platform);
+          const ownReceipt: InboundMessage | undefined = delivery.kind === 'message' && delivery.origin.platform === 'telegram'
+            ? { eventId: `tool-outgoing:${delivery.id}`, endpoint: this.store.getEndpoint(delivery.origin.endpointId)!, sender,
+              messageId: remoteMessageId, text: channel.deliveryText?.(delivery) ?? delivery.body, contextOnly: true } : undefined;
+          this.store.updateDelivery(delivery.id, { status: 'sent', remoteMessageId, error: undefined }, ownReceipt);
+          if (channel.state.accountId) {
+            try {
+              if (!ownReceipt) this.store.rememberThreadParticipant(delivery.origin.endpointId, sender, remoteMessageId);
+            } catch (error) { this.emit('diagnostic', this.options.redact(error)); }
+          }
           this.emit('delivered', delivery);
         } catch (error) {
           const classified = error instanceof ChannelError ? error : new ChannelError('Результат доставки неизвестен.', false, true);
@@ -810,7 +902,9 @@ export class Engine extends EventEmitter {
     }
     if (found.mixed || this.isMixed(request.id)) { this.store.setMeta(`mixed:${request.id}`, '1'); this.store.finishRequest(request.id, { status: 'failed', turnId: found.turnId, error: mixedMessage }, []); return; }
     if (found.state === 'completed') {
-      this.store.finishRequest(request.id, { status: 'completed', turnId: found.turnId, error: undefined }, (request.origin.platform === 'slack' ? splitSlackReply(found.text ?? '') : splitReply(found.text ?? '')).map((body, ordinal) => ({ key: `answer:${ordinal}`, ordinal, kind: 'answer' as const, body })));
+      const suppressed = found.text?.trim() === 'NOREPLY';
+      this.store.finishRequest(request.id, { status: 'completed', turnId: found.turnId, error: undefined }, suppressed ? []
+        : (request.origin.platform === 'slack' ? splitSlackReply(found.text ?? '') : splitReply(found.text ?? '')).map((body, ordinal) => ({ key: `answer:${ordinal}`, ordinal, kind: 'answer' as const, body })), suppressed);
     } else if (found.state === 'failed' || found.state === 'interrupted') {
       const error = found.state === 'interrupted' ? 'Выполнение запроса остановлено в Codex.'
         : found.failureReason === 'serverOverloaded' ? 'Сервис Codex временно перегружен. Запрос завершился с ошибкой. Rele не повторяет его автоматически.'
@@ -821,7 +915,17 @@ export class Engine extends EventEmitter {
 
   private fail(id: string, error: string): void { this.store.finishRequest(id, { status: 'failed', error }, [{ key: 'terminal:error', ordinal: 0, kind: 'error', body: error }]); }
   private isMixed(id: string): boolean { return this.store.getMeta(`mixed:${id}`) === '1'; }
-  private sameOrigin(request: ReleRequest, message: InboundMessage): boolean { const origin = request.origin; return origin.platform === message.endpoint.platform && origin.accountId === message.endpoint.accountId && origin.chatId === message.endpoint.chatId && origin.threadId === message.endpoint.threadId && origin.senderId === message.sender.id; }
+  private sameSource(request: ReleRequest, message: { endpoint: Pick<InboundMessage['endpoint'], 'platform' | 'accountId' | 'chatId' | 'threadId'> }): boolean {
+    const origin = request.origin;
+    return origin.platform === message.endpoint.platform && origin.accountId === message.endpoint.accountId && origin.chatId === message.endpoint.chatId && origin.threadId === message.endpoint.threadId;
+  }
+  private sameOrigin(request: ReleRequest, message: { endpoint: Pick<InboundMessage['endpoint'], 'platform' | 'accountId' | 'chatId' | 'threadId'>; sender: Pick<InboundMessage['sender'], 'id' | 'isBot'> }): boolean {
+    if (!this.sameSource(request, message) || message.sender.isBot === true) return false;
+    const origin = request.origin;
+    if (origin.senderIsBot !== true) return origin.senderId === message.sender.id;
+    const group = origin.platform === 'slack' ? /^[CG]/u.test(origin.chatId) : /^-/u.test(origin.chatId);
+    return group && message.sender.isBot === false;
+  }
   private expireApprovals(): void {
     for (const approval of this.store.listApprovals(1000)) if (approval.status === 'pending') { this.store.updateApproval(approval.id, { status: 'expired' }); this.store.cancelApprovalDeliveries(approval.id); }
     this.approvals.clear();

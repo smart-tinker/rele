@@ -180,8 +180,17 @@ export class ConfigStore {
   panelToken = '';
   constructor(readonly directory: string) {}
   async load(): Promise<void> {
-    await mkdir(this.directory, { recursive: true, mode: 0o700 });
-    await chmod(this.directory, 0o700);
+    await this.read(false);
+  }
+  /** Tool clients may read existing credentials, never create or repair a profile. */
+  async loadExisting(): Promise<void> {
+    await this.read(true);
+  }
+  private async read(existingOnly: boolean): Promise<void> {
+    if (!existingOnly) {
+      await mkdir(this.directory, { recursive: true, mode: 0o700 });
+      await chmod(this.directory, 0o700);
+    }
     const file = path.join(this.directory, 'config.json');
     try {
       const envelope = JSON.parse(await readFile(file, 'utf8')) as { version: number; encoding: string; value: string };
@@ -197,7 +206,7 @@ export class ConfigStore {
       if (typeof saved.panelToken !== 'string' || !/^[a-f0-9]{64}$/u.test(saved.panelToken)) throw new Error('Некорректный ключ панели.');
       this.panelToken = saved.panelToken;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      if (existingOnly || (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       this.panelToken = randomBytes(32).toString('hex');
       try { await this.save(this.config, true); }
       catch (creationError) { if ((creationError as NodeJS.ErrnoException).code === 'EEXIST') await this.load(); else throw creationError; }

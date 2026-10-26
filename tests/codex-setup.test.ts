@@ -159,7 +159,7 @@ describe('installer-only shared Codex setup', () => {
   });
 
   it.each(['starting', 'running', 'transcribing', 'waiting_approval', 'uncertain', 'queued-submission', 'queued-turn', 'pending-approval',
-    'auto-pending', 'auto-creating', 'auto-created', 'auto-uncertain', 'auto-failed', 'context-applying', 'context-uncertain'] as const)
+    'auto-pending', 'auto-creating', 'auto-created', 'auto-uncertain', 'auto-failed', 'context-applying', 'context-uncertain', 'tool-sending', 'tool-uncertain'] as const)
   ('preserves all original bytes and refuses unresolved %s', async state => {
     const f = await fixture(), db = inbox(f);
     if (state === 'queued-submission') db.store.updateRequest(db.request.id, { queuedSubmissionId: 'native-submission' });
@@ -170,6 +170,12 @@ describe('installer-only shared Codex setup', () => {
       const intent = autoIntent(f, db.store), status = state.slice(5) as 'pending' | 'creating' | 'created' | 'uncertain' | 'failed';
       db.store.updateAutoLinkIntent(intent.id, { status, ...(status === 'created' ? { threadId: 'native-created-thread' } : {}) });
     } else if (state.startsWith('context-')) db.store.updateSlackSyncEntry(db.entry.id, { state: state.slice(8) as 'applying' | 'uncertain' });
+    else if (state.startsWith('tool-')) {
+      const conversation = db.store.getConversation(db.request.conversationId)!;
+      const delivery = db.store.addToolMessage({ threadId: conversation.threadId, callId: 'synthetic-send', conversationId: conversation.id,
+        origin: { ...db.request.origin, senderId: 'UBOT', senderIsBot: true, messageId: '' }, arguments: {}, text: 'Synthetic outgoing message', mentions: [] });
+      db.store.updateDelivery(delivery.id, { status: state.slice(5) as 'sending' | 'uncertain' });
+    }
     else db.store.updateRequest(db.request.id, { status: state as 'starting' | 'running' | 'transcribing' | 'waiting_approval' | 'uncertain' });
     db.store.close(); const originalDatabase = await readFile(db.file);
     await expect(setupSharedCodex(f.config, f.verify, f.env)).rejects.toThrow('активные или неподтверждённые');
@@ -181,7 +187,7 @@ describe('installer-only shared Codex setup', () => {
     const f = await fixture(), db = inbox(f); db.store.close();
     const malformed = new DatabaseSync(db.file);
     try { malformed.exec(problem === 'foreign-owner' ? 'PRAGMA application_id=123;' : problem === 'future-schema'
-      ? 'PRAGMA user_version=7;' : 'ALTER TABLE requests RENAME COLUMN queued_submission_id TO unknown_submission;'); }
+      ? 'PRAGMA user_version=8;' : 'ALTER TABLE requests RENAME COLUMN queued_submission_id TO unknown_submission;'); }
     finally { malformed.close(); }
     const originalDatabase = await readFile(db.file);
     await expect(setupSharedCodex(f.config, f.verify, f.env)).rejects.toThrow();
