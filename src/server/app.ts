@@ -319,7 +319,9 @@ export function createApp(services: AppServices) {
       if (!codex.status().connected) throw new ApiError(400, 'Подключите Codex перед выбором маршрута.');
       const threadId = string(input.threadId, 'разговор Codex', 200);
       if (resolveAutoLinkId) recoverableAutoLink(source.endpoint, resolveAutoLinkId);
-      const thread = (await codex.listThreads({ refresh: true })).find(candidate => candidate.id === threadId);
+      let thread = (await codex.listThreads()).find(candidate => candidate.id === threadId);
+      // Explicit refresh can expose older conversations that are not in the native index yet.
+      if (!thread) thread = (await codex.listThreads({ refresh: true })).find(candidate => candidate.id === threadId);
       if (services.codex() !== codex || !codex.status().connected) throw new ApiError(409, 'Подключение Codex изменилось. Обновите список разговоров.');
       checkSource(source);
       if (!thread || thread.archived || !validWorkspace(codex, thread.cwd)) throw new ApiError(400, 'Выберите доступный разговор Codex с локальной рабочей папкой.');
