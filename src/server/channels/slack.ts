@@ -2,9 +2,10 @@ import { createHash } from 'node:crypto';
 import WebSocket from 'ws';
 import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionState, Delivery, Endpoint, InboundMessage, Origin, Person, SlackTranscriptMessage } from '../../shared/types.js';
 import type { Store } from '../store.js';
-import { ChannelError, downloadBounded, endpointId, readableTitle, splitReply, type Channel, type ChannelCallbacks, type RequestProgress, type SlackSessionStatus } from './common.js';
+import { ChannelError, downloadBounded, endpointId, readableTitle, splitReply, type ApprovalContext, type ApprovalResolution, type Channel, type ChannelCallbacks, type RequestProgress, type SlackSessionStatus } from './common.js';
 import { escapeSlackText, formatSlackReply } from './slack-format.js';
 import { slackProgressBlocks } from './slack-progress.js';
+import { QUESTION_VIEW, parseQuestionMetadata, questionAnswers, questionCard, questionHash, questionView, resolvedQuestion, supportsQuestionForm } from './slack-questions.js';
 
 type Json = Record<string, any>;
 const SLACK_TS = /^\d+\.\d+$/u;
@@ -95,6 +96,7 @@ export class SlackChannel implements Channel {
   private refreshing = new Set<string>();
   private abort = new AbortController();
   private progressWrites = new Map<string, Promise<void>>();
+  private questionTasks = new Set<Promise<void>>();
 
   constructor(private readonly botToken: string, private readonly appToken: string, private readonly callbacks: ChannelCallbacks, private readonly options: SlackOptions = {}) {
     this.fetcher = options.fetch ?? fetch;
@@ -135,6 +137,15 @@ export class SlackChannel implements Channel {
       this.socket = socket;
       socket.on('error', () => {});
       socket.on('message', raw => {
+        // Interactive ACKs/trigger IDs expire in three seconds. A slow durable
+        // inbox callback must not hold the independent question interaction queue.
+        try {
+          const envelope = JSON.parse(raw.toString());
+          if (envelope.type === 'interactive' && (envelope.payload?.view?.callback_id === QUESTION_VIEW
+              || String(envelope.payload?.actions?.[0]?.value ?? '').startsWith('releq:'))) {
+            void this.receive(raw.toString(), socket).catch(() => {}); return;
+          }
+        } catch {}
         this.processing = this.processing.then(() => this.receive(raw.toString(), socket)).catch(() => {
           this.setState({ error: 'Не удалось сохранить событие Slack. Slack сможет повторить его доставку.' });
         });
@@ -179,6 +190,7 @@ export class SlackChannel implements Channel {
     this.socket = undefined;
     socket?.terminate();
     await this.processing;
+    await Promise.allSettled([...this.questionTasks]);
     this.setState({ connected: false });
   }
 
@@ -487,9 +499,116 @@ export class SlackChannel implements Channel {
         type: 'button', action_id: `rele_${decision}`, text: { type: 'plain_text', text: decision === 'accept' ? 'Разрешить' : 'Отклонить' }, value: `rele:${approval.id}:${decision}`,
       })) },
     ];
+    if (approval?.questions?.length && this.callbacks.question) body.blocks = questionCard(delivery, approval);
     const result = await this.api('chat.postMessage', body, this.botToken, true);
     if (typeof result.ts !== 'string' || result.channel !== delivery.origin.chatId) throw new ChannelError('Slack не подтвердил адрес и идентификатор отправленного сообщения. Проверьте доставку.', false, true);
     return result.ts;
+  }
+
+  async updateApproval(delivery: Delivery, approval: Approval, resolution?: ApprovalResolution): Promise<void> {
+    this.requireAccount(delivery.origin.accountId);
+    if (delivery.origin.platform !== 'slack' || delivery.kind !== 'approval' || delivery.status !== 'sent'
+        || delivery.approvalId !== approval.id || approval.requestId !== delivery.requestId || approval.status === 'pending'
+        || !approval.questions?.length
+        || !/^[CDG][A-Z0-9]+$/u.test(delivery.origin.chatId) || !SLACK_TS.test(delivery.origin.threadId)
+        || !delivery.remoteMessageId || !SLACK_TS.test(delivery.remoteMessageId)) throw new ChannelError('Некорректная карточка вопроса Slack.');
+    const content = resolvedQuestion(delivery, approval, resolution);
+    const result = await this.api('chat.update', { channel: delivery.origin.chatId, ts: delivery.remoteMessageId,
+      text: escapeSlackText(content.text), blocks: content.blocks, mrkdwn: false, parse: 'none', link_names: false,
+      unfurl_links: false, unfurl_media: false }, this.botToken, true);
+    if (result.channel !== delivery.origin.chatId || result.ts !== delivery.remoteMessageId) throw new ChannelError('Slack не подтвердил обновление вопроса.', true, true);
+  }
+
+  private questionTask(run: () => Promise<void>): void {
+    const task = run().catch(() => {}).finally(() => this.questionTasks.delete(task));
+    this.questionTasks.add(task);
+  }
+
+  private async questionWithinDeadline<T>(read: () => Promise<T>): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    try { return await Promise.race([read(), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Question validation timed out')), 1700); timer.unref();
+    })]); } finally { clearTimeout(timer); }
+  }
+
+  private async questionContext(payload: Json, approvalId: string, source?: { accountId: string; chatId: string; threadId: string; senderId: string; messageId: string }): Promise<ApprovalContext> {
+    const accountId = this.requireAccount();
+    if (payload.team?.id !== this.teamId || !SLACK_USER.test(payload.user?.id ?? '')
+        || source && (source.accountId !== accountId || source.senderId !== payload.user.id)) throw new Error('Question actor mismatch');
+    const chatId = source?.chatId ?? payload.channel?.id, threadId = source?.threadId ?? payload.message?.thread_ts ?? payload.message?.ts;
+    const messageId = source?.messageId ?? payload.message?.ts;
+    if (!/^[CDG][A-Z0-9]+$/u.test(chatId ?? '') || !SLACK_TS.test(threadId ?? '') || !SLACK_TS.test(messageId ?? '')) throw new Error('Question source mismatch');
+    const actor = await this.person(payload.user.id);
+    this.requireAccount(accountId);
+    if (actor?.isBot !== false) throw new Error('Question requires a verified human');
+    return { approvalId, platform: 'slack', accountId, chatId, threadId, messageId,
+      senderId: actor.id, senderIsBot: false, senderName: actor.name };
+  }
+
+  private async currentQuestion(context: ApprovalContext, expectedHash: string): Promise<Approval> {
+    const approval = await this.callbacks.question?.(context);
+    this.requireAccount(context.accountId);
+    if (!approval || approval.id !== context.approvalId || approval.status !== 'pending' || !supportsQuestionForm(approval)
+        || questionHash(approval) !== expectedHash) throw new Error('Question expired or changed');
+    return approval;
+  }
+
+  private async questionFeedback(payload: Json, context?: ApprovalContext): Promise<void> {
+    if (payload.team?.id !== this.teamId) return;
+    const channel = context?.chatId ?? payload.channel?.id, user = payload.user?.id;
+    if (!/^[CDG][A-Z0-9]+$/u.test(channel ?? '') || !SLACK_USER.test(user ?? '')) return;
+    await this.api('chat.postEphemeral', { channel, user, ...(context?.threadId ? { thread_ts: context.threadId } : {}),
+      text: 'Ответ не принят: вопрос мог закрыться, доступ изменился или соединение прервано. Проверьте вопрос в Rele.',
+      parse: 'none', link_names: false }).catch(() => {});
+  }
+
+  private async questionClick(payload: Json): Promise<void> {
+    let context: ApprovalContext | undefined;
+    try {
+      const action = payload.actions?.[0];
+      const match = typeof action?.value === 'string' ? /^releq:([a-f0-9-]{36}):([a-f0-9]{64}):(all|custom|[0-8])$/u.exec(action.value) : null;
+      if (!match || action.action_id !== `rele_question_${match[3]}`) throw new Error('Invalid question action');
+      const checked = await this.questionWithinDeadline(async () => {
+        const context = await this.questionContext(payload, match[1]);
+        return { context, approval: await this.currentQuestion(context, match[2]) };
+      });
+      context = checked.context;
+      if (/^[0-8]$/u.test(match[3])) {
+        if (checked.approval.questions!.length !== 1) throw new Error('Question selection mismatch');
+        const question = checked.approval.questions![0], option = question.options?.[Number(match[3])];
+        if (!option) throw new Error('Question option unavailable');
+        await this.callbacks.action({ ...context, decision: 'accept', answers: { [question.id]: [option.label] } });
+      } else {
+        if (typeof payload.trigger_id !== 'string' || !payload.trigger_id) throw new Error('Missing modal trigger');
+        await this.api('views.open', { trigger_id: payload.trigger_id, view: questionView(checked.approval, context, match[3] as 'all' | 'custom') });
+      }
+    } catch { await this.questionFeedback(payload, context); }
+  }
+
+  private async questionSubmit(payload: Json, socket: WebSocket, envelopeId: string): Promise<void> {
+    const expired = { response_action: 'update', view: { type: 'modal', title: { type: 'plain_text', text: 'Уточнение Codex' },
+      close: { type: 'plain_text', text: 'Закрыть' }, blocks: [{ type: 'section', text: { type: 'plain_text', text: 'Вопрос недоступен или уже закрыт. Проверьте состояние в Rele.' } }] } };
+    let context: ApprovalContext | undefined;
+    let acknowledged = false;
+    try {
+      const metadata = parseQuestionMetadata(payload.view?.private_metadata);
+      if (!metadata) throw new Error('Invalid question metadata');
+      const checked = await this.questionWithinDeadline(async () => {
+        const context = await this.questionContext(payload, metadata.approvalId, metadata);
+        return { context, approval: await this.currentQuestion(context, metadata.questionHash) };
+      });
+      context = checked.context;
+      if (metadata.mode === 'custom' && checked.approval.questions!.length !== 1) throw new Error('Question form mismatch');
+      const result = questionAnswers(checked.approval, metadata, payload.view?.state?.values);
+      if (Object.keys(result.errors).length) { this.ack(socket, envelopeId, { response_action: 'errors', errors: result.errors }); return; }
+      // Close the modal before awaiting the native response write. A failed write
+      // gets visible feedback, never a duplicate RPC from a Slack ACK retry.
+      this.ack(socket, envelopeId); acknowledged = true;
+      await this.callbacks.action({ ...context, decision: 'accept', answers: result.answers });
+    } catch {
+      if (!acknowledged) this.ack(socket, envelopeId, expired);
+      else await this.questionFeedback(payload, context);
+    }
   }
 
   async download(audio: AudioAttachment, file: string): Promise<void> {
@@ -538,9 +657,17 @@ export class SlackChannel implements Channel {
         void this.refreshNames(source.message, message.endpoint).catch(() => {});
         return;
       }
+    } else if (envelope.type === 'interactive' && envelope.payload?.view?.callback_id === QUESTION_VIEW) {
+      if (envelope.payload.type === 'view_submission') this.questionTask(() => this.questionSubmit(envelope.payload, socket, envelope.envelope_id));
+      else this.ack(socket, envelope.envelope_id);
+      return;
     } else if (envelope.type === 'interactive' && envelope.payload?.type === 'block_actions') {
       const payload = envelope.payload as Json;
       const value = payload.actions?.[0]?.value;
+      if (typeof value === 'string' && value.startsWith('releq:')) {
+        this.ack(socket, envelope.envelope_id);
+        this.questionTask(() => this.questionClick(payload)); return;
+      }
       const match = typeof value === 'string' ? /^rele:([a-f0-9-]{36}):(accept|decline)$/u.exec(value) : null;
       if (match && payload.user?.id && payload.channel?.id && (!payload.team?.id || payload.team.id === this.teamId)) {
         try {
@@ -656,7 +783,7 @@ export class SlackChannel implements Channel {
     return data;
   }
 
-  private ack(socket: WebSocket, id: string): void { if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ envelope_id: id })); }
+  private ack(socket: WebSocket, id: string, payload?: Json): void { if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ envelope_id: id, ...(payload ? { payload } : {}) })); }
   private setState(patch: Partial<ConnectionState>): void { this.state = { ...this.state, ...patch }; this.callbacks.status(); }
   private schedule(): void {
     if (this.stopped || this.retry) return;

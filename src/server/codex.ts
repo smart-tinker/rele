@@ -567,6 +567,8 @@ export class CodexClient extends EventEmitter {
     this.serverRequests.delete(rpcId);
   }
 
+  hasPendingRequest(rpcId: RpcId): boolean { return this.serverRequests.has(rpcId); }
+
   async rejectRequest(rpcId: RpcId, message: string): Promise<void> {
     if (!this.state.connected || !this.isVerifiedVersion()) throw new Error('Для ответа нужен подключённый проверенный Codex.');
     if (!this.serverRequests.has(rpcId)) throw new Error('Запрос подтверждения Codex уже завершён или соединение изменилось.');
