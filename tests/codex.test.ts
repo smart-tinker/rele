@@ -11,6 +11,7 @@ import { SharedCodexError } from '../src/server/codex-shared.js';
 import { Engine } from '../src/server/engine.js';
 import { Store } from '../src/server/store.js';
 import { defaultConfig } from '../src/server/config.js';
+import { initialMessageKey } from '../src/server/initial-message.js';
 import type { Endpoint } from '../src/shared/types.js';
 
 interface Rpc { id?: string | number; method?: string; params: Record<string, unknown>; result?: unknown; error?: { code: number; message: string } }
@@ -284,6 +285,7 @@ describe('Codex native shared policy', () => {
       title: 'Retry fixture', subtitle: '', people: [{ id: '123', name: 'Fixture' }], updatedAt: new Date().toISOString() };
     store.upsertEndpoint(endpoint);
     store.createConversation({ name: 'Original', threadId, cwd: f.home, bindings: [{ platform: 'telegram', endpointId: endpoint.id, allowedSenderIds: ['123'] }] });
+    store.setMeta(initialMessageKey(f.home, threadId), JSON.stringify({ applied: true }));
     const config = { ...structuredClone(defaultConfig), codex: f.target, telegram: { enabled: true } };
     const engine = new Engine(store, f.client, { config: () => config, temporaryRoot: f.home, redact: () => 'Fixture error' });
     const deliver = vi.fn(async () => 'remote-receipt');
@@ -799,16 +801,20 @@ describe('Codex shared-runtime adapter', () => {
     const next = once(f.client, 'request');
     f.sockets[0].send(JSON.stringify({ id: 77, method: 'item/commandExecution/requestApproval', params: { threadId, turnId: 'turn', itemId: 'item' } }));
     expect((await next)[0]).toMatchObject({ id: 77, method: 'item/commandExecution/requestApproval' });
+    expect(f.client.hasPendingRequest(77)).toBe(true);
+    expect(f.client.hasPendingRequest('77')).toBe(false);
     await f.client.respond(77, { decision: 'decline' });
     await until(() => f.responses.length === 1);
     expect(f.responses[0]).toEqual({ id: 77, result: { decision: 'decline' } });
     await expect(f.client.respond(77, { decision: 'accept' })).rejects.toThrow('уже завершён');
+    expect(f.client.hasPendingRequest(77)).toBe(false);
     const pending = once(f.client, 'request');
     f.sockets[0].send(JSON.stringify({ id: 'peer-approval', method: 'item/fileChange/requestApproval', params: {} }));
     await pending;
     const resolved = once(f.client, 'notification');
     f.sockets[0].send(JSON.stringify({ method: 'serverRequest/resolved', params: { threadId, requestId: 'peer-approval' } }));
     await resolved;
+    expect(f.client.hasPendingRequest('peer-approval')).toBe(false);
     await expect(f.client.respond('peer-approval', { decision: 'accept' })).rejects.toThrow('уже завершён');
   });
 

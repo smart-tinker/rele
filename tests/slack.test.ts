@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type WebSocket from 'ws';
 import type { Approval, Delivery, Endpoint, InboundMessage } from '../src/shared/types.js';
 import { SlackChannel } from '../src/server/channels/slack.js';
+import { QUESTION_VIEW } from '../src/server/channels/slack-questions.js';
 import { Store } from '../src/server/store.js';
 import {
   ChannelError,
@@ -44,6 +45,7 @@ async function makeChannel(
   options: {
     message?: ChannelCallbacks['message'];
     action?: ChannelCallbacks['action'];
+    question?: ChannelCallbacks['question'];
     postMessage?: () => Promise<Response>;
     api?: (method: string, body: Record<string, unknown>) => Response | undefined | Promise<Response | undefined>;
     knownEndpoints?: Endpoint[];
@@ -110,7 +112,7 @@ async function makeChannel(
   const channel = new SlackChannel(
     'SLACK_TOKEN_PLACEHOLDER_4051722',
     'SLACK_TOKEN_PLACEHOLDER_6612940',
-    { message, endpoint: endpoints, action, status },
+    { message, endpoint: endpoints, action, question: options.question, status },
     {
       fetch: fetcher,
       knownEndpoints: options.knownEndpoints,
@@ -184,6 +186,201 @@ function progressFixture() {
   const progressStore = { getMeta: (key: string) => meta.get(key), setMeta: (key: string, value: string) => { meta.set(key, value); } };
   return { origin, endpoint, meta, progressStore };
 }
+
+function questionApproval(): Approval {
+  return { id: '12345678-1234-1234-1234-123456789abc', requestId: 'request-example', turnId: 'turn-example', itemId: 'question-item',
+    rpcId: 'question-rpc', method: 'item/tool/requestUserInput', title: 'Codex ждёт уточнения', details: 'Выберите ветку', status: 'pending',
+    questions: [{ id: 'branch', header: 'Ветка', question: 'С какой веткой работать?', options: [
+      { label: 'main', description: 'Основная ветка' }, { label: 'develop', description: 'Ветка разработки' },
+    ] }], createdAt: '2026-10-27T00:00:00Z', updatedAt: '2026-10-27T00:00:00Z' };
+}
+function questionDelivery(approval: Approval): Delivery {
+  return { ...delivery(), kind: 'approval', approvalId: approval.id, body: [approval.title, ...(approval.questions ?? []).map(question =>
+    `${question.header}: ${question.question}\n${(question.options ?? []).map(option => `${option.label} — ${option.description}`).join('\n')}`)].join('\n\n') };
+}
+function questionInteraction(id: string, action: Record<string, unknown>) {
+  return { envelope_id: id, type: 'interactive', payload: { type: 'block_actions', team: { id: 'TEXAMPLE' }, user: { id: 'UANNA' },
+    channel: { id: 'CEXAMPLE' }, message: { ts: '1000.2000', thread_ts: '1000.1000' }, trigger_id: 'synthetic-trigger', actions: [action] } };
+}
+const questionApi = (method: string, body: Record<string, unknown>) => method === 'views.open' ? Response.json({ ok: true, view: { id: 'VMODAL' } })
+  : method === 'chat.postEphemeral' ? Response.json({ ok: true, message_ts: '1000.3000' })
+    : method === 'chat.update' ? Response.json({ ok: true, channel: body.channel, ts: body.ts }) : undefined;
+
+describe('Slack question choices and forms', () => {
+  it('shows short in-thread choices, keeps full long labels/descriptions and maps index to the stored label', async () => {
+    const approval = questionApproval();
+    approval.questions![0].options![0] = { label: '🙂'.repeat(45), description: 'Полное описание <@UPEER> & подробности' };
+    const question = vi.fn<NonNullable<ChannelCallbacks['question']>>().mockReturnValue(approval);
+    let finish!: () => void;
+    const action = vi.fn<ChannelCallbacks['action']>().mockImplementation(() => new Promise<void>(resolve => { finish = resolve; }));
+    const { channel, calls, socket } = await makeChannel({ question, action, api: questionApi });
+    const input = questionDelivery(approval);
+    await channel.deliver(input, approval);
+    const post = JSON.parse(String(calls.find(call => call.url.endsWith('/chat.postMessage'))!.init!.body));
+    expect(post.blocks.filter((block: { type: string }) => block.type === 'section').map((block: { text: { text: string } }) => block.text.text).join('')).toBe(input.body);
+    const buttons = post.blocks.at(-1).elements;
+    expect(buttons.map((button: { text: { text: string } }) => button.text.text)).toEqual([expect.any(String), 'develop', 'Свой ответ']);
+    expect(buttons[0].text.text.length).toBeLessThanOrEqual(75);
+    expect(buttons[0].text.text).not.toMatch(/[\uD800-\uDBFF]$/u);
+    socket.receive(questionInteraction('choice', { ...buttons[0], text: { type: 'plain_text', text: 'FORGED LABEL' } }));
+    await vi.waitFor(() => expect(action).toHaveBeenCalledOnce());
+    expect(socket.sent.map(value => JSON.parse(value).envelope_id)).toContain('choice');
+    expect(question).toHaveBeenCalledWith(expect.objectContaining({ approvalId: approval.id, messageId: '1000.2000', accountId: 'TEXAMPLE:UBOT',
+      chatId: 'CEXAMPLE', threadId: '1000.1000', senderId: 'UANNA', senderIsBot: false }));
+    expect(action).toHaveBeenCalledWith(expect.objectContaining({ decision: 'accept', answers: { branch: [approval.questions![0].options![0].label] } }));
+    finish();
+  });
+
+  it('opens a bound own-answer modal, ACKs before the native write and submits the exact custom answer', async () => {
+    const approval = questionApproval(), question = vi.fn<NonNullable<ChannelCallbacks['question']>>().mockReturnValue(approval);
+    approval.questions![0].id = '__proto__';
+    let finish!: () => void;
+    const action = vi.fn<ChannelCallbacks['action']>().mockImplementation(() => new Promise<void>(resolve => { finish = resolve; }));
+    const { channel, calls, socket } = await makeChannel({ question, action, api: questionApi });
+    await channel.deliver(questionDelivery(approval), approval);
+    const post = JSON.parse(String(calls.find(call => call.url.endsWith('/chat.postMessage'))!.init!.body));
+    socket.receive(questionInteraction('open-custom', post.blocks.at(-1).elements.at(-1)));
+    await vi.waitFor(() => expect(calls.some(call => call.url.endsWith('/views.open'))).toBe(true));
+    const opened = JSON.parse(String(calls.find(call => call.url.endsWith('/views.open'))!.init!.body));
+    expect(opened.trigger_id).toBe('synthetic-trigger');
+    expect(JSON.parse(opened.view.private_metadata)).toMatchObject({ approvalId: approval.id, accountId: 'TEXAMPLE:UBOT', chatId: 'CEXAMPLE',
+      threadId: '1000.1000', messageId: '1000.2000', senderId: 'UANNA', mode: 'custom' });
+    expect(opened.view.blocks.filter((block: { type: string }) => block.type === 'input')).toHaveLength(1);
+    socket.receive({ envelope_id: 'submit-custom', type: 'interactive', payload: { type: 'view_submission', team: { id: 'TEXAMPLE' }, user: { id: 'UANNA' },
+      view: { ...opened.view, state: { values: { 'q0-text': { answer: { type: 'plain_text_input', value: '  feature/пример <@UPEER>  ' } } } } } } });
+    await vi.waitFor(() => expect(action).toHaveBeenCalledOnce());
+    expect(socket.sent.map(value => JSON.parse(value))).toContainEqual({ envelope_id: 'submit-custom' });
+    expect(action).toHaveBeenCalledWith(expect.objectContaining({ answers: { ['__proto__']: ['  feature/пример <@UPEER>  '] }, messageId: '1000.2000', senderName: 'Анна (пример)' }));
+    expect(Object.hasOwn(action.mock.calls[0][0].answers!, '__proto__')).toBe(true);
+    finish();
+  });
+
+  it('collects every modal question, validates own-answer text and leaves a dismissed form pending', async () => {
+    const approval = questionApproval();
+    approval.questions!.push({ id: 'mode', header: 'Режим', question: 'Что именно проверить?' });
+    const action = vi.fn<ChannelCallbacks['action']>().mockResolvedValue(undefined);
+    const { channel, calls, socket } = await makeChannel({ question: () => approval, action, api: questionApi });
+    await channel.deliver(questionDelivery(approval), approval);
+    const post = JSON.parse(String(calls.find(call => call.url.endsWith('/chat.postMessage'))!.init!.body));
+    expect(post.blocks.at(-1).elements.map((button: { text: { text: string } }) => button.text.text)).toEqual(['Ответить']);
+    socket.receive(questionInteraction('open-multiple', post.blocks.at(-1).elements[0]));
+    await vi.waitFor(() => expect(calls.some(call => call.url.endsWith('/views.open'))).toBe(true));
+    const view = JSON.parse(String(calls.find(call => call.url.endsWith('/views.open'))!.init!.body)).view;
+    expect(view.blocks.length).toBeLessThanOrEqual(100);
+    expect(view.blocks.filter((block: { type: string }) => block.type === 'input').map((block: { block_id: string }) => block.block_id)).toEqual(['q0-choice', 'q0-text', 'q1-text']);
+    const submit = (id: string, values: unknown) => socket.receive({ envelope_id: id, type: 'interactive', payload: { type: 'view_submission',
+      team: { id: 'TEXAMPLE' }, user: { id: 'UANNA' }, view: { ...view, state: { values } } } });
+    submit('invalid-form', { 'q0-choice': { answer: { selected_option: { value: 'custom' } } }, 'q1-text': { answer: { value: 'read-only' } } });
+    await vi.waitFor(() => expect(socket.sent.map(value => JSON.parse(value))).toContainEqual({ envelope_id: 'invalid-form', payload: {
+      response_action: 'errors', errors: { 'q0-text': 'Введите ответ длиной до 3000 символов.' },
+    } }));
+    expect(action).not.toHaveBeenCalled();
+    socket.receive({ envelope_id: 'dismiss-form', type: 'interactive', payload: { type: 'view_closed', view: { callback_id: QUESTION_VIEW } } });
+    await vi.waitFor(() => expect(socket.sent.map(value => JSON.parse(value).envelope_id)).toContain('dismiss-form'));
+    expect(approval.status).toBe('pending');
+    submit('valid-form', { 'q0-choice': { answer: { selected_option: { value: '1', text: { text: 'FORGED' } } } }, 'q1-text': { answer: { value: 'read-only' } } });
+    await vi.waitFor(() => expect(action).toHaveBeenCalledOnce());
+    expect(action).toHaveBeenCalledWith(expect.objectContaining({ answers: { branch: ['develop'], mode: ['read-only'] } }));
+  });
+
+  it.each(['foreign-team', 'bot', 'changed-question', 'bad-index', 'unavailable'] as const)('rejects %s without native submission and gives same-workspace failures visible feedback', async failure => {
+    const approval = questionApproval(), action = vi.fn<ChannelCallbacks['action']>().mockResolvedValue(undefined);
+    const { channel, calls, socket } = await makeChannel({ question: () => { if (failure === 'unavailable') throw new Error('private native detail'); return approval; }, action,
+      api: (method, body) => method === 'users.info' && failure === 'bot'
+        ? Response.json({ ok: true, user: { id: 'UANNA', is_bot: true, profile: { display_name: 'Agent' } } }) : questionApi(method, body) });
+    await channel.deliver(questionDelivery(approval), approval);
+    const post = JSON.parse(String(calls.find(call => call.url.endsWith('/chat.postMessage'))!.init!.body));
+    const event = questionInteraction('rejected-choice', post.blocks.at(-1).elements[0]);
+    if (failure === 'foreign-team') event.payload.team.id = 'TOTHER';
+    if (failure === 'changed-question') approval.questions![0].options![0].label = 'DIFFERENT STORED LABEL';
+    if (failure === 'bad-index') event.payload.actions[0] = { ...event.payload.actions[0], action_id: 'rele_question_8', value: String(event.payload.actions[0].value).replace(/:0$/u, ':8') };
+    socket.receive(event);
+    await vi.waitFor(() => expect(socket.sent.map(value => JSON.parse(value).envelope_id)).toContain('rejected-choice'));
+    if (failure !== 'foreign-team') await vi.waitFor(() => expect(calls.some(call => call.url.endsWith('/chat.postEphemeral'))).toBe(true));
+    await channel.stop();
+    expect(action).not.toHaveBeenCalled();
+    expect(JSON.stringify(calls.filter(call => call.url.endsWith('/chat.postEphemeral')))).not.toContain('private native detail');
+  });
+
+  it('rejects stale or actor-tampered modal metadata with visible modal feedback', async () => {
+    const approval = questionApproval(), action = vi.fn<ChannelCallbacks['action']>().mockResolvedValue(undefined);
+    const question = vi.fn<NonNullable<ChannelCallbacks['question']>>().mockImplementation(context => {
+      if (context.messageId !== '1000.2000') throw new Error('wrong source receipt'); return approval;
+    });
+    const { channel, calls, socket } = await makeChannel({ question, action, api: questionApi });
+    await channel.deliver(questionDelivery(approval), approval);
+    const post = JSON.parse(String(calls.find(call => call.url.endsWith('/chat.postMessage'))!.init!.body));
+    socket.receive(questionInteraction('open-stale', post.blocks.at(-1).elements.at(-1)));
+    await vi.waitFor(() => expect(calls.some(call => call.url.endsWith('/views.open'))).toBe(true));
+    const view = JSON.parse(String(calls.find(call => call.url.endsWith('/views.open'))!.init!.body)).view;
+    for (const [index, patch] of [{ senderId: 'UOTHER' }, { accountId: 'TOTHER:UBOT' }, { messageId: '1000.9999' }].entries()) {
+      socket.receive({ envelope_id: `tampered-${index}`, type: 'interactive', payload: { type: 'view_submission', team: { id: 'TEXAMPLE' }, user: { id: 'UANNA' },
+        view: { ...view, private_metadata: JSON.stringify({ ...JSON.parse(view.private_metadata), ...patch }), state: { values: { 'q0-text': { answer: { value: 'private answer' } } } } } } });
+      await vi.waitFor(() => expect(socket.sent.map(value => JSON.parse(value))).toContainEqual(expect.objectContaining({ envelope_id: `tampered-${index}`, payload: expect.objectContaining({ response_action: 'update' }) })));
+    }
+    expect(action).not.toHaveBeenCalled();
+  });
+
+  it('keeps secret, oversized and subsequent question parts on the existing text-reply path without truncation', async () => {
+    const { channel, calls } = await makeChannel({ question: () => questionApproval(), api: questionApi });
+    const secret = questionApproval(); secret.questions![0].isSecret = true;
+    const oversized = questionApproval(); oversized.questions![0].question = 'Полный вопрос '.repeat(30_000);
+    const tooManyOptions = questionApproval(); tooManyOptions.questions![0].options = Array.from({ length: 10 }, (_, index) => ({ label: `Option ${index}`, description: '' }));
+    const inputs = [questionDelivery(secret), { ...questionDelivery(oversized), body: oversized.questions![0].question.slice(0, 3000) },
+      questionDelivery(tooManyOptions), { ...questionDelivery(questionApproval()), ordinal: 1 }];
+    for (const [index, approval] of [secret, oversized, tooManyOptions, questionApproval()].entries()) await channel.deliver(inputs[index], approval);
+    const posts = calls.filter(call => call.url.endsWith('/chat.postMessage')).map(call => JSON.parse(String(call.init!.body)));
+    expect(posts).toHaveLength(4);
+    for (const [index, post] of posts.entries()) { expect(post.blocks).toBeUndefined(); expect(post.text).toBe(inputs[index].body); }
+  });
+
+  it('ACKs a question interaction while a durable inbox write is still pending', async () => {
+    const approval = questionApproval(); let release!: () => void;
+    const message = vi.fn<ChannelCallbacks['message']>().mockImplementation(() => new Promise<void>(resolve => { release = resolve; }));
+    const action = vi.fn<ChannelCallbacks['action']>().mockResolvedValue(undefined);
+    const { channel, calls, socket } = await makeChannel({ question: () => approval, action, message, api: questionApi });
+    await channel.deliver(questionDelivery(approval), approval);
+    const post = JSON.parse(String(calls.find(call => call.url.endsWith('/chat.postMessage'))!.init!.body));
+    socket.receive(envelope('blocked-inbox'));
+    await vi.waitFor(() => expect(message).toHaveBeenCalledOnce());
+    socket.receive(questionInteraction('fast-choice', post.blocks.at(-1).elements[0]));
+    await vi.waitFor(() => expect(action).toHaveBeenCalledOnce());
+    expect(socket.sent.map(value => JSON.parse(value).envelope_id)).toContain('fast-choice');
+    expect(socket.sent.map(value => JSON.parse(value).envelope_id)).not.toContain('blocked-inbox');
+    release();
+  });
+
+  it('updates only the known question card after answer, removes controls and uses generic external closure', async () => {
+    const approval = questionApproval(), input = { ...questionDelivery(approval), status: 'sent' as const, remoteMessageId: '1000.2000' };
+    approval.status = 'answered';
+    const { channel, calls } = await makeChannel({ api: questionApi });
+    await channel.updateApproval(input, approval, { source: 'slack', senderName: 'Анна <@UPEER>', answers: { branch: ['main <@UOTHER>'] } });
+    await channel.updateApproval(input, approval, { source: 'codex', senderName: 'UNPROVEN ACTOR', answers: { branch: ['UNPROVEN ANSWER'] } });
+    const updates = calls.filter(call => call.url.endsWith('/chat.update')).map(call => JSON.parse(String(call.init!.body)));
+    expect(updates).toHaveLength(2);
+    expect(calls.some(call => call.url.endsWith('/chat.postMessage'))).toBe(false);
+    expect(updates[0]).toMatchObject({ channel: 'CEXAMPLE', ts: '1000.2000', mrkdwn: false, parse: 'none', link_names: false });
+    expect(updates[0].blocks.every((block: { type: string; text: { type: string } }) => block.type === 'section' && block.text.type === 'plain_text')).toBe(true);
+    expect(updates[0].text).toContain('Ответ отправлен в Codex');
+    expect(updates[0].text).toContain('Анна &lt;@UPEER&gt;');
+    expect(updates[0].text).toContain('main &lt;@UOTHER&gt;');
+    expect(updates[1].text).toContain('Вопрос закрыт в Codex');
+    expect(JSON.stringify(updates[1])).not.toMatch(/UNPROVEN/);
+    await channel.updateApproval(input, { ...approval, status: 'expired', decision: 'uncertain' }, { source: 'slack', senderName: 'Анна', answers: { branch: ['UNCONFIRMED ANSWER'] } });
+    await channel.updateApproval(input, { ...approval, decision: 'decline' }, { source: 'rele', answers: { branch: ['DECLINED ANSWER'] } });
+    const secret = { ...approval, questions: approval.questions!.map(question => ({ ...question, isSecret: true })) };
+    await channel.updateApproval(input, secret, { source: 'rele', answers: { branch: ['SECRET ANSWER MUST STAY LOCAL'] } });
+    const closed = calls.filter(call => call.url.endsWith('/chat.update')).slice(2).map(call => JSON.parse(String(call.init!.body)));
+    expect(closed[0].text).toContain('Результат отправки ответа неизвестен. Проверьте в Codex.');
+    expect(JSON.stringify(closed[0])).not.toMatch(/UNCONFIRMED ANSWER|Ответ отправлен|ответ доступен/);
+    expect(closed[1].text).toContain('Вопрос отклонён');
+    expect(JSON.stringify(closed[1])).not.toContain('DECLINED ANSWER');
+    expect(closed[2].text).toContain('Вопрос закрыт');
+    expect(JSON.stringify(closed[2])).not.toContain('SECRET ANSWER MUST STAY LOCAL');
+    await expect(channel.updateApproval({ ...input, remoteMessageId: undefined }, approval)).rejects.toThrow('Некорректная карточка');
+    await expect(channel.updateApproval({ ...input, origin: { ...input.origin, accountId: 'TOTHER:UBOT' } }, approval)).rejects.toThrow('Подключение Slack изменилось');
+  });
+});
 
 describe('Slack native task progress', () => {
   it('closes only an existing known progress message with generic content', async () => {

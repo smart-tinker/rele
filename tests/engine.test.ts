@@ -31,6 +31,8 @@ class FakeCodex extends EventEmitter implements CodexGateway {
   verifiedVersion = true;
   isVerifiedVersion = () => this.verifiedVersion;
   queueSupported = true;
+  pendingRequests = new Set<string | number>();
+  hasPendingRequest = (id: string | number) => this.pendingRequests.has(id);
   locations = new Map<string, RequestLocation>();
   transport: CodexConnectionState['transport'] = 'managed';
   status = vi.fn(() => ({ configured: true, connected: this.connected, queueSupported: this.queueSupported, desktopVerified: false, transport: this.transport, codexHome: '/test/codex-home' }));
@@ -54,7 +56,7 @@ class FakeCodex extends EventEmitter implements CodexGateway {
     const found = this.locations.get(clientId);
     return found?.turnId === turnId ? found : { state: 'not_found' };
   });
-  respond = vi.fn(async (_rpcId: string | number, _result: unknown) => {});
+  respond = vi.fn(async (rpcId: string | number, _result: unknown) => { this.pendingRequests.delete(rpcId); });
   rejectRequest = vi.fn(async (_rpcId: string | number, _message: string) => {});
   interrupt = vi.fn(async (threadId: string, turnId: string) => {
     for (const [id, location] of this.locations) if (location.turnId === turnId && location.state === 'running') {
@@ -70,8 +72,11 @@ class FakeCodex extends EventEmitter implements CodexGateway {
   terminateBackgroundTerminal = vi.fn(async (_threadId: string, target: { serverId: number; itemId: string; processId: string }) => {
     this.terminals = this.terminals.filter(row => row.itemId !== target.itemId || row.processId !== target.processId);
   });
-  notification(event: CodexNotification): void { this.emit('notification', event); }
-  request(event: CodexServerRequest): void { this.emit('request', event); }
+  notification(event: CodexNotification): void {
+    if (event.method === 'serverRequest/resolved') this.pendingRequests.delete((event.params as { requestId: string | number }).requestId);
+    this.emit('notification', event);
+  }
+  request(event: CodexServerRequest): void { this.pendingRequests.add(event.id); this.emit('request', event); }
   connection(connected: boolean): void { this.connected = connected; this.emit('status'); }
   running(requestId: string, turnId = 'turn-1'): void {
     this.locations.set(requestId, { state: 'running', turnId });
@@ -2191,5 +2196,136 @@ describe('multiple origins and terminal reconciliation', () => {
     expect(f.store.getRequest(request.id)?.status).toBe('completed');
     expect(f.telegram.deliver.mock.calls.map(([delivery]) => delivery.body)).toContain('OK');
     expect(f.codex.interrupt).not.toHaveBeenCalled();
+  });
+});
+
+describe('Engine interactive Slack questions', () => {
+  async function questionFixture() {
+    const f = fixture({ start: false });
+    const update = vi.fn<NonNullable<Channel['updateApproval']>>().mockResolvedValue(undefined);
+    f.engine.channels.slack = { ...f.slack, updateApproval: update };
+    const request = await acceptRequest(f);
+    const approval = await requestApproval(f, request, true);
+    const prompt = f.store.listDeliveries().find(row => row.approvalId === approval.id)!;
+    expect(prompt.status).toBe('sent');
+    const context = { approvalId: approval.id, platform: 'slack' as const, accountId: request.origin.accountId,
+      chatId: request.origin.chatId, threadId: request.origin.threadId, senderId: request.origin.senderId,
+      senderIsBot: false, senderName: 'Alex', messageId: prompt.remoteMessageId };
+    return { ...f, request, approval, prompt, context, update };
+  }
+
+  it('answers the exact native RPC once and updates only its existing card with the Slack actor', async () => {
+    const f = await questionFixture();
+    expect(f.engine.question(f.context).id).toBe(f.approval.id);
+    await f.engine.action({ ...f.context, decision: 'accept', answers: { target: ['main'] } });
+    await f.engine.pump(); await f.engine.settled();
+    expect(f.codex.respond).toHaveBeenCalledExactlyOnceWith('approval-rpc', { answers: { target: { answers: ['main'] } } });
+    expect(f.update).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: f.prompt.id, remoteMessageId: f.prompt.remoteMessageId }),
+      expect.objectContaining({ id: f.approval.id, status: 'answered' }),
+      { source: 'slack', senderId: f.context.senderId, senderName: 'Alex', answers: { target: ['main'] } });
+    await expect(f.engine.action({ ...f.context, decision: 'accept', answers: { target: ['different'] } })).rejects.toThrow();
+    await f.engine.pump();
+    expect(f.update).toHaveBeenCalledTimes(1); expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+    expect(f.store.listRequests()).toHaveLength(1); expect(f.slack.deliver).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['actor', 'bot', 'account', 'thread', 'message', 'secret', 'turn', 'delivery', 'mixed'] as const)('rejects a stale or mismatched %s before exposing a form or answering', async mismatch => {
+    const f = await questionFixture(), context = { ...f.context };
+    if (mismatch === 'actor') context.senderId = 'other-human';
+    if (mismatch === 'bot') context.senderIsBot = true;
+    if (mismatch === 'account') context.accountId = 'other:bot';
+    if (mismatch === 'thread') context.threadId = 'other-thread';
+    if (mismatch === 'message') context.messageId = 'other-message';
+    if (mismatch === 'secret') f.store.updateApproval(f.approval.id, { questions: [{ id: 'target', header: '', question: 'Secret?', isSecret: true }] });
+    if (mismatch === 'turn') f.store.updateRequest(f.request.id, { turnId: 'other-turn' });
+    if (mismatch === 'delivery') f.store.addDeliveries(f.request.id, [{ key: 'question-extra', ordinal: 1, kind: 'approval', body: 'Not yet sent', approvalId: f.approval.id }]);
+    if (mismatch === 'mixed') f.store.setMeta(`mixed:${f.request.id}`, '1');
+    expect(() => f.engine.question(context)).toThrow();
+    await expect(f.engine.action({ ...context, decision: 'accept', answers: { target: ['main'] } })).rejects.toThrow();
+    expect(f.codex.respond).not.toHaveBeenCalled();
+  });
+
+  it('closes a card after native resolution without inventing a Slack answer', async () => {
+    const f = await questionFixture();
+    f.codex.notification({ method: 'serverRequest/resolved', params: { threadId: THREAD, requestId: f.approval.rpcId } });
+    await f.engine.settled(); await f.engine.pump();
+    expect(f.update).toHaveBeenCalledWith(expect.objectContaining({ id: f.prompt.id }), expect.objectContaining({ decision: 'resolved_in_codex' }), { source: 'codex' });
+    expect(() => f.engine.question(f.context)).toThrow(); expect(f.codex.respond).not.toHaveBeenCalled();
+  });
+
+  it('retries a failed known-card update after restart without resending the answer', async () => {
+    const f = await questionFixture(); f.update.mockRejectedValue(new ChannelError('Temporary update refusal', true));
+    await f.engine.action({ ...f.context, decision: 'accept', answers: { target: ['main'] } });
+    await f.engine.pump();
+    expect(f.store.resolvedApprovalDeliveries()).toHaveLength(1);
+    await f.engine.stop();
+    const next = fixture({ path: f.path, start: false });
+    const update = vi.fn<NonNullable<Channel['updateApproval']>>().mockResolvedValue(undefined);
+    next.engine.channels.slack = { ...next.slack, updateApproval: update };
+    await next.engine.pump();
+    expect(update).toHaveBeenCalledTimes(1); expect(next.codex.respond).not.toHaveBeenCalled();
+    expect(next.store.resolvedApprovalDeliveries()).toEqual([]);
+  });
+
+  it('marks an unknown answer send as uncertain and never repeats it', async () => {
+    const f = await questionFixture(); f.codex.respond.mockRejectedValueOnce(new Error('Wire closed'));
+    await expect(f.engine.action({ ...f.context, decision: 'accept', answers: { target: ['main'] } })).rejects.toThrow();
+    await f.engine.pump();
+    expect(f.update).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ status: 'expired', decision: 'uncertain' }), expect.anything());
+    await expect(f.engine.action({ ...f.context, decision: 'accept', answers: { target: ['main'] } })).rejects.toThrow();
+    expect(f.codex.respond).toHaveBeenCalledTimes(1);
+  });
+
+  it('expires all pending questions and rejects an older generation even if a native RPC ID is reused', async () => {
+    const f = await questionFixture();
+    for (let i = 0; i < 1001; i++) f.store.addApproval({ requestId: f.request.id, turnId: 'turn-1', itemId: `history-${i}`,
+      rpcId: `history-${i}`, method: 'item/commandExecution/requestApproval', title: 'History', details: '', status: 'answered' });
+    const next = new FakeCodex(); next.pendingRequests.add(f.approval.rpcId);
+    next.locations.set(f.request.id, { state: 'running', turnId: 'turn-1' });
+    f.engine.replaceCodex(next); await f.engine.settled();
+    expect(f.store.getApproval(f.approval.id)?.status).toBe('expired');
+    f.store.updateApproval(f.approval.id, { status: 'pending' });
+    expect(() => f.engine.question(f.context)).toThrow();
+    await expect(f.engine.resolveApproval(f.approval.id, 'accept', { target: ['main'] })).rejects.toThrow();
+    expect(next.respond).not.toHaveBeenCalled();
+  });
+
+  it.each(['completed', 'interrupted'] as const)('closes every known sent question part when the turn is %s', async status => {
+    const f = await questionFixture();
+    const [extra] = f.store.addDeliveries(f.request.id, [{ key: 'extra-part', ordinal: 1, kind: 'approval', body: 'Extra', approvalId: f.approval.id }]);
+    f.store.updateDelivery(extra.id, { status: 'sent', remoteMessageId: 'second-card' });
+    f.store.setMeta(`approval-ui-attempted:${f.prompt.id}`, String(Date.now()));
+    if (status === 'completed') f.codex.complete(f.request.id, 'Done');
+    else await f.engine.cancel(f.request.id);
+    await f.engine.settled(); await f.engine.pump();
+    expect(f.update).toHaveBeenCalledTimes(2);
+    expect(f.update.mock.calls[0][0].id).toBe(extra.id);
+    expect(f.update.mock.calls.map(([delivery]) => delivery.id).sort()).toEqual([f.prompt.id, extra.id].sort());
+    expect(f.store.resolvedApprovalDeliveries()).toEqual([]);
+  });
+
+  it('never stores a secret panel answer for Slack card feedback', async () => {
+    const f = await questionFixture();
+    f.store.updateApproval(f.approval.id, { questions: [{ id: 'target', header: '', question: 'Secret?', isSecret: true }] });
+    await f.engine.resolveApproval(f.approval.id, 'accept', { target: ['synthetic-private-value'] });
+    await f.engine.pump();
+    expect(f.store.getMeta(`approval-resolution:${f.approval.id}`)).toBe('{"source":"rele"}');
+    expect(f.update).toHaveBeenCalledWith(expect.anything(), expect.anything(), { source: 'rele' });
+  });
+
+  it.each(['retry', 'resolved', 'retired'] as const)('handles a transient history failure with native question %s', async outcome => {
+    const f = fixture({ start: false }), request = await acceptRequest(f); await running(f, request);
+    f.codex.findRequest.mockRejectedValueOnce(new Error('Temporary history failure'));
+    f.codex.request({ id: 'retry-question', method: 'item/tool/requestUserInput', params: { threadId: THREAD,
+      turnId: 'turn-1', itemId: 'question-retry', questions: [{ id: 'target', header: 'Target', question: 'Which branch?' }] } });
+    await f.engine.settled();
+    expect(f.store.listApprovals()).toEqual([]); expect(f.codex.rejectRequest).not.toHaveBeenCalled();
+    if (outcome === 'resolved') { f.codex.notification({ method: 'serverRequest/resolved', params: { threadId: THREAD, requestId: 'retry-question' } }); await f.engine.settled(); }
+    if (outcome === 'retired') f.codex.pendingRequests.delete('retry-question');
+    const now = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 6000);
+    try { await f.engine.pump(); await f.engine.settled(); } finally { now.mockRestore(); }
+    expect(f.store.listApprovals()).toHaveLength(outcome === 'retry' ? 1 : 0);
+    if (outcome === 'retry') expect(f.store.listDeliveries().some(row => row.body.includes('Which branch?') && row.status === 'sent')).toBe(true);
+    expect(f.codex.respond).not.toHaveBeenCalled();
   });
 });

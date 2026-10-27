@@ -90,6 +90,7 @@ async function main(): Promise<void> {
       message: message => engine.receive(message),
       endpoint: endpoint => { store.upsertEndpoint(endpoint); },
       action: action => engine.action(action), status: () => { engine.channelStatus(); activity.refresh(true); },
+      question: context => engine.question(context),
     };
     const next = config.config;
     engine.channels = {

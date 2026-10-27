@@ -1204,9 +1204,30 @@ export class Store {
     return { sent: Number(row.sent) > 0, complete: Number(row.total) > 0 && Number(row.sent) === Number(row.total) };
   }
 
+  resolvedApprovalDeliveries(): Array<{ delivery: Delivery; approval: Approval; version: string }> {
+    return this.db.prepare(`SELECT d.*, a.status||':'||COALESCE(a.decision,'')||':'||a.updated_at AS ui_version
+      FROM deliveries d JOIN approvals a ON a.id=d.approval_id
+      LEFT JOIN meta m ON m.key='approval-ui-updated:'||d.id
+      LEFT JOIN meta retry ON retry.key='approval-ui-attempted:'||d.id
+      WHERE d.kind='approval' AND d.status='sent' AND d.remote_message_id IS NOT NULL
+        AND json_extract(d.origin,'$.platform')='slack' AND json_array_length(a.questions)>0
+        AND a.status!='pending' AND (m.value IS NULL OR m.value!=a.status||':'||COALESCE(a.decision,'')||':'||a.updated_at)
+      ORDER BY COALESCE(CAST(retry.value AS INTEGER),0),d.rowid LIMIT 100`).all().map(row => ({ delivery: toDelivery(row),
+        approval: this.getApproval(String(row.approval_id))!, version: String(row.ui_version) }));
+  }
+
   cancelApprovalDeliveries(approvalId: string): void {
     this.db.prepare("UPDATE deliveries SET status='cancelled',updated_at=? WHERE approval_id=? AND kind='approval' AND status IN ('pending','failed')")
       .run(new Date().toISOString(), approvalId);
+  }
+
+  expirePendingApprovals(): void {
+    this.transaction(() => {
+      const now = new Date().toISOString();
+      this.db.prepare(`UPDATE deliveries SET status='cancelled',updated_at=? WHERE kind='approval' AND status IN ('pending','failed')
+        AND approval_id IN (SELECT id FROM approvals WHERE status='pending')`).run(now);
+      this.db.prepare("UPDATE approvals SET status='expired',updated_at=? WHERE status='pending'").run(now);
+    });
   }
   claimDelivery(now: string | number | Date = new Date()): Delivery | undefined {
     const timestamp = new Date(now).toISOString();

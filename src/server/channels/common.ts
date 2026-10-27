@@ -20,12 +20,24 @@ export interface ApprovalAction {
   threadId?: string;
   senderId: string;
   senderIsBot?: boolean;
+  senderName?: string;
+  messageId?: string;
+  answers?: Record<string, string[]>;
+}
+
+export type ApprovalContext = Omit<ApprovalAction, 'decision' | 'answers'>;
+export interface ApprovalResolution {
+  source: 'slack' | 'telegram' | 'rele' | 'codex';
+  senderId?: string;
+  senderName?: string;
+  answers?: Record<string, string[]>;
 }
 
 export interface ChannelCallbacks {
   message(message: InboundMessage): Promise<void>;
   endpoint(endpoint: Endpoint): void;
   action(action: ApprovalAction): Promise<void>;
+  question?(context: ApprovalContext): Approval | Promise<Approval>;
   status(): void;
 }
 
@@ -43,6 +55,7 @@ export interface Channel {
   discoveryInfo?(): { botUrl?: string; command: string };
   setThreadStatus?(origin: Origin, status: SlackSessionStatus): Promise<void>;
   updateProgress?(requestId: string, origin: Origin, progress: RequestProgress): Promise<void>;
+  updateApproval?(delivery: Delivery, approval: Approval, resolution?: ApprovalResolution): Promise<void>;
   readThreadPage?(target: Pick<Origin, 'endpointId' | 'accountId' | 'chatId' | 'threadId'>, options?: { cursor?: string; oldest?: string; latest?: string }): Promise<{ messages: SlackTranscriptMessage[]; nextCursor?: string }>;
 }
 

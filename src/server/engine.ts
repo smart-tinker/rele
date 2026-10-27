@@ -5,7 +5,7 @@ import type { Approval, ApprovalQuestion, AutoLinkIntent, Delivery, Endpoint, In
 import { CodexClient, CodexRpcError, CodexSteerRefusedError, CodexThreadBusyError, codexCommandItem, type CodexCommandItem, type CodexNotification, type CodexServerRequest, type CodexTerminal, type CodexTerminalSnapshot, type RequestLocation } from './codex.js';
 import { Store, type SteeringInput } from './store.js';
 import type { AppConfig } from './config.js';
-import { ChannelError, splitReply, type ApprovalAction, type Channel, type RequestProgress } from './channels/common.js';
+import { ChannelError, splitReply, type ApprovalAction, type ApprovalContext, type ApprovalResolution, type Channel, type RequestProgress } from './channels/common.js';
 import { transcribeAudio } from './voice.js';
 import { SlackSync, quotedEntry } from './slack-sync.js';
 import { InitialMessages } from './initial-message.js';
@@ -14,7 +14,7 @@ import { effectiveSharedCodexHome } from './codex-shared.js';
 import { requestInput } from './inbound-context.js';
 import { MessageToolValidationError } from '../shared/message-tool.js';
 
-export type CodexGateway = Pick<CodexClient, 'status' | 'isVerifiedVersion' | 'createThread' | 'setThreadName' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'steer' | 'findSteerReceipt' | 'interrupt' | 'backgroundTerminals' | 'terminateBackgroundTerminal' | 'findRequest' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Pick<EventEmitter, 'on' | 'off'>;
+export type CodexGateway = Pick<CodexClient, 'status' | 'isVerifiedVersion' | 'createThread' | 'setThreadName' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'steer' | 'findSteerReceipt' | 'interrupt' | 'backgroundTerminals' | 'terminateBackgroundTerminal' | 'findRequest' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Partial<Pick<CodexClient, 'hasPendingRequest'>> & Pick<EventEmitter, 'on' | 'off'>;
 export interface EngineOptions {
   config: () => AppConfig;
   temporaryRoot: string;
@@ -63,6 +63,10 @@ export class Engine extends EventEmitter {
   private steering = new Set<string>();
   private progressSending = false;
   private progressRetryAfter = new Map<string, number>();
+  private approvalUpdatesSending = false;
+  private approvalUpdateRetry = new Map<string, number>();
+  private pendingQuestions = new Map<string, { event: CodexServerRequest; epoch: string; retryAt: number }>();
+  private retryingQuestions = false;
   private slackConnection?: string;
   private readonly notification = (event: CodexNotification) => this.event(() => this.onNotification(event));
   private readonly serverRequest = (event: CodexServerRequest) => this.event(() => this.onServerRequest(event));
@@ -165,7 +169,8 @@ export class Engine extends EventEmitter {
         if (questions.length > 1 && (lines.length !== questions.length || lines.some((line, index) => !line.startsWith(`${index + 1}. `) || !line.slice(line.indexOf(' ') + 1).trim()))) {
           this.store.addDeliveries(request.id, [{ key: `question-format:${message.eventId}`, ordinal: 0, kind: 'error', body: 'Ответьте одной строкой на каждый вопрос, по порядку: 1. ответ, затем с новой строки 2. ответ.' }]);
         } else {
-          await this.resolveApproval(approval.id, 'accept', Object.fromEntries(questions.map((question, index) => [question.id, [questions.length === 1 ? lines[index] : lines[index].slice(lines[index].indexOf(' ') + 1)]])));
+          await this.resolveApproval(approval.id, 'accept', Object.fromEntries(questions.map((question, index) => [question.id, [questions.length === 1 ? lines[index] : lines[index].slice(lines[index].indexOf(' ') + 1)]])),
+            { source: message.endpoint.platform, senderId: message.sender.id, senderName: message.sender.name });
         }
       }
     } else {
@@ -202,19 +207,44 @@ export class Engine extends EventEmitter {
     if (approval?.method === 'mcpServer/elicitation/request' && action.decision === 'accept' && !this.store.approvalDeliveryProgress(approval.id).complete) {
       throw new Error('Дождитесь полной доставки запроса подтверждения.');
     }
-    await this.resolveApproval(action.approvalId, action.decision);
+    if (approval?.questions?.length) this.question(action);
+    await this.resolveApproval(action.approvalId, action.decision, action.answers,
+      { source: action.platform, senderId: action.senderId, ...(action.senderName ? { senderName: action.senderName } : {}) });
   }
 
-  async resolveApproval(id: string, decision: 'accept' | 'decline', answers?: Record<string, string[]>): Promise<void> {
+  question(context: ApprovalContext): Approval {
+    const approval = this.store.getApproval(context.approvalId);
+    const request = approval && this.store.getRequest(approval.requestId);
+    if (this.stopped || this.suspended || !approval || approval.status !== 'pending' || !request || terminal(request.status)
+      || this.resolutions.has(approval.id) || !approval.questions?.length || approval.questions.some(question => question.isSecret)
+      || this.store.getMeta(`approval-epoch:${approval.id}`) !== this.epoch
+      || this.codex.hasPendingRequest?.(approval.rpcId) === false
+      || this.isMixed(request.id) || approval.turnId !== request.turnId
+      || !this.sameOrigin(request, { endpoint: { platform: context.platform, accountId: context.accountId,
+        chatId: context.chatId, threadId: context.threadId ?? '' }, sender: { id: context.senderId, isBot: context.senderIsBot } })) {
+      throw new Error('Этот вопрос закрыт или недоступен этому участнику.');
+    }
+    if (!this.codex.status().connected || !this.codex.status().queueSupported || !this.codex.isVerifiedVersion())
+      throw new ChannelError('Codex временно недоступен. Повторите после подключения.', true);
+    if (!this.store.approvalDeliveryProgress(approval.id).complete) throw new Error('Дождитесь полной доставки вопроса.');
+    if (context.platform === 'slack' && (!context.messageId || this.store.findReplyApproval({ platform: context.platform,
+      accountId: context.accountId, chatId: context.chatId, threadId: context.threadId ?? '' }, context.messageId)?.id !== approval.id))
+      throw new Error('Исходное сообщение вопроса не подтверждено.');
+    return approval;
+  }
+
+  async resolveApproval(id: string, decision: 'accept' | 'decline', answers?: Record<string, string[]>, resolution: ApprovalResolution = { source: 'rele' }): Promise<void> {
     const approval = this.store.getApproval(id);
     const request = approval && this.store.getRequest(approval.requestId);
-    if (!approval || approval.status !== 'pending' || !request || terminal(request.status) || this.resolutions.has(id)) throw new Error('Подтверждение уже завершено или недоступно.');
+    if (!approval || approval.status !== 'pending' || !request || terminal(request.status) || this.resolutions.has(id)
+      || this.store.getMeta(`approval-epoch:${id}`) !== this.epoch
+      || this.codex.hasPendingRequest?.(approval.rpcId) === false) throw new Error('Подтверждение уже завершено или недоступно.');
     if (!this.codex.status().connected) throw new ChannelError('Codex отключён. Дождитесь повторного подключения.', true);
     if (!this.codex.status().queueSupported) throw new Error('Подтверждения недоступны для непроверенного runtime Codex.');
     if (this.isMixed(request.id)) throw new Error('Ход изменён другим клиентом. Продолжите подтверждение в Codex.');
     let result: unknown;
     if (approval.method === 'item/tool/requestUserInput') {
-      const values: Record<string, { answers: string[] }> = {};
+      const values: Record<string, { answers: string[] }> = Object.create(null);
       for (const question of approval.questions ?? []) {
         const answer = answers?.[question.id];
         if (decision === 'accept' && (!Array.isArray(answer) || !answer.length || answer.some(text => typeof text !== 'string' || !text.trim() || text.length > 10_000))) throw new Error('Ответьте на каждый вопрос.');
@@ -229,6 +259,9 @@ export class Engine extends EventEmitter {
         : { decision: decision === 'accept' ? 'accept' : capability.decline };
     }
     this.resolutions.add(id);
+    if (approval.questions?.length) this.store.setMeta(`approval-resolution:${id}`, JSON.stringify({ source: resolution.source,
+      ...(resolution.senderId ? { senderId: resolution.senderId } : {}), ...(resolution.senderName ? { senderName: resolution.senderName } : {}),
+      ...(decision === 'accept' && !approval.questions.some(question => question.isSecret) ? { answers } : {}) }));
     // Persist intent before the wire write. On a crash or disconnect this is not replayed.
     this.store.updateApproval(id, { status: 'answered', decision });
     try {
@@ -488,7 +521,7 @@ export class Engine extends EventEmitter {
   /** Exposed to deterministic integration tests; the timer uses this same path. */
   async pump(): Promise<void> {
     if (this.stopped) return;
-    const work: Promise<unknown>[] = [this.deliver(), this.flushProgress()];
+    const work: Promise<unknown>[] = [this.deliver(), this.flushProgress(), this.flushApprovalUpdates(), this.retryPendingQuestions()];
     if (!this.suspended) {
       await Promise.allSettled(this.store.listAutoLinkIntents().filter(intent => intent.status !== 'completed').map(intent => this.provision(intent)));
       await this.slackSync.backfill();
@@ -964,9 +997,12 @@ export class Engine extends EventEmitter {
     } else if (method === 'turn/completed' && p.turn?.id) {
       for (const request of this.store.activeRequests()) if (request.turnId === p.turn.id || (request.status === 'starting' && this.store.getConversation(request.conversationId)?.threadId === p.threadId)) await this.reconcile(request.id);
     } else if (method === 'serverRequest/resolved') {
+      for (const [key, pending] of this.pendingQuestions) if (pending.epoch === this.epoch
+        && pending.event.id === p.requestId && (pending.event.params as Record<string, unknown>).threadId === p.threadId) this.pendingQuestions.delete(key);
       for (const approval of this.store.listApprovals(1000)) if (approval.rpcId === p.requestId && approval.status === 'pending') {
         const request = this.store.getRequest(approval.requestId)!;
         if (this.store.getConversation(request.conversationId)?.threadId !== p.threadId) continue;
+        this.store.setMeta(`approval-resolution:${approval.id}`, JSON.stringify({ source: 'codex' }));
         this.store.updateApproval(approval.id, { status: 'answered', decision: 'resolved_in_codex' });
         this.store.cancelApprovalDeliveries(approval.id);
         if (request.status === 'waiting_approval') this.store.updateRequest(request.id, { status: 'running' });
@@ -977,6 +1013,29 @@ export class Engine extends EventEmitter {
 
   private pendingProgress(): string[] {
     return JSON.parse(this.store.getMeta('request-progress:pending') ?? '[]') as string[];
+  }
+
+  private async flushApprovalUpdates(): Promise<void> {
+    if (this.approvalUpdatesSending || this.stopped) return;
+    const channel = this.channels.slack;
+    if (!channel?.state.connected || !channel.updateApproval) return;
+    this.approvalUpdatesSending = true;
+    try {
+      for (const { delivery, approval, version } of this.store.resolvedApprovalDeliveries()) {
+        if (this.stopped || channel !== this.channels.slack || channel.state.accountId !== delivery.origin.accountId
+          || Date.now() < (this.approvalUpdateRetry.get(delivery.id) ?? 0)) continue;
+        try {
+          const raw = this.store.getMeta(`approval-resolution:${approval.id}`);
+          await channel.updateApproval(delivery, approval, raw ? JSON.parse(raw) as ApprovalResolution : undefined);
+          this.store.setMeta(`approval-ui-updated:${delivery.id}`, version);
+          this.approvalUpdateRetry.delete(delivery.id);
+        } catch (error) {
+          this.approvalUpdateRetry.set(delivery.id, Date.now() + 5000);
+          this.store.setMeta(`approval-ui-attempted:${delivery.id}`, String(Date.now()));
+          this.emit('diagnostic', this.options.redact(error));
+        }
+      }
+    } finally { this.approvalUpdatesSending = false; }
   }
   private recordProgress(id: string, patch: RequestProgress): void {
     const request = this.store.getRequest(id);
@@ -1022,8 +1081,27 @@ export class Engine extends EventEmitter {
     } finally { this.progressSending = false; }
   }
 
+  private deferQuestion(event: CodexServerRequest, epoch: string): void {
+    if (event.method === 'item/tool/requestUserInput' && epoch === this.epoch && !this.stopped)
+      this.pendingQuestions.set(JSON.stringify([epoch, (event.params as Record<string, unknown>).threadId, event.id]), { event, epoch, retryAt: Date.now() + 5000 });
+  }
+
+  private async retryPendingQuestions(): Promise<void> {
+    if (this.retryingQuestions || this.stopped || !this.codex.status().connected) return;
+    this.retryingQuestions = true;
+    try {
+      for (const [key, pending] of this.pendingQuestions) {
+        if (pending.retryAt > Date.now()) continue;
+        this.pendingQuestions.delete(key);
+        if (pending.epoch === this.epoch && this.codex.hasPendingRequest?.(pending.event.id) !== false) await this.onServerRequest(pending.event);
+      }
+    } finally { this.retryingQuestions = false; }
+  }
+
   private async onServerRequest(event: CodexServerRequest): Promise<void> {
-    const client = this.codex;
+    const client = this.codex, epoch = this.epoch;
+    const current = () => client === this.codex && epoch === this.epoch && !this.stopped && client.hasPendingRequest?.(event.id) !== false;
+    if (!current()) return;
     const managed = client.status().transport === 'managed';
     const rejectUnowned = async () => { if (managed) await client.rejectRequest(event.id, 'Rele cannot authorize this request without its original message.'); };
     const reviewHint = managed ? 'Действие отклонено. Сверьте запрос в панели Rele.' : 'Продолжите в Codex.';
@@ -1040,12 +1118,13 @@ export class Engine extends EventEmitter {
     let location: RequestLocation;
     try { location = await this.findOwnRequest(client, p.threadId, request.id); }
     catch {
-      if (client !== this.codex) return;
-      if (!terminal(this.store.getRequest(request.id)!.status)) this.store.updateRequest(request.id, { status: 'uncertain', error: `Не удалось проверить происхождение подтверждения. ${reviewHint}` });
-      await rejectUnowned();
+      if (!current()) return;
+      if (!terminal(this.store.getRequest(request.id)!.status)) this.store.updateRequest(request.id, { status: 'uncertain', error: `Не удалось проверить происхождение подтверждения. ${event.method === 'item/tool/requestUserInput' ? 'Вопрос сохранён; сверка повторится автоматически.' : reviewHint}` });
+      if (event.method === 'item/tool/requestUserInput') this.deferQuestion(event, epoch);
+      else await rejectUnowned();
       this.changed(); return;
     }
-    if (client !== this.codex) return;
+    if (!current()) return;
     if (terminal(this.store.getRequest(request.id)!.status)) { await rejectUnowned(); return; }
     if (location.mixed) {
       this.store.setMeta(`mixed:${request.id}`, '1');
@@ -1054,8 +1133,10 @@ export class Engine extends EventEmitter {
       this.changed(); return;
     }
     if (location.state !== 'running' || location.turnId !== p.turnId) {
-      this.store.updateRequest(request.id, { status: 'uncertain', error: `Подтверждение не совпало с активным ходом запроса. ${reviewHint}` });
-      await rejectUnowned();
+      const retryQuestion = event.method === 'item/tool/requestUserInput' && location.state === 'not_found';
+      if (retryQuestion) this.deferQuestion(event, epoch);
+      this.store.updateRequest(request.id, { status: 'uncertain', error: `Подтверждение не совпало с активным ходом запроса. ${retryQuestion ? 'Вопрос сохранён; сверка повторится автоматически.' : reviewHint}` });
+      if (!retryQuestion) await rejectUnowned();
       this.changed(); return;
     }
     const question = event.method === 'item/tool/requestUserInput';
@@ -1075,6 +1156,7 @@ export class Engine extends EventEmitter {
     const questionDetails = questions?.map((value, index) => `${questions.length > 1 ? `${index + 1}. ` : ''}${value.header}: ${value.question}${value.options?.length ? '\n' + value.options.map(option => `${option.label} — ${option.description}`).join('\n') : ''}`).join('\n\n');
     const details = [metadata, questionDetails].filter(Boolean).join('\n\n');
     const approval = this.store.addApproval({ requestId: request.id, turnId: p.turnId, itemId: `${mcp ? 'mcp' : p.itemId}:${p.approvalId ?? event.id}:${this.epoch}`, rpcId: event.id, method: event.method, title, details, questions });
+    this.store.setMeta(`approval-epoch:${approval.id}`, this.epoch);
     const choices: unknown[] | undefined = Array.isArray(p.availableDecisions) ? p.availableDecisions : undefined;
     this.approvals.set(approval.id, { accept: !choices || choices.includes('accept'), decline: choices?.includes('cancel') && !choices.includes('decline') ? 'cancel' : 'decline' });
     this.store.updateRequest(request.id, { status: 'waiting_approval' });
@@ -1136,7 +1218,8 @@ export class Engine extends EventEmitter {
     return group && message.sender.isBot === false;
   }
   private expireApprovals(): void {
-    for (const approval of this.store.listApprovals(1000)) if (approval.status === 'pending') { this.store.updateApproval(approval.id, { status: 'expired' }); this.store.cancelApprovalDeliveries(approval.id); }
+    this.pendingQuestions.clear();
+    this.store.expirePendingApprovals();
     this.approvals.clear();
   }
   private connectionChanged(): void {
