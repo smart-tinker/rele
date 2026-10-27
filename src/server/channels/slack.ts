@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto';
 import WebSocket from 'ws';
 import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionState, Delivery, Endpoint, InboundMessage, Origin, Person, SlackTranscriptMessage } from '../../shared/types.js';
-import { ChannelError, downloadBounded, endpointId, readableTitle, splitReply, type Channel, type ChannelCallbacks, type SlackSessionStatus } from './common.js';
+import type { Store } from '../store.js';
+import { ChannelError, downloadBounded, endpointId, readableTitle, splitReply, type Channel, type ChannelCallbacks, type RequestProgress, type SlackSessionStatus } from './common.js';
 import { escapeSlackText, formatSlackReply } from './slack-format.js';
+import { slackProgressBlocks } from './slack-progress.js';
 
 type Json = Record<string, any>;
 const SLACK_TS = /^\d+\.\d+$/u;
@@ -56,6 +58,15 @@ export interface SlackOptions {
   fetch?: typeof fetch;
   socket?: (url: string) => WebSocket;
   knownEndpoints?: Endpoint[];
+  progressStore?: Pick<Store, 'getMeta' | 'setMeta'>;
+}
+
+interface ProgressReceipt {
+  route: string;
+  state: 'posting' | 'posted' | 'uncertain';
+  ts?: string;
+  hash?: string;
+  terminal?: RequestProgress['terminal'];
 }
 
 /** Socket Mode needs outbound connections only. ACK follows the durable inbox write. */
@@ -83,6 +94,7 @@ export class SlackChannel implements Channel {
   private catalogScopes?: Set<string>;
   private refreshing = new Set<string>();
   private abort = new AbortController();
+  private progressWrites = new Map<string, Promise<void>>();
 
   constructor(private readonly botToken: string, private readonly appToken: string, private readonly callbacks: ChannelCallbacks, private readonly options: SlackOptions = {}) {
     this.fetcher = options.fetch ?? fetch;
@@ -246,6 +258,61 @@ export class SlackChannel implements Channel {
     const missingStop = result.response_metadata?.warnings?.includes('missing_agent_session_stopped_event_subscription') || result.warning === 'missing_agent_session_stopped_event_subscription';
     if (missingStop && this.state.error !== warning) this.setState({ error: warning });
     else if (!missingStop && this.state.error === warning) this.setState({ error: undefined });
+  }
+
+  async updateProgress(requestId: string, origin: Origin, progress: RequestProgress): Promise<void> {
+    const snapshot = { ...progress, ...(progress.plan ? { plan: progress.plan.map(item => ({ ...item })) } : {}) };
+    const write = (this.progressWrites.get(requestId) ?? Promise.resolve()).catch(() => {})
+      .then(() => this.writeProgress(requestId, origin, snapshot));
+    this.progressWrites.set(requestId, write);
+    try { await write; }
+    finally { if (this.progressWrites.get(requestId) === write) this.progressWrites.delete(requestId); }
+  }
+
+  private async writeProgress(requestId: string, origin: Origin, progress: RequestProgress): Promise<void> {
+    const store = this.options.progressStore;
+    if (!store || this.stopped || !requestId || origin.platform !== 'slack'
+        || origin.accountId !== this.accountId || !/^[CDG][A-Z0-9]+$/u.test(origin.chatId)
+        || !SLACK_TS.test(origin.threadId)
+        || origin.endpointId !== endpointId('slack', this.accountId, origin.chatId, origin.threadId)
+        || (progress.plan?.length ?? 0) > 50) return;
+    const endpoint = this.endpoints.get(origin.endpointId);
+    if (!endpoint || endpoint.accountId !== origin.accountId || endpoint.chatId !== origin.chatId || endpoint.threadId !== origin.threadId) return;
+    const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+    const route = digest([origin.accountId, origin.endpointId, origin.chatId, origin.threadId]);
+    const key = `slack-progress:${digest(requestId)}`;
+    const saved = store.getMeta(key);
+    let receipt: ProgressReceipt | undefined;
+    if (saved !== undefined) {
+      try { receipt = JSON.parse(saved) as ProgressReceipt; } catch { return; }
+      if (!receipt || receipt.route !== route || receipt.state !== 'posted' || typeof receipt.ts !== 'string'
+          || !SLACK_TS.test(receipt.ts) || receipt.terminal && receipt.terminal !== progress.terminal) return;
+    }
+    if (progress.existingOnly && !receipt) return;
+    const blocks = slackProgressBlocks(requestId, progress);
+    const hash = digest(blocks);
+    if (receipt?.hash === hash) return;
+    const next: ProgressReceipt = { route, state: receipt ? 'posted' : 'posting',
+      ...(receipt ? { ts: receipt.ts, hash: receipt.hash } : {}),
+      ...(progress.terminal ? { terminal: progress.terminal } : {}),
+    };
+    // Persist before the first post. A lost ACK/restart must never create a second message.
+    store.setMeta(key, JSON.stringify(next));
+    const body: Json = {
+      channel: origin.chatId, ...(receipt ? { ts: receipt.ts } : { thread_ts: origin.threadId }),
+      text: escapeSlackText(progress.commentary?.trim() || String(blocks[0].title)),
+      blocks, mrkdwn: false, parse: 'none', link_names: false, unfurl_links: false, unfurl_media: false,
+    };
+    try {
+      const result = await this.api(receipt ? 'chat.update' : 'chat.postMessage', body, this.botToken, true);
+      if (result.channel !== origin.chatId || typeof result.ts !== 'string' || !SLACK_TS.test(result.ts)
+          || receipt && result.ts !== receipt.ts) throw new ChannelError('Slack не подтвердил сообщение прогресса.', false, true);
+      store.setMeta(key, JSON.stringify({ ...next, state: 'posted', ts: result.ts, hash }));
+    } catch (error) {
+      // Updating a known ts can be retried safely; an unconfirmed first post cannot.
+      if (!receipt) store.setMeta(key, JSON.stringify({ ...next, state: 'uncertain' }));
+      else throw error;
+    }
   }
 
   async readThreadPage(target: Pick<Origin, 'endpointId' | 'accountId' | 'chatId' | 'threadId'>, options: { cursor?: string; oldest?: string; latest?: string } = {}): Promise<{ messages: SlackTranscriptMessage[]; nextCursor?: string }> {

@@ -200,7 +200,7 @@ export function Queue({
                     </td>
                     <td data-label="Состояние">
                       <Status tone={statusTone(request.status)}>
-                        {requestLabels[request.status]}
+                        {request.steeredInto && request.status === 'completed' ? 'Добавлено в выполняющийся запрос' : requestLabels[request.status]}
                       </Status>
                     </td>
                     <td data-label="Поступил">
@@ -221,7 +221,7 @@ export function Queue({
                             Сверить
                           </Button>
                         )}
-                        {request.status === 'starting' &&
+                        {!request.steeredInto && request.status === 'starting' &&
                           request.queuedSubmissionId && (
                             <Button
                               disabled={action.busy}
@@ -233,7 +233,7 @@ export function Queue({
                               Продолжить
                             </Button>
                           )}
-                        {cancellableStatuses.includes(request.status) && (
+                        {!request.steeredInto && cancellableStatuses.includes(request.status) && (
                           <Button
                             variant="quiet"
                             disabled={action.busy}

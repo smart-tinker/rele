@@ -61,7 +61,6 @@ export function Conversations({ state, api, refresh, onNavigate }: {
   const [platform, setPlatform] = useState<Platform>('telegram');
   const [query, setQuery] = useState('');
   const [editing, setEditing] = useState<string | null>(null);
-  const [accessEditing, setAccessEditing] = useState<{ endpointId: string; mode: ReactionMode } | null>(null);
   const [discovering, setDiscovering] = useState(false);
   const [automatic, setAutomatic] = useState<Endpoint | null>(null);
   const [recovery, setRecovery] = useState<{ endpoint: Endpoint; intent: AutoLinkIntent; thread: CodexThread } | null>(null);
@@ -73,7 +72,6 @@ export function Conversations({ state, api, refresh, onNavigate }: {
     return sourceMatches(endpoint, query, `${conversation?.name ?? ''} ${conversation?.cwd ?? ''}`);
   });
   const current = state.endpoints.find(endpoint => endpoint.id === editing);
-  const accessCurrent = state.endpoints.find(endpoint => endpoint.id === accessEditing?.endpointId);
   return <>
     <PageHeading title="Связи" description="Назначьте разговор Codex и доступ каждому источнику. Несколько чатов могут использовать общий контекст." />
     <SourceTabs
@@ -143,7 +141,6 @@ export function Conversations({ state, api, refresh, onNavigate }: {
                 refresh={refresh}
                 catalog={catalog}
                 onDetails={() => setEditing(endpoint.id)}
-                onAccess={mode => setAccessEditing({ endpointId: endpoint.id, mode })}
                 onAutomatic={() => setAutomatic(endpoint)}
                 onRecovery={(intent, thread) => setRecovery({ endpoint, intent, thread })}
               />)}
@@ -168,17 +165,6 @@ export function Conversations({ state, api, refresh, onNavigate }: {
       </p>
     </section>
     <AutoLinks state={state} api={api} refresh={refresh} />
-    {accessCurrent && <Drawer title={`Доступ: ${sourceTitle(accessCurrent)}`} onClose={() => setAccessEditing(null)}>
-      <SourceAccessEditor
-        key={accessCurrent.id}
-        endpoint={accessCurrent}
-        state={state}
-        api={api}
-        refresh={refresh}
-        initialMode={accessEditing!.mode}
-        onSaved={() => setAccessEditing(null)}
-      />
-    </Drawer>}
     {discovering && <Drawer title={`Источники ${platformLabel(platform)}`} onClose={() => setDiscovering(false)}>
       <p className="muted">Выберите реальный чат и обсуждение из каталога. Найденные обсуждения появятся в таблице.</p>
       {platform === 'slack' ? <SlackCatalogPicker
@@ -216,7 +202,6 @@ export function Conversations({ state, api, refresh, onNavigate }: {
         state={state}
         api={api}
         refresh={refresh}
-        onAccess={() => { setEditing(null); setAccessEditing({ endpointId: current.id, mode: sourceAccess(state, current).mode }); }}
       />
     </Drawer>}
     {recovery && <Drawer title="Продолжение сохранённых запросов" onClose={() => setRecovery(null)}>
@@ -240,8 +225,8 @@ export function Conversations({ state, api, refresh, onNavigate }: {
   </>;
 }
 
-function SourceRow({ endpoint, state, api, refresh, catalog, onDetails, onAccess, onAutomatic, onRecovery }: {
-  endpoint: Endpoint; state: DashboardState; api: ReleApi; refresh: () => Promise<void>; catalog: ReturnType<typeof useCodexThreads>; onDetails: () => void; onAccess: (mode: ReactionMode) => void; onAutomatic: () => void; onRecovery: (intent: AutoLinkIntent, thread: CodexThread) => void;
+function SourceRow({ endpoint, state, api, refresh, catalog, onDetails, onAutomatic, onRecovery }: {
+  endpoint: Endpoint; state: DashboardState; api: ReleApi; refresh: () => Promise<void>; catalog: ReturnType<typeof useCodexThreads>; onDetails: () => void; onAutomatic: () => void; onRecovery: (intent: AutoLinkIntent, thread: CodexThread) => void;
 }) {
   const action = useAction();
   const conversation = sourceConversation(state, endpoint.id);
@@ -253,7 +238,6 @@ function SourceRow({ endpoint, state, api, refresh, catalog, onDetails, onAccess
   const unresolved = recoverable ? intent : undefined;
   const locked = !!creating || state.requests.some(request => request.origin.endpointId === endpoint.id && !['completed', 'failed', 'interrupted', 'cancelled'].includes(request.status));
   const connected = sourceConnected(state, endpoint);
-  const access = sourceAccess(state, endpoint);
   const href = safeHref(endpoint.url);
   const change = async (threadId: string) => {
     if (unresolved) {
@@ -334,17 +318,7 @@ function SourceRow({ endpoint, state, api, refresh, catalog, onDetails, onAccess
       </div>
     </td>
     <td data-label="Доступ">
-      <div className="cell-copy source-access">
-        <select
-          aria-label={`Режим для ${endpoint.title}`}
-          value={access.mode}
-          onChange={event => onAccess(event.target.value as ReactionMode)}
-        >
-          {Object.entries(modes).map(([mode, label]) => <option key={mode} value={mode} disabled={mode !== 'off' && !connected}>{label}</option>)}
-        </select>
-        <small>{access.mode === 'off' ? 'Доступ выключен' : sourceIsDirect(endpoint) ? `Разрешённых людей: ${access.allowedSenderIds.length}` : access.legacy ? 'Ранее сохранённый доступ' : 'Все участники, включая агентов'}</small>
-        <Button aria-label={`Изменить доступ ${endpoint.title}`} onClick={() => onAccess(access.mode)}>Изменить</Button>
-      </div>
+      <SourceAccessControls endpoint={endpoint} state={state} api={api} refresh={refresh} />
     </td>
   </tr>;
 }
@@ -410,9 +384,10 @@ function AutomaticSource({ endpoint, api, refresh, onSaved }: { endpoint: Endpoi
   </form>;
 }
 
-function SourceDetails({ endpoint, state, api, refresh, onAccess }: { endpoint: Endpoint; state: DashboardState; api: ReleApi; refresh: () => Promise<void>; onAccess: () => void }) {
+function SourceDetails({ endpoint, state, api, refresh }: { endpoint: Endpoint; state: DashboardState; api: ReleApi; refresh: () => Promise<void> }) {
   const conversation = sourceConversation(state, endpoint.id);
   const action = useAction();
+  const initialMessage = useAction();
   const pause = async (value: Conversation) => {
     const result = await action.run(() => api.request(`/api/conversations/${encodeURIComponent(value.id)}`, 'PATCH', { paused: !value.paused }), value.paused ? 'Общий разговор возобновлён.' : 'Общий разговор приостановлен.');
     if (result.ok) await refresh();
@@ -429,7 +404,6 @@ function SourceDetails({ endpoint, state, api, refresh, onAccess }: { endpoint: 
       refresh={refresh}
       disabled={false}
     />
-    <Button onClick={onAccess}>Настроить доступ к источникам</Button>
     {conversation && <section className="form-section form-stack">
       <h3>
         {conversation.name}
@@ -454,6 +428,15 @@ function SourceDetails({ endpoint, state, api, refresh, onAccess }: { endpoint: 
         </Button>
       </div>
       <ActionMessages error={action.error} success={action.success} />
+      <div>
+        <Button
+          icon="send"
+          busy={initialMessage.busy}
+          onClick={() => void initialMessage.run(() => api.request<{ status: 'queued'; operationId: string }>(`/api/conversations/${encodeURIComponent(conversation.id)}/initial-message`, 'POST'), 'Первичное сообщение поставлено в очередь.')}
+        >Послать первичное сообщение</Button>
+      </div>
+      <p className="field-hint">Добавит инструкции Rele в этот разговор Codex. Доступ и назначения источников сохранятся.</p>
+      <ActionMessages error={initialMessage.error} success={initialMessage.success} />
     </section>}
     {conversation && <SlackSyncJournal api={api} conversationId={conversation.id} platform={endpoint.platform} />}
   </div>;
@@ -512,72 +495,71 @@ function EndpointNameEditor({ endpoint, api, refresh, disabled }: { endpoint: En
   </div>;
 }
 
-function SourceAccessEditor({ endpoint, state, api, refresh, initialMode, onSaved }: { endpoint: Endpoint; state: DashboardState; api: ReleApi; refresh: () => Promise<void>; initialMode: ReactionMode; onSaved: () => void }) {
+function SourceAccessControls({ endpoint, state, api, refresh }: { endpoint: Endpoint; state: DashboardState; api: ReleApi; refresh: () => Promise<void> }) {
   const policy = sourceAccess(state, endpoint);
-  const [mode, setMode] = useState<ReactionMode>(initialMode);
-  const [people, setPeople] = useState(policy.allowedSenderIds);
+  const [pendingMode, setPendingMode] = useState<ReactionMode | null>(null);
+  const [savingPeople, setSavingPeople] = useState<string[] | null>(null);
+  const [showPeople, setShowPeople] = useState(false);
   const action = useAction();
   const direct = sourceIsDirect(endpoint);
   const connected = sourceConnected(state, endpoint);
-  const save = async (event: FormEvent) => {
-    event.preventDefault();
-    if (direct && mode !== 'off' && !people.length) {
+  const mode = pendingMode ?? policy.mode;
+  const save = async (nextMode: ReactionMode, people?: string[]) => {
+    if (direct && nextMode !== 'off' && !(people ?? policy.allowedSenderIds).length) {
+      setPendingMode(nextMode);
+      setShowPeople(true);
       action.setError('Разрешите хотя бы одного человека для личного чата.');
       return;
     }
-    const result = await action.run(() => api.request(`/api/endpoints/${encodeURIComponent(endpoint.id)}/access`, 'PUT', { mode, ...(direct && mode !== 'off' ? { allowedSenderIds: people } : {}) }));
-    if (result.ok) {
+    setPendingMode(nextMode);
+    setSavingPeople(people ?? null);
+    await action.run(async () => {
+      await api.request(`/api/endpoints/${encodeURIComponent(endpoint.id)}/access`, 'PUT', { mode: nextMode, ...(people === undefined ? {} : { allowedSenderIds: people }) });
       await refresh();
-      onSaved();
-    }
+    }, 'Доступ сохранён.');
+    setPendingMode(null);
+    setSavingPeople(null);
   };
-  return <form className="form-stack" onSubmit={save}>
-    <p className="muted">
-      {sourceChat(endpoint)}
-      {' · '}
-      {sourceTitle(endpoint)}
-    </p>
-    <Field label="Режим реакции">
-      <select
-        value={mode}
-        disabled={action.busy}
-        onChange={event => setMode(event.target.value as ReactionMode)}
-      >
-        {Object.entries(modes).map(([value, label]) => <option
-          key={value}
-          value={value}
-          disabled={value !== 'off' && !connected}
-        >
-          {label}
-        </option>)}
-      </select>
-    </Field>
-    {!connected && <Notice tone="warning">Для включения доступа нужен доступный источник текущего подключённого бота. Выключить доступ можно сейчас.</Notice>}
-    {mode === 'off' ? <p className="field-hint">Новые сообщения этого источника не запускают запросы и не передаются как контекст. Уже принятые задачи сохраняются.</p> : <>
-      <p className="field-hint">
-        {mode === 'mention' ? 'Новый запрос запускается по настоящему упоминанию подключённого агента.' : 'Каждое разрешённое новое сообщение запускает запрос.'}{' '}
-        Назначение разговора Codex задаётся в этой же таблице.
-      </p>
-      {direct ? <AllowedSenders
-        endpoint={endpoint}
-        accountId={state.connections[endpoint.platform].accountId}
-        api={api}
-        refresh={refresh}
-        value={people}
-        onChange={setPeople}
-        disabled={action.busy || !connected}
-        humansOnly
-      /> : <Notice tone="info">Все участники этой группы или канала, включая агентов, смогут запускать запросы в выбранном режиме.</Notice>}
-      {!direct && policy.legacy && <Notice tone="warning">Сохранение заменит прежний доступ выбранным режимом для всех участников этого источника.</Notice>}
-    </>}
-    <ActionMessages error={action.error} success={action.success} />
-    <div>
+  return <div className="cell-copy source-access" aria-busy={action.busy}>
+    <select
+      aria-label={`Режим для ${endpoint.title}`}
+      value={mode}
+      disabled={action.busy}
+      onChange={event => void save(event.target.value as ReactionMode)}
+    >
+      {Object.entries(modes).map(([value, label]) => <option key={value} value={value} disabled={value !== 'off' && !connected}>{label}</option>)}
+    </select>
+    <small>{policy.mode === 'off' ? 'Доступ выключен' : direct ? `Разрешённых людей: ${policy.allowedSenderIds.length}` : policy.legacy ? 'Ранее сохранённый доступ' : 'Все участники, включая агентов'}</small>
+    {mode === 'mention' && <small>Запуск по упоминанию подключённого агента.</small>}
+    {!direct && policy.legacy && <small>После смены режима доступ определяется выбранным вариантом для всех участников, включая агентов.</small>}
+    {direct && <>
       <Button
-        type="submit"
-        variant="primary"
-        busy={action.busy}
-        disabled={mode !== 'off' && !connected}
-      >Сохранить доступ</Button>
-    </div>
-  </form>;
+        aria-label={`Разрешённые люди для ${endpoint.title}`}
+        aria-expanded={showPeople}
+        aria-controls={`source-people-${endpoint.id}`}
+        disabled={action.busy}
+        onClick={() => {
+          if (showPeople) {
+            setPendingMode(null);
+            action.setError('');
+          }
+          setShowPeople(value => !value);
+        }}
+      >{showPeople ? 'Скрыть людей' : 'Разрешённые люди'}</Button>
+      {showPeople && <div className="source-people" id={`source-people-${endpoint.id}`}>
+        {mode === 'off' && <p className="field-hint">Выберите режим доступа, чтобы изменить список людей.</p>}
+        <AllowedSenders
+          endpoint={endpoint}
+          accountId={state.connections[endpoint.platform].accountId}
+          api={api}
+          refresh={refresh}
+          value={savingPeople ?? policy.allowedSenderIds}
+          onChange={people => void save(mode, people)}
+          disabled={action.busy || !connected || mode === 'off'}
+          humansOnly
+        />
+      </div>}
+    </>}
+    <ActionMessages error={action.error} success={action.error ? '' : action.success} />
+  </div>;
 }

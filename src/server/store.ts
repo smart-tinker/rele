@@ -24,6 +24,10 @@ export interface SlackSyncEntry {
   state: 'pending' | 'applying' | 'applied' | 'uncertain';
   error?: string; retryAt?: string; createdAt: string; updatedAt: string;
 }
+export interface SteeringInput {
+  id: string; parentRequestId: string; turnId: string; requestId?: string; entryId?: string; text: string;
+  state: 'sending' | 'uncertain' | 'applied' | 'refused'; error?: string;
+}
 const APPLICATION_ID = 0x52454c45;
 const BLOCKING_REQUESTS = "'starting','running','transcribing','waiting_approval','uncertain'";
 const MIGRATIONS = [String.raw`
@@ -215,6 +219,11 @@ function toToolDelivery(r: Row): Delivery {
 function stableJson(value: unknown): string {
   return JSON.stringify(value, (_key, item: unknown) => item && typeof item === 'object' && !Array.isArray(item)
     ? Object.fromEntries(Object.keys(item).sort().map(key => [key, (item as Record<string, unknown>)[key]])) : item);
+}
+function slackRevision(message: SlackTranscriptMessage): string {
+  return createHash('sha256').update(stableJson({ kind: message.kind === 'deleted' ? 'deleted' : 'message',
+    senderId: message.sender.id, text: message.text, edited: (message.payload.edited as { ts?: unknown } | undefined)?.ts,
+    files: message.payload.files, attachments: message.payload.attachments, blocks: message.payload.blocks })).digest('hex');
 }
 function slackMessageOrder(value: string): string {
   const match = /^(\d+)\.(\d+)$/u.exec(value);
@@ -634,9 +643,7 @@ export class Store {
     const stream = this.getSlackSyncStream(streamId);
     if (!stream || stream.endpointId !== message.endpointId || stream.accountId !== message.accountId || stream.chatId !== message.chatId || stream.threadId !== message.threadId) throw new Error('Slack transcript origin does not match the sync stream');
     if (requestId && this.getRequest(requestId)?.conversationId !== stream.conversationId) throw new Error('Slack transcript request belongs to another conversation');
-    const revision = createHash('sha256').update(stableJson({ kind: message.kind === 'deleted' ? 'deleted' : 'message',
-      senderId: message.sender.id, text: message.text, edited: (message.payload.edited as { ts?: unknown } | undefined)?.ts,
-      files: message.payload.files, attachments: message.payload.attachments, blocks: message.payload.blocks })).digest('hex');
+    const revision = slackRevision(message);
     const id = randomUUID(); const now = new Date().toISOString();
     this.db.prepare(`INSERT INTO slack_sync_entries (id,stream_id,message_id,message_order,revision,message,request_id,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(stream_id,message_id,revision) DO UPDATE SET request_id=COALESCE(slack_sync_entries.request_id,excluded.request_id)`)
@@ -683,6 +690,8 @@ export class Store {
     const before = beforeMessageId === undefined ? null : slackMessageOrder(beforeMessageId);
     return this.db.prepare(`SELECT e.* FROM slack_sync_entries e JOIN slack_sync_streams s ON s.id=e.stream_id
       WHERE s.conversation_id=? AND e.state IN ('pending','uncertain') AND (e.retry_at IS NULL OR e.retry_at<=?)
+      AND NOT EXISTS(SELECT 1 FROM meta m WHERE m.key LIKE 'steering-input:%'
+        AND json_extract(m.value,'$.entryId')=e.id AND json_extract(m.value,'$.state')<>'refused')
       AND (? IS NULL OR e.message_order<=?) ORDER BY e.message_order,e.rowid LIMIT ?`)
       .all(conversationId, new Date().toISOString(), before, before, limitValue(limit)).map(toSlackSyncEntry);
   }
@@ -718,6 +727,8 @@ export class Store {
       const now = new Date().toISOString();
       const result = this.db.prepare(`UPDATE slack_sync_entries SET state='applying',updated_at=? WHERE id=?
         AND state IN ('pending','uncertain') AND (retry_at IS NULL OR retry_at<=?)
+        AND NOT EXISTS(SELECT 1 FROM meta m WHERE m.key LIKE 'steering-input:%'
+          AND json_extract(m.value,'$.entryId')=slack_sync_entries.id AND json_extract(m.value,'$.state')<>'refused')
         AND EXISTS(SELECT 1 FROM slack_sync_streams s JOIN conversations c ON c.id=s.conversation_id
           WHERE s.id=slack_sync_entries.stream_id AND c.paused=0)`).run(now, id, now);
       return result.changes ? this.getSlackSyncEntry(id) : undefined;
@@ -968,10 +979,13 @@ export class Store {
   }
   private requestFromRow(row: Row): ReleRequest {
     const request = toRequest(row);
-    return this.getMeta(`suppressed-final:${request.id}`) ? { ...request, suppressedFinal: true } : request;
+    if (this.getMeta(`suppressed-final:${request.id}`)) request.suppressedFinal = true;
+    const input = this.getSteeringInput(request.id);
+    return input?.requestId === request.id && input.state !== 'refused' ? { ...request, steeredInto: input.parentRequestId,
+      turnId: input.turnId, status: input.state === 'applied' ? 'completed' : 'uncertain', error: input.error } : request;
   }
   listRequests(limit = 100): ReleRequest[] { return this.db.prepare('SELECT * FROM requests ORDER BY rowid DESC LIMIT ?').all(limitValue(limit)).map(row => this.requestFromRow(row)); }
-  listPendingRequests(): ReleRequest[] { return this.db.prepare("SELECT * FROM requests WHERE status='queued' ORDER BY rowid").all().map(row => this.requestFromRow(row)); }
+  listPendingRequests(): ReleRequest[] { return this.db.prepare("SELECT * FROM requests WHERE status='queued' ORDER BY rowid").all().map(row => this.requestFromRow(row)).filter(request => !request.steeredInto); }
   activeRequests(): ReleRequest[] {
     return this.db.prepare(`SELECT * FROM requests WHERE status IN ('queued',${BLOCKING_REQUESTS}) ORDER BY rowid`).all().map(row => this.requestFromRow(row));
   }
@@ -979,6 +993,7 @@ export class Store {
     return this.transaction(() => {
       const row = this.db.prepare(`SELECT r.id FROM requests r JOIN conversations c ON c.id=r.conversation_id
         WHERE r.conversation_id=? AND r.status='queued' AND c.paused=0 AND (? IS NULL OR r.id=?)
+        AND NOT EXISTS(SELECT 1 FROM meta m WHERE m.key='steering-input:'||r.id AND json_extract(m.value,'$.state')<>'refused')
         AND NOT EXISTS(SELECT 1 FROM requests active WHERE active.conversation_id=r.conversation_id AND active.status IN (${BLOCKING_REQUESTS}))
         ORDER BY r.rowid LIMIT 1`).get(conversationId, requestId ?? null, requestId ?? null);
       if (!row) return undefined;
@@ -997,6 +1012,100 @@ export class Store {
       this.db.prepare('UPDATE requests SET status=?,text=?,queued_submission_id=?,turn_id=?,error=?,updated_at=? WHERE id=?')
         .run(next.status, next.text, next.queuedSubmissionId ?? null, next.turnId ?? null, next.error ?? null, new Date().toISOString(), id);
       return this.getRequest(id)!;
+    });
+  }
+
+  steeringInputs(parentId: string): SteeringInput[] {
+    const raw = this.getMeta(`steering-inputs:${parentId}`);
+    const ids: unknown = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(ids) || ids.some(id => typeof id !== 'string') || new Set(ids).size !== ids.length) throw new Error('Invalid steering input index');
+    return ids.map(id => {
+      const input = this.getSteeringInput(id);
+      if (!input || input.parentRequestId !== parentId) throw new Error('Steering input index does not match its parent');
+      return input;
+    });
+  }
+  getSteeringInput(id: string): SteeringInput | undefined {
+    const raw = this.getMeta(`steering-input:${id}`);
+    if (!raw) return;
+    const input = JSON.parse(raw) as SteeringInput;
+    if (!input || input.id !== id || !input.parentRequestId || !input.turnId || typeof input.text !== 'string'
+      || !['sending', 'uncertain', 'applied', 'refused'].includes(input.state)) throw new Error('Invalid steering input receipt');
+    return input;
+  }
+  beginSteeringInput(parentId: string, candidate: { id: string; requestId?: string; entryId?: string; text: string }): SteeringInput {
+    return this.transaction(() => {
+      required(candidate.text, 'Steering text');
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(candidate.id)
+        || !candidate.requestId && !candidate.entryId || candidate.id !== (candidate.requestId ?? candidate.entryId)) throw new Error('Steering input needs its original request or journal UUID');
+      const existing = this.getSteeringInput(candidate.id);
+      if (existing) {
+        if (existing.parentRequestId !== parentId || existing.requestId !== candidate.requestId || existing.text !== candidate.text
+          || candidate.entryId && existing.entryId !== candidate.entryId) throw new Error('Steering input already exists with different content');
+        return existing;
+      }
+      const parent = this.getRequest(parentId), conversation = parent && this.getConversation(parent.conversationId);
+      if (!parent || parent.status !== 'running' || !parent.turnId || !conversation || conversation.paused
+        || this.getMeta(`mixed:${parentId}`) === '1' || this.getMeta(`cancel-requested:${parentId}`)
+        || this.db.prepare("SELECT 1 FROM approvals WHERE request_id=? AND status='pending'").get(parentId)) throw new Error('Steering parent is not a confirmed running request');
+      const sameSource = (source: Pick<Origin, 'platform' | 'accountId' | 'chatId' | 'threadId'>) => source.platform === parent.origin.platform
+        && source.accountId === parent.origin.accountId && source.chatId === parent.origin.chatId && source.threadId === parent.origin.threadId;
+      const child = candidate.requestId ? this.getRequest(candidate.requestId) : undefined;
+      let entry = candidate.entryId ? this.getSlackSyncEntry(candidate.entryId) : undefined;
+      const sameEntrySource = (value: SlackSyncEntry) => {
+        const stream = this.getSlackSyncStream(value.streamId);
+        return !!stream && stream.active && !stream.paused && stream.conversationId === parent.conversationId
+          && sameSource(stream) && (value.message.platform === undefined || value.message.platform === stream.platform)
+          && value.message.endpointId === parent.origin.endpointId;
+      };
+      if (candidate.requestId) {
+        const binding = child && this.bindingForEndpoint(child.origin.endpointId);
+        const savedRow = child && this.db.prepare('SELECT payload FROM inbound_events WHERE request_id=?').get(child.id);
+        const saved = savedRow && json<InboundMessage>(savedRow.payload);
+        if (!child || child.id === parent.id || child.status !== 'queued' || child.audio || child.turnId || child.queuedSubmissionId
+          || child.conversationId !== parent.conversationId || !sameSource(child.origin) || !binding || binding.conversationId !== parent.conversationId
+          || !saved || !this.acceptsSourceRequest(saved, binding)) throw new Error('Steering request is not an authorized queued input from the same source');
+        const original = saved.slack ?? { platform: saved.endpoint.platform, endpointId: saved.endpoint.id, accountId: saved.endpoint.accountId,
+          chatId: saved.endpoint.chatId, threadId: saved.endpoint.threadId, messageId: saved.messageId, sender: saved.sender,
+          text: saved.text, payload: { text: saved.text }, kind: 'message' as const };
+        const matches = (value: SlackSyncEntry) => value.state === 'pending' && value.requestId === child.id && sameEntrySource(value)
+          && value.messageId === child.origin.messageId && value.message.sender.id === child.origin.senderId
+          && value.message.text === child.text && value.revision === slackRevision(original);
+        if (candidate.entryId && (!entry || !matches(entry))) throw new Error('Steering journal entry does not match the immutable request revision');
+        if (!candidate.entryId) entry = this.db.prepare('SELECT * FROM slack_sync_entries WHERE request_id=? ORDER BY rowid').all(child.id).map(toSlackSyncEntry).find(matches);
+      } else if (!entry || entry.state !== 'pending' || entry.requestId || !sameEntrySource(entry)) {
+        throw new Error('Steering journal entry is not pending context from the same source');
+      }
+      const input: SteeringInput = { id: candidate.id, parentRequestId: parentId, turnId: parent.turnId, text: candidate.text, state: 'sending',
+        ...(child ? { requestId: child.id } : {}), ...(entry ? { entryId: entry.id } : {}) };
+      const index = this.steeringInputs(parentId).map(value => value.id);
+      this.setMeta(`steering-input:${input.id}`, JSON.stringify(input));
+      this.setMeta(`steering-inputs:${parentId}`, JSON.stringify([...index, input.id]));
+      // Keep the base child queued: the one-active-request SQL index belongs to its parent.
+      if (child) this.db.prepare('UPDATE requests SET turn_id=?,error=NULL,updated_at=? WHERE id=?').run(input.turnId, new Date().toISOString(), child.id);
+      if (entry) this.db.prepare("UPDATE slack_sync_entries SET state='applying',error=NULL,retry_at=NULL,updated_at=? WHERE id=?").run(new Date().toISOString(), entry.id);
+      return input;
+    });
+  }
+  finishSteeringInput(id: string, outcome: 'applied' | 'refused' | 'uncertain', error?: string): SteeringInput {
+    return this.transaction(() => {
+      const input = this.getSteeringInput(id);
+      if (!input || !['applied', 'refused', 'uncertain'].includes(outcome)) throw new Error('Steering input receipt not found');
+      if (input.state === 'applied' || input.state === 'refused') {
+        if (input.state !== outcome) throw new Error('A final steering receipt cannot change its outcome');
+        return input;
+      }
+      const entry = input.entryId && this.getSlackSyncEntry(input.entryId);
+      if (input.entryId && (!entry || entry.requestId !== input.requestId)) throw new Error('Steering journal association changed; reconcile without replay');
+      const next: SteeringInput = { ...input, state: outcome, ...(error ? { error } : {}) };
+      if (!error) delete next.error;
+      this.setMeta(`steering-input:${id}`, JSON.stringify(next));
+      const now = new Date().toISOString();
+      if (input.requestId) this.db.prepare('UPDATE requests SET status=?,turn_id=?,error=?,updated_at=? WHERE id=?')
+        .run(outcome === 'applied' ? 'completed' : 'queued', outcome === 'refused' ? null : input.turnId, error ?? null, now, input.requestId);
+      if (entry) this.db.prepare('UPDATE slack_sync_entries SET state=?,error=?,retry_at=NULL,updated_at=? WHERE id=?')
+        .run(outcome === 'applied' ? 'applied' : outcome === 'refused' ? 'pending' : 'uncertain', error ?? null, now, entry.id);
+      return next;
     });
   }
 
@@ -1171,6 +1280,13 @@ export class Store {
   recoverInterrupted(): { requests: number; deliveries: number } {
     return this.transaction(() => {
       const now = new Date().toISOString();
+      for (const row of this.db.prepare("SELECT key FROM meta WHERE key LIKE 'steering-input:%'").all()) {
+        const input = this.getSteeringInput((row.key as string).slice('steering-input:'.length))!;
+        if (input.state !== 'sending') continue;
+        const error = 'Steering acknowledgement interrupted; reconcile without replay';
+        this.setMeta(`steering-input:${input.id}`, JSON.stringify({ ...input, state: 'uncertain', error }));
+        if (input.entryId) this.db.prepare("UPDATE slack_sync_entries SET state='uncertain',error=?,updated_at=? WHERE id=?").run(error, now, input.entryId);
+      }
       this.db.prepare("UPDATE auto_link_intents SET status='uncertain',error=COALESCE(error,'Native creation acknowledgement was interrupted; reconcile before retrying'),updated_at=? WHERE status='creating'").run(now);
       this.db.prepare("UPDATE slack_sync_entries SET state='pending',error=COALESCE(error,'Passive append acknowledgement was interrupted; replay may duplicate context'),updated_at=? WHERE state='applying'").run(now);
       const execution = this.db.prepare("UPDATE requests SET status='uncertain',error=COALESCE(error,'Execution interrupted; reconcile with Codex before retrying'),updated_at=? WHERE status IN ('starting','running')").run(now);
