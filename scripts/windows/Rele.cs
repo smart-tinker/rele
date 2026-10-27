@@ -46,6 +46,7 @@ internal static class Rele
     private static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
     private static readonly object LogLock = new object();
     private static string AppDirectory;
+    private static string MaintenanceDirectory;
     private static Settings Config;
 
     [STAThread]
@@ -64,12 +65,14 @@ internal static class Rele
             for (int i = 1; i < args.Length; i++)
             {
                 if (args[i] == "--quiet" || args[i] == "--backup" || args[i] == "--desktop-integration" || args[i] == "--prepare-codex" || args[i] == "--preserve-active" || args[i] == "--retry-desktop-integration") options.Add(args[i], "true");
-                else if (Array.IndexOf(new[] { "--app-dir", "--data-dir", "--task-name", "--port", "--codex-home", "--codex-executable", "--error-file", "--warning-file", "--path-file" }, args[i]) >= 0 && i + 1 < args.Length)
+                else if (Array.IndexOf(new[] { "--app-dir", "--data-dir", "--task-name", "--port", "--codex-home", "--codex-executable", "--error-file", "--warning-file", "--path-file", "--maintenance-dir" }, args[i]) >= 0 && i + 1 < args.Length)
                     options.Add(args[i], args[++i]);
                 else throw new InvalidOperationException("Неизвестный параметр Rele.");
             }
             if (options.ContainsKey("--retry-desktop-integration") && command != "desktop-integrate")
                 throw new InvalidOperationException("Повтор подключения Desktop допустим только для desktop-integrate.");
+            if (options.ContainsKey("--maintenance-dir") && command != "prepare-update" && command != "check-runtime")
+                throw new InvalidOperationException("Временные модули допустимы только для подготовки обновления.");
             SecurityIdentifier currentUser = WindowsIdentity.GetCurrent().User;
             if (currentUser.IsWellKnown(WellKnownSidType.LocalSystemSid) || currentUser.IsWellKnown(WellKnownSidType.LocalServiceSid) || currentUser.IsWellKnown(WellKnownSidType.NetworkServiceSid))
                 throw new InvalidOperationException("Установите и запускайте Rele из обычной учётной записи владельца Codex, а не SYSTEM или служебной учётной записи Windows.");
@@ -154,11 +157,14 @@ internal static class Rele
                 }
                 return 0;
             }
-            if (command == "prepare-update")
+            if (command == "prepare-update" || command == "check-runtime")
             {
+                ValidateMaintenance(Value(options, "--maintenance-dir", ""));
+                CheckRuntimeReplacement(); // Before stopping tasks or copying any application file.
+                if (command == "check-runtime") return 0;
                 ReadLegacyStartup();
-                Stop(true);
-                try { Backup(); }
+                Stop(true, true);
+                try { Backup(true); }
                 catch { SetTaskEnabled(true); throw; }
                 return 0;
             }
@@ -356,7 +362,7 @@ internal static class Rele
         return process;
     }
 
-    private static void Stop(bool leaveDisabled)
+    private static void Stop(bool leaveDisabled, bool maintenance = false)
     {
         dynamic task = OwnedTask(TaskFolder());
         bool enabled = task != null && (bool)task.Enabled;
@@ -369,7 +375,7 @@ internal static class Rele
             {
                 if (instance != null)
                 {
-                    RunNode("stop", false);
+                    RunNode("stop", false, false, maintenance);
                     if (!instance.WaitForExit(30000)) throw new InvalidOperationException("Rele не завершился за 30 секунд. Установка не будет заменять занятые файлы.");
                 }
             }
@@ -380,10 +386,43 @@ internal static class Rele
         catch { if (task != null) task.Enabled = enabled; throw; }
     }
 
-    private static void Backup()
+    private static void Backup(bool maintenance = false)
     {
-        if (File.Exists(Path.Combine(Config.DataDirectory, "rele.sqlite")) && File.Exists(Path.Combine(AppDirectory, "dist", "server", "main.js")))
-            RunNode("backup", false);
+        if (File.Exists(Path.Combine(Config.DataDirectory, "rele.sqlite")) && (maintenance || File.Exists(Path.Combine(AppDirectory, "dist", "server", "main.js"))))
+            RunNode("backup", false, false, maintenance);
+    }
+
+    private static void ValidateMaintenance(string directory)
+    {
+        if (String.IsNullOrEmpty(directory) || !SamePath(directory, AppDomain.CurrentDomain.BaseDirectory) || SamePath(directory, AppDirectory))
+            throw new InvalidOperationException("Подготовка обновления требует собственные временные файлы установщика.");
+        MaintenanceDirectory = Path.GetFullPath(directory);
+        if ((File.GetAttributes(MaintenanceDirectory) & FileAttributes.ReparsePoint) != 0)
+            throw new InvalidOperationException("Временный каталог обновления не должен быть ссылкой.");
+        foreach (string name in new[] { "rele-maintenance-node.exe", "maintenance.js", "config.js", "lifecycle.js", "package.json", "manifest.json" })
+        {
+            string file = Path.Combine(MaintenanceDirectory, name);
+            if (!File.Exists(file) || (File.GetAttributes(file) & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidOperationException("Временный комплект обновления неполон или содержит ссылку.");
+        }
+        var package = Json.Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(MaintenanceDirectory, "package.json")));
+        var manifest = Json.Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(MaintenanceDirectory, "manifest.json")));
+        if (!package.ContainsKey("type") || (string)package["type"] != "module" || !package.ContainsKey("version") ||
+            !manifest.ContainsKey("version") || (string)manifest["version"] != (string)package["version"] ||
+            !manifest.ContainsKey("nodeBinarySha256") || (string)manifest["nodeBinarySha256"] != FileHash(Path.Combine(MaintenanceDirectory, "rele-maintenance-node.exe")))
+            throw new InvalidOperationException("Временный runtime обновления не совпал с комплектом установщика.");
+    }
+
+    private static void CheckRuntimeReplacement()
+    {
+        string installed = Path.Combine(AppDirectory, "runtime", "node.exe");
+        if (Directory.Exists(installed)) throw new InvalidOperationException("Путь runtime Node занят каталогом. Обновление отменено.");
+        if (!File.Exists(installed)) return;
+        if ((File.GetAttributes(installed) & FileAttributes.ReparsePoint) != 0)
+            throw new InvalidOperationException("Runtime Node не должен быть ссылкой. Обновление отменено.");
+        if (FileHash(installed) == FileHash(Path.Combine(MaintenanceDirectory, "rele-maintenance-node.exe"))) return;
+        try { using (var file = new FileStream(installed, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { } }
+        catch { throw new InvalidOperationException("Новый runtime Node отличается от установленного, а прежний файл занят или недоступен. Закройте использующие его клиенты и повторите установку. Codex и MCP не остановлены."); }
     }
 
     private static InvalidOperationException UnknownStartup()
@@ -1264,15 +1303,18 @@ internal static class Rele
         SendMessageTimeout(new IntPtr(0xffff), 0x001a, UIntPtr.Zero, "Environment", 2, 1000, out result);
     }
 
-    private static int RunNode(string command, bool background, bool codex = false)
+    private static int RunNode(string command, bool background, bool codex = false, bool maintenance = false)
     {
-        var start = new ProcessStartInfo(Path.Combine(AppDirectory, "runtime", "node.exe"), "\"" + Path.Combine(AppDirectory, "dist", "server", codex ? "codex-cli.js" : "main.js") + "\" " + command)
+        string node = maintenance ? Path.Combine(MaintenanceDirectory, "rele-maintenance-node.exe") : Path.Combine(AppDirectory, "runtime", "node.exe");
+        string entry = maintenance ? Path.Combine(MaintenanceDirectory, "maintenance.js") : Path.Combine(AppDirectory, "dist", "server", codex ? "codex-cli.js" : "main.js");
+        var start = new ProcessStartInfo(node, "\"" + entry + "\" " + command)
         {
-            WorkingDirectory = AppDirectory, UseShellExecute = false, CreateNoWindow = true,
+            WorkingDirectory = maintenance ? MaintenanceDirectory : AppDirectory, UseShellExecute = false, CreateNoWindow = true,
             RedirectStandardOutput = true, RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8
         };
         start.EnvironmentVariables["RELE_DATA_DIR"] = Config.DataDirectory;
         start.EnvironmentVariables["RELE_PORT"] = Config.Port.ToString();
+        if (maintenance) { start.EnvironmentVariables.Remove("NODE_OPTIONS"); start.EnvironmentVariables.Remove("NODE_PATH"); }
         if (codex)
         {
             start.EnvironmentVariables.Remove("RELE_DESKTOP_CLI");
@@ -1289,7 +1331,7 @@ internal static class Rele
                 else lock (errors) { if (errors.Length < 4000) errors.AppendLine(line.Data); }
             };
             process.Start();
-            using (var job = background || command == "--rele-desktop-check" || command == "--rele-desktop-setup" ? new ChildJob(process) : null)
+            using (var job = maintenance || background || command == "--rele-desktop-check" || command == "--rele-desktop-setup" ? new ChildJob(process) : null)
             {
                 process.BeginOutputReadLine(); process.BeginErrorReadLine();
                 if (background) process.WaitForExit();
