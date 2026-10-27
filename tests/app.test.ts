@@ -47,6 +47,7 @@ function makeApp() {
     reconcile: vi.fn().mockResolvedValue(undefined),
     retryDelivery: vi.fn(),
     messageTool: vi.fn().mockResolvedValue({ operationId: 'synthetic-operation', status: 'pending' }),
+    sendInitialMessage: vi.fn().mockReturnValue({ status: 'queued', operationId: 'initial-operation' }),
     resolveApproval: vi.fn().mockResolvedValue(undefined),
   });
   const codex = {
@@ -113,6 +114,22 @@ function makeApp() {
   store.upsertEndpoint(endpoint);
   return { app, store, config, engine, codex, configure, endpoint, shutdown, discovery, desktopIntegration, replaceCodex: () => { currentCodex = { ...codex }; } };
 }
+
+describe('initial Rele instruction', () => {
+  it('requires panel authorization and a known conversation, rejects unexpected content and queues one operation', async () => {
+    const f = makeApp();
+    const conversation = f.store.createConversation({ name: 'Example', threadId: 'thread-example', cwd: '/work/example' });
+    const url = `/api/conversations/${conversation.id}/initial-message`;
+    expect((await f.app.inject({ method: 'POST', url, headers: { host: headers.host } })).statusCode).toBe(401);
+    expect((await f.app.inject({ method: 'POST', url: '/api/conversations/unknown/initial-message', headers })).statusCode).toBe(404);
+    expect((await f.app.inject({ method: 'POST', url, headers, payload: { text: 'override' } })).statusCode).toBe(400);
+    expect(f.engine.sendInitialMessage).not.toHaveBeenCalled();
+    const result = await f.app.inject({ method: 'POST', url, headers });
+    expect(result.statusCode).toBe(200);
+    expect(result.json()).toEqual({ status: 'queued', operationId: 'initial-operation' });
+    expect(f.engine.sendInitialMessage).toHaveBeenCalledExactlyOnceWith(conversation.id);
+  });
+});
 
 describe('explicit Desktop integration controls', () => {
   it('authenticates reads and writes, validates the action and never enables integration while merely saving shared mode', async () => {

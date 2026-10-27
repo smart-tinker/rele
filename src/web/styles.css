@@ -1745,6 +1745,7 @@ tbody tr:hover {
 .source-table th:nth-child(2) { width: 25%; }
 .source-table th:nth-child(3) { width: 33%; }
 .source-table th:nth-child(4) { width: 22%; }
+.source-table td { vertical-align: top; }
 .source-table select { min-width: 0; width: 100%; }
 .source-table .cell-copy small { white-space: normal; }
 .source-routing { gap: 8px; }
@@ -1782,3 +1783,5 @@ tbody tr:hover {
 .clear-search:hover { color: var(--text); }
 .source-access { gap: 8px; }
 .source-access .button, .source-table .cell-copy > .button { align-self: flex-start; }
+.source-people { min-width: 0; width: 100%; }
+.source-people .people-fieldset { min-width: 0; margin-top: 8px; }

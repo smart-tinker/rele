@@ -94,7 +94,7 @@ async function main(): Promise<void> {
     const next = config.config;
     engine.channels = {
       ...(next.telegram.enabled && next.telegram.token ? { telegram: new TelegramChannel(next.telegram.token, callbacks, { get: () => Number(store.getMeta(`telegram.offset:${next.telegram.token!.split(':')[0]}`) ?? 0), set: offset => store.setMeta(`telegram.offset:${next.telegram.token!.split(':')[0]}`, String(offset)) }, { knownEndpoints: store.listEndpoints() }) } : {}),
-      ...(next.slack.enabled && next.slack.botToken && next.slack.appToken ? { slack: new SlackChannel(next.slack.botToken, next.slack.appToken, callbacks, { knownEndpoints: store.listEndpoints() }) } : {}),
+      ...(next.slack.enabled && next.slack.botToken && next.slack.appToken ? { slack: new SlackChannel(next.slack.botToken, next.slack.appToken, callbacks, { knownEndpoints: store.listEndpoints(), progressStore: store }) } : {}),
     };
     for (const channel of Object.values(engine.channels)) void channel.start().catch(() => {});
   }

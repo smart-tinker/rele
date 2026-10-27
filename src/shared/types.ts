@@ -153,6 +153,7 @@ export interface ReleRequest {
   queuedSubmissionId?: string;
   turnId?: string;
   suppressedFinal?: boolean;
+  steeredInto?: string;
   error?: string;
   createdAt: string;
   updatedAt: string;

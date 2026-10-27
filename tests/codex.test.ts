@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { WebSocket, WebSocketServer } from 'ws';
-import { CodexClient, CodexThreadBusyError, CodexTransportError, classifyCodexConnectionFailure, type CodexNotification } from '../src/server/codex.js';
+import { CodexClient, CodexSteerRefusedError, CodexThreadBusyError, CodexTransportError, classifyCodexConnectionFailure, type CodexNotification } from '../src/server/codex.js';
 import { SharedCodexError } from '../src/server/codex-shared.js';
 import { Engine } from '../src/server/engine.js';
 import { Store } from '../src/server/store.js';
@@ -1225,5 +1225,122 @@ describe('Codex managed runtime', () => {
     await expect(f.client.connect()).rejects.toMatchObject({ code: 'invalid-protocol' });
     expect(JSON.stringify(f.client.status())).not.toMatch(/synthetic-secret|malformed-json/u);
     expect(f.client.status().connected).toBe(false);
+  });
+});
+
+describe('Codex addressed steering and own input receipts', () => {
+  it('steers the exact expected turn once and preserves an early native input receipt', async () => {
+    const clientId = randomUUID(), turnId = randomUUID(), events: CodexNotification[] = [];
+    const f = await fixture({ 'turn/steer': (message, socket) => {
+      socket.send(JSON.stringify({ method: 'item/started', params: { threadId, turnId, item: { type: 'userMessage', clientId: message.params.clientUserMessageId } } }));
+      return { turnId };
+    } });
+    await f.client.connect(); f.client.on('notification', event => events.push(event));
+    const before = f.calls.length;
+    expect(await f.client.steer(threadId, 'Дополнение от участника', clientId, turnId)).toEqual({ turnId });
+    expect(f.calls.slice(before).map(call => ({ method: call.method, params: call.params }))).toEqual([
+      { method: 'turn/steer', params: { threadId, input: [{ type: 'text', text: 'Дополнение от участника' }], clientUserMessageId: clientId, expectedTurnId: turnId } },
+    ]);
+    expect(events).toMatchObject([{ method: 'item/started', params: { threadId, turnId, item: { clientId } } }]);
+  });
+
+  it.each([['', randomUUID(), 'turn-1'], ['text', 'not-a-uuid', 'turn-1'], ['text', randomUUID(), '']])('rejects incomplete steering input before the wire (%s)', async (text, clientId, turnId) => {
+    const f = await fixture(); await f.client.connect();
+    await expect(f.client.steer(threadId, text, clientId, turnId)).rejects.toThrow();
+    expect(f.calls.some(call => call.method === 'turn/steer')).toBe(false);
+  });
+
+  it.each([
+    ['no active turn to steer', 'no_active_turn'], ['expected active turn id `turn-1` but found `turn-2`', 'turn_mismatch'],
+  ])('classifies only a known native NotSubmitted response: %s', async (message, reason) => {
+    const f = await fixture({ 'turn/steer': (request, socket) => {
+      socket.send(JSON.stringify({ id: request.id, error: { code: -32600, message } })); return noResponse;
+    } });
+    await f.client.connect();
+    const operation = f.client.steer(threadId, 'new input', randomUUID(), 'turn-1');
+    await expect(operation).rejects.toBeInstanceOf(CodexSteerRefusedError);
+    await expect(operation).rejects.toMatchObject({ reason });
+    expect(f.calls.filter(call => call.method === 'turn/steer')).toHaveLength(1);
+    expect(f.calls.some(call => ['turn/start', 'thread/queue/add'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it.each([
+    [-32603, 'no active turn to steer'], [-32600, 'expected active turn id `different` but found `turn-2`'],
+    [-32600, 'native-private-secret'], [-32600, 'no active turn to steer\nnative-private-secret'],
+  ])('keeps an unknown native steering error uncertain (%s, %s)', async (code, message) => {
+    const f = await fixture({ 'turn/steer': (request, socket) => {
+      socket.send(JSON.stringify({ id: request.id, error: { code, message } })); return noResponse;
+    } });
+    await f.client.connect();
+    const error = await f.client.steer(threadId, 'new input', randomUUID(), 'turn-1').catch(error => error);
+    expect(error).toBeInstanceOf(CodexTransportError);
+    expect(error).toMatchObject({ uncertain: true, code: 'steer-unconfirmed' });
+    expect(error.message).not.toContain('native-private-secret');
+    expect(f.calls.filter(call => call.method === 'turn/steer')).toHaveLength(1);
+  });
+
+  it.each([{}, { turnId: 'a-different-turn' }, null])('keeps an incomplete or mismatched ACK uncertain: %s', async response => {
+    const f = await fixture({ 'turn/steer': () => response }); await f.client.connect();
+    await expect(f.client.steer(threadId, 'new input', randomUUID(), 'turn-1')).rejects.toMatchObject({ uncertain: true, code: 'steer-unconfirmed' });
+    expect(f.calls.filter(call => call.method === 'turn/steer')).toHaveLength(1);
+  });
+
+  it('reconciles a lost steering ACK from the exact persisted input without repeating a mutation', async () => {
+    const rootId = randomUUID(), clientId = randomUUID(), turnId = randomUUID(); let accepted = false;
+    const f = await fixture({
+      'turn/steer': (_request, socket) => { accepted = true; socket.close(); return noResponse; },
+      'thread/turns/list': () => ({ data: accepted ? [{ id: turnId, status: 'completed', completedAt: 100,
+        items: [{ type: 'userMessage', clientId: rootId }, { type: 'userMessage', clientId }, { type: 'agentMessage', text: 'Updated answer' }] }] : [], nextCursor: null }),
+    });
+    await f.client.connect();
+    await expect(f.client.steer(threadId, 'new input', clientId, turnId)).rejects.toBeInstanceOf(CodexTransportError);
+    await f.client.connect();
+    expect(await f.client.findSteerReceipt(threadId, clientId, turnId, [rootId])).toEqual({ state: 'completed', turnId, text: 'Updated answer' });
+    expect(f.calls.filter(call => call.method === 'turn/steer')).toHaveLength(1);
+    expect(f.calls.some(call => ['turn/start', 'thread/queue/add'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it('accepts an explicit own input group while preserving the default single-ID policy', async () => {
+    const rootId = randomUUID(), addonId = randomUUID();
+    const f = await fixture({ 'thread/turns/list': () => ({ data: [{ id: 'own-turn', status: 'completed', items: [
+      { type: 'userMessage', clientId: rootId }, { type: 'userMessage', clientId: addonId }, { type: 'agentMessage', phase: 'final_answer', text: 'Same-source answer' },
+    ] }], nextCursor: null }) });
+    await f.client.connect();
+    expect(await f.client.findRequest(threadId, rootId)).toEqual({ state: 'completed', turnId: 'own-turn', mixed: true });
+    expect(await f.client.findRequest(threadId, rootId, [addonId])).toEqual({ state: 'completed', turnId: 'own-turn', text: 'Same-source answer' });
+    expect(await f.client.findSteerReceipt(threadId, addonId, 'own-turn', [rootId])).toEqual({ state: 'completed', turnId: 'own-turn', text: 'Same-source answer' });
+  });
+
+  it.each([null, randomUUID()])('still quarantines an external input alongside the registered group (%s)', async foreignId => {
+    const rootId = randomUUID(), addonId = randomUUID();
+    const f = await fixture({ 'thread/turns/list': () => ({ data: [{ id: 'mixed-turn', status: 'failed', error: { codexErrorInfo: 'serverOverloaded' }, items: [
+      { type: 'userMessage', clientId: rootId }, { type: 'userMessage', clientId: addonId }, { type: 'userMessage', clientId: foreignId },
+      { type: 'commandExecution', id: 'foreign-command', processId: '1234' }, { type: 'agentMessage', text: 'Must stay local' },
+    ] }], nextCursor: null }) });
+    await f.client.connect();
+    expect(await f.client.findRequest(threadId, rootId, [addonId])).toEqual({ state: 'failed', turnId: 'mixed-turn', mixed: true });
+    expect(await f.client.findSteerReceipt(threadId, addonId, 'mixed-turn', [rootId])).toEqual({ state: 'failed', turnId: 'mixed-turn', mixed: true });
+  });
+
+  it.each(['wrong-turn', 'duplicate-input'])('refuses an ambiguous steering receipt (%s)', async kind => {
+    const clientId = randomUUID();
+    const f = await fixture({ 'thread/turns/list': () => ({ data: [{ id: kind === 'wrong-turn' ? 'other-turn' : 'expected-turn', status: 'inProgress', items: [
+      { type: 'userMessage', clientId }, ...(kind === 'duplicate-input' ? [{ type: 'userMessage', clientId }] : []),
+    ] }], nextCursor: null }) });
+    await f.client.connect();
+    await expect(f.client.findSteerReceipt(threadId, clientId, 'expected-turn')).rejects.toMatchObject({ uncertain: true,
+      code: kind === 'wrong-turn' ? 'steer-receipt-turn-mismatch' : 'steer-receipt-duplicate' });
+  });
+
+  it('finds an older exact receipt and leaves an absent receipt not_found without queue fallback', async () => {
+    const clientId = randomUUID(); let present = false;
+    const f = await fixture({ 'thread/turns/list': request => request.params.cursor
+      ? { data: present ? [{ id: 'expected-turn', status: 'inProgress', items: [{ type: 'userMessage', clientId }] }] : [], nextCursor: null }
+      : { data: [], nextCursor: 'older' } });
+    await f.client.connect(); const before = f.calls.length;
+    expect(await f.client.findSteerReceipt(threadId, clientId, 'expected-turn')).toEqual({ state: 'not_found' });
+    present = true;
+    expect(await f.client.findSteerReceipt(threadId, clientId, 'expected-turn')).toMatchObject({ state: 'running', turnId: 'expected-turn' });
+    expect(f.calls.slice(before).every(call => call.method === 'thread/turns/list')).toBe(true);
   });
 });

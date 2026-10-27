@@ -47,6 +47,7 @@ async function makeChannel(
     postMessage?: () => Promise<Response>;
     api?: (method: string, body: Record<string, unknown>) => Response | undefined | Promise<Response | undefined>;
     knownEndpoints?: Endpoint[];
+    progressStore?: Pick<Store, 'getMeta' | 'setMeta'>;
   } = {},
 ) {
   const socket = new FakeSocket();
@@ -113,6 +114,7 @@ async function makeChannel(
     {
       fetch: fetcher,
       knownEndpoints: options.knownEndpoints,
+      progressStore: options.progressStore,
       socket: () => {
         queueMicrotask(() => socket.emit('open'));
         return socket as unknown as WebSocket;
@@ -172,6 +174,151 @@ function delivery(accountId = 'TEXAMPLE:UBOT'): Delivery {
     updatedAt: '2026-10-18T20:00:00Z',
   };
 }
+
+function progressFixture() {
+  const origin = delivery().origin;
+  origin.endpointId = endpointId('slack', origin.accountId, origin.chatId, origin.threadId);
+  const endpoint: Endpoint = { id: origin.endpointId, platform: 'slack', accountId: origin.accountId,
+    chatId: origin.chatId, threadId: origin.threadId, title: 'Тестовый тред', subtitle: 'Slack', people: [], updatedAt: '2026-10-27T00:00:00Z' };
+  const meta = new Map<string, string>();
+  const progressStore = { getMeta: (key: string) => meta.get(key), setMeta: (key: string, value: string) => { meta.set(key, value); } };
+  return { origin, endpoint, meta, progressStore };
+}
+
+describe('Slack native task progress', () => {
+  it('closes only an existing known progress message with generic content', async () => {
+    const fixture = progressFixture();
+    const { channel, calls } = await makeChannel({ knownEndpoints: [fixture.endpoint], progressStore: fixture.progressStore,
+      api: (method, body) => method === 'chat.update' ? Response.json({ ok: true, channel: body.channel, ts: body.ts }) : undefined });
+    await channel.updateProgress('unknown-card', fixture.origin, { terminal: 'failed', existingOnly: true });
+    expect(fixture.meta.size).toBe(0);
+    expect(calls.some(call => /\/chat\.(postMessage|update)$/u.test(call.url))).toBe(false);
+    await channel.updateProgress('known-card', fixture.origin, { commentary: 'Собственный публичный комментарий',
+      plan: [{ step: 'Собственный шаг', status: 'in_progress' }] });
+    await channel.updateProgress('known-card', fixture.origin, { terminal: 'failed', existingOnly: true });
+    expect(calls.filter(call => call.url.endsWith('/chat.postMessage'))).toHaveLength(1);
+    const updates = calls.filter(call => call.url.endsWith('/chat.update'));
+    expect(updates).toHaveLength(1);
+    expect(JSON.parse(String(updates[0].init!.body))).toMatchObject({ ts: '1000.2000', text: 'Ошибка выполнения',
+      blocks: [{ type: 'task_card', task_id: 'known-card:progress', title: 'Ошибка выполнения', status: 'error' }] });
+  });
+
+  it('posts once, updates native grouped tasks and keeps quoted mentions inert', async () => {
+    const fixture = progressFixture();
+    let sawPostIntent = false;
+    const { channel, calls, socket, message } = await makeChannel({ knownEndpoints: [fixture.endpoint], progressStore: fixture.progressStore,
+      api: (method, body) => {
+        if (method === 'chat.postMessage') sawPostIntent = [...fixture.meta.values()].some(value => JSON.parse(value).state === 'posting');
+        if (method === 'chat.update') return Response.json({ ok: true, channel: body.channel, ts: body.ts });
+      } });
+    const progress = { commentary: 'Проверяю <@UPEER> & <!channel>', plan: [
+      { step: 'Прочитать данные', status: 'completed' as const },
+      { step: 'Проверить результат', status: 'in_progress' as const },
+      { step: 'Подготовить ответ', status: 'pending' as const },
+    ] };
+    await channel.updateProgress('progress-request', fixture.origin, progress);
+    await channel.updateProgress('progress-request', fixture.origin, progress);
+    await channel.updateProgress('progress-request', fixture.origin, { ...progress, terminal: 'failed' });
+    // A late non-terminal event must not undo the terminal state.
+    await channel.updateProgress('progress-request', fixture.origin, { commentary: 'Поздний комментарий' });
+    expect(sawPostIntent).toBe(true);
+    const posts = calls.filter(call => call.url.endsWith('/chat.postMessage'));
+    const updates = calls.filter(call => call.url.endsWith('/chat.update'));
+    expect(posts).toHaveLength(1);
+    expect(updates).toHaveLength(1);
+    const post = JSON.parse(String(posts[0].init!.body));
+    expect(post).toMatchObject({ channel: fixture.origin.chatId, thread_ts: fixture.origin.threadId,
+      mrkdwn: false, parse: 'none', link_names: false, unfurl_links: false, unfurl_media: false });
+    expect(post.text).toBe('Проверяю &lt;@UPEER&gt; &amp; &lt;!channel&gt;');
+    expect(post.blocks).toEqual([
+      { type: 'task_card', task_id: 'progress-request:progress', title: 'Выполняется', status: 'in_progress',
+        details: { type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: progress.commentary }] }] } },
+      { type: 'plan', title: 'План работы', tasks: [
+        { task_id: 'progress-request:step:0', title: 'Прочитать данные', status: 'complete' },
+        { task_id: 'progress-request:step:1', title: 'Проверить результат', status: 'in_progress' },
+        { task_id: 'progress-request:step:2', title: 'Подготовить ответ', status: 'pending' },
+      ] },
+    ]);
+    const update = JSON.parse(String(updates[0].init!.body));
+    expect(update.thread_ts).toBeUndefined();
+    expect(update).toMatchObject({ channel: fixture.origin.chatId, ts: '1000.2000' });
+    expect(update.blocks[0]).toMatchObject({ status: 'error', title: 'Ошибка выполнения' });
+    expect(update.blocks[1].tasks.map((task: { status: string }) => task.status)).toEqual(['complete', 'error', 'pending']);
+    socket.receive(envelope('own-progress', 'message', { user: 'UBOT', bot_id: 'BSELF', text: post.text, blocks: post.blocks }));
+    await vi.waitFor(() => expect(message).toHaveBeenCalledOnce());
+    expect(vi.mocked(message).mock.calls[0][0].contextOnly).toBe(true);
+  });
+
+  it('recovers the known message receipt after restart and retries an update without reposting', async () => {
+    const fixture = progressFixture();
+    const first = await makeChannel({ knownEndpoints: [fixture.endpoint], progressStore: fixture.progressStore });
+    await first.channel.updateProgress('restart-progress', fixture.origin, { commentary: 'Начато' });
+    await first.channel.stop();
+    let attempts = 0;
+    const restarted = await makeChannel({ knownEndpoints: [fixture.endpoint], progressStore: fixture.progressStore,
+      api: (method, body) => {
+        if (method !== 'chat.update') return;
+        if (++attempts === 1) throw new Error('synthetic lost update ACK');
+        return Response.json({ ok: true, channel: body.channel, ts: body.ts });
+      } });
+    await expect(restarted.channel.updateProgress('restart-progress', fixture.origin, { commentary: 'Готово', terminal: 'completed' })).rejects.toThrow('Соединение со Slack прервано.');
+    await restarted.channel.updateProgress('restart-progress', fixture.origin, { commentary: 'Готово', terminal: 'completed' });
+    expect(restarted.calls.filter(call => call.url.endsWith('/chat.postMessage'))).toHaveLength(0);
+    expect(restarted.calls.filter(call => call.url.endsWith('/chat.update'))).toHaveLength(2);
+    expect(JSON.parse([...fixture.meta.values()][0])).toMatchObject({ state: 'posted', ts: '1000.2000', terminal: 'completed' });
+  });
+
+  it.each(['lost-ack', 'invalid-receipt', 'interrupted-post'] as const)('does not repost after %s, including after restart', async failure => {
+    const fixture = progressFixture();
+    const options = { knownEndpoints: [fixture.endpoint], progressStore: fixture.progressStore };
+    let release: (() => void) | undefined;
+    const first = await makeChannel({ ...options, api: async method => {
+      if (method !== 'chat.postMessage') return;
+      if (failure === 'interrupted-post') await new Promise<void>(resolve => { release = resolve; });
+      if (failure === 'invalid-receipt') return Response.json({ ok: true, channel: 'COTHER', ts: '1000.2000' });
+      throw new Error('synthetic lost post ACK');
+    } });
+    const write = first.channel.updateProgress('uncertain-progress', fixture.origin, { commentary: 'Работаю' });
+    if (failure === 'interrupted-post') await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    else await write;
+    const restarted = await makeChannel(options);
+    await restarted.channel.updateProgress('uncertain-progress', fixture.origin, { commentary: 'Новый комментарий', terminal: 'completed' });
+    expect(restarted.calls.some(call => /\/chat\.(postMessage|update)$/u.test(call.url))).toBe(false);
+    release?.();
+    await write;
+    expect(first.calls.filter(call => call.url.endsWith('/chat.postMessage'))).toHaveLength(1);
+  });
+
+  it('serializes concurrent progress calls and refuses a changed or unknown source', async () => {
+    const fixture = progressFixture();
+    const { channel, calls } = await makeChannel({ knownEndpoints: [fixture.endpoint], progressStore: fixture.progressStore,
+      api: (method, body) => method === 'chat.update' ? Response.json({ ok: true, channel: body.channel, ts: body.ts }) : undefined });
+    await Promise.all([
+      channel.updateProgress('concurrent-progress', fixture.origin, { commentary: 'Один' }),
+      channel.updateProgress('concurrent-progress', fixture.origin, { commentary: 'Два' }),
+    ]);
+    const changed = { ...fixture.origin, chatId: 'COTHER' };
+    changed.endpointId = endpointId('slack', changed.accountId, changed.chatId, changed.threadId);
+    await channel.updateProgress('concurrent-progress', changed, { commentary: 'Другой адрес' });
+    await channel.updateProgress('other-account', { ...fixture.origin, accountId: 'TOTHER:UBOT' }, { commentary: 'Другой бот' });
+    await channel.updateProgress('invalid-source', { ...fixture.origin, endpointId: 'incorrect' }, { commentary: 'Неверный ID' });
+    expect(calls.filter(call => call.url.endsWith('/chat.postMessage'))).toHaveLength(1);
+    expect(calls.filter(call => call.url.endsWith('/chat.update'))).toHaveLength(1);
+    const changedChannel = await makeChannel({ knownEndpoints: [{ ...fixture.endpoint, id: changed.endpointId, chatId: changed.chatId }], progressStore: fixture.progressStore });
+    await changedChannel.channel.updateProgress('concurrent-progress', changed, { commentary: 'Тот же запрос в другом источнике' });
+    expect(changedChannel.calls.some(call => /\/chat\.(postMessage|update)$/u.test(call.url))).toBe(false);
+  });
+
+  it('does not send progress without durable storage or with an oversized plan', async () => {
+    const fixture = progressFixture();
+    const noStore = await makeChannel({ knownEndpoints: [fixture.endpoint] });
+    await noStore.channel.updateProgress('no-store', fixture.origin, { commentary: 'Не отправлять' });
+    expect(noStore.calls.some(call => call.url.endsWith('/chat.postMessage'))).toBe(false);
+    const durable = await makeChannel({ knownEndpoints: [fixture.endpoint], progressStore: fixture.progressStore });
+    await durable.channel.updateProgress('too-many', fixture.origin, { plan: Array.from({ length: 51 }, () => ({ step: 'Шаг', status: 'pending' })) });
+    expect(durable.calls.some(call => call.url.endsWith('/chat.postMessage'))).toBe(false);
+  });
+});
 
 describe('Slack Socket Mode durability and identity', () => {
   it('ACKs only after the durable message callback completes', async () => {

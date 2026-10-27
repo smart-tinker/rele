@@ -727,3 +727,132 @@ describe('shared conversation Slack backlog ordering', () => {
     expect(store.listPendingSlackSyncEntries(other.id)).toHaveLength(1);
   });
 });
+
+describe('durable addressed steering inputs', () => {
+  function running(path?: string) {
+    const store = open(path), ep = endpoint({ accountId: 'T1:UAGENT', chatId: 'C1', people: [{ id: 'U1', name: 'Owner', isBot: false }] });
+    const conv = conversation(store, ep); store.setSourceAccess(ep.id, { mode: 'all' });
+    const parent = store.ingest(message(ep, 'parent', { sender: ep.people[0], messageId: '1770000001.000001' })).request!;
+    store.claimNextRequest(conv.id, parent.id); store.updateRequest(parent.id, { status: 'running', turnId: 'native-turn' });
+    return { store, ep, conv, parent };
+  }
+  function addon(store: Store, ep: Endpoint, sender = { id: 'U2', name: 'Another participant', isBot: false }) {
+    return store.ingest(message(ep, 'addon', { sender, messageId: '1770000002.000001', text: 'New direction' })).request!;
+  }
+
+  it.each([false, true])('attaches any authorized same-source author without transferring ownership (bot=%s)', isBot => {
+    const { store, ep, conv, parent } = running(), child = addon(store, ep, { id: isBot ? 'UBOT2' : 'U2', name: 'Participant', isBot });
+    const originalOrigin = child.origin;
+    const input = store.beginSteeringInput(parent.id, { id: child.id, requestId: child.id, text: 'Attributed input' });
+    expect(input).toMatchObject({ id: child.id, parentRequestId: parent.id, turnId: 'native-turn', state: 'sending', requestId: child.id });
+    expect(store.getRequest(child.id)).toMatchObject({ status: 'uncertain', turnId: 'native-turn', steeredInto: parent.id, origin: originalOrigin });
+    expect(store.getRequest(parent.id)?.origin).toEqual(parent.origin);
+    expect(store.listPendingRequests()).toEqual([]);
+    expect(store.beginSteeringInput(parent.id, { id: child.id, requestId: child.id, text: input.text })).toEqual(input);
+    expect(store.steeringInputs(parent.id)).toEqual([input]);
+    store.updateRequest(parent.id, { status: 'completed' });
+    expect(store.claimNextRequest(conv.id, child.id)).toBeUndefined();
+    const third = store.ingest(message(ep, 'next', { sender: ep.people[0] })).request!;
+    expect(store.claimNextRequest(conv.id)?.id).toBe(third.id);
+  });
+
+  it('commits applied receipts and their exact journal entry without creating a delivery', () => {
+    const path = join(directory(), 'steer.sqlite'), { store, ep, parent } = running(path), child = addon(store, ep);
+    const input = store.beginSteeringInput(parent.id, { id: child.id, requestId: child.id, text: 'Input with attribution' });
+    expect(store.getSlackSyncEntry(input.entryId!)?.state).toBe('applying');
+    store.finishSteeringInput(child.id, 'applied');
+    expect(store.getRequest(child.id)).toMatchObject({ status: 'completed', steeredInto: parent.id, turnId: 'native-turn', origin: child.origin });
+    expect(store.getSlackSyncEntry(input.entryId!)?.state).toBe('applied');
+    expect(store.listDeliveries()).toEqual([]);
+    store.close();
+    const restarted = open(path);
+    expect(restarted.getSteeringInput(child.id)).toMatchObject({ state: 'applied', text: input.text });
+    expect(restarted.getRequest(child.id)).toMatchObject({ status: 'completed', steeredInto: parent.id });
+    expect(restarted.finishSteeringInput(child.id, 'applied').state).toBe('applied');
+    expect(() => restarted.finishSteeringInput(child.id, 'refused')).toThrow(/final steering/);
+  });
+
+  it('returns an explicit refused input to the queue but preserves its non-replayable receipt', () => {
+    const { store, ep, parent } = running(), child = addon(store, ep);
+    const input = store.beginSteeringInput(parent.id, { id: child.id, requestId: child.id, text: 'Input' });
+    store.finishSteeringInput(child.id, 'refused');
+    expect(store.getRequest(child.id)).toMatchObject({ status: 'queued', origin: child.origin });
+    expect(store.getRequest(child.id)?.steeredInto).toBeUndefined();
+    expect(store.getRequest(child.id)?.turnId).toBeUndefined();
+    expect(store.getSlackSyncEntry(input.entryId!)?.state).toBe('pending');
+    expect(store.listPendingRequests().map(value => value.id)).toEqual([child.id]);
+    expect(store.beginSteeringInput(parent.id, { id: child.id, requestId: child.id, text: 'Input' }).state).toBe('refused');
+    expect(() => store.beginSteeringInput(parent.id, { id: child.id, requestId: child.id, text: 'Changed' })).toThrow(/different content/);
+  });
+
+  it('recovers interrupted intents as uncertain without passive or request replay', () => {
+    const path = join(directory(), 'lost-ack.sqlite'), { store, ep, conv, parent } = running(path), child = addon(store, ep);
+    const input = store.beginSteeringInput(parent.id, { id: child.id, requestId: child.id, text: 'Input' });
+    store.close(); const restarted = open(path); restarted.recoverInterrupted();
+    expect(restarted.getSteeringInput(child.id)).toMatchObject({ state: 'uncertain', parentRequestId: parent.id, turnId: 'native-turn' });
+    expect(restarted.getRequest(child.id)).toMatchObject({ status: 'uncertain', steeredInto: parent.id });
+    expect(restarted.getSlackSyncEntry(input.entryId!)?.state).toBe('uncertain');
+    expect(restarted.claimSlackSyncEntry(input.entryId!)).toBeUndefined();
+    expect(restarted.listPendingSlackSyncEntries(conv.id).some(value => value.id === input.entryId)).toBe(false);
+    expect(restarted.listPendingRequests()).toEqual([]);
+    restarted.finishSteeringInput(child.id, 'applied');
+    expect(restarted.getRequest(child.id)?.status).toBe('completed');
+    expect(restarted.listDeliveries()).toEqual([]);
+  });
+
+  it.each(['platform', 'account', 'chat', 'thread'])('refuses a different source even when linked to the same native conversation (%s)', field => {
+    const { store, ep, conv, parent } = running();
+    const other = { ...ep, id: 'another-source', ...(field === 'platform' ? { platform: 'telegram' as const, chatId: '-100' }
+      : field === 'account' ? { accountId: 'OTHER' } : field === 'chat' ? { chatId: 'C2' } : { threadId: 'another-thread' }) };
+    store.upsertEndpoint(other); store.addBinding(conv.id, other.platform, other.id, []); store.setSourceAccess(other.id, { mode: 'all' });
+    const child = addon(store, other, { id: field === 'platform' ? '42' : 'U2', name: 'Participant', isBot: false });
+    expect(child).toBeTruthy();
+    expect(() => store.beginSteeringInput(parent.id, { id: child.id, requestId: child.id, text: 'Input' })).toThrow(/same source/);
+    expect(store.getSteeringInput(child.id)).toBeUndefined();
+    expect(store.getRequest(child.id)?.status).toBe('queued');
+  });
+
+  it.each(['mixed', 'cancel', 'approval', 'paused', 'audio', 'source-off'])('fails closed before persisting an inadmissible intent (%s)', guard => {
+    const { store, ep, conv, parent } = running();
+    const child = guard === 'audio' ? store.ingest(message(ep, 'audio', { sender: ep.people[0], audio: { platform: 'slack', name: 'voice.ogg', fileId: 'F1' } })).request! : addon(store, ep);
+    if (guard === 'mixed') store.setMeta(`mixed:${parent.id}`, '1');
+    if (guard === 'cancel') store.setMeta(`cancel-requested:${parent.id}`, '1');
+    if (guard === 'approval') store.addApproval(approvalInput(parent.id));
+    if (guard === 'paused') store.updateConversation(conv.id, { paused: true });
+    if (guard === 'source-off') store.setSourceAccess(ep.id, { mode: 'off' });
+    expect(() => store.beginSteeringInput(parent.id, { id: child.id, requestId: child.id, text: 'Input' })).toThrow();
+    expect(store.getSteeringInput(child.id)).toBeUndefined();
+    expect(store.getRequest(child.id)?.status).toBe('queued');
+  });
+
+  it('applies only the immutable request revision and leaves later edits pending', () => {
+    const { store, ep, parent } = running();
+    const source = transcript(ep, '1770000002.000001', { sender: { id: 'U2', name: 'Participant' }, text: 'Original', payload: { text: 'Original', files: [{ id: 'F1' }] } });
+    const child = store.ingest(transcriptInbound(source, { endpoint: ep })).request!;
+    const original = store.listSlackSyncEntries(store.listSlackSyncStreams()[0].id).find(value => value.requestId === child.id)!;
+    const edit = store.recordSlackMessage({ ...source, kind: 'edit', text: 'Edited', payload: { text: 'Edited', edited: { ts: '1770000003.000001' } } })!;
+    store.updateSlackSyncEntry(edit.id, { requestId: child.id });
+    expect(() => store.beginSteeringInput(parent.id, { id: child.id, requestId: child.id, entryId: edit.id, text: 'Input' })).toThrow(/immutable request revision/);
+    const input = store.beginSteeringInput(parent.id, { id: child.id, requestId: child.id, text: 'Input' });
+    expect(input.entryId).toBe(original.id);
+    store.finishSteeringInput(child.id, 'applied');
+    expect(store.getSlackSyncEntry(original.id)?.state).toBe('applied');
+    expect(store.getSlackSyncEntry(edit.id)?.state).toBe('pending');
+  });
+
+  it('tracks passive same-source context without manufacturing a child request', () => {
+    const { store, ep, parent } = running();
+    const wrongPlatform = store.recordSlackMessage(transcript(ep, '1770000003.000001', { platform: 'telegram' }))!;
+    expect(() => store.beginSteeringInput(parent.id, { id: wrongPlatform.id, entryId: wrongPlatform.id, text: 'Wrong platform' })).toThrow(/same source/);
+    const entry = store.recordSlackMessage(transcript(ep, '1770000002.000001', { sender: { id: 'UBOT2', name: 'Another agent', isBot: true } }))!;
+    const input = store.beginSteeringInput(parent.id, { id: entry.id, entryId: entry.id, text: 'Attributed passive context' });
+    expect(input.requestId).toBeUndefined();
+    expect(store.getSlackSyncEntry(entry.id)?.state).toBe('applying');
+    store.finishSteeringInput(input.id, 'uncertain', 'Unknown native ACK');
+    expect(store.claimSlackSyncEntry(entry.id)).toBeUndefined();
+    store.finishSteeringInput(input.id, 'applied');
+    expect(store.getSlackSyncEntry(entry.id)?.state).toBe('applied');
+    expect(store.listRequests()).toHaveLength(1);
+    expect(store.listDeliveries()).toEqual([]);
+  });
+});

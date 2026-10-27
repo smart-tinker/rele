@@ -13,7 +13,7 @@ const timestampKey = (value: string) => {
 const currentTimestamp = () => `${Math.floor(Date.now() / 1000)}.${String(Date.now() % 1000).padStart(3, '0')}000`;
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : 'Не удалось синхронизировать контекст Slack.';
 
-function quotedEntry(entry: SlackSyncEntry): string {
+export function quotedEntry(entry: SlackSyncEntry): string {
   const data = JSON.stringify({ releEntryId: entry.id, ...entry.message }, null, 2).replaceAll('<', '\\u003c').replaceAll('>', '\\u003e');
   const platform = entry.message.platform ?? 'slack';
   // Pending legacy entries must retain their exact native receipt text after upgrade.

@@ -76,6 +76,14 @@ export class CodexRpcError extends Error {
   constructor(readonly code: number, message: string) { super(message); this.name = 'CodexRpcError'; }
 }
 
+/** Only an explicit native NotSubmitted response permits using the normal queue instead. */
+export class CodexSteerRefusedError extends Error {
+  constructor(readonly reason: 'no_active_turn' | 'turn_mismatch') {
+    super(reason === 'no_active_turn' ? 'Codex не применил дополнение: активного хода нет.' : 'Codex не применил дополнение: активный ход изменился.');
+    this.name = 'CodexSteerRefusedError';
+  }
+}
+
 const busyMessages = {
   foreign_writer: 'Разговор удерживает другой Codex. Desktop может сохранять право записи даже без выполняющейся задачи. Ожидается освобождение этого же разговора.',
   queued_input: 'В очереди Codex уже есть сообщения. Ожидается освобождение очереди этого разговора.',
@@ -395,6 +403,34 @@ export class CodexClient extends EventEmitter {
     return { queuedSubmissionId: response.queuedSubmission.id };
   }
 
+  /** The caller persists its input intent and proves ownership before this single mutation. */
+  async steer(threadId: string, text: string, clientUserMessageId: string, expectedTurnId: string): Promise<{ turnId: string }> {
+    if (!threadId.trim() || !text.trim() || !expectedTurnId.trim()) throw new Error('Дополнению нужны разговор, текст и исходный активный ход.');
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(clientUserMessageId)) {
+      throw new Error('Дополнению нужен постоянный UUID для сверки после обрыва связи.');
+    }
+    this.requireQueue();
+    const runtime = this.runtime;
+    try {
+      // expectedTurnId is native's atomic admission fence. Never substitute turn/start or retry.
+      const response = await this.call<{ turnId: string }>('turn/steer', {
+        threadId, input: [{ type: 'text', text }], clientUserMessageId, expectedTurnId,
+      });
+      if (runtime !== this.runtime || !this.state.connected || response?.turnId !== expectedTurnId) {
+        throw new CodexTransportError('Codex не подтвердил применение дополнения к исходному ходу. Требуется сверка без повтора.', 'steer-unconfirmed');
+      }
+      return { turnId: response.turnId };
+    } catch (error) {
+      if (error instanceof CodexRpcError && error.code === -32600) {
+        if (error.message === 'no active turn to steer') throw new CodexSteerRefusedError('no_active_turn');
+        const mismatch = /^expected active turn id `([^`\r\n]+)` but found `([^`\r\n]+)`$/u.exec(error.message);
+        if (mismatch?.[1] === expectedTurnId && mismatch[2] !== expectedTurnId) throw new CodexSteerRefusedError('turn_mismatch');
+      }
+      if (error instanceof CodexTransportError) throw error;
+      throw new CodexTransportError('Результат применения дополнения неизвестен. Требуется сверка без повтора.', 'steer-unconfirmed');
+    }
+  }
+
   /** Continue only the selected submission; native admission never steers an active turn. */
   async startQueued(threadId: string, queuedSubmissionId: string): Promise<{ turn: HistoryTurn }> {
     if (!queuedSubmissionId?.trim()) throw new Error('Укажите подтверждённый элемент очереди Codex.');
@@ -446,7 +482,8 @@ export class CodexClient extends EventEmitter {
   }
 
   /** A not_found result is evidence for operator review, not permission to resend queue/add. */
-  async findRequest(threadId: string, clientId: string): Promise<RequestLocation> {
+  async findRequest(threadId: string, clientId: string, ownInputIds: readonly string[] = []): Promise<RequestLocation> {
+    const known = this.knownInputIds(clientId, ownInputIds);
     const queue = await this.pages<QueueEntry>('thread/queue/list', { threadId, limit: 100 });
     const queued = queue.filter(entry => entry.clientUserMessageId === clientId);
     if (queued.length > 1) throw new Error('В очереди Codex несколько запросов с одним clientId; требуется ручная сверка.');
@@ -460,27 +497,63 @@ export class CodexClient extends EventEmitter {
       if (matches.length > 1) throw new Error('В истории Codex несколько ходов с одним clientId; требуется ручная сверка.');
       if (matches.length) {
         const turn = matches[0];
-        const mixed = turn.items.some(item => item.type === 'userMessage' && item.clientId !== clientId);
-        const state = turn.status === 'inProgress' ? 'running' : turn.status;
-        if (!['running', 'completed', 'failed', 'interrupted'].includes(state)) throw new Error('Неизвестное состояние хода Codex.');
-        // Native history can normalize a live snapshot to interrupted without a terminal event.
-        if (state === 'interrupted' && (typeof turn.completedAt !== 'number' || !Number.isFinite(turn.completedAt))) {
-          throw new CodexTransportError('Codex пока не подтвердил прерывание запроса. Ожидается сверка завершения без повторной отправки.', 'turn-interruption-unconfirmed');
-        }
-        const answers = turn.items.filter(item => item.type === 'agentMessage' && item.phase === 'final_answer');
-        const legacy = turn.items.filter(item => item.type === 'agentMessage' && item.phase == null);
-        return {
-          state: state as RequestLocation['state'], turnId: turn.id,
-          ...(mixed ? { mixed: true } : {
-            text: answers.length ? answers.map(item => item.text || '').join('\n\n') : legacy.at(-1)?.text,
-            ...(state === 'failed' && turn.error?.codexErrorInfo === 'serverOverloaded' ? { failureReason: 'serverOverloaded' as const } : {}),
-            ...(turn.items.some(item => codexCommandItem(item)) ? { commandItems: turn.items.flatMap(item => { const command = codexCommandItem(item); return command ? [command] : []; }) } : {}),
-          }),
-        };
+        return this.historyLocation(turn, known);
       }
       cursor = nextPage(page.nextCursor, seen);
     } while (cursor);
     return queued.length ? { state: 'queued', queuedSubmissionId: queued[0].id, soleQueuedSubmission: queue.length === 1 } : { state: 'not_found' };
+  }
+
+  /** An absent receipt is uncertain, never permission to replay a steer or enqueue its text. */
+  async findSteerReceipt(threadId: string, clientId: string, expectedTurnId: string, ownInputIds: readonly string[] = []): Promise<RequestLocation> {
+    if (!expectedTurnId.trim()) throw new Error('Сверке дополнения нужен исходный активный ход.');
+    const known = this.knownInputIds(clientId, ownInputIds);
+    let cursor: string | undefined;
+    const seen = new Set<string>();
+    do {
+      const page = await this.call<Page<HistoryTurn>>('thread/turns/list', {
+        threadId, limit: 50, itemsView: 'full', sortDirection: 'desc', ...(cursor ? { cursor } : {}),
+      });
+      const matches = page.data.filter(turn => turn.items.some(item => item.type === 'userMessage' && item.clientId === clientId));
+      if (matches.length) {
+        if (matches.length !== 1 || matches[0].items.filter(item => item.type === 'userMessage' && item.clientId === clientId).length !== 1) {
+          throw new CodexTransportError('В истории Codex несколько записей дополнения. Требуется сверка без повтора.', 'steer-receipt-duplicate');
+        }
+        if (matches[0].id !== expectedTurnId) {
+          throw new CodexTransportError('Дополнение найдено в другом ходе Codex. Требуется сверка без повтора.', 'steer-receipt-turn-mismatch');
+        }
+        return this.historyLocation(matches[0], known);
+      }
+      cursor = nextPage(page.nextCursor, seen);
+    } while (cursor);
+    return { state: 'not_found' };
+  }
+
+  private knownInputIds(clientId: string, ownInputIds: readonly string[]): Set<string> {
+    if (!clientId.trim() || !Array.isArray(ownInputIds) || ownInputIds.some(id => typeof id !== 'string' || !id.trim())) {
+      throw new Error('Сверке Codex нужны точные идентификаторы собственных входящих сообщений.');
+    }
+    return new Set([clientId, ...ownInputIds]);
+  }
+
+  private historyLocation(turn: HistoryTurn, known: Set<string>): RequestLocation {
+    const mixed = turn.items.some(item => item.type === 'userMessage' && (typeof item.clientId !== 'string' || !known.has(item.clientId)));
+    const state = turn.status === 'inProgress' ? 'running' : turn.status;
+    if (!['running', 'completed', 'failed', 'interrupted'].includes(state)) throw new Error('Неизвестное состояние хода Codex.');
+    // Native history can normalize a live snapshot to interrupted without a terminal event.
+    if (state === 'interrupted' && (typeof turn.completedAt !== 'number' || !Number.isFinite(turn.completedAt))) {
+      throw new CodexTransportError('Codex пока не подтвердил прерывание запроса. Ожидается сверка завершения без повторной отправки.', 'turn-interruption-unconfirmed');
+    }
+    const answers = turn.items.filter(item => item.type === 'agentMessage' && item.phase === 'final_answer');
+    const legacy = turn.items.filter(item => item.type === 'agentMessage' && item.phase == null);
+    return {
+      state: state as RequestLocation['state'], turnId: turn.id,
+      ...(mixed ? { mixed: true } : {
+        text: answers.length ? answers.map(item => item.text || '').join('\n\n') : legacy.at(-1)?.text,
+        ...(state === 'failed' && turn.error?.codexErrorInfo === 'serverOverloaded' ? { failureReason: 'serverOverloaded' as const } : {}),
+        ...(turn.items.some(item => codexCommandItem(item)) ? { commandItems: turn.items.flatMap(item => { const command = codexCommandItem(item); return command ? [command] : []; }) } : {}),
+      }),
+    };
   }
 
   async diagnostics(): Promise<{ process: { id: number }; gauges: unknown[] }> {

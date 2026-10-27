@@ -460,6 +460,13 @@ export function createApp(services: AppServices) {
       ...(page.length > limit ? { nextOffset: offset + limit } : {}),
     };
   });
+  app.post<{ Params: { id: string } }>('/api/conversations/:id/initial-message', async request => {
+    if (request.body !== undefined) fields(object(request.body), []);
+    const id = string(request.params.id, 'разговор', 200);
+    if (!store.getConversation(id)) throw new ApiError(404, 'Разговор не найден.');
+    if (configuring) throw new ApiError(409, 'Настройки подключения сохраняются.');
+    return engine.sendInitialMessage(id);
+  });
   app.patch<{ Params: { id: string } }>('/api/conversations/:id', async request => {
     const input = object(request.body); fields(input, ['name', 'paused']);
     if (!store.getConversation(request.params.id)) throw new ApiError(404, 'Связка не найдена.');

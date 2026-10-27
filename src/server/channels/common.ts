@@ -4,6 +4,13 @@ import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionSta
 
 export type SlackSessionStatus = 'processing' | 'active' | 'suspended';
 
+export interface RequestProgress {
+  existingOnly?: boolean;
+  commentary?: string;
+  plan?: { step: string; status: 'pending' | 'in_progress' | 'completed' }[];
+  terminal?: 'completed' | 'failed' | 'interrupted' | 'cancelled';
+}
+
 export interface ApprovalAction {
   approvalId: string;
   decision: 'accept' | 'decline';
@@ -35,6 +42,7 @@ export interface Channel {
   listPeople?(chatId: string, cursor?: string): Promise<CatalogPage<Person>>;
   discoveryInfo?(): { botUrl?: string; command: string };
   setThreadStatus?(origin: Origin, status: SlackSessionStatus): Promise<void>;
+  updateProgress?(requestId: string, origin: Origin, progress: RequestProgress): Promise<void>;
   readThreadPage?(target: Pick<Origin, 'endpointId' | 'accountId' | 'chatId' | 'threadId'>, options?: { cursor?: string; oldest?: string; latest?: string }): Promise<{ messages: SlackTranscriptMessage[]; nextCursor?: string }>;
 }
 
