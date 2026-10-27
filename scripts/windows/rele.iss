@@ -61,7 +61,16 @@ Name: "desktop"; Description: "{cm:IntegrateDesktop}"
 
 [Files]
 Source: "{#StageDir}\Rele.exe"; Flags: dontcopy
-Source: "{#StageDir}\*"; DestDir: "{app}"; Excludes: "start-codex.cmd,start-codex.sh,start-rele.cmd,start-rele.sh,install-autostart.cmd,install-user-service.sh,scripts\install-autostart.mjs,scripts\install-user-service.mjs"; Flags: ignoreversion recursesubdirs createallsubdirs
+; The maintenance closure lives only in Inno's automatically removed {tmp}.
+Source: "{#StageDir}\runtime\node.exe"; DestName: "rele-maintenance-node.exe"; Flags: dontcopy
+Source: "{#StageDir}\dist\server\maintenance.js"; Flags: dontcopy
+Source: "{#StageDir}\dist\server\config.js"; Flags: dontcopy
+Source: "{#StageDir}\dist\server\lifecycle.js"; Flags: dontcopy
+Source: "{#StageDir}\package.json"; Flags: dontcopy
+Source: "{#StageDir}\manifest.json"; Flags: dontcopy
+; Node is first: a late runtime lock cannot leave a partially replaced app tree.
+Source: "{#StageDir}\runtime\node.exe"; DestDir: "{app}\runtime"; Flags: ignoreversion; Check: RuntimeNeedsCopy; BeforeInstall: CheckRuntimeCanReplace
+Source: "{#StageDir}\*"; DestDir: "{app}"; Excludes: "runtime\node.exe,start-codex.cmd,start-codex.sh,start-rele.cmd,start-rele.sh,install-autostart.cmd,install-user-service.sh,scripts\install-autostart.mjs,scripts\install-user-service.mjs"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{cm:OpenRele}"; Filename: "{app}\Rele.exe"; Parameters: "open"; WorkingDir: "{app}"
@@ -141,6 +150,26 @@ begin
   Log(Result);
 end;
 
+function RuntimeNeedsCopy: Boolean;
+var
+  Candidate, Current: String;
+begin
+  Candidate := ExpandConstant('{tmp}\rele-maintenance-node.exe');
+  if not FileExists(Candidate) then ExtractTemporaryFile('rele-maintenance-node.exe');
+  Current := ExpandConstant('{app}\runtime\node.exe');
+  if not FileExists(Current) then Result := True
+  else Result := GetSHA256OfFile(Current) <> GetSHA256OfFile(Candidate);
+end;
+
+procedure CheckRuntimeCanReplace;
+var
+  ErrorText: String;
+begin
+  ErrorText := RunLauncher(ExpandConstant('{tmp}\Rele.exe'), 'check-runtime' + SettingsArguments +
+    ' --maintenance-dir ' + Quoted(ExpandConstant('{tmp}')));
+  if ErrorText <> '' then RaiseException(ErrorText);
+end;
+
 function ExplicitTaskSelection: Boolean;
 var
   I: Integer;
@@ -194,7 +223,13 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   HadRuntime := FileExists(ExpandConstant('{app}\dist\server\main.js'));
   ExtractTemporaryFile('Rele.exe');
-  Result := RunLauncher(ExpandConstant('{tmp}\Rele.exe'), 'prepare-update' + SettingsArguments);
+  ExtractTemporaryFile('rele-maintenance-node.exe');
+  ExtractTemporaryFile('maintenance.js');
+  ExtractTemporaryFile('config.js');
+  ExtractTemporaryFile('lifecycle.js');
+  ExtractTemporaryFile('package.json');
+  ExtractTemporaryFile('manifest.json');
+  Result := RunLauncher(ExpandConstant('{tmp}\Rele.exe'), 'prepare-update' + SettingsArguments + ' --maintenance-dir ' + Quoted(ExpandConstant('{tmp}')));
   Prepared := Result = '';
 end;
 
