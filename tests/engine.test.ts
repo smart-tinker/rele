@@ -304,11 +304,28 @@ describe('Engine public Slack progress', () => {
     f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1', item: { id: 'comment', type: 'agentMessage', phase: 'commentary', text: 'Access checked, reading results.' } } });
     f.codex.notification({ method: 'turn/plan/updated', params: { threadId: THREAD, turnId: 'turn-1', plan } });
     await f.engine.settled(); await f.engine.pump();
-    expect(f.slack.updateProgress).toHaveBeenCalledExactlyOnceWith(root.id, root.origin, { commentary: 'Access checked, reading results.', plan });
+    expect(f.slack.updateProgress).toHaveBeenCalledExactlyOnceWith(root.id, root.origin, { steps: [{ id: 'turn-1:comment', text: 'Access checked, reading results.' }], commentary: 'Access checked, reading results.', plan });
     expect(f.telegram.updateProgress).not.toHaveBeenCalled();
     f.codex.complete(root.id, 'NOREPLY'); await f.engine.settled(); await f.engine.pump();
-    expect(f.slack.updateProgress.mock.calls.at(-1)?.[2]).toEqual({ commentary: 'Access checked, reading results.', plan, terminal: 'completed' });
+    expect(f.slack.updateProgress.mock.calls.at(-1)?.[2]).toEqual({ steps: [{ id: 'turn-1:comment', text: 'Access checked, reading results.' }], commentary: 'Access checked, reading results.', plan, terminal: 'completed' });
     expect(f.store.listDeliveries().some(row => row.kind === 'answer')).toBe(false);
+  });
+
+  it('keeps the complete ordered commentary across duplicate events and history recovery', async () => {
+    const f = fixture(); const root = await acceptRequest(f); await running(f, root);
+    const first = { id: 'turn-1:one', text: 'First recovered step' };
+    const second = { id: 'turn-1:two', text: 'Long public commentary '.repeat(200) };
+    const event = { method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1',
+      item: { id: 'two', type: 'agentMessage', phase: 'commentary', text: second.text } } };
+    f.codex.notification(event); f.codex.notification(event); await f.engine.settled();
+    expect(JSON.parse(f.store.getMeta(`request-progress:${root.id}`)!).steps).toEqual([second]);
+    f.codex.locations.set(root.id, { state: 'running', turnId: 'turn-1', commentary: [first, second] });
+    await f.engine.reconcile(root.id); await f.engine.pump();
+    expect(f.slack.updateProgress.mock.calls.at(-1)?.[2]).toMatchObject({ steps: [first, second], commentary: second.text });
+    await f.engine.reconcile(root.id);
+    expect(JSON.parse(f.store.getMeta(`request-progress:${root.id}`)!).steps).toEqual([first, second]);
+    f.codex.complete(root.id, 'Done'); await f.engine.settled(); await f.engine.pump();
+    expect(f.slack.updateProgress.mock.calls.at(-1)?.[2]).toMatchObject({ steps: [first, second], terminal: 'completed' });
   });
 
   it('does not forward Desktop or mixed progress and does not fail the answer when Slack progress is unavailable', async () => {

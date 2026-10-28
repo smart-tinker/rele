@@ -701,11 +701,11 @@ describe('Codex shared-runtime adapter', () => {
     f.handlers['thread/turns/list'] = message => message.params.cursor
       ? { data: [{ id: 'completed-turn', status: 'completed', items: [
         { type: 'userMessage', clientId },
-        { type: 'agentMessage', phase: 'commentary', text: 'Работаю' },
+        { id: 'comment-1', type: 'agentMessage', phase: 'commentary', text: 'Работаю' },
         { type: 'agentMessage', phase: 'final_answer', text: 'Готовый ответ' },
       ] }], nextCursor: null }
       : { data: [], nextCursor: 'older' };
-    expect(await f.client.findRequest(threadId, clientId)).toEqual({ state: 'completed', turnId: 'completed-turn', text: 'Готовый ответ' });
+    expect(await f.client.findRequest(threadId, clientId)).toEqual({ state: 'completed', turnId: 'completed-turn', text: 'Готовый ответ', commentary: [{ id: 'completed-turn:comment-1', text: 'Работаю' }] });
     expect(f.calls.some(call => call.method === 'thread/queue/add')).toBe(false);
   });
 
@@ -1370,11 +1370,14 @@ describe('Overload continuation protocol', () => {
   });
 
   it.each(['desktop', 'rele', 'page-boundary'])('finds an empty %s continuation from the original client ID', async kind => {
-    const continued = { ...retry, rootTurnId: kind === 'desktop' ? retry.id : failed.id };
+    const comment = (id: string) => ({ id, type: 'agentMessage', phase: 'commentary', text: id });
+    const original = { ...failed, items: [...failed.items, comment('before')] };
+    const continued = { ...retry, rootTurnId: kind === 'desktop' ? retry.id : failed.id, items: [comment('after'), ...retry.items] };
     const f = await fixture({ 'thread/turns/list': message => kind === 'page-boundary' && !message.params?.cursor
-      ? { data: [continued], nextCursor: 'older' } : page(kind === 'page-boundary' ? [failed] : [continued, failed]) });
+      ? { data: [continued], nextCursor: 'older' } : page(kind === 'page-boundary' ? [original] : [continued, original]) });
     await f.client.connect();
-    expect(await f.client.findRequest(threadId, clientId, [], true)).toMatchObject({ state: 'completed', turnId: retry.id, text: 'Recovered', retryCount: 1 });
+    expect(await f.client.findRequest(threadId, clientId, [], true)).toMatchObject({ state: 'completed', turnId: retry.id, text: 'Recovered', retryCount: 1,
+      commentary: [{ id: `${failed.id}:before`, text: 'before' }, { id: `${retry.id}:after`, text: 'after' }] });
   });
 
   it.each(['foreign-input', 'foreign-root'])('does not adopt or retry past %s', async kind => {

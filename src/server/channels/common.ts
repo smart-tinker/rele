@@ -8,6 +8,7 @@ export interface RequestProgress {
   statusText?: string;
   existingOnly?: boolean;
   commentary?: string;
+  steps?: { id: string; text: string }[];
   plan?: { step: string; status: 'pending' | 'in_progress' | 'completed' }[];
   terminal?: 'completed' | 'failed' | 'interrupted' | 'cancelled';
 }

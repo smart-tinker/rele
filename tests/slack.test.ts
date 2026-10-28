@@ -517,6 +517,136 @@ describe('Slack native task progress', () => {
   });
 });
 
+describe('Slack progress and result in one message', () => {
+  const updateApi = (method: string, body: Record<string, unknown>) => method === 'chat.update'
+    ? Response.json({ ok: true, channel: body.channel, ts: body.ts }) : undefined;
+  const writes = (calls: { url: string; init?: RequestInit }[]) => calls.filter(call => /\/chat\.(postMessage|update)$/u.test(call.url)).map(call => JSON.parse(String(call.init!.body)));
+
+  it('keeps every public step with the final result, including after restart and late progress', async () => {
+    const fixture = progressFixture();
+    const options = { knownEndpoints: [fixture.endpoint], progressStore: fixture.progressStore, api: updateApi };
+    const first = await makeChannel(options);
+    const progress = { steps: [{ id: '1', text: 'First' }, { id: '2', text: 'Second <@UPEER>' }], commentary: 'Second <@UPEER>' };
+    await first.channel.updateProgress('request-example', fixture.origin, progress);
+    const final = { ...delivery(), origin: fixture.origin, key: 'answer:0', body: '**Result**' };
+    expect(await first.channel.deliver(final)).toBe('1000.2000');
+    expect(first.calls.filter(call => call.url.endsWith('/chat.postMessage'))).toHaveLength(1);
+    expect(writes(first.calls).at(-1).blocks).toMatchObject([
+      { type: 'task_card', status: 'complete', details: { elements: [{ elements: [{ type: 'text', text: 'First\n\nSecond <@UPEER>' }] }] } },
+      { type: 'markdown', text: '**Result**' },
+    ]);
+    await first.channel.stop();
+    const restarted = await makeChannel(options);
+    await restarted.channel.updateProgress('request-example', fixture.origin, { ...progress, terminal: 'completed' });
+    await restarted.channel.updateProgress('request-example', fixture.origin, { commentary: 'Late running event' });
+    expect(await restarted.channel.deliver(final)).toBe('1000.2000');
+    expect(writes(restarted.calls)).toHaveLength(0);
+  });
+
+  it('pages the full long history and multipart result in the same message without dropping content', async () => {
+    const fixture = progressFixture();
+    const f = await makeChannel({ knownEndpoints: [fixture.endpoint], progressStore: fixture.progressStore, api: updateApi });
+    const text = '😀 Long step. '.repeat(1500);
+    const progress = { steps: [{ id: 'long', text }] };
+    fixture.meta.set('request-progress:request-example', JSON.stringify({ ...progress, terminal: 'completed' }));
+    await f.channel.updateProgress('request-example', fixture.origin, progress);
+    await f.channel.deliver({ ...delivery(), origin: fixture.origin, key: 'answer:0', body: 'Result page one' });
+    await f.channel.deliver({ ...delivery(), origin: fixture.origin, key: 'answer:1', ordinal: 1, body: 'Result page two' });
+    const latest = writes(f.calls).at(-1);
+    expect(latest.blocks.some((block: any) => block.text === 'Result page one')).toBe(true);
+    const resultNext = latest.blocks.flatMap((block: any) => block.elements ?? []).find((item: any) => item.value === 'relep:request-example:answer:1');
+    f.socket.receive(questionInteraction('page-result', resultNext));
+    await vi.waitFor(() => expect(writes(f.calls).at(-1).blocks.some((block: any) => block.text === 'Result page two')).toBe(true));
+    const history: string[] = [];
+    const count = Math.ceil([...text].length / 6000);
+    for (let page = 0; page < count; page++) {
+      f.socket.receive(questionInteraction(`page-${page}`, { value: `relep:request-example:history:${page}` }));
+      await vi.waitFor(() => expect(writes(f.calls).at(-1).blocks.some((block: any) => block.type === 'context' && block.elements[0].text === `Ход работы: часть ${page + 1} из ${count}`)).toBe(true));
+      history.push(writes(f.calls).at(-1).blocks[0].details.elements[0].elements.map((element: any) => element.text).join(''));
+    }
+    expect(history.join('')).toBe(text);
+    expect(f.calls.filter(call => call.url.endsWith('/chat.postMessage'))).toHaveLength(1);
+    expect(writes(f.calls).slice(1).every(body => body.ts === '1000.2000' && !body.thread_ts)).toBe(true);
+    expect(f.action).not.toHaveBeenCalled();
+  });
+
+  it('rejects cross-thread, cross-message and cross-team pagination', async () => {
+    const fixture = progressFixture();
+    const f = await makeChannel({ knownEndpoints: [fixture.endpoint], progressStore: fixture.progressStore, api: updateApi });
+    await f.channel.updateProgress('request-example', fixture.origin, { commentary: 'x'.repeat(7000) });
+    const base = questionInteraction('forged', { value: 'relep:request-example:history:0' });
+    f.socket.receive({ ...base, payload: { ...base.payload, message: { ...base.payload.message, ts: '9999.9999' } } });
+    f.socket.receive({ ...base, payload: { ...base.payload, message: { ...base.payload.message, thread_ts: '9999.9999' } } });
+    f.socket.receive({ ...base, payload: { ...base.payload, team: { id: 'TOTHER' } } });
+    f.socket.receive(questionInteraction('out-of-range', { value: 'relep:request-example:history:99999999' }));
+    await f.channel.stop();
+    expect(writes(f.calls)).toHaveLength(1);
+  });
+
+  it('retains hidden earlier history when the visible page is unchanged', async () => {
+    const fixture = progressFixture();
+    const f = await makeChannel({ knownEndpoints: [fixture.endpoint], progressStore: fixture.progressStore, api: updateApi });
+    await f.channel.updateProgress('request-example', fixture.origin, { commentary: 'A'.repeat(6000) + 'Z'.repeat(6000) });
+    await f.channel.updateProgress('request-example', fixture.origin, { commentary: 'B'.repeat(6000) + 'Z'.repeat(6000) });
+    expect(writes(f.calls)).toHaveLength(1);
+    f.socket.receive(questionInteraction('earlier-page', { value: 'relep:request-example:history:0' }));
+    await vi.waitFor(() => expect(writes(f.calls)).toHaveLength(2));
+    expect(writes(f.calls).at(-1).blocks[0].details.elements[0].elements.map((item: any) => item.text).join('')).toBe('B'.repeat(6000));
+  });
+
+  it('retries a lost update ACK on the known message and never reposts its final', async () => {
+    const fixture = progressFixture(); let fail = true;
+    const f = await makeChannel({ knownEndpoints: [fixture.endpoint], progressStore: fixture.progressStore,
+      api: (method, body) => { if (method === 'chat.update' && fail) { fail = false; throw new Error('lost ACK'); } return updateApi(method, body); } });
+    await f.channel.updateProgress('request-example', fixture.origin, { commentary: 'Working' });
+    const final = { ...delivery(), origin: fixture.origin, key: 'answer:0', body: 'Done' };
+    await expect(f.channel.deliver(final)).rejects.toMatchObject({ retryable: true, uncertain: false });
+    expect(await f.channel.deliver(final)).toBe('1000.2000');
+    expect(f.calls.filter(call => call.url.endsWith('/chat.postMessage'))).toHaveLength(1);
+    expect(f.calls.filter(call => call.url.endsWith('/chat.update'))).toHaveLength(2);
+  });
+
+  it('does not blindly resend an unconfirmed first combined result after restart', async () => {
+    const fixture = progressFixture();
+    const options = { knownEndpoints: [fixture.endpoint], progressStore: fixture.progressStore };
+    const f = await makeChannel({ ...options, api: method => { if (method === 'chat.postMessage') throw new Error('lost ACK'); return undefined; } });
+    const final = { ...delivery(), origin: fixture.origin, key: 'answer:0', body: 'Done' };
+    await expect(f.channel.deliver(final)).rejects.toMatchObject({ uncertain: true });
+    await f.channel.stop();
+    const restarted = await makeChannel(options);
+    await expect(restarted.channel.deliver(final)).rejects.toMatchObject({ uncertain: true });
+    expect(writes(restarted.calls)).toHaveLength(0);
+    expect(writes(f.calls)).toHaveLength(1);
+  });
+
+  it('falls back to a separate final only when the unconfirmed first post contained progress alone', async () => {
+    const fixture = progressFixture(); let fail = true;
+    const f = await makeChannel({ knownEndpoints: [fixture.endpoint], progressStore: fixture.progressStore,
+      api: method => { if (method === 'chat.postMessage' && fail) { fail = false; throw new Error('lost ACK'); } return undefined; } });
+    await f.channel.updateProgress('request-example', fixture.origin, { commentary: 'Working' });
+    expect(await f.channel.deliver({ ...delivery(), origin: fixture.origin, key: 'answer:0', body: 'Done' })).toBe('1000.2000');
+    expect(writes(f.calls)).toHaveLength(2);
+    expect(writes(f.calls)[1].blocks).toEqual([{ type: 'markdown', text: 'Done' }]);
+  });
+
+  it('clears detailed history on mixed-client closure and keeps retry notices in the existing card', async () => {
+    const fixture = progressFixture();
+    const f = await makeChannel({ knownEndpoints: [fixture.endpoint], progressStore: fixture.progressStore, api: updateApi });
+    const progress = { commentary: 'Own progress' };
+    fixture.meta.set('request-progress:request-example', JSON.stringify(progress));
+    await f.channel.updateProgress('request-example', fixture.origin, progress);
+    await f.channel.deliver({ ...delivery(), origin: fixture.origin, key: 'retry:1', body: 'Retry in 15 s' });
+    expect(writes(f.calls).at(-1).blocks[0].title).toBe('Retry in 15 s');
+    await f.channel.updateProgress('request-example', fixture.origin, { terminal: 'failed', existingOnly: true });
+    expect(writes(f.calls).at(-1).blocks).toHaveLength(1);
+    expect(writes(f.calls).at(-1).blocks[0].details).toBeUndefined();
+    await f.channel.deliver({ ...delivery(), origin: fixture.origin, key: 'terminal:error', kind: 'error', body: 'Generic closure' });
+    expect(writes(f.calls).at(-1).blocks[0].details).toBeUndefined();
+    expect(writes(f.calls).at(-1).blocks[1]).toEqual({ type: 'markdown', text: 'Generic closure' });
+    expect(f.calls.filter(call => call.url.endsWith('/chat.postMessage'))).toHaveLength(1);
+  });
+});
+
 describe('Slack Socket Mode durability and identity', () => {
   it('ACKs only after the durable message callback completes', async () => {
     let commit!: () => void;

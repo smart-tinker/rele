@@ -512,6 +512,7 @@ export class Engine extends EventEmitter {
       const found = await this.findOwnRequest(client, conversation.threadId, id);
       if (client !== this.codex || epoch !== this.epoch || terminal(this.store.getRequest(id)!.status)) return;
       if (found.mixed) this.store.setMeta(`mixed:${id}`, '1');
+      else if (found.commentary?.length && !this.isMixed(id)) this.recordProgress(id, { steps: found.commentary }, true);
       if (found.state === 'not_found') this.store.updateRequest(id, { status: 'uncertain', error: 'Запрос не найден в очереди и истории Codex. Автоматическая повторная отправка запрещена; требуется сверка.' });
       else if (found.state === 'queued') {
         this.store.updateRequest(id, { status: 'starting', queuedSubmissionId: found.queuedSubmissionId, error: undefined });
@@ -989,7 +990,9 @@ export class Engine extends EventEmitter {
         this.retryNotice(progressRequest, `native:${p.turnId}`, 'Codex временно перегружен и автоматически повторяет попытку. Ожидаю продолжения.');
       }
       if (method === 'item/completed' && p.item?.type === 'agentMessage' && p.item.phase === 'commentary' && typeof p.item.text === 'string' && p.item.text.trim()) {
-        this.recordProgress(progressRequest.id, { statusText: undefined, commentary: this.options.redact(p.item.text).slice(0, 3000) });
+        this.recordProgress(progressRequest.id, { statusText: undefined, steps: [{
+          id: `${p.turnId}:${p.item.id ?? createHash('sha256').update(p.item.text).digest('hex')}`, text: p.item.text,
+        }] });
       } else if (method === 'turn/plan/updated' && Array.isArray(p.plan) && p.plan.length <= 50
         && p.plan.every((item: any) => typeof item?.step === 'string' && item.step.trim() && ['pending', 'in_progress', 'completed'].includes(item.status))) {
         this.recordProgress(progressRequest.id, { plan: p.plan.map((item: any) => ({ step: this.options.redact(item.step).slice(0, 300), status: item.status })) });
@@ -1063,12 +1066,24 @@ export class Engine extends EventEmitter {
       }
     } finally { this.approvalUpdatesSending = false; }
   }
-  private recordProgress(id: string, patch: RequestProgress): void {
+  private recordProgress(id: string, patch: RequestProgress, historyOrder = false): void {
     const request = this.store.getRequest(id);
     if (!request || request.origin.platform !== 'slack' || request.steeredInto) return;
     const key = `request-progress:${id}`, previous = this.store.getMeta(key);
     if (!previous && patch.terminal) return;
-    this.store.setMeta(key, JSON.stringify({ ...JSON.parse(previous ?? '{}'), ...patch }));
+    const old = JSON.parse(previous ?? '{}') as RequestProgress;
+    if (patch.steps) {
+      const incoming = patch.steps.map(step => ({ ...step, text: this.options.redact(step.text) }));
+      const before = old.steps ?? (old.commentary ? [{ id: 'legacy', text: old.commentary }] : []);
+      const retained = before.filter(step => step.id !== 'legacy' || !incoming.some(next => next.text === step.text));
+      const byId = new Map(retained.map(step => [step.id, step]));
+      for (const step of incoming) byId.set(step.id, step);
+      patch.steps = historyOrder ? [...incoming, ...retained.filter(step => !incoming.some(next => next.id === step.id))] : [...byId.values()];
+      patch.commentary = patch.steps.at(-1)?.text;
+    }
+    const next = JSON.stringify({ ...old, ...patch });
+    if (previous === next) return;
+    this.store.setMeta(key, next);
     this.store.setMeta('request-progress:pending', JSON.stringify([...new Set([...this.pendingProgress(), id])]));
   }
   private async flushProgress(): Promise<void> {

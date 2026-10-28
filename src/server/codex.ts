@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -36,6 +36,7 @@ export interface RequestLocation {
   turnId?: string;
   text?: string;
   failureReason?: 'serverOverloaded';
+  commentary?: { id: string; text: string }[];
   retryCount?: number;
   retryBlocked?: boolean;
   rootTurnId?: string;
@@ -57,7 +58,7 @@ export function codexCommandItem(value: unknown): CodexCommandItem | undefined {
 }
 export interface CodexRuntime { userAgent: string; codexHome: string; platformFamily: string; platformOs: string }
 interface QueueEntry { id: string; clientUserMessageId: string }
-interface HistoryItem { type: string; clientId?: string | null; text?: string; phase?: string | null }
+interface HistoryItem { type: string; id?: string; clientId?: string | null; text?: string; phase?: string | null }
 interface HistoryTurn { id: string; rootTurnId?: string | null; status: string; completedAt?: number | null; items: HistoryItem[]; error?: { codexErrorInfo?: unknown } | null }
 interface Page<T> { data: T[]; nextCursor: string | null }
 interface RawThread {
@@ -517,7 +518,9 @@ export class CodexClient extends EventEmitter {
           }
           turn = next;
           const location = this.historyLocation(turn, known);
-          found = { ...location, commandItems: [...(found.commandItems ?? []), ...(location.commandItems ?? [])] };
+          const commentary = [...(found.commentary ?? []), ...(location.commentary ?? [])];
+          found = { ...location, ...(commentary.length ? { commentary } : {}),
+            commandItems: [...(found.commandItems ?? []), ...(location.commandItems ?? [])] };
           retryCount++;
         }
         return { ...found, rootTurnId, retryCount };
@@ -597,11 +600,14 @@ export class CodexClient extends EventEmitter {
     if (state === 'interrupted' && (typeof turn.completedAt !== 'number' || !Number.isFinite(turn.completedAt))) {
       throw new CodexTransportError('Codex пока не подтвердил прерывание запроса. Ожидается сверка завершения без повторной отправки.', 'turn-interruption-unconfirmed');
     }
+    const commentary = turn.items.filter(item => item.type === 'agentMessage' && item.phase === 'commentary' && item.text?.trim())
+      .map(item => ({ id: `${turn.id}:${item.id ?? createHash('sha256').update(item.text!).digest('hex')}`, text: item.text! }));
     const answers = turn.items.filter(item => item.type === 'agentMessage' && item.phase === 'final_answer');
     const legacy = turn.items.filter(item => item.type === 'agentMessage' && item.phase == null);
     return {
       state: state as RequestLocation['state'], turnId: turn.id,
       ...(mixed ? { mixed: true } : {
+        ...(commentary.length ? { commentary } : {}),
         text: answers.length ? answers.map(item => item.text || '').join('\n\n') : legacy.at(-1)?.text,
         ...(state === 'failed' && turn.error?.codexErrorInfo === 'serverOverloaded' ? { failureReason: 'serverOverloaded' as const } : {}),
         ...(turn.items.some(item => codexCommandItem(item)) ? { commandItems: turn.items.flatMap(item => { const command = codexCommandItem(item); return command ? [command] : []; }) } : {}),
