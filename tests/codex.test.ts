@@ -1350,3 +1350,67 @@ describe('Codex addressed steering and own input receipts', () => {
     expect(f.calls.slice(before).every(call => call.method === 'thread/turns/list')).toBe(true);
   });
 });
+
+describe('Overload continuation protocol', () => {
+  const clientId = 'overloaded-request';
+  const failed = { id: 'failed-turn', rootTurnId: 'failed-turn', status: 'failed', items: [{ type: 'userMessage', clientId }], error: { codexErrorInfo: 'serverOverloaded' } };
+  const retry = { id: 'retry-turn', rootTurnId: 'failed-turn', status: 'completed', items: [{ type: 'agentMessage', phase: 'final_answer', text: 'Recovered' }] };
+  const page = (data: unknown[]) => ({ data, nextCursor: null });
+
+  it('continues via empty turn/start with lineage and without changing model or policies', async () => {
+    const f = await fixture({
+      'thread/turns/list': () => page([failed]),
+      'turn/start': () => ({ turn: { ...retry, status: 'inProgress', items: [] } }),
+    });
+    await f.client.connect();
+    let intent = 0;
+    expect(await f.client.retryOverloaded(threadId, clientId, failed.id, [], () => { intent++; return true; })).toEqual({ turnId: retry.id });
+    expect(intent).toBe(1);
+    expect(f.calls.find(call => call.method === 'turn/start')?.params).toEqual({ threadId, input: [], turnTrigger: 'capacity_retry_automatic', parentTurnId: failed.id, rootTurnId: failed.id });
+  });
+
+  it.each(['desktop', 'rele', 'page-boundary'])('finds an empty %s continuation from the original client ID', async kind => {
+    const continued = { ...retry, rootTurnId: kind === 'desktop' ? retry.id : failed.id };
+    const f = await fixture({ 'thread/turns/list': message => kind === 'page-boundary' && !message.params?.cursor
+      ? { data: [continued], nextCursor: 'older' } : page(kind === 'page-boundary' ? [failed] : [continued, failed]) });
+    await f.client.connect();
+    expect(await f.client.findRequest(threadId, clientId, [], true)).toMatchObject({ state: 'completed', turnId: retry.id, text: 'Recovered', retryCount: 1 });
+  });
+
+  it.each(['foreign-input', 'foreign-root'])('does not adopt or retry past %s', async kind => {
+    const foreign = kind === 'foreign-input' ? { ...retry, items: [{ type: 'userMessage', clientId: 'foreign' }] } : { ...retry, rootTurnId: 'different-root' };
+    const f = await fixture({ 'thread/turns/list': () => page([foreign, failed]) }); await f.client.connect();
+    expect(await f.client.findRequest(threadId, clientId, [], true)).toMatchObject({ state: 'failed', turnId: failed.id, retryBlocked: true });
+    expect(await f.client.retryOverloaded(threadId, clientId, failed.id, [], () => { throw Error('must not send'); })).toBeUndefined();
+    expect(f.calls.filter(call => call.method === 'turn/start')).toHaveLength(0);
+  });
+
+  it('does not send after Desktop has already retried', async () => {
+    const f = await fixture({ 'thread/turns/list': () => page([{ ...retry, status: 'inProgress' }, failed]) }); await f.client.connect();
+    expect(await f.client.retryOverloaded(threadId, clientId, failed.id, [], () => { throw Error('must not send'); })).toBeUndefined();
+  });
+
+  it.each(['active', 'queued', 'cancelled'])('checks %s immediately before retry', async condition => {
+    const f = await fixture({ 'thread/turns/list': () => page([failed]),
+      'thread/read': () => ({ thread: { ...rawThread, status: { type: condition === 'active' ? 'active' : 'idle' } } }),
+      'thread/queue/list': () => page(condition === 'queued' ? [{ id: 'foreign', clientUserMessageId: 'other' }] : []),
+    }); await f.client.connect();
+    expect(await f.client.retryOverloaded(threadId, clientId, failed.id, [], () => false)).toBeUndefined();
+    expect(f.calls.filter(call => call.method === 'turn/start')).toHaveLength(0);
+  });
+
+  it('treats the exact native EmptyInput rejection as a busy thread', async () => {
+    const f = await fixture({ 'thread/turns/list': () => page([failed]), 'turn/start': (message, socket) => {
+      socket.send(JSON.stringify({ id: message.id, error: { code: -32603, message: 'failed to submit turn input: EmptyInput' } })); return noResponse;
+    } }); await f.client.connect();
+    await expect(f.client.retryOverloaded(threadId, clientId, failed.id, [], () => true)).rejects.toMatchObject({ reason: 'non_idle' });
+    expect(f.calls.filter(call => call.method === 'turn/start')).toHaveLength(1);
+  });
+
+  it('does not replay the mutation after losing its ACK', async () => {
+    const f = await fixture({ 'thread/turns/list': () => page([failed]), 'turn/start': (_message, socket) => { socket.close(); return noResponse; } });
+    await f.client.connect();
+    await expect(f.client.retryOverloaded(threadId, clientId, failed.id, [], () => true)).rejects.toMatchObject({ uncertain: true });
+    expect(f.calls.filter(call => call.method === 'turn/start')).toHaveLength(1);
+  });
+});

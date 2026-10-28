@@ -9,7 +9,7 @@ export function slackProgressBlocks(requestId: string, progress: RequestProgress
   const status = progress.terminal === 'completed' ? 'complete' : progress.terminal ? 'error' : 'in_progress';
   const blocks: Record<string, unknown>[] = [{
     type: 'task_card', task_id: `${requestId}:progress`,
-    title: progress.terminal ? titles[progress.terminal] : 'Выполняется', status,
+    title: progress.terminal ? titles[progress.terminal] : progress.statusText || 'Выполняется', status,
     ...(progress.commentary?.trim() ? { details: {
       type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: progress.commentary }] }],
     } } : {}),

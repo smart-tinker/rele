@@ -5,6 +5,7 @@ import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionSta
 export type SlackSessionStatus = 'processing' | 'active' | 'suspended';
 
 export interface RequestProgress {
+  statusText?: string;
   existingOnly?: boolean;
   commentary?: string;
   plan?: { step: string; status: 'pending' | 'in_progress' | 'completed' }[];
