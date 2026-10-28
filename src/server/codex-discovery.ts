@@ -245,6 +245,8 @@ async function collectCodex(options: CodexDiscoveryOptions): Promise<CodexDiscov
   const env = codexEnvironment(options.codexHome, options.env ?? process.env, platform);
   const home = options.home ?? homedir();
   const paths = platform === 'win32' ? path.win32 : path.posix;
+  const localAppData = platform === 'win32' && environmentValue(env, 'LOCALAPPDATA');
+  const desktopCacheRoot = localAppData ? paths.join(localAppData, 'OpenAI', 'Codex', 'bin') : undefined;
   const codexHome = (platform === 'win32' ? environmentValue(env, 'CODEX_HOME') : env.CODEX_HOME) || paths.join(home, '.codex');
   const defaultSocket = paths.isAbsolute(codexHome) ? paths.join(codexHome, 'app-server-control', 'app-server-control.sock') : undefined;
   const exists = options.exists ?? fileExists;
@@ -371,9 +373,11 @@ async function collectCodex(options: CodexDiscoveryOptions): Promise<CodexDiscov
   };
   for (let offset = 0; offset < selected.length; offset += 4) await Promise.allSettled(selected.slice(offset, offset + 4).map(prepare));
   for (const candidate of selected) {
+    // Desktop relocates its WindowsApps backend into this content-addressed directory.
+    const desktopWorkingCopy = desktopCacheRoot && /^[a-f0-9]{16}\\codex\.exe$/iu.test(paths.relative(desktopCacheRoot, candidate.executable));
     const installation: CodexInstallation = {
       executable: candidate.executable,
-      name: candidate.source.startsWith('desktop') ? 'Codex из Desktop' : 'Codex CLI',
+      name: desktopWorkingCopy ? 'Рабочая копия Codex Desktop' : candidate.source.startsWith('desktop') ? 'Codex из Desktop' : 'Codex CLI',
       source: candidate.source, running: !!candidate.process,
       ...(candidate.process ? { processId: candidate.process.processId } : {}),
     };

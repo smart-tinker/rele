@@ -132,6 +132,21 @@ describe('Codex installation and existing Desktop discovery', () => {
     expect(result.recommended).toEqual({ executable, transport: 'proxy', endpoint: '' });
   });
 
+  it.each([false, true])('labels the Desktop working copy without changing discovery or selection (running=%s)', async running => {
+    const local = 'C:\\Users\\Example User\\AppData\\Local';
+    const root = win.join(local, 'OpenAI', 'Codex', 'bin');
+    const directory = '2993767bd1dfb009';
+    const executable = win.join(root, directory, 'codex.exe');
+    const f = windowsFixture({ processes: running ? [{ executable: executable.toUpperCase(), processId: 1234, listenKind: 'websocket', listen: 'ws://127.0.0.1:4500' }] : [], packages: [], issues: [] }, [executable]);
+    f.options.env = { LOCALAPPDATA: local, PATH: '' };
+    f.options.readDirectory = async requested => requested === root ? [directory] : [];
+    const result = await discoverCodex(f.options);
+    expect(result.installations).toHaveLength(1);
+    expect(result.installations[0]).toMatchObject({ name: 'Рабочая копия Codex Desktop', source: running ? 'desktop-process' : 'standard', running });
+    expect(result.recommendedManaged?.executable.toLowerCase()).toBe(executable.toLowerCase());
+    if (running) expect(result.recommended?.endpoint).toBe('ws://127.0.0.1:4500');
+  });
+
   it('finds the versioned Windows CLI while Desktop is closed and prefers supported versions over an older PATH CLI', async () => {
     const local = 'C:\\Users\\Example User\\AppData\\Local';
     const root = win.join(local, 'OpenAI', 'Codex', 'bin');
