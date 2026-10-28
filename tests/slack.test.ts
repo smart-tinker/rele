@@ -383,6 +383,29 @@ describe('Slack question choices and forms', () => {
 });
 
 describe('Slack native task progress', () => {
+  it('temporarily relabels only a known card using its published history, then resumes normal progress', async () => {
+    const fixture = progressFixture();
+    const { channel, calls } = await makeChannel({ knownEndpoints: [fixture.endpoint], progressStore: fixture.progressStore,
+      api: (method, body) => method === 'chat.update' ? Response.json({ ok: true, channel: body.channel, ts: body.ts }) : undefined });
+    const uncertain = { statusText: 'Проверяю состояние Codex', existingOnly: true };
+    await channel.updateProgress('unknown-card', fixture.origin, uncertain);
+    expect(calls.some(call => /\/chat\.(postMessage|update)$/u.test(call.url))).toBe(false);
+    const published = { steps: [{ id: 'step-1', text: 'Published step' }] };
+    await channel.updateProgress('known-card', fixture.origin, published);
+    await channel.updateProgress('known-card', fixture.origin, { ...uncertain, commentary: 'UNVERIFIED DETAIL' });
+    await channel.updateProgress('known-card', fixture.origin, { steps: [...published.steps, { id: 'step-2', text: 'Recovered step' }] });
+    const updates = calls.filter(call => call.url.endsWith('/chat.update')).map(call => JSON.parse(String(call.init!.body)));
+    expect(calls.filter(call => call.url.endsWith('/chat.postMessage'))).toHaveLength(1);
+    expect(updates).toHaveLength(2);
+    expect(updates[0].blocks[0].title).toBe(uncertain.statusText);
+    expect(JSON.stringify(updates[0])).toContain('Published step');
+    expect(JSON.stringify(updates[0])).not.toContain('UNVERIFIED DETAIL');
+    expect(updates[1].blocks[0].title).toBe('Выполняется');
+    expect(JSON.stringify(updates[1])).toContain('Published step');
+    expect(JSON.stringify(updates[1])).toContain('Recovered step');
+    expect(updates.every(body => body.ts === '1000.2000')).toBe(true);
+  });
+
   it('closes only an existing known progress message with generic content', async () => {
     const fixture = progressFixture();
     const { channel, calls } = await makeChannel({ knownEndpoints: [fixture.endpoint], progressStore: fixture.progressStore,

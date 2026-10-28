@@ -6,6 +6,7 @@ export type SlackSessionStatus = 'processing' | 'active' | 'suspended';
 
 export interface RequestProgress {
   statusText?: string;
+  /** Known card only: nonterminal updates its title; terminal replaces its content. */
   existingOnly?: boolean;
   commentary?: string;
   steps?: { id: string; text: string }[];

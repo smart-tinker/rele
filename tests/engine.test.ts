@@ -297,6 +297,50 @@ describe('Engine initial instruction and same-source steering', () => {
 });
 
 describe('Engine public Slack progress', () => {
+  it.each(['missing', 'unavailable'] as const)('periodically recovers a request with %s history while another thread runs, without resending', async failure => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture();
+    const otherEndpoint = { ...f.eps.slack, id: 'other-slack-endpoint', threadId: '170000.456' };
+    f.store.upsertEndpoint(otherEndpoint);
+    f.store.createConversation({ name: 'Other', threadId: 'other-codex-thread', cwd: '/projects/other',
+      bindings: [{ platform: 'slack', endpointId: otherEndpoint.id, allowedSenderIds: ['U1'] }] });
+    f.store.setMeta(initialMessageKey('/test/codex-home', 'other-codex-thread'), JSON.stringify({ applied: true }));
+    const first = await acceptRequest(f);
+    await running(f, first);
+    await f.engine.receive(f.message('slack', 'other', { endpoint: otherEndpoint }));
+    await f.engine.settled();
+    vi.setSystemTime(Date.now() + 1500); // Allow the second source's paced initial backfill.
+    await f.engine.pump(); await f.engine.settled();
+    const second = f.store.listRequests().find(row => row.eventId === 'other')!;
+    expect(second).toMatchObject({ status: 'starting', error: undefined });
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(2);
+    f.codex.locations.set(second.id, { state: 'running', turnId: 'other-turn' });
+    await f.engine.reconcile(second.id);
+    expect(f.store.getRequest(second.id)?.status).toBe('running');
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1',
+      item: { id: 'comment', type: 'agentMessage', phase: 'commentary', text: 'Public step' } } });
+    await f.engine.settled(); await f.engine.pump();
+    if (failure === 'missing') f.codex.locations.delete(first.id);
+    else f.codex.findRequest.mockRejectedValueOnce(new Error('Private backend detail'));
+    await f.engine.reconcile(first.id);
+    expect(f.store.getRequest(first.id)?.status).toBe('uncertain');
+    await f.engine.pump();
+    expect(f.slack.updateProgress.mock.calls.at(-1)).toEqual([first.id, first.origin,
+      { statusText: 'Проверяю состояние Codex', existingOnly: true }]);
+    f.codex.locations.set(first.id, { state: 'running', turnId: 'turn-1' });
+    vi.setSystemTime(Date.now() + 16_000);
+    await f.engine.pump(); await f.engine.settled();
+    expect(f.store.getRequest(first.id)).toMatchObject({ status: 'running', turnId: 'turn-1', error: undefined });
+    expect(f.store.getRequest(second.id)).toMatchObject({ status: 'running', turnId: 'other-turn' });
+    await f.engine.pump();
+    expect(f.slack.updateProgress.mock.calls.at(-1)).toEqual([first.id, first.origin,
+      { commentary: 'Public step', steps: [{ id: 'turn-1:comment', text: 'Public step' }] }]);
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(2);
+    expect(f.codex.retryOverloaded).not.toHaveBeenCalled();
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+    expect(f.store.listDeliveries()).toEqual([]);
+  });
+
   it('coalesces public commentary and native plan for the same request, excludes reasoning and closes even with NOREPLY', async () => {
     const f = fixture(); const root = await acceptRequest(f); await running(f, root);
     const plan = [{ step: 'Check access', status: 'completed' }, { step: 'Read results', status: 'in_progress' }];

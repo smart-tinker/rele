@@ -161,6 +161,32 @@ describe('Slack request activity', () => {
     ]);
   });
 
+  it('keeps two parallel threads processing when one finishes or waits for approval', async () => {
+    const first = request();
+    const second = { ...request('running', { threadId: '200.1' }), id: 'second', conversationId: 'second-conversation' };
+    const { activity, send, set } = make([first, second]);
+    activity.start(); await settle();
+    expect(send.mock.calls.map(([origin, status]) => [origin.threadId, status])).toEqual([['100.1', 'processing'], ['200.1', 'processing']]);
+    set([{ ...first, status: 'waiting_approval' }, second]); activity.refresh(); await settle();
+    expect(send.mock.calls.at(-1)?.map(value => typeof value === 'object' ? value.threadId : value)).toEqual(['100.1', 'suspended']);
+    set([{ ...first, status: 'completed' }, second]); activity.refresh(); await settle();
+    await vi.advanceTimersByTimeAsync(45_000);
+    const secondWrites = send.mock.calls.filter(([origin]) => origin.threadId === second.origin.threadId);
+    expect(secondWrites.map(([, status]) => status)).toEqual(['processing', 'processing']);
+    expect(send.mock.calls.filter(([origin]) => origin.threadId === first.origin.threadId).map(([, status]) => status)).toEqual(['processing', 'suspended', 'active']);
+  });
+
+  it('does not block the second thread behind a slow or failed status write for the first', async () => {
+    const slow = deferred();
+    const { activity, send } = make([request(), { ...request('running', { threadId: '200.1' }), id: 'second' }]);
+    send.mockImplementationOnce(() => slow.promise);
+    activity.start(); await settle();
+    expect(send.mock.calls.map(([origin, status]) => [origin.threadId, status])).toEqual([['100.1', 'processing'], ['200.1', 'processing']]);
+    slow.reject(new Error('First thread status unavailable')); await settle();
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(send.mock.calls.filter(([origin]) => origin.threadId === '200.1').map(([, status]) => status)).toEqual(['processing', 'processing']);
+  });
+
   it('serializes slow writes and coalesces intermediate states before clearing a quick completion', async () => {
     const pending = deferred();
     const { activity, send, set } = make([request('transcribing')]);

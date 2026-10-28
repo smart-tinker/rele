@@ -23,6 +23,7 @@ export interface EngineOptions {
 }
 const terminal = (status: ReleRequest['status']) => ['completed', 'failed', 'cancelled', 'interrupted'].includes(status);
 const mixedMessage = 'В ход Rele добавлено сообщение из другого клиента Codex. Смешанный ответ не отправляется в мессенджер.';
+const uncertainProgress = 'Проверяю состояние Codex';
 const overloadDelays = [15, 30, 60, 120];
 interface OverloadRetry { turnId: string; attempts: number; dueAt: number; sending?: boolean; target: string }
 interface CancelCleanup {
@@ -528,6 +529,11 @@ export class Engine extends EventEmitter {
         this.store.updateRequest(id, { status: error instanceof CodexThreadBusyError && this.store.getRequest(id)?.queuedSubmissionId ? 'starting' : 'uncertain', error: this.options.redact(error) });
       }
     } finally {
+      const current = this.store.getRequest(id), progress = this.store.getMeta(`request-progress:${id}`);
+      if (current && !terminal(current.status) && progress && !this.isMixed(id)) {
+        if (current.status === 'uncertain') this.recordProgress(id, { statusText: uncertainProgress });
+        else if (JSON.parse(progress).statusText === uncertainProgress) this.recordProgress(id, { statusText: undefined });
+      }
       this.reconciling.delete(id);
       if (this.reconcileAgain.delete(id) && !this.stopped) this.track(this.reconcile(id));
       await this.releaseIdleThread(request.conversationId);
@@ -1100,6 +1106,13 @@ export class Engine extends EventEmitter {
         const key = `request-progress:${id}`, saved = this.store.getMeta(key);
         if (!saved) continue;
         try {
+          if (request.status === 'uncertain' && !this.isMixed(id)) {
+            // Only relabel an already published card; unverified details stay local.
+            await channel.updateProgress(id, request.origin, { statusText: uncertainProgress, existingOnly: true });
+            if (this.store.getMeta(key) === saved) this.store.setMeta('request-progress:pending', JSON.stringify(this.pendingProgress().filter(value => value !== id)));
+            this.progressRetryAfter.delete(id);
+            continue;
+          }
           const found = await this.findOwnRequest(client, conversation.threadId, id);
           if (client !== this.codex || this.stopped) continue;
           if (found.mixed || this.isMixed(id)) {

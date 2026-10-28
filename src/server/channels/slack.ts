@@ -319,6 +319,7 @@ export class SlackChannel implements Channel {
         return;
       }
       if (receipt.progress?.existingOnly) progress = receipt.progress;
+      else if (progress?.existingOnly && !progress.terminal) progress = { ...receipt.progress, statusText: progress.statusText };
       else if (update.answer && progress && !progress.existingOnly) progress = { ...receipt.progress, ...progress };
       if (receipt.terminal && progress && receipt.terminal !== progress.terminal) {
         if (update.answer) throw new ChannelError('Состояние итогового сообщения Slack уже изменилось.');
