@@ -14,7 +14,7 @@ import { effectiveSharedCodexHome } from './codex-shared.js';
 import { requestInput } from './inbound-context.js';
 import { MessageToolValidationError } from '../shared/message-tool.js';
 
-export type CodexGateway = Pick<CodexClient, 'status' | 'isVerifiedVersion' | 'createThread' | 'setThreadName' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'steer' | 'findSteerReceipt' | 'interrupt' | 'backgroundTerminals' | 'terminateBackgroundTerminal' | 'findRequest' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Partial<Pick<CodexClient, 'hasPendingRequest'>> & Pick<EventEmitter, 'on' | 'off'>;
+export type CodexGateway = Pick<CodexClient, 'status' | 'isVerifiedVersion' | 'createThread' | 'setThreadName' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'steer' | 'findSteerReceipt' | 'interrupt' | 'backgroundTerminals' | 'terminateBackgroundTerminal' | 'findRequest' | 'retryOverloaded' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Partial<Pick<CodexClient, 'hasPendingRequest'>> & Pick<EventEmitter, 'on' | 'off'>;
 export interface EngineOptions {
   config: () => AppConfig;
   temporaryRoot: string;
@@ -23,6 +23,9 @@ export interface EngineOptions {
 }
 const terminal = (status: ReleRequest['status']) => ['completed', 'failed', 'cancelled', 'interrupted'].includes(status);
 const mixedMessage = 'В ход Rele добавлено сообщение из другого клиента Codex. Смешанный ответ не отправляется в мессенджер.';
+const uncertainProgress = 'Проверяю состояние Codex';
+const overloadDelays = [15, 30, 60, 120];
+interface OverloadRetry { turnId: string; attempts: number; dueAt: number; sending?: boolean; target: string }
 interface CancelCleanup {
   epoch: string; target: string; done: boolean; turnId?: string; interruptAttempted?: boolean; terminalAttempts?: CodexTerminal[];
 }
@@ -67,6 +70,7 @@ export class Engine extends EventEmitter {
   private approvalUpdateRetry = new Map<string, number>();
   private pendingQuestions = new Map<string, { event: CodexServerRequest; epoch: string; retryAt: number }>();
   private retryingQuestions = false;
+  private retryingOverloads = new Map<string, Promise<{ turnId: string } | undefined>>();
   private slackConnection?: string;
   private readonly notification = (event: CodexNotification) => this.event(() => this.onNotification(event));
   private readonly serverRequest = (event: CodexServerRequest) => this.event(() => this.onServerRequest(event));
@@ -284,6 +288,18 @@ export class Engine extends EventEmitter {
     if (request.steeredInto) throw new Error('Дополнение относится к уже выполняющемуся запросу. Остановить можно исходный запрос.');
     // A lost cancellation ACK must never let reconciliation restart the original request.
     this.store.setMeta(`cancel-requested:${id}`, '1');
+    if (this.retryingOverloads.has(id)) {
+      await this.retryingOverloads.get(id)!.catch(() => {});
+      return this.cancel(id);
+    }
+    const retryRaw = this.store.getMeta(`overload-retry:${id}`);
+    if (retryRaw && (JSON.parse(retryRaw) as OverloadRetry).sending) {
+      const found = await this.findOwnRequest(this.codex, this.store.getConversation(request.conversationId)!.threadId, id);
+      if (found.turnId === (JSON.parse(retryRaw) as OverloadRetry).turnId || found.state === 'not_found') {
+        this.store.updateRequest(id, { status: 'uncertain', error: 'Отмена сохранена. Ожидается подтверждение запуска повтора в Codex.' });
+        return;
+      }
+    }
     if (request.status === 'queued' || request.status === 'transcribing'
       || request.status === 'starting' && this.dispatching.has(request.conversationId) && !this.store.getMeta(`request-terminal-baseline:${id}`)) {
       this.store.finishRequest(id, { status: 'cancelled', error: undefined }, []);
@@ -497,20 +513,27 @@ export class Engine extends EventEmitter {
       const found = await this.findOwnRequest(client, conversation.threadId, id);
       if (client !== this.codex || epoch !== this.epoch || terminal(this.store.getRequest(id)!.status)) return;
       if (found.mixed) this.store.setMeta(`mixed:${id}`, '1');
+      else if (found.commentary?.length && !this.isMixed(id)) this.recordProgress(id, { steps: found.commentary }, true);
       if (found.state === 'not_found') this.store.updateRequest(id, { status: 'uncertain', error: 'Запрос не найден в очереди и истории Codex. Автоматическая повторная отправка запрещена; требуется сверка.' });
       else if (found.state === 'queued') {
         this.store.updateRequest(id, { status: 'starting', queuedSubmissionId: found.queuedSubmissionId, error: undefined });
         await this.continueQueued(request, found, true);
       }
       else if (found.state === 'running') {
+        if (this.store.getMeta(`cancel-requested:${id}`)) { this.track(this.cancel(id)); return; }
         const pending = this.store.listApprovals(1000).some(approval => approval.requestId === id && approval.status === 'pending');
         this.store.updateRequest(id, { status: this.isMixed(id) ? 'uncertain' : pending ? 'waiting_approval' : 'running', turnId: found.turnId, error: this.isMixed(id) ? mixedMessage : undefined });
-      } else this.finishFromHistory(request, found);
+      } else if (!await this.retryOverload(request, found)) this.finishFromHistory(request, found);
     } catch (error) {
       if (client === this.codex && epoch === this.epoch && !terminal(this.store.getRequest(id)!.status)) {
         this.store.updateRequest(id, { status: error instanceof CodexThreadBusyError && this.store.getRequest(id)?.queuedSubmissionId ? 'starting' : 'uncertain', error: this.options.redact(error) });
       }
     } finally {
+      const current = this.store.getRequest(id), progress = this.store.getMeta(`request-progress:${id}`);
+      if (current && !terminal(current.status) && progress && !this.isMixed(id)) {
+        if (current.status === 'uncertain') this.recordProgress(id, { statusText: uncertainProgress });
+        else if (JSON.parse(progress).statusText === uncertainProgress) this.recordProgress(id, { statusText: undefined });
+      }
       this.reconciling.delete(id);
       if (this.reconcileAgain.delete(id) && !this.stopped) this.track(this.reconcile(id));
       await this.releaseIdleThread(request.conversationId);
@@ -527,13 +550,18 @@ export class Engine extends EventEmitter {
       await this.slackSync.backfill();
     }
     if (this.stopped) { await Promise.allSettled(work); return; }
+    if (this.codex.status().connected) {
+      const periodic = Date.now() - this.lastReconcile > 15_000;
+      if (periodic) this.lastReconcile = Date.now();
+      for (const request of this.store.activeRequests()) {
+        const raw = this.store.getMeta(`overload-retry:${request.id}`), retry = raw ? JSON.parse(raw) as OverloadRetry : undefined;
+        if ((periodic || retry && !retry.sending && retry.dueAt <= Date.now()) && !['queued', 'transcribing'].includes(request.status)
+          && !this.dispatching.has(request.conversationId)) work.push(this.reconcile(request.id));
+      }
+    }
     if (!this.suspended && this.codex.status().connected) for (const conversation of this.store.listConversations()) {
       if (!conversation.paused && !this.dispatching.has(conversation.id) && !this.releasing.has(conversation.id)
           && Date.now() >= (this.retryThreadAfter.get(conversation.id) ?? 0)) work.push(this.dispatch(conversation.id));
-    }
-    if (this.codex.status().connected && Date.now() - this.lastReconcile > 15_000) {
-      this.lastReconcile = Date.now();
-      for (const request of this.store.activeRequests()) if (!['queued', 'transcribing'].includes(request.status) && !this.dispatching.has(request.conversationId)) work.push(this.reconcile(request.id));
     }
     await Promise.allSettled(work);
   }
@@ -625,13 +653,12 @@ export class Engine extends EventEmitter {
 
   private findOwnRequest(client: CodexGateway, threadId: string, requestId: string): Promise<RequestLocation> {
     const inputs = this.ownInputIds(requestId);
-    return inputs.length > 1 ? client.findRequest(threadId, requestId, inputs) : client.findRequest(threadId, requestId);
+    return client.findRequest(threadId, requestId, inputs, true);
   }
 
   private ownInputIds(requestId: string): string[] {
-    const request = this.store.getRequest(requestId);
     return [requestId, ...this.store.steeringInputs(requestId)
-      .filter(input => input.state !== 'refused' && input.turnId === request?.turnId).map(input => input.id)];
+      .filter(input => input.state !== 'refused').map(input => input.id)];
   }
 
   private async reconcileSteering(input: SteeringInput): Promise<void> {
@@ -959,11 +986,19 @@ export class Engine extends EventEmitter {
 
   private async onNotification({ method, params }: CodexNotification): Promise<void> {
     const p = params as Record<string, any>;
+    if (method === 'turn/started') for (const active of this.store.activeRequests()) {
+      if (!active.steeredInto && this.store.getMeta(`overload-retry:${active.id}`) && this.store.getConversation(active.conversationId)?.threadId === p.threadId) await this.reconcile(active.id);
+    }
     const progressRequest = this.store.activeRequests().find(request => !request.steeredInto && request.turnId === p.turnId
       && this.store.getConversation(request.conversationId)?.threadId === p.threadId);
     if (progressRequest && !this.isMixed(progressRequest.id)) {
+      if (method === 'error' && p.willRetry === true && p.error?.codexErrorInfo === 'serverOverloaded') {
+        this.retryNotice(progressRequest, `native:${p.turnId}`, 'Codex временно перегружен и автоматически повторяет попытку. Ожидаю продолжения.');
+      }
       if (method === 'item/completed' && p.item?.type === 'agentMessage' && p.item.phase === 'commentary' && typeof p.item.text === 'string' && p.item.text.trim()) {
-        this.recordProgress(progressRequest.id, { commentary: this.options.redact(p.item.text).slice(0, 3000) });
+        this.recordProgress(progressRequest.id, { statusText: undefined, steps: [{
+          id: `${p.turnId}:${p.item.id ?? createHash('sha256').update(p.item.text).digest('hex')}`, text: p.item.text,
+        }] });
       } else if (method === 'turn/plan/updated' && Array.isArray(p.plan) && p.plan.length <= 50
         && p.plan.every((item: any) => typeof item?.step === 'string' && item.step.trim() && ['pending', 'in_progress', 'completed'].includes(item.status))) {
         this.recordProgress(progressRequest.id, { plan: p.plan.map((item: any) => ({ step: this.options.redact(item.step).slice(0, 300), status: item.status })) });
@@ -1037,12 +1072,24 @@ export class Engine extends EventEmitter {
       }
     } finally { this.approvalUpdatesSending = false; }
   }
-  private recordProgress(id: string, patch: RequestProgress): void {
+  private recordProgress(id: string, patch: RequestProgress, historyOrder = false): void {
     const request = this.store.getRequest(id);
     if (!request || request.origin.platform !== 'slack' || request.steeredInto) return;
     const key = `request-progress:${id}`, previous = this.store.getMeta(key);
     if (!previous && patch.terminal) return;
-    this.store.setMeta(key, JSON.stringify({ ...JSON.parse(previous ?? '{}'), ...patch }));
+    const old = JSON.parse(previous ?? '{}') as RequestProgress;
+    if (patch.steps) {
+      const incoming = patch.steps.map(step => ({ ...step, text: this.options.redact(step.text) }));
+      const before = old.steps ?? (old.commentary ? [{ id: 'legacy', text: old.commentary }] : []);
+      const retained = before.filter(step => step.id !== 'legacy' || !incoming.some(next => next.text === step.text));
+      const byId = new Map(retained.map(step => [step.id, step]));
+      for (const step of incoming) byId.set(step.id, step);
+      patch.steps = historyOrder ? [...incoming, ...retained.filter(step => !incoming.some(next => next.id === step.id))] : [...byId.values()];
+      patch.commentary = patch.steps.at(-1)?.text;
+    }
+    const next = JSON.stringify({ ...old, ...patch });
+    if (previous === next) return;
+    this.store.setMeta(key, next);
     this.store.setMeta('request-progress:pending', JSON.stringify([...new Set([...this.pendingProgress(), id])]));
   }
   private async flushProgress(): Promise<void> {
@@ -1059,6 +1106,13 @@ export class Engine extends EventEmitter {
         const key = `request-progress:${id}`, saved = this.store.getMeta(key);
         if (!saved) continue;
         try {
+          if (request.status === 'uncertain' && !this.isMixed(id)) {
+            // Only relabel an already published card; unverified details stay local.
+            await channel.updateProgress(id, request.origin, { statusText: uncertainProgress, existingOnly: true });
+            if (this.store.getMeta(key) === saved) this.store.setMeta('request-progress:pending', JSON.stringify(this.pendingProgress().filter(value => value !== id)));
+            this.progressRetryAfter.delete(id);
+            continue;
+          }
           const found = await this.findOwnRequest(client, conversation.threadId, id);
           if (client !== this.codex || this.stopped) continue;
           if (found.mixed || this.isMixed(id)) {
@@ -1106,6 +1160,9 @@ export class Engine extends EventEmitter {
     const rejectUnowned = async () => { if (managed) await client.rejectRequest(event.id, 'Rele cannot authorize this request without its original message.'); };
     const reviewHint = managed ? 'Действие отклонено. Сверьте запрос в панели Rele.' : 'Продолжите в Codex.';
     const p = event.params as Record<string, any>;
+    for (const active of this.store.activeRequests()) if (!active.steeredInto && this.store.getConversation(active.conversationId)?.threadId === p.threadId
+      && this.retryingOverloads.has(active.id)) await this.retryingOverloads.get(active.id)!.catch(() => {});
+    if (!current()) return;
     const request = this.store.activeRequests().find(row => !row.steeredInto && row.turnId === p.turnId && this.store.getConversation(row.conversationId)?.threadId === p.threadId);
     // An external server may broadcast another client's request. In our own child,
     // an unowned request has no authorized handler and must receive an explicit error.
@@ -1172,10 +1229,77 @@ export class Engine extends EventEmitter {
     this.track(this.deliver());
   }
 
+  private retryNotice(request: ReleRequest, key: string, text: string): void {
+    if (this.store.getMeta(`retry-notice:${request.id}:${key}`)) return;
+    this.store.addDeliveries(request.id, [{ key: `retry:${key}`, ordinal: 0, kind: 'answer', body: text }]);
+    this.store.setMeta(`retry-notice:${request.id}:${key}`, '1');
+    this.recordProgress(request.id, { statusText: text });
+  }
+
+  private async retryOverload(request: ReleRequest, found: RequestLocation): Promise<boolean> {
+    if (found.state !== 'failed' || found.failureReason !== 'serverOverloaded' || !found.turnId || found.mixed || this.isMixed(request.id)) return false;
+    if (this.store.getMeta(`cancel-requested:${request.id}`)) { this.track(this.cancel(request.id)); return true; }
+    if (found.retryBlocked) return false;
+    const key = `overload-retry:${request.id}`, raw = this.store.getMeta(key);
+    let retry = raw ? JSON.parse(raw) as OverloadRetry : undefined;
+    if (retry && retry.target !== this.targetFingerprint()) {
+      this.store.updateRequest(request.id, { status: 'uncertain', error: 'Подключение Codex изменилось. Автоматический повтор приостановлен до сверки.' });
+      return true;
+    }
+    if (retry?.turnId !== found.turnId) {
+      const attempts = Math.max(retry?.attempts ?? 0, found.retryCount ?? 0);
+      if (attempts >= overloadDelays.length) return false;
+      retry = { turnId: found.turnId, attempts, dueAt: Date.now() + overloadDelays[attempts] * 1000, target: this.targetFingerprint() };
+      this.store.setMeta(key, JSON.stringify(retry));
+      this.retryNotice(request, found.turnId, `Codex временно перегружен. Автоматический повтор ${attempts + 1}/${overloadDelays.length} — через ${overloadDelays[attempts]} с. Запрос можно остановить.`);
+    }
+    if (retry!.sending) {
+      const error = 'Проверяется результат повтора Codex. Повторная отправка запрещена до подтверждения в истории.';
+      this.store.updateRequest(request.id, { status: 'uncertain', error });
+      this.retryNotice(request, `uncertain:${found.turnId}`, error);
+      return true;
+    }
+    this.store.updateRequest(request.id, { status: 'running', turnId: found.turnId, error: `Codex перегружен. Ожидается автоматический повтор ${retry!.attempts + 1}/${overloadDelays.length}.` });
+    const conversation = this.store.getConversation(request.conversationId)!;
+    if (Date.now() < retry!.dueAt || this.stopped || this.suspended || conversation.paused || this.waitsForSource(request)) return true;
+    const client = this.codex, epoch = this.epoch;
+    if (this.store.steeringInputs(request.id).some(input => input.state === 'sending' || input.state === 'uncertain')) return true;
+    try {
+      const operation = client.retryOverloaded(conversation.threadId, request.id, found.turnId, this.ownInputIds(request.id), () => {
+        if (this.stopped || this.suspended || client !== this.codex || epoch !== this.epoch || this.store.getMeta(`cancel-requested:${request.id}`)
+          || terminal(this.store.getRequest(request.id)!.status) || this.store.getConversation(request.conversationId)?.paused || this.waitsForSource(request)) return false;
+        retry!.sending = true; retry!.attempts++;
+        this.store.setMeta(key, JSON.stringify(retry));
+        return true;
+      });
+      this.retryingOverloads.set(request.id, operation);
+      let result: { turnId: string } | undefined;
+      try { result = await operation; } finally { this.retryingOverloads.delete(request.id); }
+      if (client !== this.codex || epoch !== this.epoch) return true;
+      if (result) {
+        this.store.updateRequest(request.id, { turnId: result.turnId, status: 'running', error: undefined });
+        this.recordProgress(request.id, { statusText: `Автоматический повтор ${retry!.attempts}/${overloadDelays.length}: Codex продолжает работу.` });
+      }
+      if (result) this.reconcileAgain.add(request.id);
+      else { retry!.dueAt = Date.now() + 15_000; this.store.setMeta(key, JSON.stringify(retry)); }
+    } catch (error) {
+      if (error instanceof CodexThreadBusyError) {
+        retry!.sending = false; retry!.attempts--; retry!.dueAt = Date.now() + 15_000;
+        this.store.setMeta(key, JSON.stringify(retry));
+      } else throw error;
+    }
+    return true;
+  }
+
   private finishFromHistory(request: ReleRequest, found: RequestLocation): void {
     const cleanup = this.cancelCleanup(request.id);
     if (this.cancelling.has(request.id) && !cleanup?.done || cleanup && !cleanup.done) {
       this.store.updateRequest(request.id, { status: 'uncertain', error: 'Ожидается подтверждение остановки фоновых команд.' });
+      return;
+    }
+    if (cleanup?.done && found.failureReason === 'serverOverloaded' && this.store.getMeta(`cancel-requested:${request.id}`)) {
+      this.store.finishRequest(request.id, { status: 'cancelled', error: undefined, turnId: found.turnId }, []);
+      this.recordProgress(request.id, { terminal: 'cancelled' });
       return;
     }
     if (found.mixed || this.isMixed(request.id)) {
@@ -1197,7 +1321,7 @@ export class Engine extends EventEmitter {
       this.recordProgress(request.id, { terminal: 'completed' });
     } else if (found.state === 'failed' || found.state === 'interrupted') {
       const error = found.state === 'interrupted' ? 'Выполнение запроса остановлено в Codex.'
-        : found.failureReason === 'serverOverloaded' ? 'Сервис Codex временно перегружен. Запрос завершился с ошибкой. Rele не повторяет его автоматически.'
+        : found.failureReason === 'serverOverloaded' ? found.retryBlocked ? 'Codex временно перегружен. В чате уже началась другая задача; автоматические повторы этого запроса остановлены.' : 'Codex остаётся перегружен после автоматических повторов. Запрос завершён с ошибкой.'
           : 'Codex завершил запрос с ошибкой. Подробности доступны в Codex.';
       this.store.finishRequest(request.id, { status: found.state, turnId: found.turnId, error }, [{ key: 'terminal:error', ordinal: 0, kind: 'error', body: error }]);
       this.recordProgress(request.id, { terminal: found.state });

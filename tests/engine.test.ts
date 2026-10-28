@@ -47,6 +47,12 @@ class FakeCodex extends EventEmitter implements CodexGateway {
     return { queuedSubmissionId };
   });
   findRequest = vi.fn(async (_threadId: string, clientId: string): Promise<RequestLocation> => this.locations.get(clientId) ?? { state: 'not_found' });
+  retryOverloaded = vi.fn<import('../src/server/codex.js').CodexClient['retryOverloaded']>(async (_thread, id, previous, _inputs, beforeSend) => {
+    if (!beforeSend()) return;
+    const turnId = `${previous}-retry`;
+    this.locations.set(id, { state: 'running', turnId });
+    return { turnId };
+  });
   steer = vi.fn(async (threadId: string, _text: string, clientId: string, turnId: string) => {
     this.locations.set(clientId, { state: 'running', turnId });
     this.notification({ method: 'item/started', params: { threadId, turnId, item: { type: 'userMessage', clientId } } });
@@ -291,6 +297,50 @@ describe('Engine initial instruction and same-source steering', () => {
 });
 
 describe('Engine public Slack progress', () => {
+  it.each(['missing', 'unavailable'] as const)('periodically recovers a request with %s history while another thread runs, without resending', async failure => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture();
+    const otherEndpoint = { ...f.eps.slack, id: 'other-slack-endpoint', threadId: '170000.456' };
+    f.store.upsertEndpoint(otherEndpoint);
+    f.store.createConversation({ name: 'Other', threadId: 'other-codex-thread', cwd: '/projects/other',
+      bindings: [{ platform: 'slack', endpointId: otherEndpoint.id, allowedSenderIds: ['U1'] }] });
+    f.store.setMeta(initialMessageKey('/test/codex-home', 'other-codex-thread'), JSON.stringify({ applied: true }));
+    const first = await acceptRequest(f);
+    await running(f, first);
+    await f.engine.receive(f.message('slack', 'other', { endpoint: otherEndpoint }));
+    await f.engine.settled();
+    vi.setSystemTime(Date.now() + 1500); // Allow the second source's paced initial backfill.
+    await f.engine.pump(); await f.engine.settled();
+    const second = f.store.listRequests().find(row => row.eventId === 'other')!;
+    expect(second).toMatchObject({ status: 'starting', error: undefined });
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(2);
+    f.codex.locations.set(second.id, { state: 'running', turnId: 'other-turn' });
+    await f.engine.reconcile(second.id);
+    expect(f.store.getRequest(second.id)?.status).toBe('running');
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1',
+      item: { id: 'comment', type: 'agentMessage', phase: 'commentary', text: 'Public step' } } });
+    await f.engine.settled(); await f.engine.pump();
+    if (failure === 'missing') f.codex.locations.delete(first.id);
+    else f.codex.findRequest.mockRejectedValueOnce(new Error('Private backend detail'));
+    await f.engine.reconcile(first.id);
+    expect(f.store.getRequest(first.id)?.status).toBe('uncertain');
+    await f.engine.pump();
+    expect(f.slack.updateProgress.mock.calls.at(-1)).toEqual([first.id, first.origin,
+      { statusText: 'Проверяю состояние Codex', existingOnly: true }]);
+    f.codex.locations.set(first.id, { state: 'running', turnId: 'turn-1' });
+    vi.setSystemTime(Date.now() + 16_000);
+    await f.engine.pump(); await f.engine.settled();
+    expect(f.store.getRequest(first.id)).toMatchObject({ status: 'running', turnId: 'turn-1', error: undefined });
+    expect(f.store.getRequest(second.id)).toMatchObject({ status: 'running', turnId: 'other-turn' });
+    await f.engine.pump();
+    expect(f.slack.updateProgress.mock.calls.at(-1)).toEqual([first.id, first.origin,
+      { commentary: 'Public step', steps: [{ id: 'turn-1:comment', text: 'Public step' }] }]);
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(2);
+    expect(f.codex.retryOverloaded).not.toHaveBeenCalled();
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+    expect(f.store.listDeliveries()).toEqual([]);
+  });
+
   it('coalesces public commentary and native plan for the same request, excludes reasoning and closes even with NOREPLY', async () => {
     const f = fixture(); const root = await acceptRequest(f); await running(f, root);
     const plan = [{ step: 'Check access', status: 'completed' }, { step: 'Read results', status: 'in_progress' }];
@@ -298,11 +348,28 @@ describe('Engine public Slack progress', () => {
     f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1', item: { id: 'comment', type: 'agentMessage', phase: 'commentary', text: 'Access checked, reading results.' } } });
     f.codex.notification({ method: 'turn/plan/updated', params: { threadId: THREAD, turnId: 'turn-1', plan } });
     await f.engine.settled(); await f.engine.pump();
-    expect(f.slack.updateProgress).toHaveBeenCalledExactlyOnceWith(root.id, root.origin, { commentary: 'Access checked, reading results.', plan });
+    expect(f.slack.updateProgress).toHaveBeenCalledExactlyOnceWith(root.id, root.origin, { steps: [{ id: 'turn-1:comment', text: 'Access checked, reading results.' }], commentary: 'Access checked, reading results.', plan });
     expect(f.telegram.updateProgress).not.toHaveBeenCalled();
     f.codex.complete(root.id, 'NOREPLY'); await f.engine.settled(); await f.engine.pump();
-    expect(f.slack.updateProgress.mock.calls.at(-1)?.[2]).toEqual({ commentary: 'Access checked, reading results.', plan, terminal: 'completed' });
+    expect(f.slack.updateProgress.mock.calls.at(-1)?.[2]).toEqual({ steps: [{ id: 'turn-1:comment', text: 'Access checked, reading results.' }], commentary: 'Access checked, reading results.', plan, terminal: 'completed' });
     expect(f.store.listDeliveries().some(row => row.kind === 'answer')).toBe(false);
+  });
+
+  it('keeps the complete ordered commentary across duplicate events and history recovery', async () => {
+    const f = fixture(); const root = await acceptRequest(f); await running(f, root);
+    const first = { id: 'turn-1:one', text: 'First recovered step' };
+    const second = { id: 'turn-1:two', text: 'Long public commentary '.repeat(200) };
+    const event = { method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1',
+      item: { id: 'two', type: 'agentMessage', phase: 'commentary', text: second.text } } };
+    f.codex.notification(event); f.codex.notification(event); await f.engine.settled();
+    expect(JSON.parse(f.store.getMeta(`request-progress:${root.id}`)!).steps).toEqual([second]);
+    f.codex.locations.set(root.id, { state: 'running', turnId: 'turn-1', commentary: [first, second] });
+    await f.engine.reconcile(root.id); await f.engine.pump();
+    expect(f.slack.updateProgress.mock.calls.at(-1)?.[2]).toMatchObject({ steps: [first, second], commentary: second.text });
+    await f.engine.reconcile(root.id);
+    expect(JSON.parse(f.store.getMeta(`request-progress:${root.id}`)!).steps).toEqual([first, second]);
+    f.codex.complete(root.id, 'Done'); await f.engine.settled(); await f.engine.pump();
+    expect(f.slack.updateProgress.mock.calls.at(-1)?.[2]).toMatchObject({ steps: [first, second], terminal: 'completed' });
   });
 
   it('does not forward Desktop or mixed progress and does not fail the answer when Slack progress is unavailable', async () => {
@@ -538,21 +605,142 @@ describe('Engine correlation and queue', () => {
     expect(f.telegram.deliver).not.toHaveBeenCalled();
   });
 
-  it.each(['slack', 'telegram'] as const)('reports a confirmed overload to its %s source once without retrying the request', async platform => {
-    const f = fixture();
-    const request = await acceptRequest(f, platform);
-    await running(f, request);
+  it.each(['slack', 'telegram'] as const)('retries overload with backoff and delivers only to %s', async platform => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture(); const request = await acceptRequest(f, platform); await running(f, request);
+    f.codex.locations.set(request.id, { state: 'failed', turnId: 'turn-1', failureReason: 'serverOverloaded' });
+    await f.engine.reconcile(request.id); await f.engine.pump();
+    expect(f.codex.retryOverloaded).not.toHaveBeenCalled();
+    expect(f.store.getRequest(request.id)?.status).toBe('running');
+    expect(f.store.listDeliveries()).toMatchObject([{ kind: 'answer', body: expect.stringContaining('через 15 с'), status: 'sent' }]);
+    vi.setSystemTime(Date.now() + 15_000); await f.engine.reconcile(request.id); await f.engine.settled();
+    expect(f.codex.retryOverloaded).toHaveBeenCalledTimes(1);
+    f.codex.complete(request.id, 'Recovered answer', 'turn-1-retry');
+    await f.engine.settled(); await f.engine.pump();
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'completed', turnId: 'turn-1-retry' });
+    expect(f.store.listDeliveries().filter(row => row.key.startsWith('answer:'))).toMatchObject([{ body: 'Recovered answer', status: 'sent' }]);
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+    expect(f[platform === 'slack' ? 'telegram' : 'slack'].deliver).not.toHaveBeenCalled();
+  });
+
+  it('stops after four increasing overload delays without replaying input', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture(); const request = await acceptRequest(f); await running(f, request);
+    let turnId = 'turn-1';
+    for (const seconds of [15, 30, 60, 120]) {
+      f.codex.locations.set(request.id, { state: 'failed', turnId, failureReason: 'serverOverloaded' });
+      await f.engine.reconcile(request.id);
+      const before = f.codex.retryOverloaded.mock.calls.length;
+      vi.setSystemTime(Date.now() + seconds * 1000 - 1); await f.engine.reconcile(request.id);
+      expect(f.codex.retryOverloaded).toHaveBeenCalledTimes(before);
+      vi.setSystemTime(Date.now() + 1); await f.engine.reconcile(request.id); await f.engine.settled();
+      expect(f.codex.retryOverloaded).toHaveBeenCalledTimes(before + 1); turnId += '-retry';
+    }
+    f.codex.locations.set(request.id, { state: 'failed', turnId, failureReason: 'serverOverloaded' });
+    await f.engine.reconcile(request.id); await f.engine.pump();
+    expect(f.store.getRequest(request.id)?.status).toBe('failed');
+    expect(f.store.listDeliveries().filter(row => row.kind === 'error')).toHaveLength(1);
+    expect(f.codex.retryOverloaded).toHaveBeenCalledTimes(4);
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports native willRetry once without scheduling a second turn', async () => {
+    const f = fixture(); const request = await acceptRequest(f); await running(f, request);
+    for (let i = 0; i < 2; i++) f.codex.notification({ method: 'error', params: { threadId: THREAD, turnId: 'turn-1', willRetry: true, error: { codexErrorInfo: 'serverOverloaded', message: 'private' } } });
+    await f.engine.settled(); await f.engine.pump();
+    expect(f.store.listDeliveries()).toMatchObject([{ kind: 'answer', body: expect.stringContaining('автоматически повторяет') }]);
+    expect(f.codex.retryOverloaded).not.toHaveBeenCalled();
+    expect(JSON.stringify(f.store.listDeliveries())).not.toContain('private');
+  });
+
+  it('adopts a Desktop continuation during backoff', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture(); const request = await acceptRequest(f); await running(f, request);
     f.codex.locations.set(request.id, { state: 'failed', turnId: 'turn-1', failureReason: 'serverOverloaded' });
     await f.engine.reconcile(request.id);
-    await f.engine.pump();
+    f.codex.locations.set(request.id, { state: 'running', turnId: 'desktop-retry', retryCount: 1 });
+    f.codex.notification({ method: 'turn/started', params: { threadId: THREAD, turn: { id: 'desktop-retry' } } });
+    await f.engine.settled(); expect(f.store.getRequest(request.id)?.turnId).toBe('desktop-retry');
+    vi.setSystemTime(Date.now() + 20_000); await f.engine.reconcile(request.id);
+    expect(f.codex.retryOverloaded).not.toHaveBeenCalled();
+    f.codex.complete(request.id, 'Desktop retry result', 'desktop-retry');
+    await f.engine.settled(); await f.engine.pump();
+    expect(f.store.listDeliveries().filter(row => row.key.startsWith('answer:'))).toMatchObject([{ body: 'Desktop retry result' }]);
+  });
+
+  it('Stop during backoff prevents retry', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture(); const request = await acceptRequest(f); await running(f, request);
+    f.codex.locations.set(request.id, { state: 'failed', turnId: 'turn-1', failureReason: 'serverOverloaded' });
+    await f.engine.reconcile(request.id); await f.engine.cancel(request.id);
+    vi.setSystemTime(Date.now() + 300_000); await f.engine.reconcile(request.id);
+    expect(f.store.getRequest(request.id)?.status).toBe('cancelled');
+    expect(f.codex.retryOverloaded).not.toHaveBeenCalled(); expect(f.codex.interrupt).not.toHaveBeenCalled();
+  });
+
+  it('does not resend a lost retry ACK and accepts a later receipt', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture(); const request = await acceptRequest(f); await running(f, request);
+    f.codex.locations.set(request.id, { state: 'failed', turnId: 'turn-1', failureReason: 'serverOverloaded' });
+    f.codex.retryOverloaded.mockImplementationOnce(async (_thread, _id, _turn, _inputs, beforeSend) => { beforeSend(); throw new Error('Lost ACK'); });
+    await f.engine.reconcile(request.id); vi.setSystemTime(Date.now() + 15_000);
+    await f.engine.reconcile(request.id); vi.setSystemTime(Date.now() + 300_000); await f.engine.reconcile(request.id);
+    expect(f.store.getRequest(request.id)?.status).toBe('uncertain'); expect(f.codex.retryOverloaded).toHaveBeenCalledTimes(1);
+    f.codex.locations.set(request.id, { state: 'completed', turnId: 'recovered-retry', text: 'Recovered once' });
+    await f.engine.reconcile(request.id); await f.engine.pump();
+    expect(f.store.getRequest(request.id)?.status).toBe('completed');
+    expect(f.store.listDeliveries().filter(row => row.key.startsWith('answer:'))).toHaveLength(1);
+  });
+
+  it('preserves the retry deadline across an Engine restart', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture(); const request = await acceptRequest(f); await running(f, request);
+    const failed: RequestLocation = { state: 'failed', turnId: 'turn-1', failureReason: 'serverOverloaded' };
+    f.codex.locations.set(request.id, failed); await f.engine.reconcile(request.id); await f.engine.stop();
+    const restored = fixture({ path: f.path, start: false }); restored.codex.locations.set(request.id, failed);
+    restored.engine.start(); await restored.engine.settled();
+    vi.setSystemTime(Date.now() + 14_999); await restored.engine.reconcile(request.id);
+    expect(restored.codex.retryOverloaded).not.toHaveBeenCalled();
+    vi.setSystemTime(Date.now() + 1); await restored.engine.reconcile(request.id); await restored.engine.settled();
+    expect(restored.codex.retryOverloaded).toHaveBeenCalledTimes(1); expect(restored.codex.enqueue).not.toHaveBeenCalled();
+  });
+
+  it('does not retry when foreign work follows the overload', async () => {
+    const f = fixture(); const request = await acceptRequest(f); await running(f, request);
+    f.codex.locations.set(request.id, { state: 'failed', turnId: 'turn-1', failureReason: 'serverOverloaded', retryBlocked: true });
     await f.engine.reconcile(request.id);
-    await f.engine.pump();
-    const error = 'Сервис Codex временно перегружен. Запрос завершился с ошибкой. Rele не повторяет его автоматически.';
-    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'failed', turnId: 'turn-1', error });
-    expect(f.store.listDeliveries()).toMatchObject([{ kind: 'error', body: error, status: 'sent', attempts: 1 }]);
-    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
-    expect(f[platform].deliver).toHaveBeenCalledTimes(1);
-    expect(f[platform === 'slack' ? 'telegram' : 'slack'].deliver).not.toHaveBeenCalled();
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'failed', error: expect.stringContaining('другая задача') });
+    expect(f.codex.retryOverloaded).not.toHaveBeenCalled();
+  });
+
+  it('Stop racing a retry ACK waits for the new turn and interrupts it', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture(); const request = await acceptRequest(f); await running(f, request);
+    f.codex.locations.set(request.id, { state: 'failed', turnId: 'turn-1', failureReason: 'serverOverloaded' });
+    await f.engine.reconcile(request.id); vi.setSystemTime(Date.now() + 15_000);
+    const ack = deferred<{ turnId: string }>();
+    f.codex.retryOverloaded.mockImplementationOnce(async (_thread, _id, _turn, _inputs, beforeSend) => { beforeSend(); return ack.promise; });
+    const reconciliation = f.engine.reconcile(request.id);
+    await vi.waitFor(() => expect(f.codex.retryOverloaded).toHaveBeenCalledTimes(1));
+    const cancellation = f.engine.cancel(request.id);
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+    f.codex.locations.set(request.id, { state: 'running', turnId: 'new-retry' }); ack.resolve({ turnId: 'new-retry' });
+    await reconciliation; await cancellation; await f.engine.settled();
+    expect(f.codex.interrupt).toHaveBeenCalledWith(THREAD, 'new-retry');
+    expect(f.store.getRequest(request.id)?.status).toBe('interrupted');
+  });
+
+  it('a native busy rejection defers retry without burning an attempt or looping', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture(); const request = await acceptRequest(f); await running(f, request);
+    f.codex.locations.set(request.id, { state: 'failed', turnId: 'turn-1', failureReason: 'serverOverloaded' });
+    await f.engine.reconcile(request.id); vi.setSystemTime(Date.now() + 15_000);
+    f.codex.retryOverloaded.mockImplementationOnce(async (_thread, _id, _turn, _inputs, beforeSend) => { beforeSend(); throw new CodexThreadBusyError(THREAD, 'non_idle'); });
+    await f.engine.reconcile(request.id); await f.engine.settled();
+    await f.engine.reconcile(request.id); expect(f.codex.retryOverloaded).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(Date.now() + 15_000); await f.engine.pump(); await f.engine.settled();
+    expect(f.codex.retryOverloaded).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(f.store.getMeta(`overload-retry:${request.id}`)!)).toMatchObject({ attempts: 1 });
   });
 
   it('keeps an unknown native failure generic without publishing raw error details', async () => {

@@ -4,7 +4,7 @@ import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionSta
 import type { Store } from '../store.js';
 import { ChannelError, downloadBounded, endpointId, readableTitle, splitReply, type ApprovalContext, type ApprovalResolution, type Channel, type ChannelCallbacks, type RequestProgress, type SlackSessionStatus } from './common.js';
 import { escapeSlackText, formatSlackReply } from './slack-format.js';
-import { slackProgressBlocks } from './slack-progress.js';
+import { slackPageControls, slackProgressBlocks, slackProgressPages } from './slack-progress.js';
 import { QUESTION_VIEW, parseQuestionMetadata, questionAnswers, questionCard, questionHash, questionView, resolvedQuestion, supportsQuestionForm } from './slack-questions.js';
 
 type Json = Record<string, any>;
@@ -68,7 +68,16 @@ interface ProgressReceipt {
   ts?: string;
   hash?: string;
   terminal?: RequestProgress['terminal'];
+  progress?: RequestProgress;
+  answers?: { key: string; ordinal: number; text: string }[];
+  historyPage?: number;
+  answerPage?: number;
 }
+
+type ProgressUpdate = {
+  answer?: { key: string; ordinal: number; text: string };
+  page?: { kind: 'history' | 'answer'; index: number; ts: string };
+};
 
 /** Socket Mode needs outbound connections only. ACK follows the durable inbox write. */
 export class SlackChannel implements Channel {
@@ -95,7 +104,7 @@ export class SlackChannel implements Channel {
   private catalogScopes?: Set<string>;
   private refreshing = new Set<string>();
   private abort = new AbortController();
-  private progressWrites = new Map<string, Promise<void>>();
+  private progressWrites = new Map<string, Promise<string | undefined>>();
   private questionTasks = new Set<Promise<void>>();
 
   constructor(private readonly botToken: string, private readonly appToken: string, private readonly callbacks: ChannelCallbacks, private readonly options: SlackOptions = {}) {
@@ -142,7 +151,7 @@ export class SlackChannel implements Channel {
         try {
           const envelope = JSON.parse(raw.toString());
           if (envelope.type === 'interactive' && (envelope.payload?.view?.callback_id === QUESTION_VIEW
-              || String(envelope.payload?.actions?.[0]?.value ?? '').startsWith('releq:'))) {
+              || /^rele[qp]:/u.test(String(envelope.payload?.actions?.[0]?.value ?? '')))) {
             void this.receive(raw.toString(), socket).catch(() => {}); return;
           }
         } catch {}
@@ -273,21 +282,25 @@ export class SlackChannel implements Channel {
   }
 
   async updateProgress(requestId: string, origin: Origin, progress: RequestProgress): Promise<void> {
-    const snapshot = { ...progress, ...(progress.plan ? { plan: progress.plan.map(item => ({ ...item })) } : {}) };
+    await this.queueProgress(requestId, origin, progress);
+  }
+
+  private async queueProgress(requestId: string, origin: Origin, progress: RequestProgress | undefined, update: ProgressUpdate = {}): Promise<string | undefined> {
+    const snapshot = progress ? structuredClone(progress) : undefined;
     const write = (this.progressWrites.get(requestId) ?? Promise.resolve()).catch(() => {})
-      .then(() => this.writeProgress(requestId, origin, snapshot));
+      .then(() => this.writeProgress(requestId, origin, snapshot, update));
     this.progressWrites.set(requestId, write);
-    try { await write; }
+    try { return await write; }
     finally { if (this.progressWrites.get(requestId) === write) this.progressWrites.delete(requestId); }
   }
 
-  private async writeProgress(requestId: string, origin: Origin, progress: RequestProgress): Promise<void> {
+  private async writeProgress(requestId: string, origin: Origin, progress: RequestProgress | undefined, update: ProgressUpdate): Promise<string | undefined> {
     const store = this.options.progressStore;
     if (!store || this.stopped || !requestId || origin.platform !== 'slack'
         || origin.accountId !== this.accountId || !/^[CDG][A-Z0-9]+$/u.test(origin.chatId)
         || !SLACK_TS.test(origin.threadId)
         || origin.endpointId !== endpointId('slack', this.accountId, origin.chatId, origin.threadId)
-        || (progress.plan?.length ?? 0) > 50) return;
+        || (progress?.plan?.length ?? 0) > 50) return;
     const endpoint = this.endpoints.get(origin.endpointId);
     if (!endpoint || endpoint.accountId !== origin.accountId || endpoint.chatId !== origin.chatId || endpoint.threadId !== origin.threadId) return;
     const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -297,22 +310,52 @@ export class SlackChannel implements Channel {
     let receipt: ProgressReceipt | undefined;
     if (saved !== undefined) {
       try { receipt = JSON.parse(saved) as ProgressReceipt; } catch { return; }
-      if (!receipt || receipt.route !== route || receipt.state !== 'posted' || typeof receipt.ts !== 'string'
-          || !SLACK_TS.test(receipt.ts) || receipt.terminal && receipt.terminal !== progress.terminal) return;
+      if (!receipt || receipt.route !== route) {
+        if (update.answer) throw new ChannelError('Источник сохранённого сообщения Slack не совпадает.');
+        return;
+      }
+      if (receipt.state !== 'posted' || typeof receipt.ts !== 'string' || !SLACK_TS.test(receipt.ts)) {
+        if (update.answer && receipt.answers?.length) throw new ChannelError('Slack не подтвердил сообщение с результатом. Проверьте доставку.', false, true);
+        return;
+      }
+      if (receipt.progress?.existingOnly) progress = receipt.progress;
+      else if (progress?.existingOnly && !progress.terminal) progress = { ...receipt.progress, statusText: progress.statusText };
+      else if (update.answer && progress && !progress.existingOnly) progress = { ...receipt.progress, ...progress };
+      if (receipt.terminal && progress && receipt.terminal !== progress.terminal) {
+        if (update.answer) throw new ChannelError('Состояние итогового сообщения Slack уже изменилось.');
+        return receipt.ts;
+      }
     }
-    if (progress.existingOnly && !receipt) return;
-    const blocks = slackProgressBlocks(requestId, progress);
+    if (update.page && (!receipt || receipt.ts !== update.page.ts)) return;
+    progress ??= receipt?.progress;
+    if (!progress || progress.existingOnly && !receipt) return;
+    const next: ProgressReceipt = { ...receipt, route, state: receipt ? 'posted' : 'posting', progress,
+      ...(progress.terminal ? { terminal: progress.terminal } : {}) };
+    // Mixed-client closure must remove earlier details, including stored result pages.
+    if (progress.existingOnly) { delete next.answers; delete next.historyPage; delete next.answerPage; }
+    if (update.answer) {
+      const previous = next.answers?.find(answer => answer.key === update.answer!.key);
+      if (previous && previous.text !== update.answer.text) throw new ChannelError('Содержимое сохранённого результата Slack изменилось.');
+      next.answers = [...(next.answers ?? []).filter(answer => answer.key !== update.answer!.key), update.answer].sort((a, b) => a.ordinal - b.ordinal);
+    }
+    if (update.page) {
+      const count = update.page.kind === 'history' ? slackProgressPages(progress).length : next.answers?.length ?? 0;
+      if (!Number.isSafeInteger(update.page.index) || update.page.index < 0 || update.page.index >= count) return;
+      if (update.page.kind === 'history') next.historyPage = update.page.index;
+      else next.answerPage = update.page.index;
+    }
+    const blocks = slackProgressBlocks(requestId, progress, next.historyPage);
+    const answerPage = Math.min(next.answerPage ?? 0, Math.max(0, (next.answers?.length ?? 0) - 1));
+    const answer = next.answers?.[answerPage]?.text;
+    if (answer !== undefined) blocks.push({ type: 'markdown', text: formatSlackReply(answer) },
+      ...slackPageControls(requestId, 'answer', answerPage, next.answers!.length));
     const hash = digest(blocks);
-    if (receipt?.hash === hash) return;
-    const next: ProgressReceipt = { route, state: receipt ? 'posted' : 'posting',
-      ...(receipt ? { ts: receipt.ts, hash: receipt.hash } : {}),
-      ...(progress.terminal ? { terminal: progress.terminal } : {}),
-    };
-    // Persist before the first post. A lost ACK/restart must never create a second message.
+    if (receipt?.hash === hash) { store.setMeta(key, JSON.stringify(next)); return receipt.ts; }
+    // Persist before mutation; known-ts updates are replaceable, first posts are not.
     store.setMeta(key, JSON.stringify(next));
     const body: Json = {
       channel: origin.chatId, ...(receipt ? { ts: receipt.ts } : { thread_ts: origin.threadId }),
-      text: escapeSlackText(progress.commentary?.trim() || String(blocks[0].title)),
+      text: escapeSlackText(splitReply(answer !== undefined ? formatSlackReply(answer) : progress.commentary?.trim() || String(blocks[0].title), 3000)[0]),
       blocks, mrkdwn: false, parse: 'none', link_names: false, unfurl_links: false, unfurl_media: false,
     };
     try {
@@ -320,11 +363,26 @@ export class SlackChannel implements Channel {
       if (result.channel !== origin.chatId || typeof result.ts !== 'string' || !SLACK_TS.test(result.ts)
           || receipt && result.ts !== receipt.ts) throw new ChannelError('Slack не подтвердил сообщение прогресса.', false, true);
       store.setMeta(key, JSON.stringify({ ...next, state: 'posted', ts: result.ts, hash }));
+      return result.ts;
     } catch (error) {
-      // Updating a known ts can be retried safely; an unconfirmed first post cannot.
-      if (!receipt) store.setMeta(key, JSON.stringify({ ...next, state: 'uncertain' }));
-      else throw error;
+      if (receipt) {
+        if (error instanceof ChannelError && error.uncertain) throw new ChannelError(error.message, true, false, error.retryAfterMs, error.statusCode);
+        throw error;
+      }
+      store.setMeta(key, JSON.stringify({ ...next, state: 'uncertain' }));
+      if (update.answer) throw error;
     }
+  }
+
+  private async progressClick(payload: Json): Promise<void> {
+    const match = /^relep:([A-Za-z0-9_-]{1,128}):(history|answer):(\d{1,8})$/u.exec(String(payload.actions?.[0]?.value ?? ''));
+    const chatId = payload.channel?.id, threadId = payload.message?.thread_ts;
+    if (!match || payload.team?.id !== this.teamId || !SLACK_USER.test(payload.user?.id ?? '')
+        || typeof chatId !== 'string' || typeof threadId !== 'string' || !SLACK_TS.test(payload.message?.ts ?? '')) return;
+    const origin: Origin = { platform: 'slack', accountId: this.accountId, chatId, threadId,
+      endpointId: endpointId('slack', this.accountId, chatId, threadId),
+      senderId: payload.user.id, senderName: '', messageId: payload.message.ts };
+    await this.queueProgress(match[1], origin, undefined, { page: { kind: match[2] as 'history' | 'answer', index: Number(match[3]), ts: payload.message.ts } });
   }
 
   async readThreadPage(target: Pick<Origin, 'endpointId' | 'accountId' | 'chatId' | 'threadId'>, options: { cursor?: string; oldest?: string; latest?: string } = {}): Promise<{ messages: SlackTranscriptMessage[]; nextCursor?: string }> {
@@ -477,6 +535,17 @@ export class SlackChannel implements Channel {
   }
   async deliver(delivery: Delivery, approval?: Approval): Promise<string> {
     if (!this.accountId || delivery.origin.accountId !== this.accountId) throw new ChannelError('Учётная запись Slack изменилась. Доставка через другого бота запрещена.');
+    if (!approval && delivery.requestId && this.options.progressStore
+        && (delivery.key.startsWith('answer:') || delivery.key === 'terminal:error' || delivery.key.startsWith('retry:'))) {
+      const raw = this.options.progressStore.getMeta(`request-progress:${delivery.requestId}`);
+      const progress: RequestProgress = raw ? JSON.parse(raw) : {};
+      const retry = delivery.key.startsWith('retry:');
+      const ts = await this.queueProgress(delivery.requestId, delivery.origin,
+        retry ? { ...progress, statusText: delivery.body } : { ...progress, terminal: progress.terminal ?? (delivery.key === 'terminal:error' ? 'failed' : 'completed') },
+        retry ? {} : { answer: { key: delivery.key, ordinal: delivery.ordinal, text: delivery.body } });
+      if (ts) return ts;
+      // shortcut: after a lost progress-post ACK, send the final separately until Slack receipt reconciliation is available.
+    }
     const rich = (delivery.kind === 'answer' || delivery.kind === 'message') && !approval;
     const formatted = rich ? formatSlackReply(delivery.body) : delivery.body;
     if (delivery.kind === 'message' && (approval || [...delivery.body].length > 3000 || delivery.mentions?.some(person => !SLACK_USER.test(person.id)))) throw new ChannelError('Некорректное сообщение или адрес упоминания Slack.');
@@ -664,6 +733,10 @@ export class SlackChannel implements Channel {
     } else if (envelope.type === 'interactive' && envelope.payload?.type === 'block_actions') {
       const payload = envelope.payload as Json;
       const value = payload.actions?.[0]?.value;
+      if (typeof value === 'string' && value.startsWith('relep:')) {
+        this.ack(socket, envelope.envelope_id);
+        this.questionTask(() => this.progressClick(payload)); return;
+      }
       if (typeof value === 'string' && value.startsWith('releq:')) {
         this.ack(socket, envelope.envelope_id);
         this.questionTask(() => this.questionClick(payload)); return;

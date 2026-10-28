@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -36,6 +36,10 @@ export interface RequestLocation {
   turnId?: string;
   text?: string;
   failureReason?: 'serverOverloaded';
+  commentary?: { id: string; text: string }[];
+  retryCount?: number;
+  retryBlocked?: boolean;
+  rootTurnId?: string;
   mixed?: boolean;
   commandItems?: CodexCommandItem[];
 }
@@ -54,8 +58,8 @@ export function codexCommandItem(value: unknown): CodexCommandItem | undefined {
 }
 export interface CodexRuntime { userAgent: string; codexHome: string; platformFamily: string; platformOs: string }
 interface QueueEntry { id: string; clientUserMessageId: string }
-interface HistoryItem { type: string; clientId?: string | null; text?: string; phase?: string | null }
-interface HistoryTurn { id: string; status: string; completedAt?: number | null; items: HistoryItem[]; error?: { codexErrorInfo?: unknown } | null }
+interface HistoryItem { type: string; id?: string; clientId?: string | null; text?: string; phase?: string | null }
+interface HistoryTurn { id: string; rootTurnId?: string | null; status: string; completedAt?: number | null; items: HistoryItem[]; error?: { codexErrorInfo?: unknown } | null }
 interface Page<T> { data: T[]; nextCursor: string | null }
 interface RawThread {
   id: string; name?: string | null; cwd: string; preview: string; updatedAt: number;
@@ -482,11 +486,12 @@ export class CodexClient extends EventEmitter {
   }
 
   /** A not_found result is evidence for operator review, not permission to resend queue/add. */
-  async findRequest(threadId: string, clientId: string, ownInputIds: readonly string[] = []): Promise<RequestLocation> {
+  async findRequest(threadId: string, clientId: string, ownInputIds: readonly string[] = [], followRetries = false): Promise<RequestLocation> {
     const known = this.knownInputIds(clientId, ownInputIds);
     const queue = await this.pages<QueueEntry>('thread/queue/list', { threadId, limit: 100 });
     const queued = queue.filter(entry => entry.clientUserMessageId === clientId);
     if (queued.length > 1) throw new Error('В очереди Codex несколько запросов с одним clientId; требуется ручная сверка.');
+    const newer: HistoryTurn[] = [];
     let cursor: string | undefined;
     const seen = new Set<string>();
     do {
@@ -496,12 +501,63 @@ export class CodexClient extends EventEmitter {
       const matches = page.data.filter(turn => turn.items.some(item => item.type === 'userMessage' && item.clientId === clientId));
       if (matches.length > 1) throw new Error('В истории Codex несколько ходов с одним clientId; требуется ручная сверка.');
       if (matches.length) {
-        const turn = matches[0];
-        return this.historyLocation(turn, known);
+        let turn = matches[0];
+        let found = this.historyLocation(turn, known);
+        if (!followRetries || found.mixed || found.failureReason !== 'serverOverloaded') return found;
+        const rootTurnId = turn.rootTurnId ?? turn.id;
+        let retryCount = 0;
+        for (const next of [...newer, ...page.data.slice(0, page.data.indexOf(turn))].reverse()) {
+          if (found.failureReason !== 'serverOverloaded') break;
+          // Desktop Retry creates an empty successor; Rele also tags its root for recovery.
+          const users = next.items.filter(item => item.type === 'userMessage');
+          if (users.length && (next.rootTurnId !== rootTurnId || users.some(item => !item.clientId || !known.has(item.clientId)))) {
+            return { ...found, rootTurnId, retryCount, retryBlocked: true };
+          }
+          if (next.rootTurnId && next.rootTurnId !== next.id && next.rootTurnId !== rootTurnId) {
+            return { ...found, rootTurnId, retryCount, retryBlocked: true };
+          }
+          turn = next;
+          const location = this.historyLocation(turn, known);
+          const commentary = [...(found.commentary ?? []), ...(location.commentary ?? [])];
+          found = { ...location, ...(commentary.length ? { commentary } : {}),
+            commandItems: [...(found.commandItems ?? []), ...(location.commandItems ?? [])] };
+          retryCount++;
+        }
+        return { ...found, rootTurnId, retryCount };
       }
+      newer.push(...page.data);
       cursor = nextPage(page.nextCursor, seen);
     } while (cursor);
     return queued.length ? { state: 'queued', queuedSubmissionId: queued[0].id, soleQueuedSubmission: queue.length === 1 } : { state: 'not_found' };
+  }
+
+  /** Desktop's Retry: continue the history, never replay the original user message. */
+  async retryOverloaded(threadId: string, clientId: string, expectedTurnId: string, ownInputIds: readonly string[], beforeSend: () => boolean): Promise<{ turnId: string } | undefined> {
+    this.requireQueue();
+    const runtime = this.runtime;
+    const snapshot = await this.call<{ thread: RawThread }>('thread/read', { threadId });
+    const queue = await this.pages<QueueEntry>('thread/queue/list', { threadId, limit: 100 });
+    if (snapshot.thread.id !== threadId || snapshot.thread.status?.type !== 'idle' || queue.length) return;
+    const found = await this.findRequest(threadId, clientId, ownInputIds, true);
+    if (found.turnId !== expectedTurnId || found.failureReason !== 'serverOverloaded' || found.mixed || found.retryBlocked) return;
+    // shortcut: native has no expected-previous-turn fence; history is checked immediately before sending.
+    if (runtime !== this.runtime || !this.state.connected || !beforeSend()) return;
+    try {
+      // Native rejects empty input on an active turn; it cannot steer another client's work.
+      const response = await this.call<{ turn: HistoryTurn }>('turn/start', {
+        threadId, input: [], turnTrigger: 'capacity_retry_automatic',
+        parentTurnId: expectedTurnId, rootTurnId: found.rootTurnId ?? expectedTurnId,
+      });
+      if (runtime !== this.runtime || !response?.turn?.id || response.turn.id === expectedTurnId) {
+        throw new CodexTransportError('Результат повтора Codex не подтверждён. Ожидается сверка истории без повторной отправки.');
+      }
+      return { turnId: response.turn.id };
+    } catch (error) {
+      if (error instanceof CodexRpcError && error.code === -32603 && error.message === 'failed to submit turn input: EmptyInput') {
+        throw new CodexThreadBusyError(threadId, 'non_idle');
+      }
+      throw error;
+    }
   }
 
   /** An absent receipt is uncertain, never permission to replay a steer or enqueue its text. */
@@ -544,11 +600,14 @@ export class CodexClient extends EventEmitter {
     if (state === 'interrupted' && (typeof turn.completedAt !== 'number' || !Number.isFinite(turn.completedAt))) {
       throw new CodexTransportError('Codex пока не подтвердил прерывание запроса. Ожидается сверка завершения без повторной отправки.', 'turn-interruption-unconfirmed');
     }
+    const commentary = turn.items.filter(item => item.type === 'agentMessage' && item.phase === 'commentary' && item.text?.trim())
+      .map(item => ({ id: `${turn.id}:${item.id ?? createHash('sha256').update(item.text!).digest('hex')}`, text: item.text! }));
     const answers = turn.items.filter(item => item.type === 'agentMessage' && item.phase === 'final_answer');
     const legacy = turn.items.filter(item => item.type === 'agentMessage' && item.phase == null);
     return {
       state: state as RequestLocation['state'], turnId: turn.id,
       ...(mixed ? { mixed: true } : {
+        ...(commentary.length ? { commentary } : {}),
         text: answers.length ? answers.map(item => item.text || '').join('\n\n') : legacy.at(-1)?.text,
         ...(state === 'failed' && turn.error?.codexErrorInfo === 'serverOverloaded' ? { failureReason: 'serverOverloaded' as const } : {}),
         ...(turn.items.some(item => codexCommandItem(item)) ? { commandItems: turn.items.flatMap(item => { const command = codexCommandItem(item); return command ? [command] : []; }) } : {}),
