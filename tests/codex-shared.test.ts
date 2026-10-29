@@ -200,18 +200,18 @@ describe('Windows direct shared Codex', () => {
     expect(f.run.mock.calls.find(([, args]) => args[0] === 'codex-start')?.[1]).toContain(f.executable);
   });
 
-  it('automatically chooses the highest supported version while ignoring a newer unsupported installation', async () => {
+  it.each(['0.165.0-alpha.1.2', '0.166.0-alpha.5.1'])('automatically chooses supported %s while ignoring a newer unsupported installation', async version => {
     const f = await windowsFixture(), newer = await desktopFixture(path.join(f.home, 'newer')), unsupported = await desktopFixture(path.join(f.home, 'unsupported'));
     f.discovery.installations.unshift(
       { executable: unsupported, name: 'Unverified Desktop', source: 'desktop-install', version: '9.0.0', running: false },
-      { executable: newer, name: 'Newer Desktop', source: 'desktop-install', version: '0.165.0-alpha.1.2', running: false },
+      { executable: newer, name: 'Newer Desktop', source: 'desktop-install', version, running: false },
     );
     f.receipt.executable = newer;
     f.receipt.executableSha256 = createHash('sha256').update(await readFile(newer)).digest('hex');
-    f.runtime.userAgent = 'codex_cli_rs/0.165.0-alpha.1.2 (Windows)';
+    f.runtime.userAgent = `codex_cli_rs/${version} (Windows)`;
     f.run.mockImplementation(async (command, args) => ({ code: 0, stdout: args[0] === 'codex-status'
       ? JSON.stringify({ status: 'notRunning' }) : args.at(-1) === '--version'
-        ? `codex-cli ${command === newer ? '0.165.0-alpha.1.2' : '0.163.0-alpha.11.2'}` : JSON.stringify(f.receipt) }));
+        ? `codex-cli ${command === newer ? version : '0.163.0-alpha.11.2'}` : JSON.stringify(f.receipt) }));
     expect(await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).toMatchObject({ executable: newer });
     expect(f.run.mock.calls.find(([, args]) => args[0] === 'codex-start')?.[1]).toContain(newer);
     expect(f.run.mock.calls.some(([command]) => command === unsupported)).toBe(false);

@@ -1,5 +1,5 @@
 export const SUPPORTED_CODEX_VERSION = '0.163.0';
-export const SUPPORTED_CODEX_VERSIONS: readonly string[] = [SUPPORTED_CODEX_VERSION, '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2'];
+export const SUPPORTED_CODEX_VERSIONS: readonly string[] = [SUPPORTED_CODEX_VERSION, '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1'];
 
 const versionPattern = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/u;
 

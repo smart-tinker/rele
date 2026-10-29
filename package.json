@@ -1,6 +1,6 @@
 {
   "name": "rele",
-  "version": "0.1.0-rc.28",
+  "version": "0.1.0-rc.29",
   "private": true,
   "type": "module",
   "description": "Local Slack and Telegram gateway for shared Codex conversations",
