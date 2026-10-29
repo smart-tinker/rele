@@ -179,6 +179,11 @@ export class CodexClient extends EventEmitter {
     return this.disconnect('Соединение с Codex закрыто.');
   }
 
+  setSharedExecutable(executable: string): void {
+    if (this.config.transport !== 'shared' || !executable.trim()) throw new Error('Выбор версии допустим только для общего Codex.');
+    this.config.executable = executable;
+  }
+
   async listThreads(options: { archived?: boolean; refresh?: boolean } = {}): Promise<CodexThread[]> {
     const archived = options.archived === true;
     const rows = await this.pages<RawThread>('thread/list', {

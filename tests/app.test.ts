@@ -1204,6 +1204,38 @@ describe('automatic group access and private chat boundaries', () => {
 
 
 describe('automatic rules remain scoped to the selected Codex target', () => {
+  it.each(['global rule', 'source route'])('preserves an enabled unchanged automatic %s during an executable-only shared selection change', async automatic => {
+    const f = makeApp();
+    f.config.config.codex = { transport: 'shared', executable: '/opt/codex-old', endpoint: '', codexHome: '/home/example/.codex' };
+    if (automatic === 'global rule') f.config.config = mergeConfig(f.config.config, { autoLinkRules: [{ id: 'same-profile-rule', platform: 'telegram', accountId: f.endpoint.accountId,
+      chatId: f.endpoint.chatId, cwd: '/work/example', enabled: true, allowedSenderIds: ['sender-anna'], allowAllSenders: false, requireMention: true }] });
+    else {
+      f.store.routeSource(f.endpoint.id, null, '/work/example');
+      f.store.setSourceAccess(f.endpoint.id, { mode: 'all', allowedSenderIds: [] });
+    }
+    const rules = structuredClone(f.config.config.autoLinkRules), route = f.store.getSourceRoute(f.endpoint.id), access = f.store.getSourceAccess(f.endpoint.id);
+    const response = await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { codex: { executable: 'codex' } } });
+    expect(response.statusCode).toBe(200);
+    expect(f.configure).toHaveBeenCalledOnce();
+    expect(f.config.config.codex).toEqual({ transport: 'shared', executable: 'codex', endpoint: '', codexHome: '/home/example/.codex' });
+    expect(f.config.config.autoLinkRules).toEqual(rules);
+    expect(f.store.getSourceRoute(f.endpoint.id)).toEqual(route);
+    expect(f.store.getSourceAccess(f.endpoint.id)).toEqual(access);
+    expect(f.codex.connect).not.toHaveBeenCalled();
+  });
+
+  it.each([{ codexHome: '/different-profile' }, { token: 'replacement-synthetic-token' }])('does not exempt a selection change combined with changed shared scope %j', async changed => {
+    const f = makeApp();
+    f.config.config.codex = { transport: 'shared', executable: '/opt/codex-old', endpoint: '', codexHome: '/home/example/.codex' };
+    f.store.routeSource(f.endpoint.id, null, '/work/example');
+    f.store.setSourceAccess(f.endpoint.id, { mode: 'all', allowedSenderIds: [] });
+    const before = structuredClone(f.config.config);
+    const response = await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { codex: { executable: 'codex', ...changed } } });
+    expect(response.statusCode).toBe(400);
+    expect(f.configure).not.toHaveBeenCalled();
+    expect(f.config.config).toEqual(before);
+  });
+
   it('requires disabling rules before changing the target and checks the new runtime before re-enabling', async () => {
     const f = makeApp();
     f.engine.channels.telegram = { state: { configured: true, connected: true, accountId: f.endpoint.accountId } } as Channel;

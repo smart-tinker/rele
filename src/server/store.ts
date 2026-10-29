@@ -989,6 +989,13 @@ export class Store {
   activeRequests(): ReleRequest[] {
     return this.db.prepare(`SELECT * FROM requests WHERE status IN ('queued',${BLOCKING_REQUESTS}) ORDER BY rowid`).all().map(row => this.requestFromRow(row));
   }
+  hasUnfinishedCodexOperations(): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM auto_link_intents WHERE status<>'completed'
+      UNION ALL SELECT 1 FROM meta WHERE
+        (key LIKE 'cancel-cleanup:%' AND COALESCE(json_extract(value,'$.done'),0)<>1)
+        OR (key LIKE 'steering-input:%' AND json_extract(value,'$.state') IN ('sending','uncertain'))
+      LIMIT 1`).get();
+  }
   claimNextRequest(conversationId: string, requestId?: string): ReleRequest | undefined {
     return this.transaction(() => {
       const row = this.db.prepare(`SELECT r.id FROM requests r JOIN conversations c ON c.id=r.conversation_id

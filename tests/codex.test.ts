@@ -182,6 +182,23 @@ describe('Codex native shared policy', () => {
     expect((await f.peer.listThreads())[0].id).toBe(threadId);
   });
 
+  it('keeps the live connection while changing selection and uses the new policy on reconnect', async () => {
+    const f = await sharedFixture();
+    await f.client.connect();
+    const actual = f.client.status();
+    for (const executable of [path.join(f.home, 'chosen-codex'), 'codex']) {
+      const count = f.shared.mock.calls.length;
+      f.client.setSharedExecutable(executable);
+      expect(f.shared).toHaveBeenCalledTimes(count);
+      expect(f.client.status()).toEqual(actual);
+      await f.client.close(); await f.client.connect();
+      expect(f.shared.mock.lastCall?.[0]).toMatchObject({ executable, transport: 'shared', codexHome: f.home });
+      expect(f.client.status()).toEqual(actual);
+    }
+    expect(() => f.client.setSharedExecutable('')).toThrow('общего Codex');
+    expect(() => f.peer.setSharedExecutable('codex')).toThrow('общего Codex');
+  });
+
   it('keeps the last connection error visible during retry and clears it after a verified reconnect', async () => {
     const f = await sharedFixture();
     f.shared.mockRejectedValueOnce(new SharedCodexError('Fixed safe startup failure.', 'shared-daemon-unavailable'));

@@ -102,11 +102,14 @@ async function main(): Promise<void> {
   }
   async function configure(next: AppConfig): Promise<void> {
     if (shuttingDown) throw new Error('Rele завершает работу.');
-    engine.suspend(true);
-    try {
-      const codexChanged = JSON.stringify(next.codex) !== JSON.stringify(config.config.codex);
+    const previousCodex = JSON.stringify(config.config.codex);
+    const codexChanged = JSON.stringify(next.codex) !== previousCodex;
+    let selectionOnly = false;
+    const save = async () => {
+      if (JSON.stringify(config.config.codex) !== previousCodex) throw new Error('Настройки Codex изменились. Обновите страницу перед сохранением.');
+      if (codexChanged && !selectionOnly) engine.assertCodexSelectionChange();
       if (codexChanged && store.activeRequests().some(request => request.status !== 'queued')) throw new Error('Завершите или отмените активные запросы перед сменой подключения Codex.');
-      if (codexChanged && process.platform === 'win32') {
+      if (codexChanged && !selectionOnly && process.platform === 'win32') {
         try {
           const installation = JSON.parse(await readFile(path.join(root, 'rele-install.json'), 'utf8')) as { DesktopIntegrationOwned?: boolean };
           if (installation.DesktopIntegrationOwned) throw new Error('Перед сменой сервера или профиля Codex отключите интеграцию Desktop в разделе «Codex». Это сохраняет обычный запуск Desktop рабочим.');
@@ -115,11 +118,12 @@ async function main(): Promise<void> {
       // Voice-only changes do not reconnect transports or expire approvals.
       const channelsChanged = JSON.stringify([next.telegram, next.slack]) !== JSON.stringify([config.config.telegram, config.config.slack]);
       await config.save(next);
+      if (selectionOnly) codex.setSharedExecutable(next.codex.executable);
       if (channelsChanged) {
         await activity.stop();
         await Promise.allSettled(Object.values(engine.channels).map(channel => channel.stop()));
       }
-      if (codexChanged) {
+      if (codexChanged && !selectionOnly) {
         const old = codex;
         await old.close();
         codex = new CodexClient(next.codex, codexOptions);
@@ -127,7 +131,13 @@ async function main(): Promise<void> {
         void codex.connect().catch(() => {});
       }
       if (channelsChanged) { attachChannels(); activity.start(); }
-    } finally { engine.suspend(false); }
+    };
+    if (codexChanged && await codexUpdate.changeSelection(next.codex, async () => {
+      selectionOnly = true;
+      await engine.maintainCodex(save, 'selection');
+    })) return;
+    engine.suspend(true);
+    try { await save(); } finally { engine.suspend(false); }
   }
   const codexUpdate = new CodexUpdate(root, config.directory, () => config.config.codex, () => codex.status());
   async function applyCodexUpdate() {

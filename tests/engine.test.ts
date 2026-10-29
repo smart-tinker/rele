@@ -177,6 +177,41 @@ afterEach(async () => {
 });
 
 describe('Engine Codex maintenance', () => {
+  it('changes a version policy with unsent queue intact, but preserves native and cleanup receipts', async () => {
+    const f = fixture({ start: false });
+    f.codex.connected = false;
+    const queued = await acceptRequest(f);
+    expect(queued.status).toBe('queued');
+    expect(() => f.engine.assertCodexSelectionChange()).not.toThrow();
+    f.store.updateRequest(queued.id, { queuedSubmissionId: 'native-submission' });
+    expect(() => f.engine.assertCodexSelectionChange()).toThrow('незаконченные операции');
+    f.store.updateRequest(queued.id, { queuedSubmissionId: undefined });
+    f.store.setMeta('cancel-cleanup:older-terminal-request', JSON.stringify({ done: false }));
+    expect(() => f.engine.assertCodexSelectionChange()).toThrow('незаконченные операции');
+    f.store.setMeta('cancel-cleanup:older-terminal-request', JSON.stringify({ done: true }));
+    f.store.setMeta('steering-input:older-input', JSON.stringify({ state: 'uncertain' }));
+    expect(() => f.engine.assertCodexSelectionChange()).toThrow('незаконченные операции');
+    f.store.setMeta('steering-input:older-input', JSON.stringify({ state: 'applied' }));
+    expect(() => f.engine.assertCodexSelectionChange()).not.toThrow();
+    expect(f.store.getRequest(queued.id)).toMatchObject({ id: queued.id, status: 'queued' });
+    expect(f.codex.enqueue).not.toHaveBeenCalled();
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+  });
+
+  it('asks channels to retry during a policy save so no new intent gets the old target fingerprint', async () => {
+    const f = fixture({ start: false });
+    let release!: () => void;
+    const operation = vi.fn(async () => new Promise<void>(resolve => { release = resolve; }));
+    const saving = f.engine.maintainCodex(operation, 'selection');
+    await vi.waitFor(() => expect(operation).toHaveBeenCalledOnce());
+    const message = f.message('slack', 'during-selection-save');
+    await expect(f.engine.receive(message)).rejects.toMatchObject({ retryable: true });
+    expect(f.store.listRequests()).toHaveLength(0);
+    release(); await saving;
+    await f.engine.receive(message); await f.engine.settled();
+    expect(f.store.listRequests()).toHaveLength(1);
+  });
+
   it('keeps incoming messages durable and queued until maintenance ends, then dispatches the original request', async () => {
     const f = fixture({ start: false });
     let release!: () => void;

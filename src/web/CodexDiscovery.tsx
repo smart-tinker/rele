@@ -80,6 +80,7 @@ export function CodexDiscovery({
     standard: 'Стандартный каталог',
   };
   const startsServer = transport === 'shared' || transport === 'managed';
+  const manualVersion = transport === 'shared' && value !== 'auto';
   const recommended =
     transport === 'shared'
       ? discovery?.recommendedManaged && automaticCodex
@@ -90,7 +91,7 @@ export function CodexDiscovery({
         : undefined;
   return (
     <fieldset className="codex-discovery">
-      <legend>Выбор Codex</legend>
+      <legend>{transport === 'shared' ? 'Версия Codex' : 'Выбор Codex'}</legend>
       {startsServer && (
         <label className="check-row">
           <input
@@ -101,15 +102,25 @@ export function CodexDiscovery({
             onChange={() => onChange('auto')}
           />
           <span>
-            <strong>Находить Codex автоматически</strong>
+            <strong>{transport === 'shared' ? 'Максимальная поддерживаемая версия' : 'Находить Codex автоматически'}</strong>
             <small>
               {transport === 'shared'
-                ? 'Rele использует работающий общий сервер, сохраняя его версию. Если сервера нет, найдёт установленный Codex и запустит его.'
+                ? 'Максимальная среди найденных установленных версий, поддерживаемых Rele. Работающий сервер сохраняется; переход подготовьте и примените после завершения задач.'
                 : 'Rele выберет подходящий Codex и запустит отдельный сервер.'}
             </small>
           </span>
         </label>
       )}
+      {transport === 'shared' && (
+        <label className="check-row">
+          <input type="radio" name="codex-target" checked={manualVersion} disabled={disabled} onChange={() => onChange('manual')} />
+          <span>
+            <strong>Выбрать конкретную версию</strong>
+            <small>Выберите найденную установку или укажите полный путь. Rele не выбирает другую версию автоматически.</small>
+          </span>
+        </label>
+      )}
+      <div hidden={transport === 'shared' && !manualVersion}>
       <div className="section-heading discovery-heading">
         <h3>Найдено на этом компьютере</h3>
         <div className="discovery-actions">
@@ -136,7 +147,6 @@ export function CodexDiscovery({
           Ищем установку и запущенный процесс Codex…
         </p>
       )}
-      {error && <Notice>{error}</Notice>}
       {discovery && !discovery.installations.length && (
         <Notice tone="info">
           Локальная установка Codex не найдена. Установите Codex Desktop или
@@ -144,7 +154,7 @@ export function CodexDiscovery({
         </Notice>
       )}
       {!!discovery?.installations.length && (
-        <div className="discovery-options">
+        <div className="discovery-options" role={transport === 'shared' ? 'radiogroup' : undefined} aria-label={transport === 'shared' ? 'Найденные установки Codex' : undefined}>
           {discovery.installations.map((installation, index) => {
             const connection =
               startsServer
@@ -164,7 +174,7 @@ export function CodexDiscovery({
               >
                 <input
                   type="radio"
-                  name="codex-target"
+                  name={transport === 'shared' ? 'codex-installation' : 'codex-target'}
                   checked={!!connection && value === codexTargetKey(connection)}
                   disabled={disabled || !connection}
                   onChange={() => connection && onChange(connection)}
@@ -206,26 +216,12 @@ export function CodexDiscovery({
           })}
         </div>
       )}
-      {discovery?.issues
-        .filter(
-          (issue) =>
-            transport !== 'managed' ||
-            !externalConnectionIssues.has(issue.code),
-        )
-        .map((issue, index) => (
-          <Notice key={`${issue.code}:${index}`} tone="warning">
-            {issue.message}
-            {issue.executable && (
-              <div className="discovery-path">{issue.executable}</div>
-            )}
-          </Notice>
-        ))}
       <p className="field-hint">
         {startsServer
           ? 'Это установленные версии Codex. Какая из них запущена для Rele, показано в фактическом подключении после сохранения.'
           : 'Найденный файл и версия CLI ещё не подтверждают соединение с существующим сервером. Фактическое подключение показано выше.'}
       </p>
-      <label className="check-row">
+      {transport !== 'shared' && <label className="check-row">
         <input
           type="radio"
           name="codex-target"
@@ -241,7 +237,23 @@ export function CodexDiscovery({
               : 'Путь к исполняемому файлу или адрес существующего сервера.'}
           </small>
         </span>
-      </label>
+      </label>}
+      </div>
+      {error && <Notice>{error}</Notice>}
+      {discovery?.issues
+        .filter(
+          (issue) =>
+            transport !== 'managed' ||
+            !externalConnectionIssues.has(issue.code),
+        )
+        .map((issue, index) => (
+          <Notice key={`${issue.code}:${index}`} tone="warning">
+            {issue.message}
+            {issue.executable && (
+              <div className="discovery-path">{issue.executable}</div>
+            )}
+          </Notice>
+        ))}
     </fieldset>
   );
 }

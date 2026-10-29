@@ -179,6 +179,29 @@ describe('Codex installation and existing Desktop discovery', () => {
     expect(result.recommended).toEqual({ executable: desktop, transport: 'websocket', endpoint: 'ws://127.0.0.1:4500' });
   });
 
+  it('recommends the highest supported installed version even when a newer unsupported package is found first', async () => {
+    const latest = desktop.replace('26.1_', '26.2_'), unsupported = desktop.replace('26.1_', '26.3_');
+    const packages = [unsupported, desktop, latest].map(executable => ({ name: 'OpenAI.Codex', location: win.dirname(win.dirname(win.dirname(executable))) }));
+    const metadata = { processes: [], packages, issues: [] };
+    const f = windowsFixture(metadata, [unsupported, desktop, latest]);
+    f.run.mockImplementation(async (command, args) => args.includes(WINDOWS_CODEX_METADATA_SCRIPT)
+      ? { stdout: JSON.stringify(metadata), code: 0 }
+      : { stdout: `codex-cli ${command === unsupported ? '9.0.0' : command === latest ? '0.165.0-alpha.1.2' : '0.163.0'}`, code: 0 });
+    const result = await discoverCodex(f.options);
+    expect(result.recommendedManaged?.executable).toBe(latest);
+    expect(result.recommended?.executable).toBe(latest);
+    expect(result.installations.find(item => item.executable === unsupported)?.version).toBe('9.0.0');
+  });
+
+  it.each([false, true])('breaks equal-version installation ties by normalized path independently of discovery order (reverse=%s)', async reverse => {
+    const first = desktop.replace('26.1_', '26.0_');
+    const executables = reverse ? [desktop, first] : [first, desktop];
+    const f = windowsFixture({ processes: [], packages: executables.map(executable => ({
+      name: 'OpenAI.Codex', location: win.dirname(win.dirname(win.dirname(executable))),
+    })), issues: [] }, executables);
+    expect((await discoverCodex(f.options)).recommendedManaged?.executable).toBe(first);
+  });
+
   it('keeps an unverified CLI available for explicit read-only selection without recommending it', async () => {
     const f = windowsFixture(undefined, [npmShim, npmEntry]);
     f.run.mockImplementation(async (_command, args) => args.includes(WINDOWS_CODEX_METADATA_SCRIPT)

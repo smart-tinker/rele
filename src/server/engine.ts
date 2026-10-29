@@ -61,6 +61,7 @@ export class Engine extends EventEmitter {
   private cancelling = new Map<string, Promise<void>>();
   private lastReconcile = 0;
   private suspended = false;
+  private changingSelection = false;
   private readonly slackSync: SlackSync;
   private readonly initialMessages: InitialMessages;
   private steering = new Set<string>();
@@ -86,9 +87,15 @@ export class Engine extends EventEmitter {
   }
 
   suspend(value: boolean): void { this.suspended = value; }
-  async maintainCodex<T>(operation: () => Promise<T>): Promise<T> {
+  assertCodexSelectionChange(): void {
+    // A new executable changes target fingerprints; preserve every unresolved native receipt.
+    if (this.store.activeRequests().some(request => request.status !== 'queued' || request.queuedSubmissionId || request.turnId)
+      || this.store.hasUnfinishedCodexOperations()) throw new Error('Сначала завершите незаконченные операции Codex. Выбор версии не изменён; очередь сохранена.');
+  }
+  async maintainCodex<T>(operation: () => Promise<T>, change: 'runtime' | 'selection' = 'runtime'): Promise<T> {
     if (this.stopped || this.suspended) throw new Error('Rele уже приостановлен или завершает работу.');
     this.suspended = true;
+    this.changingSelection = change === 'selection';
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const busy = () => this.store.activeRequests().some(request => request.status !== 'queued')
       || this.resolutions.size > 0 || this.cancelling.size > 0 || this.startingQueued.size > 0 || this.retryingOverloads.size > 0
@@ -99,9 +106,11 @@ export class Engine extends EventEmitter {
         timeout = setTimeout(() => reject(new Error('Операции Rele ещё завершаются. Повторите обновление позже.')), 15_000);
       })]);
       if (busy()) throw new Error('Сначала завершите активные запросы и начальные сообщения Rele.');
+      if (this.changingSelection) this.assertCodexSelectionChange();
       return await operation();
     } finally {
       clearTimeout(timeout);
+      this.changingSelection = false;
       this.suspended = false;
       this.changed();
       this.track(this.pump());
@@ -153,6 +162,7 @@ export class Engine extends EventEmitter {
 
   async receive(message: InboundMessage): Promise<void> {
     if (this.stopped) throw new ChannelError('Rele завершает работу; событие будет доставлено повторно.', true);
+    if (this.changingSelection) throw new ChannelError('Выбор версии Codex меняется; событие будет доставлено повторно.', true);
     const controlText = message.endpoint.platform === 'slack'
       ? message.text.replaceAll(`<@${message.endpoint.accountId.split(':').at(-1)}>`, '').trim() : message.text.trim();
     if (message.control === 'stop' || !message.contextOnly && !message.audio && /^(?:rele:cancel|\/rele_cancel(?:@[A-Za-z0-9_]+)?)$/iu.test(controlText)) {

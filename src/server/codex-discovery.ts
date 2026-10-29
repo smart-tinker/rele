@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { readdir, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { SUPPORTED_CODEX_VERSIONS } from '../shared/codex-runtime.js';
+import { compareCodexVersions, SUPPORTED_CODEX_VERSIONS } from '../shared/codex-runtime.js';
 import type { CodexConnectionTarget, CodexDiscoveryIssue, CodexDiscoveryResult, CodexInstallation } from '../shared/types.js';
 import { isLocalEndpoint, isLocalSocketPath } from './config.js';
 import { codexEnvironment, environmentValue, fileExists, isDesktopLauncher, resolveCodexLaunch } from './codex-launch.js';
@@ -232,6 +232,19 @@ function version(stdout: string): string | undefined {
   return stdout.trim().match(/^codex(?:-cli)?\s+(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)(?:\s|$)/iu)?.[1];
 }
 
+/** Callers filter to confirmed supported versions before comparing installation candidates. */
+export function compareCodexInstallations(left: CodexInstallation, right: CodexInstallation, platform = process.platform): number {
+  const byVersion = compareCodexVersions(right.version!, left.version!);
+  if (byVersion) return byVersion;
+  const priority = { 'desktop-install': 0, 'desktop-process': 1, path: 2, standard: 3 };
+  const bySource = priority[left.source] - priority[right.source];
+  if (bySource) return bySource;
+  const paths = platform === 'win32' ? path.win32 : path.posix;
+  const a = platform === 'win32' ? paths.normalize(left.executable).toLowerCase() : paths.normalize(left.executable);
+  const b = platform === 'win32' ? paths.normalize(right.executable).toLowerCase() : paths.normalize(right.executable);
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 /** Read installed CLI metadata and existing server addresses; never start a server. */
 let defaultDiscovery: Promise<CodexDiscoveryResult> | undefined;
 export function discoverCodex(options?: CodexDiscoveryOptions): Promise<CodexDiscoveryResult> {
@@ -408,7 +421,7 @@ async function collectCodex(options: CodexDiscoveryOptions): Promise<CodexDiscov
     } else installation.connection = { executable: found.executable, transport: 'proxy', endpoint: '', ...profile };
   }
   const verified = installations.filter(item => item.version && SUPPORTED_CODEX_VERSIONS.includes(item.version))
-    .sort((a, b) => SUPPORTED_CODEX_VERSIONS.indexOf(a.version!) - SUPPORTED_CODEX_VERSIONS.indexOf(b.version!));
+    .sort((a, b) => compareCodexInstallations(a, b, platform));
   const recommendedManaged = verified.find(item => item.managedConnection)?.managedConnection;
   const running = installations.filter(item => item.running);
   const attachable = running.filter(item => item.connection);

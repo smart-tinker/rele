@@ -11,7 +11,7 @@ import WebSocket from 'ws';
 import type { CodexConnectionTarget, CodexDiscoveryResult } from '../shared/types.js';
 import { SUPPORTED_CODEX_VERSIONS } from '../shared/codex-runtime.js';
 import { defaultDataDirectory, isLocalCodexHome, isLocalSocketPath } from './config.js';
-import { discoverCodex } from './codex-discovery.js';
+import { compareCodexInstallations, discoverCodex } from './codex-discovery.js';
 import { codexEnvironment, environmentValue, resolveCodexLaunch, type CodexLaunch } from './codex-launch.js';
 
 export class SharedCodexError extends Error {
@@ -94,7 +94,7 @@ export function effectiveSharedCodexHome(env: NodeJS.ProcessEnv = process.env): 
 }
 
 /** An official npm wrapper selects only its own optional native package or bundled vendor files. */
-async function nativeCodexExecutable(executable: string, platform = process.platform): Promise<string> {
+export async function nativeCodexExecutable(executable: string, platform = process.platform): Promise<string> {
   const native = await realpath(executable);
   if (!/\.[cm]?js$/iu.test(native)) return native;
   const root = path.dirname(path.dirname(native));
@@ -108,12 +108,12 @@ async function nativeCodexExecutable(executable: string, platform = process.plat
   return realpath(path.join(vendor, `${architecture}-${suffix}`, 'bin', platform === 'win32' ? 'codex.exe' : 'codex'));
 }
 
-/** Match the pinned native daemon's local package preflight; native code verifies copied contents. */
-async function completeCodexPackage(executable: string): Promise<boolean> {
+/** Return the complete supported package's version; native code verifies copied contents. */
+async function completeCodexPackage(executable: string): Promise<string | undefined> {
   try {
     const architecture = process.arch === 'x64' ? 'x86_64' : process.arch === 'arm64' ? 'aarch64' : '';
     const suffix = process.platform === 'win32' ? 'pc-windows-msvc' : process.platform === 'linux' ? 'unknown-linux-musl' : '';
-    if (!architecture || !suffix) return false;
+    if (!architecture || !suffix) return undefined;
     const target = `${architecture}-${suffix}`, binary = process.platform === 'win32' ? 'codex.exe' : 'codex';
     const native = await nativeCodexExecutable(executable);
     const directory = path.dirname(native);
@@ -123,7 +123,7 @@ async function completeCodexPackage(executable: string): Promise<boolean> {
     const entrypoint = `bin/${binary}`;
     const winget = process.platform === 'win32' && metadata.layoutVersion === 1 && metadata.entrypoint === `codex-${target}.exe` && path.basename(native) === metadata.entrypoint;
     if (!packaged && !winget || typeof metadata.version !== 'string' || !SUPPORTED_CODEX_VERSIONS.includes(metadata.version)
-      || metadata.target !== target || metadata.entrypoint !== entrypoint && !winget) return false;
+      || metadata.target !== target || metadata.entrypoint !== entrypoint && !winget) return undefined;
     const sourceEntrypoint = String(metadata.entrypoint);
     const files = ['codex-package.json', sourceEntrypoint, path.posix.join(path.posix.dirname(sourceEntrypoint), process.platform === 'win32' ? 'codex-code-mode-host.exe' : 'codex-code-mode-host'),
       process.platform === 'win32' ? 'codex-path/rg.exe' : 'codex-path/rg',
@@ -132,8 +132,8 @@ async function completeCodexPackage(executable: string): Promise<boolean> {
       const info = await stat(path.join(root, file));
       return info.isFile() && (process.platform === 'win32' || file === 'codex-package.json' || !!(info.mode & 0o111));
     }));
-    return present.every(Boolean);
-  } catch { return false; }
+    return present.every(Boolean) ? metadata.version : undefined;
+  } catch { return undefined; }
 }
 
 const DESKTOP_PACKAGE_FILES = [
@@ -236,14 +236,14 @@ export async function resolveSharedCodexExecutable(target: CodexConnectionTarget
   const expectedSocket = path.join(home, 'app-server-control', 'app-server-control.sock');
   const run = options.run ?? runSharedCommand;
   const timeoutMs = options.timeoutMs ?? 15_000;
-  let executable = target.executable;
+  let executable = target.executable, installedCurrent = false;
   if (executable === 'codex') {
     const native = path.join(home, 'packages', 'app-server-daemon', 'current', 'bin', process.platform === 'win32' ? 'codex.exe' : 'codex');
     const installed = await stat(native).then(info => info.isFile(), error => {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
       throw new SharedCodexError('Нет доступа к установленному общему Codex.', 'shared-cli-unavailable');
     });
-    if (installed) executable = native;
+    if (installed) { executable = native; installedCurrent = true; }
     else {
       const found = await (options.discover ?? discoverCodex)({ env, ...(target.codexHome ? { codexHome: target.codexHome } : {}) });
       executable = found.installations.find(item => item.running && item.version && SUPPORTED_CODEX_VERSIONS.includes(item.version) && item.connection?.transport === 'proxy' && item.connection.endpoint && samePath(path.resolve(item.connection.endpoint), expectedSocket))?.executable
@@ -254,7 +254,23 @@ export async function resolveSharedCodexExecutable(target: CodexConnectionTarget
   const launch = await resolveCodexLaunch(executable, { env });
   const cli = await run(launch.command, [...launch.args, '--version'], Math.min(timeoutMs, 4_000), env);
   const version = cli.stdout.trim().match(/^codex(?:-cli)?\s+(\S+)(?:\s|$)/iu)?.[1];
-  if (cli.code !== 0 || !version || !SUPPORTED_CODEX_VERSIONS.includes(version)) throw new SharedCodexError(`Для общего daemon нужен проверенный Codex ${SUPPORTED_CODEX_VERSIONS.join(' или ')}.`, 'shared-cli-unverified');
+  if (cli.code !== 0 || !version || !SUPPORTED_CODEX_VERSIONS.includes(version)) {
+    // An unsupported cached daemon package must not hide a supported installed control client.
+    if (installedCurrent) {
+      const found = await (options.discover ?? discoverCodex)({ env, ...(target.codexHome ? { codexHome: target.codexHome } : {}) });
+      const candidates = found.installations.filter(item => item.version && SUPPORTED_CODEX_VERSIONS.includes(item.version))
+        .sort((a, b) => compareCodexInstallations(a, b));
+      const seen = new Set<string>();
+      for (const candidate of candidates) {
+        const key = path.normalize(candidate.executable);
+        if (seen.has(key) || samePath(path.resolve(candidate.executable), path.resolve(executable))) continue;
+        seen.add(key);
+        try { return await resolveSharedCodexExecutable({ ...target, executable: candidate.executable }, { ...options, env }); }
+        catch (error) { if (!(error instanceof SharedCodexError)) throw error; }
+      }
+    }
+    throw new SharedCodexError(`Для общего daemon нужен проверенный Codex ${SUPPORTED_CODEX_VERSIONS.join(' или ')}.`, 'shared-cli-unverified');
+  }
   return launch.executable;
 }
 
@@ -355,36 +371,41 @@ export async function ensureWindowsSharedCodex(target: CodexConnectionTarget, op
         || !Number.isSafeInteger(receipt.processId) || receipt.processId <= 0 || typeof receipt.processStartTime !== 'string' || !/^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/u.test(receipt.processStartTime) || !Number.isFinite(Date.parse(receipt.processStartTime))
         || typeof receipt.executable !== 'string' || typeof receipt.codexHome !== 'string' || !samePath(await realpath(receipt.codexHome), home)
         || typeof receipt.executableSha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(receipt.executableSha256)
-        || executable && (target.executable !== 'codex' || receipt.status !== 'alreadyRunning') && !samePath(await realpath(receipt.executable), executable)
+        || executable && receipt.status !== 'alreadyRunning' && !samePath(await realpath(receipt.executable), executable)
         || await fileDigest(receipt.executable) !== receipt.executableSha256) throw invalid();
       return receipt;
     };
-    let selected = target.executable;
-    if (selected === 'codex') {
-      // An update can expose both old running and new installed Desktop paths.
-      // Ask the trusted owner first; absence alone permits installation discovery.
-      const current = await run(path.join(installationDirectory, 'Rele.exe'), ['codex-status', '--quiet', '--codex-home', home], timeoutMs, env);
-      const status = JSON.parse(current.stdout) as { status?: unknown; pendingUpdate?: unknown; pendingExe?: unknown } | null;
-      if (current.code !== 0 || !status || !['notRunning', 'alreadyRunning'].includes(String(status.status))) throw invalid();
-      if (status.status === 'alreadyRunning') selected = (await validateReceipt(current, undefined, true)).executable;
-      else if (status.pendingUpdate === true) {
-        if (typeof status.pendingExe !== 'string' || !path.isAbsolute(status.pendingExe)) throw invalid();
-        selected = status.pendingExe;
+    let selected = target.executable, resolved: string | undefined;
+    // The saved executable is desired policy; an existing owned server remains actual until explicit maintenance.
+    const current = await run(path.join(installationDirectory, 'Rele.exe'), ['codex-status', '--quiet', '--codex-home', home], timeoutMs, env);
+    const status = JSON.parse(current.stdout) as { status?: unknown; pendingUpdate?: unknown; pendingExe?: unknown } | null;
+    if (current.code !== 0 || !status || !['notRunning', 'alreadyRunning'].includes(String(status.status))) throw invalid();
+    if (status.status === 'alreadyRunning') selected = (await validateReceipt(current, undefined, true)).executable;
+    else if (status.pendingUpdate === true) {
+      if (typeof status.pendingExe !== 'string' || !path.isAbsolute(status.pendingExe)) throw invalid();
+      selected = status.pendingExe;
+    } else if (selected === 'codex') {
+      const discovery = await (options.discover ?? discoverCodex)({ env, ...(target.codexHome ? { codexHome: target.codexHome } : {}) });
+      const candidates = discovery.installations.filter(item => item.version && SUPPORTED_CODEX_VERSIONS.includes(item.version))
+        .sort((a, b) => compareCodexInstallations(a, b, 'win32'));
+      const seen = new Set<string>();
+      for (const candidate of candidates) {
+        const key = path.win32.normalize(candidate.executable).toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        try {
+          const native = await nativeCodexExecutable(await resolveSharedCodexExecutable({ ...target, executable: candidate.executable }, { ...options, env }), 'win32');
+          if (path.basename(native).toLowerCase() !== 'codex.exe') continue;
+          selected = candidate.executable; resolved = native; break;
+        } catch { /* Another confirmed installation may have a complete native entrypoint. */ }
       }
-      else {
-        const discovery = await (options.discover ?? discoverCodex)({ env, ...(target.codexHome ? { codexHome: target.codexHome } : {}) });
-        const desktops = [...new Map(discovery.installations.filter(item => ['desktop-install', 'desktop-process'].includes(item.source)
-          && item.version && SUPPORTED_CODEX_VERSIONS.includes(item.version)).map(item => [item.executable.toLowerCase(), item.executable])).values()];
-        if (desktops.length > 1) throw new SharedCodexError('Найдено несколько установок Desktop. Выберите исходный Codex; другой профиль не создаётся.', 'shared-cli-unavailable');
-        selected = desktops[0] ?? discovery.recommendedManaged?.executable ?? '';
-        if (!selected) throw new SharedCodexError('Не найден проверенный установленный Codex Desktop.', 'shared-cli-unavailable');
-      }
+      if (!resolved) throw new SharedCodexError('Не найден проверенный установленный Codex Desktop.', 'shared-cli-unavailable');
     }
-    const executable = await nativeCodexExecutable(await resolveSharedCodexExecutable({ ...target, executable: selected }, { ...options, env }), 'win32');
+    const executable = resolved ?? await nativeCodexExecutable(await resolveSharedCodexExecutable({ ...target, executable: selected }, { ...options, env }), 'win32');
     if (path.basename(executable).toLowerCase() !== 'codex.exe') throw new SharedCodexError('Общему Windows Codex нужен штатный codex.exe из установленного Desktop.', 'shared-cli-unverified');
     const deadline = Date.now() + timeoutMs;
     const result = await run(path.join(installationDirectory, 'Rele.exe'), ['codex-start', '--quiet', '--codex-executable', executable, '--codex-home', home,
-      ...(target.executable === 'codex' ? ['--preserve-active'] : [])], timeoutMs, env);
+      '--preserve-active'], timeoutMs, env);
     const receipt = await validateReceipt(result, executable);
     const actual = await resolveSharedCodexExecutable({ ...target, executable: receipt.executable }, { ...options, env });
     if (!samePath(await realpath(actual), await realpath(receipt.executable))) throw invalid();
@@ -458,19 +479,27 @@ export async function ensureSharedCodex(target: CodexConnectionTarget, options: 
     throw new SharedCodexError(`Не удалось проверить существующий сервер Desktop (${ownerIssue.code}${trace ? `; ${trace}` : ''}). Проверьте доступ Rele к процессам текущего пользователя; новый сервер не запущен.`, 'shared-owner-unknown');
   }
   if (found.installations.some(item => item.running && item.connection?.transport !== 'proxy') || !socketPresent && found.installations.some(item => item.running)) throw new SharedCodexError('Codex Desktop уже использует отдельный сервер. После завершения его задач один раз полностью закройте Desktop и откройте снова с включённой интеграцией Rele. Rele не завершает чужие процессы.', 'shared-desktop-conflict');
-  if (!await completeCodexPackage(launch.executable)) {
-    let selected: string | undefined;
-    if (target.executable === 'codex') {
-      const available = await discover();
-      const candidates = available.installations.filter(item => item.version && SUPPORTED_CODEX_VERSIONS.includes(item.version))
-        .sort((a, b) => SUPPORTED_CODEX_VERSIONS.indexOf(a.version!) - SUPPORTED_CODEX_VERSIONS.indexOf(b.version!));
-      for (const candidate of new Set([available.recommendedManaged?.executable, ...candidates.map(item => item.executable)])) {
-        if (candidate && await completeCodexPackage(candidate)) { selected = candidate; break; }
-      }
+  let completeVersion = await completeCodexPackage(launch.executable);
+  if (target.executable === 'codex') {
+    const available = await discover();
+    const candidates = available.installations.filter(item => item.version && SUPPORTED_CODEX_VERSIONS.includes(item.version));
+    // Query the current daemon before considering a different installed version. Only this absent-daemon path selects a successor.
+    if (completeVersion) candidates.push({ executable: launch.executable, version: completeVersion, source: 'standard', name: 'Codex', running: false });
+    candidates.sort((a, b) => compareCodexInstallations(a, b));
+    const seen = new Set<string>();
+    for (const candidate of candidates) {
+      const key = path.normalize(candidate.executable);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (await completeCodexPackage(candidate.executable) !== candidate.version) continue;
+      try {
+        launch = await resolveCodexLaunch(await resolveSharedCodexExecutable({ ...target, executable: candidate.executable }, { ...options, env }), { env });
+        completeVersion = candidate.version;
+        break;
+      } catch (error) { if (!(error instanceof SharedCodexError)) throw error; }
     }
-    if (!selected) throw new SharedCodexError(`Для запуска общего Codex нужен полный пакет CLI или комплектная поставка Desktop ${SUPPORTED_CODEX_VERSIONS.join(' или ')}. Проверьте установку Codex; существующий сервер не заменён.`, 'shared-package-incomplete');
-    launch = await resolveCodexLaunch(await resolveSharedCodexExecutable({ ...target, executable: selected }, { ...options, env }), { env });
   }
+  if (!completeVersion) throw new SharedCodexError(`Для запуска общего Codex нужен полный пакет CLI или комплектная поставка Desktop ${SUPPORTED_CODEX_VERSIONS.join(' или ')}. Проверьте установку Codex; существующий сервер не заменён.`, 'shared-package-incomplete');
   await (options.prepareControlDirectory ?? prepareWindowsControlDirectory)(selectedHome, launch, env);
   // Native singleton locks and liveness checks own stale-socket recovery.
   const deadline = Date.now() + timeoutMs;

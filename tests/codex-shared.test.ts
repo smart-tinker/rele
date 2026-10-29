@@ -120,12 +120,12 @@ describe('Windows direct shared Codex', () => {
     expect(f.prepareControlDirectory).not.toHaveBeenCalled(); expect(f.target).toEqual(before);
   });
 
-  it('keeps an explicitly selected native backend and never grants automatic preservation of a different target', async () => {
+  it('cold-starts only the explicitly selected native backend and rejects a different started identity', async () => {
     const f = await windowsFixture();
     const target = { ...f.target, executable: f.executable };
     await ensureWindowsSharedCodex(target, f.options, f.installationDirectory);
     expect(f.discover).not.toHaveBeenCalled();
-    expect(f.run.mock.calls.find(([, args]) => args[0] === 'codex-start')?.[1]).not.toContain('--preserve-active');
+    expect(f.run.mock.calls.find(([, args]) => args[0] === 'codex-start')?.[1]).toContain('--preserve-active');
     const other = await desktopFixture(path.join(f.home, 'other'));
     await expect(ensureWindowsSharedCodex({ ...target, executable: other }, f.options, f.installationDirectory)).rejects.toMatchObject({ code: 'shared-daemon-invalid' });
   });
@@ -142,7 +142,7 @@ describe('Windows direct shared Codex', () => {
     f.receipt.executable = native; f.receipt.executableSha256 = createHash('sha256').update(await readFile(native)).digest('hex');
     expect(await ensureWindowsSharedCodex({ ...f.target, executable: wrapper }, f.options, f.installationDirectory)).toMatchObject({ executable: native, transport: 'websocket' });
     const started = f.run.mock.calls.find(([, args]) => args[0] === 'codex-start')!;
-    expect(started[1]).toContain(native); expect(started[1]).not.toContain('--preserve-active');
+    expect(started[1]).toContain(native); expect(started[1]).toContain('--preserve-active');
     expect(f.discover).not.toHaveBeenCalled();
   });
 
@@ -193,12 +193,47 @@ describe('Windows direct shared Codex', () => {
     expect(f.calls).toEqual(['initialize', 'initialized', 'server/diagnostics']);
   });
 
-  it('keeps ambiguous installations closed when there is no verified live owner', async () => {
+  it('chooses a deterministic installed backend when several supported paths exist without a live owner', async () => {
     const f = await windowsFixture(), other = await desktopFixture(path.join(f.home, 'other'));
     f.discovery.installations.push({ executable: other, name: 'Other Desktop', source: 'desktop-process', version: '0.163.0-alpha.11.2', running: true });
-    await expect(ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).rejects.toMatchObject({ code: 'shared-cli-unavailable' });
-    expect(f.run.mock.calls.map(([, args]) => args[0])).toEqual(['codex-status']);
-    expect(f.calls).toEqual([]);
+    expect(await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).toMatchObject({ executable: f.executable });
+    expect(f.run.mock.calls.find(([, args]) => args[0] === 'codex-start')?.[1]).toContain(f.executable);
+  });
+
+  it('automatically chooses the highest supported version while ignoring a newer unsupported installation', async () => {
+    const f = await windowsFixture(), newer = await desktopFixture(path.join(f.home, 'newer')), unsupported = await desktopFixture(path.join(f.home, 'unsupported'));
+    f.discovery.installations.unshift(
+      { executable: unsupported, name: 'Unverified Desktop', source: 'desktop-install', version: '9.0.0', running: false },
+      { executable: newer, name: 'Newer Desktop', source: 'desktop-install', version: '0.165.0-alpha.1.2', running: false },
+    );
+    f.receipt.executable = newer;
+    f.receipt.executableSha256 = createHash('sha256').update(await readFile(newer)).digest('hex');
+    f.runtime.userAgent = 'codex_cli_rs/0.165.0-alpha.1.2 (Windows)';
+    f.run.mockImplementation(async (command, args) => ({ code: 0, stdout: args[0] === 'codex-status'
+      ? JSON.stringify({ status: 'notRunning' }) : args.at(-1) === '--version'
+        ? `codex-cli ${command === newer ? '0.165.0-alpha.1.2' : '0.163.0-alpha.11.2'}` : JSON.stringify(f.receipt) }));
+    expect(await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).toMatchObject({ executable: newer });
+    expect(f.run.mock.calls.find(([, args]) => args[0] === 'codex-start')?.[1]).toContain(newer);
+    expect(f.run.mock.calls.some(([command]) => command === unsupported)).toBe(false);
+  });
+
+  it('attaches the actual verified owner before resolving a different manually selected executable', async () => {
+    const f = await windowsFixture(), desired = await desktopFixture(path.join(f.home, 'desired'));
+    f.owner.running = true; f.receipt.status = 'alreadyRunning';
+    expect(await ensureWindowsSharedCodex({ ...f.target, executable: desired }, f.options, f.installationDirectory)).toMatchObject({ executable: f.executable });
+    expect(f.run.mock.calls[0][1]).toEqual(['codex-status', '--quiet', '--codex-home', f.home]);
+    expect(f.run.mock.calls.some(([command]) => command === desired)).toBe(false);
+    expect(f.discover).not.toHaveBeenCalled();
+    expect(f.run.mock.calls.find(([, args]) => args[0] === 'codex-start')?.[1]).toEqual([
+      'codex-start', '--quiet', '--codex-executable', f.executable, '--codex-home', f.home, '--preserve-active',
+    ]);
+  });
+
+  it('never falls back to an installed candidate when a manually selected cold backend is missing', async () => {
+    const f = await windowsFixture();
+    await expect(ensureWindowsSharedCodex({ ...f.target, executable: path.join(f.home, 'missing', 'codex.exe') }, f.options, f.installationDirectory)).rejects.toThrow();
+    expect(f.discover).not.toHaveBeenCalled();
+    expect(f.run.mock.calls.filter(([, args]) => args[0] === 'codex-start')).toEqual([]);
   });
 
   it('adopts a verified owner restored in memory before the start command persists an upgraded installation pointer', async () => {
@@ -520,6 +555,35 @@ describe.skipIf(process.platform === 'win32')('native shared Codex UDS lifecycle
     await ensureSharedCodex({ ...f.target, executable: 'codex' }, f.options);
     expect(f.discover.mock.calls.map(([options]) => options.processesOnly ?? false)).toEqual([false, true]);
     expect(f.run.mock.calls.filter(([, args]) => args.at(-1) === 'start')).toHaveLength(1);
+  });
+
+  it.each(['automatic', 'manual'])('queries the current daemon first and cold-starts the %s selection policy', async policy => {
+    const f = await fixture();
+    const current = await packageFixture(path.join(f.home, 'packages', 'app-server-daemon', 'current'));
+    const newer = await packageFixture(path.join(f.home, 'newer'), '0.165.0-alpha.1.2');
+    const unsupported = await packageFixture(path.join(f.home, 'unsupported'), '9.0.0');
+    f.discovery.installations.push(
+      { executable: unsupported, name: 'Unverified CLI', source: 'path', version: '9.0.0', running: false },
+      { executable: newer, name: 'Newer CLI', source: 'path', version: '0.165.0-alpha.1.2', running: false },
+    );
+    f.run.mockImplementation(async (command, args) => ({ code: args.at(-1) === 'version' ? 1 : 0,
+      stdout: args.at(-1) === '--version' ? `codex-cli ${command === newer ? '0.165.0-alpha.1.2' : '0.163.0'}`
+        : JSON.stringify({ ...f.daemon, status: 'started', managedCodexPath: command, managedCodexVersion: command === newer ? '0.165.0-alpha.1.2' : '0.163.0' }) }));
+    const selected = policy === 'automatic' ? newer : current;
+    expect(await ensureSharedCodex({ ...f.target, executable: policy === 'automatic' ? 'codex' : current }, f.options)).toMatchObject({ executable: selected });
+    expect(f.run.mock.calls.find(([, args]) => args.at(-1) === 'version')?.[0]).toBe(current);
+    expect(f.run.mock.calls.filter(([, args]) => args.at(-1) === 'start').map(([command]) => command)).toEqual([selected]);
+    expect(f.run.mock.calls.some(([command]) => command === unsupported)).toBe(false);
+  });
+
+  it('does not let an unsupported cached daemon package hide a supported installed control client', async () => {
+    const f = await fixture(), current = await packageFixture(path.join(f.home, 'packages', 'app-server-daemon', 'current'), '9.0.0');
+    const supported = await packageFixture(path.join(f.home, 'supported'), '0.165.0-alpha.1.2');
+    f.discovery.installations.push({ executable: supported, name: 'Supported CLI', source: 'path', version: '0.165.0-alpha.1.2', running: false });
+    f.run.mockImplementation(async command => ({ code: 0, stdout: `codex-cli ${command === current ? '9.0.0' : '0.165.0-alpha.1.2'}` }));
+    expect(await resolveSharedCodexExecutable({ ...f.target, executable: 'codex' }, f.options)).toBe(supported);
+    expect(f.run.mock.calls.every(([, args]) => args.at(-1) === '--version')).toBe(true);
+    await expect(resolveSharedCodexExecutable({ ...f.target, executable: current }, f.options)).rejects.toMatchObject({ code: 'shared-cli-unverified' });
   });
 
   it.each(['0.163.0', '0.163.0-alpha.11'])('selects a complete CLI instead of the preferred incomplete Desktop %s before starting', async desktopVersion => {

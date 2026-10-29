@@ -389,7 +389,13 @@ export function createApp(services: AppServices) {
 
   async function validateAutoLinkRules(next: AppConfig) {
     const target = (value: AppConfig) => JSON.stringify([value.codex.transport, value.codex.executable, value.codex.endpoint, value.codex.codexHome ?? '']);
-    const targetChanged = target(next) !== target(config.config);
+    const previous = config.config.codex;
+    const selectionFields = new Set([...Object.keys(previous), ...Object.keys(next.codex)]);
+    // Native ownership and unfinished operations are checked by configure; this guard only recognizes the unchanged scope.
+    const selectionOnly = previous.transport === 'shared' && next.codex.transport === 'shared' && !previous.endpoint && !next.codex.endpoint
+      && !previous.token && !next.codex.token && previous.executable !== next.codex.executable
+      && [...selectionFields].every(field => field === 'executable' || JSON.stringify(previous[field as keyof typeof previous]) === JSON.stringify(next.codex[field as keyof typeof next.codex]));
+    const targetChanged = target(next) !== target(config.config) && !selectionOnly;
     const activeAutomaticSource = store.listEndpoints().some(endpoint => store.getSourceRoute(endpoint.id).mode === 'auto' && store.getSourceAccess(endpoint.id).mode !== 'off');
     if (targetChanged && (next.autoLinkRules.some(rule => rule.enabled) || activeAutomaticSource)) throw new ApiError(400, 'Отключите правила автосоздания и доступ источников с автосозданием, затем смените подключение Codex, проверьте рабочие папки и включите доступ заново.');
     if (targetChanged) return;

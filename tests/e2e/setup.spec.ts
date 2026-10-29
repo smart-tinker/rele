@@ -323,7 +323,7 @@ for (const transport of ['proxy', 'websocket'] as const) {
     const writesBefore = api.mutations.length;
     await page.getByRole('button', { name: 'Перейти на общий Codex', exact: true }).click();
     await expect(page.getByLabel('Режим работы', { exact: true })).toHaveValue('shared');
-    await expect(page.getByRole('radio', { name: /Находить Codex автоматически/ })).toBeChecked();
+    await expect(page.getByRole('radio', { name: /Максимальная поддерживаемая версия/ })).toBeChecked();
     await expect(page.getByLabel('Папка профиля Codex', { exact: true })).toHaveValue('/profiles/legacy');
     expect(api.mutations).toHaveLength(writesBefore);
     await page.getByRole('button', { name: 'Сохранить Codex', exact: true }).click();
@@ -382,14 +382,14 @@ test('shared mode saves an automatic policy without a transient endpoint and pre
   await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
   await page.getByText('Настройки подключения', { exact: true }).click();
   await expect(page.getByLabel('Режим работы', { exact: true })).toHaveValue('shared');
-  await expect(page.getByRole('radio', { name: /Находить Codex автоматически/ })).toBeChecked();
+  await expect(page.getByRole('radio', { name: /Максимальная поддерживаемая версия/ })).toBeChecked();
   await expect(page.getByText('Rele подключается к общему Codex или запускает его.', { exact: false })).toBeVisible();
-  await expect(page.getByText('Rele использует работающий общий сервер, сохраняя его версию.', { exact: false })).toBeVisible();
+  await expect(page.getByText('Максимальная среди найденных установленных версий, поддерживаемых Rele.', { exact: false })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Выбрать рекомендуемый', exact: true })).toHaveCount(0);
   expect(api.mutations).toEqual([]);
-  await page.getByRole('radio', { name: /Указать параметры вручную/ }).check();
-  await page.getByRole('radio', { name: /Находить Codex автоматически/ }).check();
-  await expect(page.getByRole('radio', { name: /Находить Codex автоматически/ })).toBeChecked();
+  await page.getByRole('radio', { name: /Выбрать конкретную версию/ }).check();
+  await page.getByRole('radio', { name: /Максимальная поддерживаемая версия/ }).check();
+  await expect(page.getByRole('radio', { name: /Максимальная поддерживаемая версия/ })).toBeChecked();
   await page.getByRole('button', { name: 'Сохранить Codex', exact: true }).click();
   await expect.poll(() => api.mutations.at(-1)?.body).toEqual({ codex: { executable: 'codex', transport: 'shared', endpoint: '', codexHome: '/profiles/shared' } });
   await page.screenshot({ path: testInfo.outputPath('shared-desktop.png'), fullPage: true });
@@ -397,6 +397,87 @@ test('shared mode saves an automatic policy without a transient endpoint and pre
   await expect(page.getByLabel('Режим работы', { exact: true })).toHaveValue('shared');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath('shared-mobile.png'), fullPage: true });
+});
+
+test('shared version policy preserves a manual pin and saves automatic selection without changing the live version', async ({ page }, testInfo) => {
+  const state = fixtureState(true);
+  const pinned = '/opt/example/versions/0.164/codex';
+  const newer = '/opt/example/versions/0.165/codex';
+  state.config.codex = { executable: pinned, transport: 'shared', endpoint: '', codexHome: '/profiles/shared', tokenConfigured: false };
+  state.codex = { ...state.codex, name: 'Codex 0.164.0-alpha.11.1', transport: 'shared', executable: pinned, codexHome: '/profiles/shared' };
+  const discovery: CodexDiscoveryResult = { installations: [
+    { executable: pinned, source: 'desktop-install', name: 'Codex 0.164 (пример)', version: '0.164.0-alpha.11.1', running: false,
+      managedConnection: { transport: 'managed', executable: pinned, endpoint: '' } },
+    { executable: newer, source: 'desktop-install', name: 'Codex 0.165 (пример)', version: '0.165.0-alpha.1.2', running: false,
+      managedConnection: { transport: 'managed', executable: newer, endpoint: '' } },
+  ], recommendedManaged: { transport: 'managed', executable: newer, endpoint: '' }, issues: [] };
+  const api = await installApi(page, state, { discovery });
+  const updates: unknown[] = [];
+  await page.route('**/api/codex/update', async route => {
+    if (route.request().method() === 'POST') updates.push(route.request().postDataJSON());
+    const automatic = state.config.codex.executable === 'codex';
+    await route.fulfill({ json: { available: true, phase: automatic ? 'available' : 'current',
+      selectionMode: automatic ? 'auto' : 'manual', selectedVersion: automatic ? '0.165.0-alpha.1.2' : '0.164.0-alpha.11.1',
+      currentVersion: '0.164.0-alpha.11.1', installedVersion: '0.165.0-alpha.1.2' } });
+  });
+  await openPanel(page);
+  await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  const policy = page.getByRole('region', { name: 'Сохранённый выбор версии Codex', exact: true });
+  await expect(policy).toContainText('Выбор версии: Конкретная версия.');
+  await expect(policy).toContainText('Выбрана версия: 0.164.0-alpha.11.1.');
+  await expect(policy).toContainText(pinned);
+  await expect(policy).toContainText('Новые версии автоматически не выбираются.');
+  await expect(page.getByLabel('Режим работы', { exact: true })).toBeHidden();
+  await expect(page.getByRole('button', { name: 'Подготовить обновление', exact: true })).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath('version-policy-manual-desktop.png'), fullPage: true });
+  await page.reload();
+  await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  await expect(policy).toContainText('Выбор версии: Конкретная версия.');
+  await page.getByText('Настройки подключения', { exact: true }).click();
+  await expect(page.getByRole('radio', { name: /^Выбрать конкретную версию/u })).toBeChecked();
+  await expect(page.getByRole('radio', { name: /^Codex 0.164 \(пример\)/u })).toBeChecked();
+  await expect(page.getByLabel('Исполняемый файл Codex', { exact: true })).toHaveValue(pinned);
+  await expect(page.locator('input[type="radio"][name="codex-target"]')).toHaveCount(2);
+  await expect(page.getByRole('radio', { name: /Указать параметры вручную/u })).toHaveCount(0);
+  await page.getByRole('radio', { name: /^Максимальная поддерживаемая версия/u }).check();
+  await page.getByRole('button', { name: 'Сохранить Codex', exact: true }).click();
+  await expect.poll(() => api.mutations.at(-1)?.body).toEqual({ codex: { executable: 'codex', transport: 'shared', endpoint: '', codexHome: '/profiles/shared' } });
+  await expect(page.getByText('Выбор версии Codex сохранён. Работающий сервер не изменён; переход применяется отдельно после завершения задач.', { exact: true })).toBeVisible();
+  await expect(policy).toContainText('Выбор версии: Максимальная поддерживаемая версия.');
+  await expect(policy).toContainText('Выбрана версия: 0.165.0-alpha.1.2.');
+  await expect(page.getByText('Подключён: Codex 0.164.0-alpha.11.1', { exact: true })).toBeVisible();
+  await expect(page.getByText('Работающий сервер: 0.164.0-alpha.11.1. Выбрана версия: 0.165.0-alpha.1.2.', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Подготовить обновление', exact: true })).toBeEnabled();
+  expect(updates).toEqual([]);
+  await page.getByText('Настройки подключения', { exact: true }).click();
+  await expect(page.getByLabel('Режим работы', { exact: true })).toBeHidden();
+  await page.screenshot({ path: testInfo.outputPath('version-policy-auto-desktop.png'), fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath('version-policy-auto-mobile.png'), fullPage: true });
+});
+
+test('automatic version policy separates the supported selection from the newest installed Desktop and rejects a sentinel manual pin', async ({ page }) => {
+  const state = fixtureState(true);
+  state.config.codex = { executable: 'codex', transport: 'shared', endpoint: '', tokenConfigured: false };
+  state.codex = { ...state.codex, name: 'Codex 0.164.0-alpha.11.1', transport: 'shared' };
+  const api = await installApi(page, state);
+  await page.route('**/api/codex/update', route => route.fulfill({ json: { available: true, phase: 'available', selectionMode: 'auto',
+    selectedVersion: '0.165.0-alpha.1.2', currentVersion: '0.164.0-alpha.11.1', installedVersion: '9.0.0' } }));
+  await openPanel(page);
+  await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  await expect(page.getByText('Работающий сервер: 0.164.0-alpha.11.1. Выбрана версия: 0.165.0-alpha.1.2.', { exact: true })).toBeVisible();
+  await expect(page.getByText('Новейший установленный Desktop: 9.0.0.', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Подготовить обновление', exact: true })).toBeEnabled();
+  await page.getByText('Настройки подключения', { exact: true }).click();
+  await page.getByRole('radio', { name: /^Выбрать конкретную версию/u }).check();
+  const executable = page.getByLabel('Исполняемый файл Codex', { exact: true });
+  await expect(executable).toHaveValue('');
+  await executable.fill('codex');
+  await page.getByRole('button', { name: 'Сохранить Codex', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('Для конкретной версии выберите установку или укажите полный путь к Codex.');
+  expect(api.mutations).toEqual([]);
+  expect(state.config.codex.executable).toBe('codex');
 });
 
 test('legacy WebSocket settings require a saved shared target and an explicit Desktop integration action', async ({ page }, testInfo) => {
@@ -590,12 +671,12 @@ test('Codex update requires closed-client confirmation and applies without reboo
     }
     await route.fulfill({ json: { available: true, phase,
       currentVersion: phase === 'current' ? '0.165.0-alpha.1.2' : '0.164.0-alpha.11.1',
-      installedVersion: '0.165.0-alpha.1.2', ...(phase === 'ready' ? { pendingVersion: '0.165.0-alpha.1.2' } : {}) } });
+      selectionMode: 'auto', selectedVersion: '0.165.0-alpha.1.2', installedVersion: '0.165.0-alpha.1.2', ...(phase === 'ready' ? { pendingVersion: '0.165.0-alpha.1.2' } : {}) } });
   });
   await openPanel(page);
   await expect(page).toHaveTitle(/Rele/u);
   await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
-  await expect(page.getByText('Работающий сервер: 0.164.0-alpha.11.1. Установленный Desktop: 0.165.0-alpha.1.2.', { exact: true })).toBeVisible();
+  await expect(page.getByText('Работающий сервер: 0.164.0-alpha.11.1. Выбрана версия: 0.165.0-alpha.1.2.', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Подготовить обновление', exact: true }).click();
   await expect(page.getByText('Подготовлена версия: 0.165.0-alpha.1.2.', { exact: true })).toBeVisible();
   await expect(page.getByText('Завершите задачи, полностью закройте Desktop и CLI и не запускайте их до завершения обновления.', { exact: true })).toBeVisible();
@@ -637,7 +718,7 @@ test('Codex update keeps native busy refusal retryable and requires a fresh clos
     }
     await route.fulfill({ json: { available: true, phase: attempts > 1 ? 'current' : 'ready',
       currentVersion: attempts > 1 ? '0.165.0-alpha.1.2' : '0.164.0-alpha.11.1',
-      installedVersion: '0.165.0-alpha.1.2', ...(attempts > 1 ? {} : { pendingVersion: '0.165.0-alpha.1.2' }) } });
+      selectionMode: 'auto', selectedVersion: '0.165.0-alpha.1.2', installedVersion: '0.165.0-alpha.1.2', ...(attempts > 1 ? {} : { pendingVersion: '0.165.0-alpha.1.2' }) } });
   });
   await openPanel(page);
   await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
@@ -657,7 +738,7 @@ test('Codex update keeps native busy refusal retryable and requires a fresh clos
 
 test('Codex update in progress disables reconnect and exposes no parallel update action', async ({ page }) => {
   const api = await installApi(page, fixtureState(true));
-  await page.route('**/api/codex/update', route => route.fulfill({ json: { available: true, phase: 'applying', currentVersion: '0.164.0-alpha.11.1', installedVersion: '0.165.0-alpha.1.2', pendingVersion: '0.165.0-alpha.1.2' } }));
+  await page.route('**/api/codex/update', route => route.fulfill({ json: { available: true, phase: 'applying', currentVersion: '0.164.0-alpha.11.1', selectionMode: 'auto', selectedVersion: '0.165.0-alpha.1.2', installedVersion: '0.165.0-alpha.1.2', pendingVersion: '0.165.0-alpha.1.2' } }));
   await openPanel(page);
   await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
   await expect(page.getByText('Проверяем простой и обновляем общий Codex. Не открывайте Desktop и CLI до завершения.', { exact: true })).toBeVisible();
@@ -669,11 +750,11 @@ test('Codex update in progress disables reconnect and exposes no parallel update
 
 test('an unsupported installed Codex remains visible without an update action', async ({ page }) => {
   await installApi(page, fixtureState(true));
-  await page.route('**/api/codex/update', route => route.fulfill({ json: { available: true, phase: 'unsupported', currentVersion: '0.164.0-alpha.11.1', installedVersion: '9.0.0' } }));
+  await page.route('**/api/codex/update', route => route.fulfill({ json: { available: true, phase: 'unsupported', currentVersion: '0.164.0-alpha.11.1', selectionMode: 'manual', selectedVersion: '9.0.0', installedVersion: '9.0.0' } }));
   await openPanel(page);
   await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
-  await expect(page.getByText('Установленный Desktop: 9.0.0.', { exact: false })).toBeVisible();
-  await expect(page.getByText('Эта версия ещё не поддерживается Rele.', { exact: false })).toBeVisible();
+  await expect(page.getByText('Работающий сервер: 0.164.0-alpha.11.1. Выбрана версия: 9.0.0.', { exact: true })).toBeVisible();
+  await expect(page.getByText('Переход на выбранную версию недоступен.', { exact: false })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Подготовить обновление', exact: true })).toHaveCount(0);
 });
 

@@ -439,6 +439,7 @@ export function CodexSettings({
   const [update, setUpdate] = useState<CodexUpdateState | null>(null);
   const [updateError, setUpdateError] = useState('');
   const [clientsClosed, setClientsClosed] = useState(false);
+  const savedSelectionMode = update?.selectionMode ?? (state.config.codex.executable === 'codex' ? 'auto' : 'manual');
   const savedTarget = JSON.stringify([codexTargetKey(state.config.codex), state.config.codex.codexHome ?? '']);
   const pendingTarget = selection === 'auto'
     ? { ...automaticCodex, transport }
@@ -499,9 +500,14 @@ export function CodexSettings({
   };
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    const policyOnly = transport === 'shared' && state.config.codex.transport === 'shared'
+      && codexHome.trim() === (state.config.codex.codexHome ?? '') && !token.trim();
     const result = await action.run(
-      () =>
-        api.request('/api/config', 'PUT', {
+      () => {
+        if (transport === 'shared' && selection !== 'auto' && executable.trim() === 'codex') {
+          throw new Error('Для конкретной версии выберите установку или укажите полный путь к Codex.');
+        }
+        return api.request('/api/config', 'PUT', {
           codex: {
             ...(selection === 'auto'
               ? { ...automaticCodex, transport }
@@ -517,8 +523,10 @@ export function CodexSettings({
               ? { token: token.trim() }
               : {}),
           },
-        }),
-      'Настройки Codex сохранены. Состояние подключения обновится автоматически.',
+        });
+      },
+      policyOnly ? 'Выбор версии Codex сохранён. Работающий сервер не изменён; переход применяется отдельно после завершения задач.'
+        : 'Настройки Codex сохранены. Состояние подключения обновится автоматически.',
     );
     if (result.ok) {
       setToken('');
@@ -571,6 +579,15 @@ export function CodexSettings({
           </Status>
         )}
       </div>
+      {state.config.codex.transport === 'shared' && (
+        <div className="codex-mode-copy" role="region" aria-label="Сохранённый выбор версии Codex">
+          <p><strong>Выбор версии: </strong>{savedSelectionMode === 'auto' ? 'Максимальная поддерживаемая версия' : 'Конкретная версия'}.</p>
+          {update?.selectedVersion && <p>Выбрана версия: {update.selectedVersion}.</p>}
+          {savedSelectionMode === 'auto'
+            ? <p className="field-hint">Среди найденных установленных версий. Работающий сервер сохраняется до подготовки и применения обновления после завершения задач.</p>
+            : <><p className="field-hint">Установка закреплена. Новые версии автоматически не выбираются.</p><p className="discovery-path">{state.config.codex.executable}</p></>}
+        </div>
+      )}
       {state.codex.error && <Notice tone="warning">{state.codex.error}</Notice>}
       {desktopError && <Notice>{desktopError}</Notice>}
       {updateError && <Notice>{updateError}</Notice>}
@@ -579,7 +596,8 @@ export function CodexSettings({
       {update?.available && update.phase !== 'current' && (
         <Notice tone={update.phase === 'failed' || update.phase === 'unsupported' ? 'warning' : 'info'}>
           <strong>Обновление Codex</strong>
-          <p>Работающий сервер: {update.currentVersion || 'не подключён'}. Установленный Desktop: {update.installedVersion || 'версия не определена'}.</p>
+          <p>Работающий сервер: {update.currentVersion || 'не подключён'}. Выбрана версия: {update.selectedVersion || 'версия не определена'}.</p>
+          {update.installedVersion && update.installedVersion !== update.selectedVersion && <p>Новейший установленный Desktop: {update.installedVersion}.</p>}
           {update.pendingVersion && <p>Подготовлена версия: {update.pendingVersion}.</p>}
           {update.phase === 'ready' || update.phase === 'failed' && update.pendingVersion
             ? <p>Завершите задачи, полностью закройте Desktop и CLI и не запускайте их до завершения обновления.</p>
@@ -588,7 +606,7 @@ export function CodexSettings({
             : update.phase === 'applying'
               ? <p>Проверяем простой и обновляем общий Codex. Не открывайте Desktop и CLI до завершения.</p>
             : update.phase === 'unsupported'
-              ? <p>Эта версия ещё не поддерживается Rele. Работающий сервер сохраняется.</p>
+              ? <p>Переход на выбранную версию недоступен. Работающий сервер сохраняется.</p>
               : <p>Rele подготовит обновление общего сервера. Затем завершите задачи и полностью закройте Desktop и CLI. Чаты, профиль и очередь Rele сохранятся.</p>}
           {update.error && <p>{update.error}</p>}
           {unsavedCodex && <p>Сначала сохраните настройки подключения Codex.</p>}
@@ -710,15 +728,15 @@ export function CodexSettings({
           <CodexDiscovery
             api={api}
             transport={transport}
-            value={selection}
+            value={transport === 'shared' && selection !== 'auto' ? codexTargetKey(pendingTarget) : selection}
             refreshKey={discoveryRevision}
             disabled={action.busy}
             onChange={(choice) => {
               if (choice === 'auto') chooseMode(transport === 'managed' ? 'managed' : 'shared');
-              else if (choice === 'manual') setSelection(choice);
+              else if (choice === 'manual') { setSelection(choice); if (transport === 'shared' && executable.trim() === 'codex') setExecutable(''); }
               else if (choice.transport === 'shared' && codexTargetKey(choice) === codexTargetKey(automaticCodex)) chooseMode('shared');
               else {
-                setSelection(codexTargetKey(choice));
+                setSelection(choice.transport === 'shared' ? 'manual' : codexTargetKey(choice));
                 setTransport(choice.transport);
                 setExecutable(choice.executable);
                 setEndpoint(
@@ -734,7 +752,7 @@ export function CodexSettings({
             <div className="form-stack codex-manual">
               <Field
                 label="Исполняемый файл Codex"
-                hint="Имя команды или полный путь к Codex на этом компьютере."
+                hint={transport === 'shared' ? 'Полный путь к выбранной версии Codex на этом компьютере.' : 'Имя команды или полный путь к Codex на этом компьютере.'}
               >
                 <input
                   value={executable}
