@@ -104,7 +104,7 @@ export function CodexDiscovery({
             <strong>Находить Codex автоматически</strong>
             <small>
               {transport === 'shared'
-                ? 'Rele найдёт установленный Codex и общий сервер. При отсутствии сервера запустит штатный daemon Codex.'
+                ? 'Rele использует работающий общий сервер, сохраняя его версию. Если сервера нет, найдёт установленный Codex и запустит его.'
                 : 'Rele выберет подходящий Codex и запустит отдельный сервер.'}
             </small>
           </span>
@@ -113,7 +113,7 @@ export function CodexDiscovery({
       <div className="section-heading discovery-heading">
         <h3>Найдено на этом компьютере</h3>
         <div className="discovery-actions">
-          {recommended && (
+          {recommended && transport !== 'shared' && (
             <Button
               disabled={disabled}
               onClick={() => onChange(recommended)}

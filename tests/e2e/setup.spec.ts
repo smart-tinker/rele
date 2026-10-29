@@ -384,8 +384,11 @@ test('shared mode saves an automatic policy without a transient endpoint and pre
   await expect(page.getByLabel('Режим работы', { exact: true })).toHaveValue('shared');
   await expect(page.getByRole('radio', { name: /Находить Codex автоматически/ })).toBeChecked();
   await expect(page.getByText('Rele подключается к общему Codex или запускает его.', { exact: false })).toBeVisible();
+  await expect(page.getByText('Rele использует работающий общий сервер, сохраняя его версию.', { exact: false })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Выбрать рекомендуемый', exact: true })).toHaveCount(0);
   expect(api.mutations).toEqual([]);
-  await page.getByRole('button', { name: 'Выбрать рекомендуемый', exact: true }).click();
+  await page.getByRole('radio', { name: /Указать параметры вручную/ }).check();
+  await page.getByRole('radio', { name: /Находить Codex автоматически/ }).check();
   await expect(page.getByRole('radio', { name: /Находить Codex автоматически/ })).toBeChecked();
   await page.getByRole('button', { name: 'Сохранить Codex', exact: true }).click();
   await expect.poll(() => api.mutations.at(-1)?.body).toEqual({ codex: { executable: 'codex', transport: 'shared', endpoint: '', codexHome: '/profiles/shared' } });
