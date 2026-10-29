@@ -1195,10 +1195,6 @@ tbody tr:hover {
 .codex-form {
   max-width: 850px;
 }
-.codex-version-hint {
-  max-width: 850px;
-  margin: 16px 0;
-}
 .codex-details {
   border-bottom: 1px solid var(--border);
   padding: 18px 0;

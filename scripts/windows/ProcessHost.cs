@@ -46,6 +46,9 @@ internal sealed class ProcessHost : IDisposable
         public string CodexHome { get; set; }
         public string Endpoint { get; set; }
         public string TaskName { get; set; }
+        public string ColdPredecessorDirectory { get; set; }
+        public string PreviousScheduledDirectory { get; set; }
+        public string PreparedBootIdentity { get; set; }
     }
 
     private static int Main(string[] args)
@@ -100,6 +103,8 @@ internal sealed class ProcessHost : IDisposable
             if (!String.Equals(Path.GetDirectoryName(executable), directory, StringComparison.OrdinalIgnoreCase) ||
                 Hash(executable) != owner.HostSha256 || Hash(owner.Executable) != owner.ExecutableSha256)
                 throw new InvalidOperationException("WebSocket owner executable changed");
+            if (ValidateColdSuccessor(directory, owner) && BootIdentity() == owner.PreparedBootIdentity)
+                return 0; // A future Task action must never replace a legacy server on its preparation boot.
             // The task is independent of Rele's gateway; only this host owns the native child Job.
             using (var operation = new FileStream(Path.Combine(directory, "owner.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
             using (var native = new FileStream(owner.Executable, FileMode.Open, FileAccess.Read, FileShare.Read))
@@ -136,6 +141,64 @@ internal sealed class ProcessHost : IDisposable
     {
         using (var hash = SHA256.Create()) using (var input = File.OpenRead(file))
             return BitConverter.ToString(hash.ComputeHash(input)).Replace("-", "").ToLowerInvariant();
+    }
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtQuerySystemInformation(int informationClass, [Out] byte[] information, int length, out int returnedLength);
+
+    private static string BootIdentity()
+    {
+        var information = new byte[32]; int returned;
+        if (NtQuerySystemInformation(90, information, information.Length, out returned) != 0 || returned < 16 || returned > information.Length)
+            throw new InvalidOperationException("cannot confirm Windows boot identity");
+        var identifier = new byte[16]; Array.Copy(information, identifier, identifier.Length);
+        Guid boot = new Guid(identifier);
+        if (boot == Guid.Empty) throw new InvalidOperationException("Windows boot identity is empty");
+        return boot.ToString("N");
+    }
+
+    private static bool SamePath(string first, string second)
+    {
+        return String.Equals(Path.GetFullPath(first).TrimEnd('\\'), Path.GetFullPath(second).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static WebSocketOwner ReadColdPredecessor(string directory, string cache, string currentDirectory)
+    {
+        if (String.IsNullOrEmpty(directory) || !Path.IsPathRooted(directory) || !SamePath(Path.GetDirectoryName(directory), cache) ||
+            !Regex.IsMatch(Path.GetFileName(directory), "^[a-f0-9]{64}$") || SamePath(directory, currentDirectory))
+            throw new InvalidOperationException("cold predecessor directory changed");
+        RequirePrivateDirectory(directory);
+        string file = Path.Combine(directory, "owner.json");
+        if (new FileInfo(file).Length > 65536) throw new InvalidOperationException("cold predecessor marker is too large");
+        string marker = File.ReadAllText(file);
+        using (var hash = SHA256.Create())
+            if (BitConverter.ToString(hash.ComputeHash(Encoding.UTF8.GetBytes(marker))).Replace("-", "").ToLowerInvariant() != Path.GetFileName(directory))
+                throw new InvalidOperationException("cold predecessor marker changed");
+        WebSocketOwner previous = new JavaScriptSerializer().Deserialize<WebSocketOwner>(marker);
+        if (previous == null || previous.Version != 1 || !Regex.IsMatch(previous.HostSha256 ?? "", "^[a-f0-9]{64}$") ||
+            !Regex.IsMatch(previous.ExecutableSha256 ?? "", "^[a-f0-9]{64}$") || !Path.IsPathRooted(previous.Executable ?? "") ||
+            Hash(Path.Combine(directory, "Rele.Process.exe")) != previous.HostSha256)
+            throw new InvalidOperationException("cold predecessor host changed");
+        return previous;
+    }
+
+    private static bool ValidateColdSuccessor(string directory, WebSocketOwner owner)
+    {
+        bool cold = !String.IsNullOrEmpty(owner.ColdPredecessorDirectory) || !String.IsNullOrEmpty(owner.PreviousScheduledDirectory) ||
+            !String.IsNullOrEmpty(owner.PreparedBootIdentity);
+        if (!cold) return false;
+        if (!Regex.IsMatch(owner.PreparedBootIdentity ?? "", "^[a-f0-9]{32}$"))
+            throw new InvalidOperationException("cold successor boot identity changed");
+        string cache = Path.GetDirectoryName(directory); RequirePrivateDirectory(cache);
+        WebSocketOwner previous = ReadColdPredecessor(owner.ColdPredecessorDirectory, cache, directory);
+        WebSocketOwner scheduledBefore = ReadColdPredecessor(owner.PreviousScheduledDirectory, cache, directory);
+        if (previous.OwnerSid != owner.OwnerSid || previous.TaskName != owner.TaskName || previous.Endpoint != owner.Endpoint ||
+            !SamePath(previous.CodexHome, owner.CodexHome) || scheduledBefore.OwnerSid != previous.OwnerSid ||
+            scheduledBefore.TaskName != previous.TaskName || scheduledBefore.Endpoint != previous.Endpoint ||
+            !SamePath(scheduledBefore.CodexHome, previous.CodexHome) || !SamePath(scheduledBefore.Executable, previous.Executable) ||
+            scheduledBefore.ExecutableSha256 != previous.ExecutableSha256)
+            throw new InvalidOperationException("cold successor installation or profile changed");
+        return true;
     }
 
     private static void RequirePrivateDirectory(string directory)

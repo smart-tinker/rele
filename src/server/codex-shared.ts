@@ -364,9 +364,14 @@ export async function ensureWindowsSharedCodex(target: CodexConnectionTarget, op
       // An update can expose both old running and new installed Desktop paths.
       // Ask the trusted owner first; absence alone permits installation discovery.
       const current = await run(path.join(installationDirectory, 'Rele.exe'), ['codex-status', '--quiet', '--codex-home', home], timeoutMs, env);
-      const status = JSON.parse(current.stdout) as { status?: unknown } | null;
+      const status = JSON.parse(current.stdout) as { status?: unknown; pendingUpdate?: unknown; restartRequired?: unknown; pendingExe?: unknown } | null;
       if (current.code !== 0 || !status || !['notRunning', 'alreadyRunning'].includes(String(status.status))) throw invalid();
       if (status.status === 'alreadyRunning') selected = (await validateReceipt(current, undefined, true)).executable;
+      else if (status.pendingUpdate === true) {
+        if (status.restartRequired === true) throw new SharedCodexError('Обновление Codex подготовлено. После завершения задач перезагрузите Windows.', 'shared-update-restart-required');
+        if (typeof status.pendingExe !== 'string' || !path.isAbsolute(status.pendingExe)) throw invalid();
+        selected = status.pendingExe;
+      }
       else {
         const discovery = await (options.discover ?? discoverCodex)({ env, ...(target.codexHome ? { codexHome: target.codexHome } : {}) });
         const desktops = [...new Map(discovery.installations.filter(item => ['desktop-install', 'desktop-process'].includes(item.source)

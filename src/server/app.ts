@@ -8,7 +8,7 @@ import { isLocalCodexHome, isLocalWorkspace, mergeConfig, publicConfig } from '.
 import type { Store } from './store.js';
 import type { Engine } from './engine.js';
 import type { CodexClient } from './codex.js';
-import type { DashboardState, DesktopIntegrationState, Endpoint, Platform, SlackSyncJournal } from '../shared/types.js';
+import type { CodexUpdateState, DashboardState, DesktopIntegrationState, Endpoint, Platform, SlackSyncJournal } from '../shared/types.js';
 import { ChannelError } from './channels/common.js';
 import { discoverCodex } from './codex-discovery.js';
 import { MessageToolValidationError } from '../shared/message-tool.js';
@@ -27,6 +27,10 @@ export interface AppServices {
     status(): Promise<DesktopIntegrationState>;
     shouldRetry(): Promise<boolean>;
     setEnabled(enabled: boolean, retry?: boolean): Promise<DesktopIntegrationState>;
+  };
+  codexUpdate?: {
+    status(): Promise<CodexUpdateState>;
+    prepare(): Promise<CodexUpdateState>;
   };
 }
 
@@ -237,6 +241,16 @@ export function createApp(services: AppServices) {
   });
   app.get('/api/codex/desktop-integration', async (): Promise<DesktopIntegrationState> =>
     services.desktopIntegration?.status() ?? { available: false, enabled: false, lastCheckFailed: false });
+  app.get('/api/codex/update', async () =>
+    services.codexUpdate?.status() ?? { available: false, phase: 'current' });
+  app.post('/api/codex/update', async request => {
+    fields(object(request.body), []);
+    if (configuring) throw new ApiError(409, 'Дождитесь завершения изменения подключения Codex.');
+    if (!services.codexUpdate) throw new ApiError(400, 'Обновление общего Codex доступно в установленном Rele для Windows.');
+    configuring = true;
+    try { return await services.codexUpdate.prepare(); }
+    finally { configuring = false; retryDesktopIntegration(); }
+  });
   app.post('/api/codex/desktop-integration', async request => {
     const body = object(request.body); fields(body, ['enabled']);
     if (typeof body.enabled !== 'boolean') throw new ApiError(400, 'enabled должен быть логическим значением.');

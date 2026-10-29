@@ -88,6 +88,10 @@ function makeApp() {
     shouldRetry: vi.fn().mockResolvedValue(false),
     setEnabled: vi.fn().mockImplementation(async (enabled: boolean) => ({ available: true, enabled, lastCheckFailed: false })),
   };
+  const codexUpdate = {
+    status: vi.fn().mockResolvedValue({ available: true, phase: 'available', currentVersion: '0.164.0-alpha.11.1', installedVersion: '0.165.0-alpha.1.2' }),
+    prepare: vi.fn().mockResolvedValue({ available: true, phase: 'restartRequired', pendingVersion: '0.165.0-alpha.1.2' }),
+  };
   const app = createApp({
     store,
     config,
@@ -98,6 +102,7 @@ function makeApp() {
     shutdown,
     discoverCodex: discovery,
     desktopIntegration,
+    codexUpdate,
   });
   opened.push({ app, store });
   const endpoint: Endpoint = {
@@ -112,8 +117,45 @@ function makeApp() {
     updatedAt: '2026-10-18T20:00:00Z',
   };
   store.upsertEndpoint(endpoint);
-  return { app, store, config, engine, codex, configure, endpoint, shutdown, discovery, desktopIntegration, replaceCodex: () => { currentCodex = { ...codex }; } };
+  return { app, store, config, engine, codex, configure, endpoint, shutdown, discovery, desktopIntegration, codexUpdate, replaceCodex: () => { currentCodex = { ...codex }; } };
 }
+
+describe('shared Codex update', () => {
+  it('requires panel authorization and rejects executable paths supplied by the caller', async () => {
+    const f = makeApp();
+    const url = '/api/codex/update';
+    expect((await f.app.inject({ url })).statusCode).toBe(401);
+    expect((await f.app.inject({ url, method: 'POST', payload: {} })).statusCode).toBe(401);
+    expect(f.codexUpdate.status).not.toHaveBeenCalled();
+    expect((await f.app.inject({ url, headers })).json()).toMatchObject({ phase: 'available' });
+    expect((await f.app.inject({ url, method: 'POST', headers, payload: { executable: '/untrusted/native' } })).statusCode).toBe(400);
+    expect(f.codexUpdate.prepare).not.toHaveBeenCalled();
+    expect((await f.app.inject({ url, method: 'POST', headers, payload: {} })).json()).toMatchObject({ phase: 'restartRequired' });
+    expect(f.codexUpdate.prepare).toHaveBeenCalledOnce();
+    expect(f.codex.connect).not.toHaveBeenCalled();
+    expect(f.engine.cancel).not.toHaveBeenCalled();
+  });
+
+  it('serializes preparation with connection changes while leaving status readable and releases the guard after failure', async () => {
+    const f = makeApp();
+    let release!: () => void;
+    f.codexUpdate.prepare.mockImplementationOnce(async () => {
+      await new Promise<void>(resolve => { release = resolve; });
+      throw new Error('Synthetic preparation failure');
+    });
+    const pending = f.app.inject({ url: '/api/codex/update', method: 'POST', headers, payload: {} }).then(value => value);
+    await vi.waitFor(() => expect(f.codexUpdate.prepare).toHaveBeenCalledOnce());
+    for (const request of [
+      { url: '/api/codex/update', payload: {} },
+      { url: '/api/codex/connect' },
+      { url: '/api/config', method: 'PUT' as const, payload: { codex: { transport: 'shared' } } },
+      { url: '/api/codex/desktop-integration', payload: { enabled: false } },
+    ]) expect((await f.app.inject({ method: 'POST', ...request, headers })).statusCode).toBe(409);
+    expect((await f.app.inject({ url: '/api/codex/update', headers })).statusCode).toBe(200);
+    release(); expect((await pending).statusCode).toBe(400);
+    expect((await f.app.inject({ url: '/api/codex/connect', method: 'POST', headers })).statusCode).toBe(200);
+  });
+});
 
 describe('initial Rele instruction', () => {
   it('requires panel authorization and a known conversation, rejects unexpected content and queues one operation', async () => {

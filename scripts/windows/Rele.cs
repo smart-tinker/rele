@@ -56,7 +56,7 @@ internal static class Rele
         var options = new Dictionary<string, string>(StringComparer.Ordinal);
         try
         {
-            if (command == "codex-start" || command == "codex-status")
+            if (command == "codex-start" || command == "codex-status" || command == "codex-update")
             {
                 // This GUI launcher has redirected pipes, not an attached console/code page.
                 Console.SetOut(new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true });
@@ -65,7 +65,7 @@ internal static class Rele
             for (int i = 1; i < args.Length; i++)
             {
                 if (args[i] == "--quiet" || args[i] == "--backup" || args[i] == "--desktop-integration" || args[i] == "--prepare-codex" || args[i] == "--preserve-active" || args[i] == "--retry-desktop-integration") options.Add(args[i], "true");
-                else if (Array.IndexOf(new[] { "--app-dir", "--data-dir", "--task-name", "--port", "--codex-home", "--codex-executable", "--error-file", "--warning-file", "--path-file", "--maintenance-dir" }, args[i]) >= 0 && i + 1 < args.Length)
+                else if (Array.IndexOf(new[] { "--app-dir", "--data-dir", "--task-name", "--port", "--codex-home", "--codex-executable", "--expected-sha256", "--error-file", "--warning-file", "--path-file", "--maintenance-dir" }, args[i]) >= 0 && i + 1 < args.Length)
                     options.Add(args[i], args[++i]);
                 else throw new InvalidOperationException("Неизвестный параметр Rele.");
             }
@@ -73,6 +73,8 @@ internal static class Rele
                 throw new InvalidOperationException("Повтор подключения Desktop допустим только для desktop-integrate.");
             if (options.ContainsKey("--maintenance-dir") && command != "prepare-update" && command != "check-runtime")
                 throw new InvalidOperationException("Временные модули допустимы только для подготовки обновления.");
+            if (options.ContainsKey("--expected-sha256") && command != "codex-update")
+                throw new InvalidOperationException("Ожидаемый хеш backend допустим только для codex-update.");
             SecurityIdentifier currentUser = WindowsIdentity.GetCurrent().User;
             if (currentUser.IsWellKnown(WellKnownSidType.LocalSystemSid) || currentUser.IsWellKnown(WellKnownSidType.LocalServiceSid) || currentUser.IsWellKnown(WellKnownSidType.NetworkServiceSid))
                 throw new InvalidOperationException("Установите и запускайте Rele из обычной учётной записи владельца Codex, а не SYSTEM или служебной учётной записи Windows.");
@@ -122,6 +124,13 @@ internal static class Rele
                 if (!File.Exists(settingsPath) || !options.ContainsKey("--codex-executable") || !options.ContainsKey("--codex-home"))
                     throw new InvalidOperationException("Запуск общего Codex требует существующую установку, backend и исходный профиль.");
                 Console.Out.WriteLine(Json.Serialize(StartCodexWebSocket(options["--codex-executable"], options["--codex-home"], options.ContainsKey("--preserve-active"))));
+                return 0;
+            }
+            if (command == "codex-update")
+            {
+                if (!File.Exists(settingsPath) || !options.ContainsKey("--codex-executable") || !options.ContainsKey("--codex-home") || !options.ContainsKey("--expected-sha256"))
+                    throw new InvalidOperationException("Обновление общего Codex требует существующую установку, backend, исходный профиль и ожидаемый SHA-256.");
+                Console.Out.WriteLine(Json.Serialize(StageColdCodexUpdate(options["--codex-executable"], options["--codex-home"], options["--expected-sha256"])));
                 return 0;
             }
             if (command == "desktop-check")
@@ -229,7 +238,7 @@ internal static class Rele
                 try { File.WriteAllText(options["--error-file"], message, new UTF8Encoding(false)); } catch { }
             }
             if (command == "serve") Log(message);
-            else if (command == "codex-start" || command == "codex-status") Console.Error.WriteLine(message);
+            else if (command == "codex-start" || command == "codex-status" || command == "codex-update") Console.Error.WriteLine(message);
             else if (!options.ContainsKey("--quiet")) MessageBox.Show(message, "Rele", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1;
         }
@@ -516,6 +525,9 @@ internal static class Rele
         public string CodexHome { get; set; }
         public string Endpoint { get; set; }
         public string TaskName { get; set; }
+        public string ColdPredecessorDirectory { get; set; }
+        public string PreviousScheduledDirectory { get; set; }
+        public string PreparedBootIdentity { get; set; }
     }
 
     private sealed class CodexWebSocketPointer
@@ -539,6 +551,21 @@ internal static class Rele
     {
         using (var hash = SHA256.Create())
             return BitConverter.ToString(hash.ComputeHash(Encoding.UTF8.GetBytes(text))).Replace("-", "").ToLowerInvariant();
+    }
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtQuerySystemInformation(int informationClass, [Out] byte[] information, int length, out int returnedLength);
+
+    private static string BootIdentity()
+    {
+        // SYSTEM_BOOT_ENVIRONMENT_INFORMATION begins with the kernel's per-boot GUID.
+        var information = new byte[32]; int returned;
+        if (NtQuerySystemInformation(90, information, information.Length, out returned) != 0 || returned < 16 || returned > information.Length)
+            throw new InvalidOperationException("Не удалось подтвердить текущую загрузку Windows; обновление Codex отложено.");
+        var identifier = new byte[16]; Array.Copy(information, identifier, identifier.Length);
+        Guid boot = new Guid(identifier);
+        if (boot == Guid.Empty) throw new InvalidOperationException("Идентификатор загрузки Windows пуст; обновление Codex отложено.");
+        return boot.ToString("N");
     }
 
     private static void AtomicJson(string file, string contents)
@@ -714,13 +741,34 @@ internal static class Rele
             FileHash(Path.Combine(directory, "Rele.Process.exe")) != owner.HostSha256)
             throw new InvalidOperationException("Сохранённый владелец Codex изменён; чужие процессы и задачи не затронуты.");
         WebSocketPort(owner.Endpoint);
+        bool cold = !String.IsNullOrEmpty(owner.ColdPredecessorDirectory) || !String.IsNullOrEmpty(owner.PreviousScheduledDirectory) ||
+            !String.IsNullOrEmpty(owner.PreparedBootIdentity);
+        if (cold && (!OwnerCacheDirectory(owner.ColdPredecessorDirectory, cache) || !OwnerCacheDirectory(owner.PreviousScheduledDirectory, cache) ||
+            SamePath(owner.ColdPredecessorDirectory, directory) || SamePath(owner.PreviousScheduledDirectory, directory) ||
+            !Regex.IsMatch(owner.PreparedBootIdentity ?? "", "^[a-f0-9]{32}$")))
+            throw new InvalidOperationException("Подготовленный преемник Codex не соответствует установке.");
         return owner;
+    }
+
+    private static bool OwnerCacheDirectory(string directory, string cache)
+    {
+        return !String.IsNullOrEmpty(directory) && Path.IsPathRooted(directory) &&
+            SamePath(Path.GetDirectoryName(directory), cache) && Regex.IsMatch(Path.GetFileName(directory), "^[a-f0-9]{64}$");
     }
 
     private static bool SameCodexWebSocketScope(CodexWebSocketOwner first, CodexWebSocketOwner second)
     {
         return first.OwnerSid == second.OwnerSid && first.TaskName == second.TaskName && first.Endpoint == second.Endpoint &&
             SamePath(first.Executable, second.Executable) && first.ExecutableSha256 == second.ExecutableSha256 && SamePath(first.CodexHome, second.CodexHome);
+    }
+
+    private static bool ColdSuccessorOf(CodexWebSocketOwner previous, string previousDirectory, CodexWebSocketOwner next, string nextDirectory)
+    {
+        if (next == null || String.IsNullOrEmpty(next.ColdPredecessorDirectory) || !SamePath(next.ColdPredecessorDirectory, previousDirectory)) return false;
+        if (previous.OwnerSid != next.OwnerSid || previous.TaskName != next.TaskName || previous.Endpoint != next.Endpoint ||
+            !SamePath(previous.CodexHome, next.CodexHome) || SamePath(previousDirectory, nextDirectory)) return false;
+        CodexWebSocketOwner scheduledBefore = ReadCodexWebSocketOwner(next.PreviousScheduledDirectory);
+        return scheduledBefore != null && SameCodexWebSocketScope(previous, scheduledBefore);
     }
 
     private static dynamic OwnedCodexWebSocketTask(dynamic folder, CodexWebSocketOwner owner, string directory)
@@ -741,7 +789,7 @@ internal static class Rele
             throw new InvalidOperationException("Задача общего Codex принадлежит другой установке; она не изменена.");
         scheduledDirectory = Path.GetDirectoryName((string)definition.Actions[1].Path);
         CodexWebSocketOwner scheduled = ReadCodexWebSocketOwner(scheduledDirectory);
-        if (scheduled == null || !SameCodexWebSocketScope(owner, scheduled) ||
+        if (scheduled == null || (!SameCodexWebSocketScope(owner, scheduled) && !ColdSuccessorOf(owner, directory, scheduled, scheduledDirectory)) ||
             (!SamePath(directory, scheduledDirectory) && (int)definition.Settings.MultipleInstances != 2) ||
             !SamePath((string)definition.Actions[1].Path, Path.Combine(scheduledDirectory, "Rele.Process.exe")) ||
             (string)definition.Actions[1].Arguments != "--codex-websocket-owner " + QuoteArgument(Path.Combine(scheduledDirectory, "owner.json")) ||
@@ -899,10 +947,91 @@ internal static class Rele
         string scheduledDirectory;
         OwnedCodexWebSocketTask(TaskFolder(), owner, directory, out scheduledDirectory);
         var active = ReadCodexWebSocketReceipt(owner, directory, status);
-        if (active != null || SamePath(directory, scheduledDirectory)) return active;
+        if (SamePath(directory, scheduledDirectory)) return active;
         CodexWebSocketOwner scheduled = ReadCodexWebSocketOwner(scheduledDirectory);
+        bool pending = ColdSuccessorOf(owner, directory, scheduled, scheduledDirectory);
+        if (active != null) return pending ? PendingCodexUpdate(active, scheduled, scheduledDirectory) : active;
         active = ReadCodexWebSocketReceipt(scheduled, scheduledDirectory, status);
-        return active;
+        if (active != null) return active;
+        return null;
+    }
+
+    private static Dictionary<string, object> PendingCodexUpdate(Dictionary<string, object> result, CodexWebSocketOwner successor, string directory)
+    {
+        result["pendingUpdate"] = true;
+        result["restartRequired"] = BootIdentity() == successor.PreparedBootIdentity;
+        result["successorDirectory"] = directory; result["successorExe"] = successor.Executable;
+        result["successorSha256"] = successor.ExecutableSha256;
+        result["pendingExe"] = successor.Executable; result["pendingSha256"] = successor.ExecutableSha256;
+        result["endpoint"] = successor.Endpoint; result["codexHome"] = successor.CodexHome;
+        result["ownerSid"] = successor.OwnerSid; result["taskName"] = successor.TaskName;
+        return result;
+    }
+
+    private static Dictionary<string, object> StageColdCodexUpdate(string executable, string codexHome, string expectedSha256)
+    {
+        if (expectedSha256 == null || expectedSha256.Length != 64 || !Regex.IsMatch(expectedSha256, "^[a-f0-9]{64}$"))
+            throw new InvalidOperationException("Ожидаемый SHA-256 backend должен содержать 64 строчных шестнадцатеричных символа.");
+        if (!Path.IsPathRooted(executable) || !Path.IsPathRooted(codexHome))
+            throw new InvalidOperationException("Backend и профиль Codex должны быть абсолютными путями.");
+        executable = CanonicalPath(executable); codexHome = CanonicalPath(codexHome);
+        if (!File.Exists(executable)) throw new InvalidOperationException("Не найден новый штатный backend Codex.");
+        using (var operation = CodexOperationLock("start.lock"))
+        using (var candidate = new FileStream(executable, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            Settings current = ReadInstallationSettings(); ValidateInstallationOwner(current); Config = current;
+            RestoreCodexWebSocketPointer(Path.Combine(Config.DataDirectory, "codex-websocket-owners"), codexHome);
+            CodexWebSocketOwner previous = ReadCodexWebSocketOwner();
+            if (previous == null || !SamePath(previous.CodexHome, codexHome))
+                throw new InvalidOperationException("Не подтверждён прежний общий Codex с этим исходным профилем.");
+            string previousDirectory = Config.CodexWebSocketOwnerDirectory, scheduledDirectory;
+            dynamic task = OwnedCodexWebSocketTask(TaskFolder(), previous, previousDirectory, out scheduledDirectory);
+            CodexWebSocketOwner scheduled = ReadCodexWebSocketOwner(scheduledDirectory);
+            var active = CodexWebSocketReceipt(previous, previousDirectory, "alreadyRunning");
+            string candidateHash = FileHash(executable);
+            if (candidateHash != expectedSha256)
+                throw new InvalidOperationException("Новый backend Codex изменён после проверки; будущая задача не изменена.");
+            if (ColdSuccessorOf(previous, previousDirectory, scheduled, scheduledDirectory))
+            {
+                if (!SamePath(scheduled.Executable, executable) || scheduled.ExecutableSha256 != candidateHash)
+                    throw new InvalidOperationException("Уже подготовлен другой backend Codex; текущая подготовка сохранена.");
+                if (active != null && !active.ContainsKey("pendingUpdate")) { active["status"] = "alreadyCurrent"; return active; }
+                var pending = PendingCodexUpdate(active ?? new Dictionary<string, object>(), scheduled, scheduledDirectory);
+                pending["status"] = (bool)pending["restartRequired"] ? "restartRequired" : "updatePrepared";
+                return pending;
+            }
+            if (active == null || !active.ContainsKey("processId") || task == null || (int)task.State != 4 ||
+                (int)task.Definition.Settings.MultipleInstances != 2)
+                throw new InvalidOperationException("Для подготовки обновления нужен подтверждённый работающий владелец Codex и его задача IgnoreNew.");
+            previousDirectory = (string)active["ownerDirectory"];
+            previous = ReadCodexWebSocketOwner(previousDirectory);
+            if (SamePath(previous.Executable, executable) && previous.ExecutableSha256 == candidateHash)
+            { active["status"] = "alreadyCurrent"; return active; }
+
+            // Promote only an already verified live host successor. The backend and endpoint stay unchanged.
+            if (!SamePath(Config.CodexWebSocketOwnerDirectory, previousDirectory)) SaveCodexWebSocketOwner(previous, previousDirectory);
+            task = OwnedCodexWebSocketTask(TaskFolder(), previous, previousDirectory, out scheduledDirectory);
+            string source = Path.Combine(AppDirectory, "dist", "native", "Rele.Process.exe");
+            var successor = new CodexWebSocketOwner { Version = 1, OwnerSid = previous.OwnerSid, Executable = executable,
+                ExecutableSha256 = candidateHash, HostSha256 = FileHash(source), CodexHome = previous.CodexHome,
+                Endpoint = previous.Endpoint, TaskName = previous.TaskName, ColdPredecessorDirectory = previousDirectory,
+                PreviousScheduledDirectory = scheduledDirectory, PreparedBootIdentity = BootIdentity() };
+            string successorDirectory = StageCodexWebSocketOwner(successor, source);
+            // This one definition update affects future executions only; the current IgnoreNew instance is never stopped or run.
+            bool enabled = (bool)task.Enabled;
+            dynamic definition = task.Definition;
+            definition.Settings.Enabled = enabled;
+            definition.Actions[1].Path = Path.Combine(successorDirectory, "Rele.Process.exe");
+            definition.Actions[1].Arguments = "--codex-websocket-owner " + QuoteArgument(Path.Combine(successorDirectory, "owner.json"));
+            definition.Actions[1].WorkingDirectory = successorDirectory;
+            TaskFolder().RegisterTaskDefinition(previous.TaskName, definition, 6, Config.OwnerSid, null, 3, null);
+            dynamic updatedTask = OwnedCodexWebSocketTask(TaskFolder(), previous, previousDirectory, out scheduledDirectory);
+            if (!SamePath(scheduledDirectory, successorDirectory) || (bool)updatedTask.Enabled != enabled)
+                throw new InvalidOperationException("Не подтверждён будущий запуск нового backend Codex или его политика автозапуска.");
+            active = PendingCodexUpdate(active, successor, successorDirectory);
+            active["status"] = "restartRequired";
+            return active;
+        }
     }
 
     private static Dictionary<string, object> ReadCodexWebSocketReceipt(CodexWebSocketOwner owner, string directory, string status)
@@ -954,8 +1083,14 @@ internal static class Rele
         CodexWebSocketOwner owner = ReadCodexWebSocketOwner();
         if (owner == null) return new Dictionary<string, object> { { "status", "notRunning" } };
         if (!SamePath(owner.CodexHome, codexHome)) throw new InvalidOperationException("Общий Codex использует другой исходный профиль.");
-        return CodexWebSocketReceipt(owner, Config.CodexWebSocketOwnerDirectory, "alreadyRunning") ??
-            new Dictionary<string, object> { { "status", "notRunning" } };
+        var active = CodexWebSocketReceipt(owner, Config.CodexWebSocketOwnerDirectory, "alreadyRunning");
+        if (active != null) return active;
+        string scheduledDirectory;
+        OwnedCodexWebSocketTask(TaskFolder(), owner, Config.CodexWebSocketOwnerDirectory, out scheduledDirectory);
+        CodexWebSocketOwner scheduled = ReadCodexWebSocketOwner(scheduledDirectory);
+        var result = new Dictionary<string, object> { { "status", "notRunning" } };
+        return ColdSuccessorOf(owner, Config.CodexWebSocketOwnerDirectory, scheduled, scheduledDirectory) ?
+            PendingCodexUpdate(result, scheduled, scheduledDirectory) : result;
     }
 
     private static Dictionary<string, object> StartCodexWebSocket(string executable, string codexHome, bool preserveActive)
@@ -984,17 +1119,32 @@ internal static class Rele
             CodexWebSocketOwner previous = ReadCodexWebSocketOwner();
             if (previous != null)
             {
-                dynamic previousTask = OwnedCodexWebSocketTask(TaskFolder(), previous, Config.CodexWebSocketOwnerDirectory);
+                string scheduledDirectory;
+                dynamic previousTask = OwnedCodexWebSocketTask(TaskFolder(), previous, Config.CodexWebSocketOwnerDirectory, out scheduledDirectory);
+                CodexWebSocketOwner scheduled = ReadCodexWebSocketOwner(scheduledDirectory);
+                bool coldSuccessor = ColdSuccessorOf(previous, Config.CodexWebSocketOwnerDirectory, scheduled, scheduledDirectory);
+                if (coldSuccessor)
+                {
+                    if (!SamePath(scheduled.CodexHome, codexHome)) throw new InvalidOperationException("Подготовленный Codex использует другой профиль.");
+                    var active = CodexWebSocketReceipt(previous, Config.CodexWebSocketOwnerDirectory, "alreadyRunning");
+                    if (BootIdentity() == scheduled.PreparedBootIdentity)
+                        return active ?? PendingCodexUpdate(new Dictionary<string, object> { { "status", "notRunning" } }, scheduled, scheduledDirectory);
+                    if (active != null && active.ContainsKey("pendingUpdate"))
+                        throw new InvalidOperationException("После перезагрузки ещё обнаружен прежний владелец Codex; автоматическая смена отменена.");
+                    // A staged target is authoritative after reboot, even if discovery/settings still mention its predecessor.
+                    executable = scheduled.Executable;
+                }
                 var activeWait = Stopwatch.StartNew();
                 do
                 {
                     var active = CodexWebSocketReceipt(previous, Config.CodexWebSocketOwnerDirectory, "alreadyRunning");
                     if (active != null)
                     {
-                        if ((!preserveActive && !SamePath(previous.Executable, executable)) || !SamePath(previous.CodexHome, codexHome))
-                            throw new InvalidOperationException("Общий Codex уже работает с другим backend или профилем; работающие задачи не остановлены.");
                         string activeDirectory = (string)active["ownerDirectory"];
-                        previous = ReadCodexWebSocketOwner(activeDirectory);
+                        CodexWebSocketOwner activeOwner = ReadCodexWebSocketOwner(activeDirectory);
+                        if ((!preserveActive && !SamePath(activeOwner.Executable, executable)) || !SamePath(activeOwner.CodexHome, codexHome))
+                            throw new InvalidOperationException("Общий Codex уже работает с другим backend или профилем; работающие задачи не остановлены.");
+                        previous = activeOwner;
                         SaveCodexWebSocketOwner(previous, activeDirectory);
                         string hostSource = Path.Combine(AppDirectory, "dist", "native", "Rele.Process.exe");
                         string sourceHash = FileHash(hostSource);
@@ -1005,9 +1155,9 @@ internal static class Rele
                             var successor = new CodexWebSocketOwner { Version = 1, OwnerSid = previous.OwnerSid, Executable = previous.Executable,
                                 ExecutableSha256 = previous.ExecutableSha256, HostSha256 = sourceHash, CodexHome = previous.CodexHome,
                                 Endpoint = previous.Endpoint, TaskName = previous.TaskName };
-                            string successorDirectory = StageCodexWebSocketOwner(successor, hostSource), scheduledDirectory;
-                            OwnedCodexWebSocketTask(TaskFolder(), previous, Config.CodexWebSocketOwnerDirectory, out scheduledDirectory);
-                            if (!SamePath(successorDirectory, scheduledDirectory) || !HasCodexRecoveryTrigger(previousTask))
+                            string successorDirectory = StageCodexWebSocketOwner(successor, hostSource), hostScheduledDirectory;
+                            OwnedCodexWebSocketTask(TaskFolder(), previous, Config.CodexWebSocketOwnerDirectory, out hostScheduledDirectory);
+                            if (!SamePath(successorDirectory, hostScheduledDirectory) || !HasCodexRecoveryTrigger(previousTask))
                                 RegisterCodexWebSocketTask(successor, successorDirectory);
                         }
                         // A missing/non-running Task cannot exclude a second owner in a different cache; retain the old owner.lock until cold start.
@@ -1020,6 +1170,28 @@ internal static class Rele
                 }
                 while (activeWait.ElapsedMilliseconds < 15000);
                 if (TaskActive(previousTask)) throw new InvalidOperationException("Работающая задача Codex не подтвердила свой PID и порт.");
+                if (coldSuccessor)
+                {
+                    if (FileHash(scheduled.Executable) != scheduled.ExecutableSha256)
+                        throw new InvalidOperationException("Подготовленный backend Codex изменён; прежний backend автоматически не запускается.");
+                    if (!(bool)previousTask.Enabled)
+                        return PendingCodexUpdate(new Dictionary<string, object> { { "status", "notRunning" } }, scheduled, scheduledDirectory);
+                    var portCheck = new TcpListener(IPAddress.Loopback, WebSocketPort(scheduled.Endpoint)); portCheck.ExclusiveAddressUse = true;
+                    try { portCheck.Start(); }
+                    catch (SocketException) { throw new InvalidOperationException("Адрес подготовленного Codex занят; прежний backend автоматически не запускается."); }
+                    finally { portCheck.Stop(); }
+                    previousTask.Run(null);
+                    var successorWait = Stopwatch.StartNew();
+                    while (successorWait.ElapsedMilliseconds < 15000)
+                    {
+                        var active = ReadCodexWebSocketReceipt(scheduled, scheduledDirectory, "started");
+                        if (active != null) { SaveCodexWebSocketOwner(scheduled, scheduledDirectory); return active; }
+                        if (!TaskActive(previousTask) && (int)previousTask.LastTaskResult != 0x41303 && (int)previousTask.LastTaskResult != 0x41301)
+                            throw new InvalidOperationException("Подготовленный backend Codex не запустился (" + (int)previousTask.LastTaskResult + ").");
+                        Thread.Sleep(100);
+                    }
+                    throw new InvalidOperationException("Подготовленный Codex не подтвердил запуск; будущая задача сохранена без возврата к старому backend.");
+                }
             }
             int port;
             if (String.IsNullOrEmpty(Config.CodexWebSocketEndpoint))

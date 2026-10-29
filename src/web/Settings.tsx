@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import type {
   CodexTransport,
+  CodexUpdateState,
   ConnectionState,
   DashboardState,
   DesktopIntegrationState,
@@ -435,6 +436,8 @@ export function CodexSettings({
   const [desktopError, setDesktopError] = useState('');
   const [desktopRevision, setDesktopRevision] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(!state.codex.connected);
+  const [update, setUpdate] = useState<CodexUpdateState | null>(null);
+  const [updateError, setUpdateError] = useState('');
   const savedTarget = JSON.stringify([codexTargetKey(state.config.codex), state.config.codex.codexHome ?? '']);
   const pendingTarget = selection === 'auto'
     ? { ...automaticCodex, transport }
@@ -449,6 +452,20 @@ export function CodexSettings({
     );
     return () => controller.abort();
   }, [api, desktopRevision, savedTarget]);
+  useEffect(() => {
+    const controller = new AbortController();
+    setUpdateError('');
+    void api.request<CodexUpdateState>('/api/codex/update', 'GET', undefined, controller.signal).then(
+      value => { if (!controller.signal.aborted) setUpdate(value); },
+      error => { if (!controller.signal.aborted) setUpdateError(errorText(error)); },
+    );
+    return () => controller.abort();
+  }, [api, desktopRevision, savedTarget, state.codex.connected, state.codex.name, state.codex.executable, state.codex.endpoint, state.codex.codexHome]);
+  const prepareUpdate = async () => {
+    const result = await action.run(() => api.request<CodexUpdateState>('/api/codex/update', 'POST', {}), '');
+    if (result.ok) { setUpdate(result.value); setUpdateError(''); }
+    else setDesktopRevision(value => value + 1);
+  };
   const setDesktopEnabled = async (enabled: boolean) => {
     const result = await action.run(
       () => api.request<DesktopIntegrationState>('/api/codex/desktop-integration', 'POST', { enabled }),
@@ -541,12 +558,28 @@ export function CodexSettings({
       </div>
       {state.codex.error && <Notice tone="warning">{state.codex.error}</Notice>}
       {desktopError && <Notice>{desktopError}</Notice>}
+      {updateError && <Notice>{updateError}</Notice>}
+      {update?.phase === 'failed' && !update.available && update.error && <Notice>{update.error}</Notice>}
       <ActionMessages error={action.error} success={action.success} />
-      {state.codex.connected && state.codex.transport === 'shared' && (
-        <p className="field-hint codex-version-hint">
-          Здесь указана версия работающего сервера. Обновление Desktop и кнопка «Обновить статус»
-          не заменяют этот сервер и не прерывают задачи. Автоматической смены версии сервера пока нет.
-        </p>
+      {update?.available && update.phase !== 'current' && (
+        <Notice tone={update.phase === 'failed' || update.phase === 'unsupported' ? 'warning' : 'info'}>
+          <strong>Обновление Codex</strong>
+          <p>Работающий сервер: {update.currentVersion || 'не подключён'}. Установленный Desktop: {update.installedVersion || 'версия не определена'}.</p>
+          {update.pendingVersion && <p>Подготовлена версия: {update.pendingVersion}.</p>}
+          {update.phase === 'restartRequired'
+            ? <p>Обновление подготовлено. После завершения задач перезагрузите Windows: общий сервер запустится на новой версии с прежними чатами и профилем.</p>
+            : update.phase === 'preparing'
+              ? <p>Проверяем запуск подготовленного Codex…</p>
+            : update.phase === 'unsupported'
+              ? <p>Эта версия ещё не поддерживается Rele. Работающий сервер сохраняется.</p>
+              : <p>Rele подготовит новый запуск общего сервера. Для перехода потребуется перезагрузка Windows после завершения задач.</p>}
+          {update.error && <p>{update.error}</p>}
+          {['available', 'failed'].includes(update.phase) && (
+            <Button busy={action.busy} onClick={() => void prepareUpdate()}>
+              Подготовить обновление
+            </Button>
+          )}
+        </Notice>
       )}
       <details className="codex-details">
         <summary>Технические сведения</summary>

@@ -13,6 +13,7 @@ import { SlackChannel } from './channels/slack.js';
 import type { ChannelCallbacks } from './channels/common.js';
 import { instanceDiagnostics, openPanel, serverStatus, stopServer } from './lifecycle.js';
 import { DesktopIntegration } from './desktop-integration.js';
+import { CodexUpdate } from './codex-update.js';
 import { runReleMcp } from './rele-mcp.js';
 import { registerRelePlugin } from './rele-plugin.js';
 
@@ -129,7 +130,8 @@ async function main(): Promise<void> {
     } finally { engine.suspend(false); }
   }
   app = createApp({ store, config, engine, codex: () => codex, configure, version, webDirectory: path.join(root, 'dist', 'web'), shutdown,
-    desktopIntegration: new DesktopIntegration(root, config.directory) });
+    desktopIntegration: new DesktopIntegration(root, config.directory),
+    codexUpdate: new CodexUpdate(root, config.directory, () => config.config.codex, () => codex.status()) });
   const instanceFile = path.join(config.directory, 'instance.json');
   const temporaryInstance = path.join(config.directory, `instance-${process.pid}.tmp`);
   try {

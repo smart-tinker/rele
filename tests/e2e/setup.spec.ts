@@ -548,7 +548,6 @@ test('connected Codex shows actual version and saved Desktop setup without a fal
   await expect(page.getByLabel('Режим работы', { exact: true })).toBeHidden();
   await expect(page.getByLabel('Фактическое подключение Codex')).toBeHidden();
   await expect(page.getByRole('table')).toBeVisible();
-  await expect(page.getByText('Автоматической смены версии сервера пока нет.', { exact: false })).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath('codex-compact-desktop.png'), fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
@@ -568,6 +567,52 @@ test('connected Codex shows actual version and saved Desktop setup without a fal
   await expect(page.getByRole('alert')).toContainText('Пример: проверка соединения недоступна.');
   await expect(page.getByLabel('Режим работы', { exact: true })).toBeHidden();
   expect(errors).toEqual([]);
+});
+
+test('Codex update stages the selected version without changing the running version and survives panel reload', async ({ page }, testInfo) => {
+  const state = fixtureState(true);
+  state.codex = { ...state.codex, transport: 'shared', name: 'Codex 0.164.0-alpha.11.1' };
+  await installApi(page, state);
+  let phase = 'available';
+  const actions: unknown[] = [];
+  await page.route('**/api/codex/update', async route => {
+    if (state.codex.name === 'Codex 0.165.0-alpha.1.2') phase = 'current';
+    if (route.request().method() === 'POST') {
+      actions.push(route.request().postDataJSON());
+      phase = 'restartRequired';
+    }
+    await route.fulfill({ json: { available: true, phase, currentVersion: '0.164.0-alpha.11.1', installedVersion: '0.165.0-alpha.1.2', ...(phase === 'restartRequired' ? { pendingVersion: '0.165.0-alpha.1.2' } : {}) } });
+  });
+  await openPanel(page);
+  await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  await expect(page.getByText('Работающий сервер: 0.164.0-alpha.11.1. Установленный Desktop: 0.165.0-alpha.1.2.', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Подготовить обновление', exact: true }).click();
+  await expect(page.getByText('Подготовлена версия: 0.165.0-alpha.1.2.', { exact: true })).toBeVisible();
+  await expect(page.getByText('Обновление подготовлено. После завершения задач перезагрузите Windows:', { exact: false })).toBeVisible();
+  await expect(page.getByText('Подключён: Codex 0.164.0-alpha.11.1', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Подготовить обновление', exact: true })).toHaveCount(0);
+  expect(actions).toEqual([{}]);
+  await page.screenshot({ path: testInfo.outputPath('codex-update-desktop.png'), fullPage: true });
+  await page.reload();
+  await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  await expect(page.getByText('Подготовлена версия: 0.165.0-alpha.1.2.', { exact: true })).toBeVisible();
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath('codex-update-mobile.png'), fullPage: true });
+  state.codex.name = 'Codex 0.165.0-alpha.1.2';
+  await expect(page.getByText('Подключён: Codex 0.165.0-alpha.1.2', { exact: true })).toBeVisible({ timeout: 10000 });
+  await expect(page.getByText('Обновление Codex', { exact: true })).toHaveCount(0);
+  expect(actions).toEqual([{}]);
+});
+
+test('an unsupported installed Codex remains visible without an update action', async ({ page }) => {
+  await installApi(page, fixtureState(true));
+  await page.route('**/api/codex/update', route => route.fulfill({ json: { available: true, phase: 'unsupported', currentVersion: '0.164.0-alpha.11.1', installedVersion: '9.0.0' } }));
+  await openPanel(page);
+  await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  await expect(page.getByText('Установленный Desktop: 9.0.0.', { exact: false })).toBeVisible();
+  await expect(page.getByText('Эта версия ещё не поддерживается Rele.', { exact: false })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Подготовить обновление', exact: true })).toHaveCount(0);
 });
 
 test('unavailable Desktop integration exposes no action that changes ordinary Desktop startup', async ({ page }) => {
