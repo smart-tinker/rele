@@ -286,7 +286,7 @@ export interface DesktopIntegrationState {
 
 export interface CodexUpdateState {
   available: boolean;
-  phase: 'current' | 'available' | 'unsupported' | 'preparing' | 'restartRequired' | 'failed';
+  phase: 'current' | 'available' | 'unsupported' | 'preparing' | 'ready' | 'applying' | 'failed';
   currentVersion?: string;
   installedVersion?: string;
   pendingVersion?: string;

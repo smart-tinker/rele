@@ -90,7 +90,8 @@ function makeApp() {
   };
   const codexUpdate = {
     status: vi.fn().mockResolvedValue({ available: true, phase: 'available', currentVersion: '0.164.0-alpha.11.1', installedVersion: '0.165.0-alpha.1.2' }),
-    prepare: vi.fn().mockResolvedValue({ available: true, phase: 'restartRequired', pendingVersion: '0.165.0-alpha.1.2' }),
+    prepare: vi.fn().mockResolvedValue({ available: true, phase: 'ready', pendingVersion: '0.165.0-alpha.1.2' }),
+    apply: vi.fn().mockResolvedValue({ available: true, phase: 'current', currentVersion: '0.165.0-alpha.1.2' }),
   };
   const app = createApp({
     store,
@@ -130,10 +131,30 @@ describe('shared Codex update', () => {
     expect((await f.app.inject({ url, headers })).json()).toMatchObject({ phase: 'available' });
     expect((await f.app.inject({ url, method: 'POST', headers, payload: { executable: '/untrusted/native' } })).statusCode).toBe(400);
     expect(f.codexUpdate.prepare).not.toHaveBeenCalled();
-    expect((await f.app.inject({ url, method: 'POST', headers, payload: {} })).json()).toMatchObject({ phase: 'restartRequired' });
+    expect((await f.app.inject({ url, method: 'POST', headers, payload: {} })).json()).toMatchObject({ phase: 'ready' });
     expect(f.codexUpdate.prepare).toHaveBeenCalledOnce();
     expect(f.codex.connect).not.toHaveBeenCalled();
     expect(f.engine.cancel).not.toHaveBeenCalled();
+  });
+
+  it('requires an explicit closed-client confirmation and serializes apply with native controls and shutdown', async () => {
+    const f = makeApp(), url = '/api/codex/update';
+    for (const payload of [{ action: 'apply' }, { action: 'apply', clientsClosed: false }, { action: 'unknown', clientsClosed: true }, { clientsClosed: true }])
+      expect((await f.app.inject({ url, method: 'POST', headers, payload })).statusCode).toBe(400);
+    expect(f.codexUpdate.apply).not.toHaveBeenCalled();
+    let release!: () => void;
+    f.codexUpdate.apply.mockImplementationOnce(async () => {
+      await new Promise<void>(resolve => { release = resolve; });
+      return { available: true, phase: 'current', currentVersion: '0.165.0-alpha.1.2' };
+    });
+    const pending = f.app.inject({ url, method: 'POST', headers, payload: { action: 'apply', clientsClosed: true } }).then(value => value);
+    await vi.waitFor(() => expect(f.codexUpdate.apply).toHaveBeenCalledOnce());
+    for (const endpoint of ['/api/codex/connect', '/api/shutdown', '/api/requests/example/cancel', '/api/requests/example/resume', '/api/requests/example/reconcile', '/api/approvals/example/resolve', '/api/conversations'])
+      expect((await f.app.inject({ url: endpoint, method: 'POST', headers, payload: {} })).statusCode).toBe(409);
+    expect(f.engine.resume).not.toHaveBeenCalled(); expect(f.engine.cancel).not.toHaveBeenCalled();
+    expect(f.codexUpdate.prepare).not.toHaveBeenCalled();
+    release(); expect((await pending).json()).toMatchObject({ phase: 'current' });
+    expect((await f.app.inject({ url: '/api/codex/connect', method: 'POST', headers })).statusCode).toBe(200);
   });
 
   it('serializes preparation with connection changes while leaving status readable and releases the guard after failure', async () => {

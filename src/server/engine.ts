@@ -86,6 +86,27 @@ export class Engine extends EventEmitter {
   }
 
   suspend(value: boolean): void { this.suspended = value; }
+  async maintainCodex<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.stopped || this.suspended) throw new Error('Rele уже приостановлен или завершает работу.');
+    this.suspended = true;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const busy = () => this.store.activeRequests().some(request => request.status !== 'queued')
+      || this.resolutions.size > 0 || this.cancelling.size > 0 || this.startingQueued.size > 0 || this.retryingOverloads.size > 0
+      || this.store.listConversations().some(conversation => this.initialMessages.hasPending(conversation.id));
+    try {
+      if (busy()) throw new Error('Сначала завершите активные запросы и начальные сообщения Rele.');
+      await Promise.race([this.settled(), new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error('Операции Rele ещё завершаются. Повторите обновление позже.')), 15_000);
+      })]);
+      if (busy()) throw new Error('Сначала завершите активные запросы и начальные сообщения Rele.');
+      return await operation();
+    } finally {
+      clearTimeout(timeout);
+      this.suspended = false;
+      this.changed();
+      this.track(this.pump());
+    }
+  }
   sendInitialMessage(conversationId: string): { status: 'queued'; operationId: string } {
     if (this.stopped || this.suspended) throw new Error('Rele временно не принимает новые операции.');
     const result = this.initialMessages.queue(conversationId);
@@ -135,6 +156,7 @@ export class Engine extends EventEmitter {
     const controlText = message.endpoint.platform === 'slack'
       ? message.text.replaceAll(`<@${message.endpoint.accountId.split(':').at(-1)}>`, '').trim() : message.text.trim();
     if (message.control === 'stop' || !message.contextOnly && !message.audio && /^(?:rele:cancel|\/rele_cancel(?:@[A-Za-z0-9_]+)?)$/iu.test(controlText)) {
+      if (this.suspended) throw new ChannelError('Rele временно приостановлен. Повторите управление запросом после обновления.', true);
       if (this.store.recordInbound(message).duplicate) return;
       const requests = this.store.activeRequests().filter(request => !request.steeredInto && this.sameOrigin(request, message)
         // A delayed native Stop must not reach the next run, even if it was queued before the click.
@@ -161,6 +183,7 @@ export class Engine extends EventEmitter {
           && this.store.approvalDeliveryProgress(candidate.id).sent;
       });
     if (approval && (message.endpoint.platform === 'telegram' || (message.text.trim() && !message.audio))) {
+      if (this.suspended) throw new ChannelError('Rele временно приостановлен. Ответ на вопрос пока не принят.', true);
       // Record first: after any crash this event cannot become a fresh Codex turn.
       // A crash before resolution leaves the question available in the panel.
       if (this.store.recordInbound(message).duplicate) return;
@@ -238,6 +261,7 @@ export class Engine extends EventEmitter {
   }
 
   async resolveApproval(id: string, decision: 'accept' | 'decline', answers?: Record<string, string[]>, resolution: ApprovalResolution = { source: 'rele' }): Promise<void> {
+    if (this.suspended) throw new Error('Rele временно приостановлен. Повторите ответ после обновления.');
     const approval = this.store.getApproval(id);
     const request = approval && this.store.getRequest(approval.requestId);
     if (!approval || approval.status !== 'pending' || !request || terminal(request.status) || this.resolutions.has(id)
@@ -281,6 +305,7 @@ export class Engine extends EventEmitter {
   }
 
   async cancel(id: string): Promise<void> {
+    if (this.suspended) throw new Error('Rele временно приостановлен. Повторите отмену после обновления.');
     const pending = this.cancelling.get(id);
     if (pending) return pending;
     const request = this.store.getRequest(id);
@@ -432,6 +457,7 @@ export class Engine extends EventEmitter {
   }
 
   async resume(id: string): Promise<void> {
+    if (this.suspended) throw new Error('Rele временно приостановлен. Повторите продолжение после обновления.');
     const request = this.store.getRequest(id);
     if (!request || terminal(request.status)) throw new Error('Запрос уже завершён.');
     const conversation = this.store.getConversation(request.conversationId)!;
@@ -450,6 +476,10 @@ export class Engine extends EventEmitter {
     const operation = (async () => {
       const current = this.store.getRequest(request.id)!;
       if (terminal(current.status)) return;
+      if (this.suspended) {
+        if (automatic) return;
+        throw new Error('Rele временно приостановлен. Повторите продолжение после обновления.');
+      }
       if (current.turnId || this.isMixed(current.id) || this.store.getMeta(`cancel-requested:${current.id}`)) {
         throw new Error('Этот запрос нельзя продолжить; сверьте его состояние и отмену.');
       }

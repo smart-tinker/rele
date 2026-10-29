@@ -438,6 +438,7 @@ export function CodexSettings({
   const [settingsOpen, setSettingsOpen] = useState(!state.codex.connected);
   const [update, setUpdate] = useState<CodexUpdateState | null>(null);
   const [updateError, setUpdateError] = useState('');
+  const [clientsClosed, setClientsClosed] = useState(false);
   const savedTarget = JSON.stringify([codexTargetKey(state.config.codex), state.config.codex.codexHome ?? '']);
   const pendingTarget = selection === 'auto'
     ? { ...automaticCodex, transport }
@@ -454,6 +455,7 @@ export function CodexSettings({
   }, [api, desktopRevision, savedTarget]);
   useEffect(() => {
     const controller = new AbortController();
+    setUpdate(null);
     setUpdateError('');
     void api.request<CodexUpdateState>('/api/codex/update', 'GET', undefined, controller.signal).then(
       value => { if (!controller.signal.aborted) setUpdate(value); },
@@ -461,10 +463,22 @@ export function CodexSettings({
     );
     return () => controller.abort();
   }, [api, desktopRevision, savedTarget, state.codex.connected, state.codex.name, state.codex.executable, state.codex.endpoint, state.codex.codexHome]);
+  useEffect(() => { setClientsClosed(false); }, [savedTarget, update?.pendingVersion]);
   const prepareUpdate = async () => {
     const result = await action.run(() => api.request<CodexUpdateState>('/api/codex/update', 'POST', {}), '');
     if (result.ok) { setUpdate(result.value); setUpdateError(''); }
     else setDesktopRevision(value => value + 1);
+  };
+  const applyUpdate = async () => {
+    if (!clientsClosed) return;
+    setClientsClosed(false);
+    const result = await action.run(() => api.request<CodexUpdateState>('/api/codex/update', 'POST', { action: 'apply', clientsClosed: true }), 'Codex обновлён. Можно открыть Desktop.');
+    if (result.ok) {
+      setUpdate(result.value); setUpdateError('');
+      await refresh(); loadThreads();
+      setDiscoveryRevision(value => value + 1);
+    }
+    setDesktopRevision(value => value + 1);
   };
   const setDesktopEnabled = async (enabled: boolean) => {
     const result = await action.run(
@@ -539,6 +553,7 @@ export function CodexSettings({
           <Button
             icon="refresh"
             busy={action.busy}
+            disabled={update?.phase === 'preparing' || update?.phase === 'applying'}
             onClick={() => void connect()}
           >
             {state.codex.connected ? 'Обновить статус' : 'Подключить'}
@@ -566,18 +581,34 @@ export function CodexSettings({
           <strong>Обновление Codex</strong>
           <p>Работающий сервер: {update.currentVersion || 'не подключён'}. Установленный Desktop: {update.installedVersion || 'версия не определена'}.</p>
           {update.pendingVersion && <p>Подготовлена версия: {update.pendingVersion}.</p>}
-          {update.phase === 'restartRequired'
-            ? <p>Обновление подготовлено. После завершения задач перезагрузите Windows: общий сервер запустится на новой версии с прежними чатами и профилем.</p>
+          {update.phase === 'ready' || update.phase === 'failed' && update.pendingVersion
+            ? <p>Завершите задачи, полностью закройте Desktop и CLI и не запускайте их до завершения обновления.</p>
             : update.phase === 'preparing'
-              ? <p>Проверяем запуск подготовленного Codex…</p>
+              ? <p>Подготавливаем обновление. Работающие задачи продолжаются…</p>
+            : update.phase === 'applying'
+              ? <p>Проверяем простой и обновляем общий Codex. Не открывайте Desktop и CLI до завершения.</p>
             : update.phase === 'unsupported'
               ? <p>Эта версия ещё не поддерживается Rele. Работающий сервер сохраняется.</p>
-              : <p>Rele подготовит новый запуск общего сервера. Для перехода потребуется перезагрузка Windows после завершения задач.</p>}
+              : <p>Rele подготовит обновление общего сервера. Затем завершите задачи и полностью закройте Desktop и CLI. Чаты, профиль и очередь Rele сохранятся.</p>}
           {update.error && <p>{update.error}</p>}
-          {['available', 'failed'].includes(update.phase) && (
-            <Button busy={action.busy} onClick={() => void prepareUpdate()}>
+          {unsavedCodex && <p>Сначала сохраните настройки подключения Codex.</p>}
+          {(update.phase === 'available' || update.phase === 'failed' && !update.pendingVersion) && (
+            <Button busy={action.busy} disabled={unsavedCodex} onClick={() => void prepareUpdate()}>
               Подготовить обновление
             </Button>
+          )}
+          {(update.phase === 'ready' || update.phase === 'failed' && update.pendingVersion) && (
+            <>
+              <label className="check-row">
+                <input type="checkbox" checked={clientsClosed} disabled={action.busy || unsavedCodex} onChange={event => setClientsClosed(event.target.checked)} />
+                <span>Я завершил задачи и полностью закрыл Codex Desktop и CLI.</span>
+              </label>
+              <div className="form-actions">
+                <Button busy={action.busy} disabled={!clientsClosed || unsavedCodex || !update.pendingVersion} onClick={() => void applyUpdate()}>
+                  Обновить Codex
+                </Button>
+              </div>
+            </>
           )}
         </Notice>
       )}

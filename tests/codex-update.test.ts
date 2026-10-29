@@ -37,12 +37,19 @@ async function fixture() {
   const run = vi.fn(async (command: string, args: string[]) => {
     if (args[0] === 'codex-status') return { code: 0, stdout: JSON.stringify(native) };
     if (command === installed && args.length === 1 && args[0] === '--version') return { code: 0, stdout: 'codex-cli 0.164.0-alpha.11.1\n' };
+    if (args[0] === 'codex-apply-update') {
+      if (!native.pendingUpdate) return { code: 1, stdout: '' };
+      native = { ...native, status: 'alreadyRunning', pendingUpdate: false, ownerDirectory: successor,
+        executable: installed, executableSha256: native.successorSha256 ?? native.pendingSha256,
+        processId: 54321, processStartTime: '2026-10-29T01:00:00.000Z' };
+      return { code: 0, stdout: JSON.stringify(native) };
+    }
     if (args[0] !== 'codex-update') throw new Error('Unexpected synthetic launcher operation');
     const digest = createHash('sha256').update(await readFile(installed)).digest('hex');
     if (args[args.indexOf('--expected-sha256') + 1] !== digest) return { code: 1, stdout: '' };
-    native = { ...native, pendingUpdate: true, restartRequired: true, successorDirectory: successor,
+    native = { ...native, pendingUpdate: true, successorDirectory: successor,
       successorExe: installed, successorSha256: digest };
-    return { code: 0, stdout: JSON.stringify({ ...native, status: 'restartRequired' }) };
+    return { code: 0, stdout: JSON.stringify({ ...native, status: 'updatePrepared' }) };
   });
   const discover = vi.fn(async () => discovery);
   const service = () => new CodexUpdate(root, data, () => target, () => current, { platform: 'win32', discover, run });
@@ -50,7 +57,7 @@ async function fixture() {
     service, update: service(), setNative: (value: Record<string, unknown>) => { native = value; }, getNative: () => native };
 }
 
-describe('cold shared Codex update preparation', () => {
+describe('controlled shared Codex update', () => {
   it('reports the newest installed Desktop independently of an old running backend and changes nothing during status reads', async () => {
     const f = await fixture(), before = await readFile(f.config, 'utf8');
     f.discovery.installations.push({ executable: path.join(f.root, 'cli'), source: 'path', name: 'Unrelated CLI', version: '99.0.0', running: false });
@@ -70,12 +77,12 @@ describe('cold shared Codex update preparation', () => {
   it('stages the supported installed backend through the fixed launcher and preserves the live target and settings', async () => {
     const f = await fixture(), before = structuredClone({ target: f.target, current: f.current });
     const settings = await readFile(f.config, 'utf8');
-    expect(await f.update.prepare()).toMatchObject({ available: true, phase: 'restartRequired', installedVersion: '0.164.0-alpha.11.1', pendingVersion: '0.164.0-alpha.11.1' });
+    expect(await f.update.prepare()).toMatchObject({ available: true, phase: 'ready', installedVersion: '0.164.0-alpha.11.1', pendingVersion: '0.164.0-alpha.11.1' });
     const digest = createHash('sha256').update(await readFile(f.installed)).digest('hex');
     expect(f.run).toHaveBeenLastCalledWith(path.join(f.root, 'Rele.exe'), ['codex-update', '--quiet', '--codex-executable', f.installed, '--expected-sha256', digest, '--codex-home', f.home]);
     expect({ target: f.target, current: f.current }).toEqual(before);
     expect(await readFile(f.config, 'utf8')).toBe(settings);
-    expect((await f.update.status()).phase).toBe('restartRequired');
+    expect((await f.update.status()).phase).toBe('ready');
     await f.update.prepare();
     expect(f.run.mock.calls.filter(([, args]) => args[0] === 'codex-update')).toHaveLength(1);
   });
@@ -104,24 +111,24 @@ describe('cold shared Codex update preparation', () => {
     expect(f.run).not.toHaveBeenCalled();
   });
 
-  it('recovers a pending reboot status in a new gateway service without repeating preparation', async () => {
+  it('recovers a prepared update in a new gateway service without repeating preparation', async () => {
     const f = await fixture();
     await f.update.prepare();
     f.current.connected = false; delete f.current.name; delete f.current.codexHome;
     const fresh = f.service();
-    expect(await fresh.status()).toMatchObject({ available: true, phase: 'restartRequired', currentVersion: '0.163.0-alpha.11.2', installedVersion: '0.164.0-alpha.11.1', pendingVersion: '0.164.0-alpha.11.1' });
+    expect(await fresh.status()).toMatchObject({ available: true, phase: 'ready', currentVersion: '0.163.0-alpha.11.2', installedVersion: '0.164.0-alpha.11.1', pendingVersion: '0.164.0-alpha.11.1' });
     await fresh.prepare();
     expect(f.run.mock.calls.filter(([, args]) => args[0] === 'codex-update')).toHaveLength(1);
-    f.setNative({ ...f.getNative(), pendingUpdate: false, restartRequired: false, executable: f.installed, executableSha256: 'b'.repeat(64) });
+    f.setNative({ ...f.getNative(), pendingUpdate: false, executable: f.installed, executableSha256: 'b'.repeat(64) });
     expect(await f.service().status()).toMatchObject({ phase: 'current', currentVersion: '0.164.0-alpha.11.1' });
   });
 
-  it('reports a same-boot pending cold owner without claiming that a restart has completed', async () => {
+  it('reports a prepared stopped owner without claiming the update is applied', async () => {
     const f = await fixture();
     f.current.connected = false;
-    f.setNative({ status: 'notRunning', pendingUpdate: true, restartRequired: true, pendingExe: f.installed, pendingSha256: 'b'.repeat(64),
+    f.setNative({ status: 'notRunning', ownerSid: f.marker.OwnerSid, taskName: `${f.marker.TaskName}-Codex`, pendingUpdate: true, pendingExe: f.installed, pendingSha256: 'b'.repeat(64),
       successorDirectory: f.successor, endpoint: f.current.endpoint, codexHome: f.home });
-    expect(await f.update.status()).toMatchObject({ phase: 'restartRequired', pendingVersion: '0.164.0-alpha.11.1' });
+    expect(await f.update.status()).toMatchObject({ phase: 'ready', pendingVersion: '0.164.0-alpha.11.1' });
     expect(f.run.mock.calls.map(([, args]) => args[0])).toEqual(['codex-status']);
   });
 
@@ -154,11 +161,11 @@ describe('cold shared Codex update preparation', () => {
     expect(f.getNative().pendingUpdate).toBeUndefined();
   });
 
-  it('distinguishes the prepared successor from a newer unsupported Desktop installed later', async () => {
+  it('distinguishes the prepared successor from a newer Desktop installed later', async () => {
     const f = await fixture();
     await f.update.prepare();
     f.discovery.installations.push({ executable: path.join(f.root, 'later-codex.exe'), source: 'desktop-install', name: 'Later Desktop', version: '0.165.0-alpha.1.2', running: false });
-    expect(await f.service().status()).toMatchObject({ phase: 'restartRequired', installedVersion: '0.165.0-alpha.1.2', pendingVersion: '0.164.0-alpha.11.1' });
+    expect(await f.service().status()).toMatchObject({ phase: 'ready', installedVersion: '0.165.0-alpha.1.2', pendingVersion: '0.164.0-alpha.11.1' });
     expect(f.run.mock.calls.filter(([, args]) => args[0] === 'codex-update')).toHaveLength(1);
   });
 
@@ -182,8 +189,94 @@ describe('cold shared Codex update preparation', () => {
     await expect(f.update.prepare()).rejects.toMatchObject({ statusCode: 409 });
     expect((await f.update.status()).phase).toBe('preparing');
     release();
-    expect((await pending).phase).toBe('restartRequired');
+    expect((await pending).phase).toBe('ready');
     expect(f.run.mock.calls.filter(([, args]) => args[0] === 'codex-update')).toHaveLength(1);
+  });
+
+  it('applies the exact prepared successor after Rele disconnects, without changing the target or settings', async () => {
+    const f = await fixture();
+    await f.update.prepare();
+    f.current.connected = false;
+    const target = structuredClone(f.target), settings = await readFile(f.config, 'utf8');
+    expect(await f.update.apply()).toEqual({ available: true, phase: 'current', currentVersion: '0.164.0-alpha.11.1', installedVersion: '0.164.0-alpha.11.1' });
+    expect(f.run).toHaveBeenLastCalledWith(path.join(f.root, 'Rele.exe'), ['codex-apply-update', '--quiet', '--codex-home', f.home]);
+    expect(f.target).toEqual(target);
+    expect(await readFile(f.config, 'utf8')).toBe(settings);
+    expect(await f.service().status()).toMatchObject({ phase: 'current', currentVersion: '0.164.0-alpha.11.1' });
+    expect(f.getNative().processId).toBe(54321);
+  });
+
+  it('requires a verified own pending update before applying', async () => {
+    const f = await fixture();
+    await expect(f.update.apply()).rejects.toThrow('Сначала подготовьте');
+    expect(f.run.mock.calls.some(([, args]) => args[0] === 'codex-apply-update')).toBe(false);
+  });
+
+  it.each(['target', 'runtime', 'marker', 'hash'] as const)('rejects a changed %s before applying the prepared update', async changed => {
+    const f = await fixture();
+    await f.update.prepare();
+    f.current.connected = false;
+    if (changed === 'target' || changed === 'runtime') f.discover.mockImplementationOnce(async () => {
+      if (changed === 'target') f.target.codexHome = path.join(f.root, 'replacement-profile');
+      else f.current.endpoint = 'ws://127.0.0.1:3220';
+      return f.discovery;
+    });
+    if (changed === 'marker') {
+      const original = f.run.getMockImplementation()!;
+      f.run.mockImplementationOnce(async (command, args) => {
+        f.marker.TaskName = 'Rele-Replacement'; await f.save();
+        return original(command, args);
+      });
+    }
+    if (changed === 'hash') await writeFile(f.installed, 'replaced prepared backend');
+    await expect(f.update.apply()).rejects.toMatchObject({ statusCode: 409 });
+    expect(f.run.mock.calls.some(([, args]) => args[0] === 'codex-apply-update')).toBe(false);
+    expect(f.getNative().processId).toBe(12345);
+  });
+
+  it('keeps a native busy refusal retryable and does not promise the old PID after an unconfirmed apply', async () => {
+    const f = await fixture(), original = f.run.getMockImplementation()!;
+    await f.update.prepare();
+    f.current.connected = false;
+    f.run.mockImplementation(async (command, args) => args[0] === 'codex-apply-update'
+      ? { code: 1, stdout: 'PRIVATE_OUTPUT busy details' } : original(command, args));
+    await expect(f.update.apply()).rejects.toMatchObject({ statusCode: 502, message: 'Обновление не подтверждено. Проверьте состояние Codex; очередь сохранена.' });
+    expect(await f.update.status()).toMatchObject({ phase: 'ready', pendingVersion: '0.164.0-alpha.11.1' });
+    expect(f.getNative().processId).toBe(12345);
+    expect(JSON.stringify(await f.update.status())).not.toContain('PRIVATE_OUTPUT');
+    f.run.mockImplementation(original);
+    expect((await f.update.apply()).phase).toBe('current');
+  });
+
+  it('serializes apply with preparation and exposes applying status', async () => {
+    const f = await fixture(), original = f.run.getMockImplementation()!;
+    await f.update.prepare(); f.current.connected = false;
+    let release!: () => void;
+    f.run.mockImplementation(async (command, args) => {
+      if (args[0] === 'codex-apply-update') await new Promise<void>(resolve => { release = resolve; });
+      return original(command, args);
+    });
+    const applying = f.update.apply();
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    expect((await f.update.status()).phase).toBe('applying');
+    await expect(f.update.prepare()).rejects.toMatchObject({ statusCode: 409 });
+    await expect(f.update.apply()).rejects.toMatchObject({ statusCode: 409 });
+    release();
+    expect((await applying).phase).toBe('current');
+  });
+
+  it.each(['owner', 'task', 'profile', 'endpoint', 'executable', 'hash', 'directory', 'pid', 'birth'] as const)('does not accept an applied receipt with a different %s', async field => {
+    const f = await fixture(), original = f.run.getMockImplementation()!;
+    await f.update.prepare(); f.current.connected = false;
+    const patch = { owner: { ownerSid: 'S-1-5-21-999' }, task: { taskName: 'Rele-Foreign-Codex' },
+      profile: { codexHome: f.data }, endpoint: { endpoint: 'ws://127.0.0.1:3220' }, executable: { executable: f.old },
+      hash: { executableSha256: '0'.repeat(64) }, directory: { ownerDirectory: path.dirname(f.successor) },
+      pid: { processId: 0 }, birth: { processStartTime: 'unconfirmed' } }[field];
+    f.run.mockImplementation(async (command, args) => {
+      const result = await original(command, args);
+      return args[0] === 'codex-apply-update' ? { ...result, stdout: JSON.stringify({ ...JSON.parse(result.stdout), ...patch }) } : result;
+    });
+    await expect(f.update.apply()).rejects.toMatchObject({ statusCode: 502, message: 'Обновление не подтверждено. Проверьте состояние Codex; очередь сохранена.' });
   });
 
   it.each(['throw', 'unconfirmed', 'foreign-successor', 'foreign-hash'] as const)('never leaks native output or accepts an unconfirmed %s preparation', async kind => {

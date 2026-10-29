@@ -176,6 +176,43 @@ afterEach(async () => {
   vi.useRealTimers();
 });
 
+describe('Engine Codex maintenance', () => {
+  it('keeps incoming messages durable and queued until maintenance ends, then dispatches the original request', async () => {
+    const f = fixture({ start: false });
+    let release!: () => void;
+    const operation = vi.fn(async () => new Promise<void>(resolve => { release = resolve; }));
+    const maintenance = f.engine.maintainCodex(operation);
+    await vi.waitFor(() => expect(operation).toHaveBeenCalledOnce());
+    const message = f.message('slack', 'during-maintenance');
+    await f.engine.receive(message);
+    const [queued] = f.store.listRequests();
+    expect(queued).toMatchObject({ eventId: 'during-maintenance', status: 'queued' });
+    expect(f.codex.enqueue).not.toHaveBeenCalled();
+    await expect(f.engine.resume(queued.id)).rejects.toThrow('приостановлен');
+    await expect(f.engine.resolveApproval('unused', 'accept')).rejects.toThrow('приостановлен');
+    await expect(f.engine.receive({ ...message, eventId: 'stop-during-maintenance', control: 'stop' })).rejects.toMatchObject({ retryable: true });
+    expect(f.codex.startQueued).not.toHaveBeenCalled();
+    release(); await maintenance; await f.engine.settled();
+    expect(f.store.listRequests()).toHaveLength(1);
+    expect(f.store.listRequests()[0].id).toBe(queued.id);
+    expect(f.codex.enqueue).toHaveBeenCalledOnce();
+  });
+
+  it('does not enter maintenance while work is running and restores admission after a failed operation', async () => {
+    const f = fixture(), request = await acceptRequest(f);
+    await running(f, request);
+    const replace = vi.fn(async () => {});
+    await expect(f.engine.maintainCodex(replace)).rejects.toThrow('активные запросы');
+    expect(replace).not.toHaveBeenCalled();
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+    const idle = fixture({ start: false });
+    await expect(idle.engine.maintainCodex(async () => { throw new Error('native declined'); })).rejects.toThrow('native declined');
+    await idle.engine.settled();
+    const next = await acceptRequest(idle, 'slack', 'after-failure');
+    expect(idle.codex.enqueue.mock.calls.some(([, , id]) => id === next.id)).toBe(true);
+  });
+});
+
 describe('Engine initial instruction and same-source steering', () => {
   it('does not start existing disabled chats on idle startup, but accepts an explicit initial-message action', async () => {
     const f = fixture({ initialized: false, start: false });

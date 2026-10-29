@@ -129,9 +129,33 @@ async function main(): Promise<void> {
       if (channelsChanged) { attachChannels(); activity.start(); }
     } finally { engine.suspend(false); }
   }
+  const codexUpdate = new CodexUpdate(root, config.directory, () => config.config.codex, () => codex.status());
+  async function applyCodexUpdate() {
+    return engine.maintainCodex(async () => {
+      const previousHome = codex.status().codexHome;
+      let result: Awaited<ReturnType<CodexUpdate['apply']>> | undefined, failure: unknown;
+      try { await codex.close(); result = await codexUpdate.apply(); } catch (error) { failure = error; }
+      // A fresh client must not replay the old client's native subscriptions during maintenance.
+      codex = new CodexClient(config.config.codex, codexOptions);
+      engine.replaceCodex(codex);
+      try {
+        await codex.connect();
+        const status = codex.status();
+        if (result && (!codex.isVerifiedVersion() || status.name !== `Codex ${result.currentVersion}`
+          || previousHome && path.resolve(status.codexHome ?? '').toLowerCase() !== path.resolve(previousHome).toLowerCase())) {
+          await codex.close();
+          throw new Error('Codex не подтвердил новую версию и исходный профиль. Очередь сохранена.');
+        }
+      } catch (error) {
+        if (!failure) throw new Error('Сервер обновлён, но Rele не подтвердил подключение. Очередь сохранена; проверьте состояние Codex.', { cause: error });
+      }
+      if (failure) throw failure;
+      return codexUpdate.status();
+    });
+  }
   app = createApp({ store, config, engine, codex: () => codex, configure, version, webDirectory: path.join(root, 'dist', 'web'), shutdown,
     desktopIntegration: new DesktopIntegration(root, config.directory),
-    codexUpdate: new CodexUpdate(root, config.directory, () => config.config.codex, () => codex.status()) });
+    codexUpdate: { status: () => codexUpdate.status(), prepare: () => codexUpdate.prepare(), apply: applyCodexUpdate } });
   const instanceFile = path.join(config.directory, 'instance.json');
   const temporaryInstance = path.join(config.directory, `instance-${process.pid}.tmp`);
   try {

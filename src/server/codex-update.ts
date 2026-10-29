@@ -12,6 +12,7 @@ import { effectiveSharedCodexHome, isSharedCodexWebSocket } from './codex-shared
 
 const execute = promisify(execFile);
 const failure = 'Не удалось подтвердить подготовку обновления Codex. Работающий сервер и его задачи не изменялись.';
+const applyFailure = 'Обновление не подтверждено. Проверьте состояние Codex; очередь сохранена.';
 const versionPattern = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/u;
 type CommandResult = { stdout: string; code: number | null };
 type Installation = { DataDirectory: string; OwnerSid: string; TaskName: string; CodexHome?: string };
@@ -25,7 +26,7 @@ export class CodexUpdateError extends Error {
   constructor(message: string, readonly statusCode = 400) { super(message); this.name = 'CodexUpdateError'; }
 }
 async function runLauncher(command: string, args: string[]): Promise<CommandResult> {
-  const { stdout } = await execute(command, args, { windowsHide: true, timeout: 30_000, maxBuffer: 16 * 1024 });
+  const { stdout } = await execute(command, args, { windowsHide: true, timeout: args[0] === 'codex-apply-update' ? 60_000 : 30_000, maxBuffer: 16 * 1024 });
   return { stdout, code: 0 };
 }
 async function executableDigest(executable: string): Promise<string> {
@@ -50,16 +51,16 @@ function compareVersions(left: string, right: string): number {
   }
   return 0;
 }
-function nativeResult(result: CommandResult): NativeStatus {
-  if (result.code !== 0 || Buffer.byteLength(result.stdout, 'utf8') > 16 * 1024) throw new CodexUpdateError(failure, 502);
+function nativeResult(result: CommandResult, message = failure): NativeStatus {
+  if (result.code !== 0 || Buffer.byteLength(result.stdout, 'utf8') > 16 * 1024) throw new CodexUpdateError(message, 502);
   const value: unknown = JSON.parse(result.stdout);
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new CodexUpdateError(failure, 502);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new CodexUpdateError(message, 502);
   return value as NativeStatus;
 }
 
-/** Stage only a future owner action. The native launcher preserves the live server. */
+/** Preparation preserves the live server; applying requires native's exclusive idle gate. */
 export class CodexUpdate {
-  private preparing = false;
+  private operation?: 'preparing' | 'applying';
   private last: CodexUpdateState = { available: false, phase: 'current' };
   private lastError?: string;
   constructor(
@@ -91,6 +92,12 @@ export class CodexUpdate {
         || !samePath(await realpath(marker.DataDirectory), await realpath(this.dataDirectory))) return;
       return marker;
     } catch { return; }
+  }
+  private async checkedInstallation(expected: Installation): Promise<Installation> {
+    const marker = await this.installation();
+    if (!marker || marker.OwnerSid !== expected.OwnerSid || marker.TaskName !== expected.TaskName
+      || marker.CodexHome !== expected.CodexHome) throw new CodexUpdateError('Установка Rele изменилась. Обновите состояние Codex.', 409);
+    return marker;
   }
   private async inspect() {
     const identity = this.identity(), marker = await this.installation();
@@ -127,16 +134,16 @@ export class CodexUpdate {
     if (native.pendingUpdate === true) {
       const pendingExecutable = native.status === 'notRunning' ? native.pendingExe : native.successorExe;
       const pendingHash = native.status === 'notRunning' ? native.pendingSha256 : native.successorSha256;
-      if (typeof native.codexHome !== 'string' || !samePath(await realpath(native.codexHome), home)
+      if (native.ownerSid !== marker.OwnerSid || native.taskName !== `${marker.TaskName}-Codex`
+        || typeof native.codexHome !== 'string' || !samePath(await realpath(native.codexHome), home)
         || typeof native.endpoint !== 'string' || !isSharedCodexWebSocket(native.endpoint)
         || typeof pendingExecutable !== 'string' || !path.isAbsolute(pendingExecutable)
         || typeof pendingHash !== 'string' || !/^[a-f0-9]{64}$/u.test(pendingHash)
         || typeof native.successorDirectory !== 'string' || !/^[a-f0-9]{64}$/u.test(path.basename(native.successorDirectory))
-        || !samePath(path.dirname(native.successorDirectory), path.join(await realpath(this.dataDirectory), 'codex-websocket-owners'))
-        || typeof native.restartRequired !== 'boolean') throw new CodexUpdateError(failure, 502);
+        || !samePath(path.dirname(native.successorDirectory), path.join(await realpath(this.dataDirectory), 'codex-websocket-owners'))) throw new CodexUpdateError(failure, 502);
       const pending = discovery.installations.find(item => samePath(item.executable, pendingExecutable) && item.version && versionPattern.test(item.version));
       if (pending?.version) state.pendingVersion = pending.version;
-      state.phase = native.restartRequired ? 'restartRequired' : 'preparing';
+      state.phase = 'ready';
     } else if (candidate && state.currentVersion && compareVersions(candidate.version, state.currentVersion) > 0) {
       state.phase = SUPPORTED_CODEX_VERSIONS.includes(candidate.version) ? 'available' : 'unsupported';
     }
@@ -147,23 +154,24 @@ export class CodexUpdate {
   }
 
   async status(): Promise<CodexUpdateState> {
-    if (this.preparing) return { ...this.last, phase: 'preparing' };
+    if (this.operation) return { ...this.last, phase: this.operation };
     try {
       const { state } = await this.inspect();
-      if (this.preparing) return { ...state, phase: 'preparing' };
-      this.last = this.lastError && state.phase === 'available' ? { ...state, phase: 'failed', error: this.lastError } : state;
-    } catch { this.last = { ...this.last, phase: 'failed', error: failure }; }
+      if (this.operation) return { ...state, phase: this.operation };
+      this.last = this.lastError && ['available', 'ready'].includes(state.phase)
+        ? { ...state, phase: state.phase === 'ready' ? 'ready' : 'failed', error: this.lastError } : state;
+    } catch { this.last = { ...this.last, phase: 'failed', error: this.lastError ?? failure }; }
     return { ...this.last };
   }
 
   async prepare(): Promise<CodexUpdateState> {
-    if (this.preparing) throw new CodexUpdateError('Подготовка обновления Codex уже выполняется.', 409);
-    this.preparing = true;
+    if (this.operation) throw new CodexUpdateError('Обновление Codex уже выполняется.', 409);
+    this.operation = 'preparing';
     this.lastError = undefined;
     try {
       const before = await this.inspect();
       this.last = before.state;
-      if (before.state.phase === 'restartRequired') return { ...before.state };
+      if (before.state.phase === 'ready') return { ...before.state };
       if (!before.marker || !before.home || !before.candidate || !path.isAbsolute(before.candidate.executable)
         || !this.current().connected || !this.current().codexHome || before.native?.status !== 'alreadyRunning' || before.state.phase !== 'available') {
         throw new CodexUpdateError(before.state.phase === 'unsupported'
@@ -177,12 +185,10 @@ export class CodexUpdate {
         || await executableDigest(before.candidate.executable) !== digest) {
         throw new CodexUpdateError('Установка Codex изменилась во время проверки. Обновите состояние перед подготовкой обновления.', 409);
       }
-      const marker = await this.installation();
-      if (!marker || marker.OwnerSid !== before.marker.OwnerSid || marker.TaskName !== before.marker.TaskName
-        || marker.CodexHome !== before.marker.CodexHome) throw new CodexUpdateError('Установка Rele изменилась. Обновите состояние Codex.', 409);
+      const marker = await this.checkedInstallation(before.marker);
       this.assertIdentity(before.identity);
       const native = nativeResult(await (this.options.run ?? runLauncher)(path.join(this.root, 'Rele.exe'), ['codex-update', '--quiet', '--codex-executable', before.candidate.executable, '--expected-sha256', digest, '--codex-home', before.home]));
-      if (native.status !== 'restartRequired' || native.restartRequired !== true || native.pendingUpdate !== true
+      if (native.status !== 'updatePrepared' || native.pendingUpdate !== true
         || native.ownerSid !== marker.OwnerSid || native.taskName !== `${marker.TaskName}-Codex`
         || typeof native.codexHome !== 'string' || !samePath(await realpath(native.codexHome), before.home)
         || typeof native.endpoint !== 'string' || !isSharedCodexWebSocket(native.endpoint)
@@ -190,13 +196,55 @@ export class CodexUpdate {
         || native.successorSha256 !== digest
         || typeof native.successorDirectory !== 'string' || !/^[a-f0-9]{64}$/u.test(path.basename(native.successorDirectory))
         || !samePath(path.dirname(native.successorDirectory), path.join(await realpath(this.dataDirectory), 'codex-websocket-owners'))) throw new CodexUpdateError(failure, 502);
-      this.last = { ...before.state, phase: 'restartRequired', pendingVersion: before.candidate.version };
+      this.last = { ...before.state, phase: 'ready', pendingVersion: before.candidate.version };
       return { ...this.last };
     } catch (error) {
       const safe = error instanceof CodexUpdateError ? error : new CodexUpdateError(failure, 502);
       this.lastError = safe.message;
       this.last = { ...this.last, phase: 'failed', error: safe.message };
       throw safe;
-    } finally { this.preparing = false; }
+    } finally { this.operation = undefined; }
+  }
+
+  /** The caller pauses Engine and closes Rele's client before invoking native's idle gate. */
+  async apply(): Promise<CodexUpdateState> {
+    if (this.operation) throw new CodexUpdateError('Обновление Codex уже выполняется.', 409);
+    this.operation = 'applying';
+    this.lastError = undefined;
+    try {
+      const before = await this.inspect();
+      this.last = before.state;
+      if (!before.marker || !before.home || before.state.phase !== 'ready' || !before.state.pendingVersion
+        || !SUPPORTED_CODEX_VERSIONS.includes(before.state.pendingVersion) || before.native?.pendingUpdate !== true) {
+        throw new CodexUpdateError('Сначала подготовьте проверенное обновление общего Codex.');
+      }
+      const pendingExe = before.native.status === 'notRunning' ? before.native.pendingExe : before.native.successorExe;
+      const pendingHash = before.native.status === 'notRunning' ? before.native.pendingSha256 : before.native.successorSha256;
+      if (typeof pendingExe !== 'string' || await executableDigest(pendingExe) !== pendingHash) {
+        throw new CodexUpdateError('Подготовленный файл Codex изменился. Обновление остановлено; проверьте установку Desktop.', 409);
+      }
+      const marker = await this.checkedInstallation(before.marker);
+      this.assertIdentity(before.identity);
+      const native = nativeResult(await (this.options.run ?? runLauncher)(path.join(this.root, 'Rele.exe'),
+        ['codex-apply-update', '--quiet', '--codex-home', before.home]), applyFailure);
+      if (!['started', 'alreadyRunning'].includes(String(native.status)) || native.pendingUpdate === true
+        || native.ownerSid !== marker.OwnerSid || native.taskName !== `${marker.TaskName}-Codex`
+        || typeof native.codexHome !== 'string' || !samePath(await realpath(native.codexHome), before.home)
+        || native.endpoint !== before.native.endpoint
+        || typeof native.executable !== 'string' || typeof pendingExe !== 'string' || !samePath(native.executable, pendingExe)
+        || native.executableSha256 !== pendingHash
+        || typeof native.ownerDirectory !== 'string' || typeof before.native.successorDirectory !== 'string'
+        || !samePath(native.ownerDirectory, before.native.successorDirectory)
+        || !Number.isSafeInteger(native.processId) || Number(native.processId) <= 0
+        || typeof native.processStartTime !== 'string' || !Number.isFinite(Date.parse(native.processStartTime))) throw new CodexUpdateError(applyFailure, 502);
+      this.last = { available: true, phase: 'current', currentVersion: before.state.pendingVersion,
+        ...(before.state.installedVersion ? { installedVersion: before.state.installedVersion } : {}) };
+      return { ...this.last };
+    } catch (error) {
+      const safe = error instanceof CodexUpdateError ? error : new CodexUpdateError(applyFailure, 502);
+      this.lastError = safe.message;
+      this.last = { ...this.last, phase: 'failed', error: safe.message };
+      throw safe;
+    } finally { this.operation = undefined; }
   }
 }

@@ -91,18 +91,18 @@ async function windowsFixture() {
 }
 
 describe('Windows direct shared Codex', () => {
-  it('does not start or rediscover a pending successor before the required Windows reboot', async () => {
+  it('rejects a pending successor without a pinned executable instead of rediscovering an arbitrary backend', async () => {
     const f = await windowsFixture();
-    f.run.mockResolvedValue({ code: 0, stdout: JSON.stringify({ status: 'notRunning', pendingUpdate: true, restartRequired: true, pendingExe: f.executable }) });
-    await expect(ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).rejects.toMatchObject({ code: 'shared-update-restart-required' });
+    f.run.mockResolvedValue({ code: 0, stdout: JSON.stringify({ status: 'notRunning', pendingUpdate: true }) });
+    await expect(ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).rejects.toThrow();
     expect(f.discover).not.toHaveBeenCalled();
     expect(f.run.mock.calls.filter(([, args]) => args[0] === 'codex-start')).toHaveLength(0);
   });
 
-  it('uses the pinned cold successor after reboot instead of rediscovering the previous backend', async () => {
+  it('uses the pinned successor after its predecessor exits instead of rediscovering the previous backend', async () => {
     const f = await windowsFixture();
     f.run.mockImplementation(async (_command, args) => ({ code: 0, stdout: args[0] === 'codex-status'
-      ? JSON.stringify({ status: 'notRunning', pendingUpdate: true, restartRequired: false, pendingExe: f.executable })
+      ? JSON.stringify({ status: 'notRunning', pendingUpdate: true, pendingExe: f.executable })
       : args.at(-1) === '--version' ? 'codex-cli 0.163.0-alpha.11.2' : JSON.stringify(f.receipt) }));
     expect(await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).toMatchObject({ executable: f.executable, endpoint: f.receipt.endpoint });
     expect(f.discover).not.toHaveBeenCalled();
