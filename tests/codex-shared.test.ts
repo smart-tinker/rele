@@ -91,6 +91,24 @@ async function windowsFixture() {
 }
 
 describe('Windows direct shared Codex', () => {
+  it('rejects a pending successor without a pinned executable instead of rediscovering an arbitrary backend', async () => {
+    const f = await windowsFixture();
+    f.run.mockResolvedValue({ code: 0, stdout: JSON.stringify({ status: 'notRunning', pendingUpdate: true }) });
+    await expect(ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).rejects.toThrow();
+    expect(f.discover).not.toHaveBeenCalled();
+    expect(f.run.mock.calls.filter(([, args]) => args[0] === 'codex-start')).toHaveLength(0);
+  });
+
+  it('uses the pinned successor after its predecessor exits instead of rediscovering the previous backend', async () => {
+    const f = await windowsFixture();
+    f.run.mockImplementation(async (_command, args) => ({ code: 0, stdout: args[0] === 'codex-status'
+      ? JSON.stringify({ status: 'notRunning', pendingUpdate: true, pendingExe: f.executable })
+      : args.at(-1) === '--version' ? 'codex-cli 0.163.0-alpha.11.2' : JSON.stringify(f.receipt) }));
+    expect(await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).toMatchObject({ executable: f.executable, endpoint: f.receipt.endpoint });
+    expect(f.discover).not.toHaveBeenCalled();
+    expect(f.run.mock.calls.find(([, args]) => args[0] === 'codex-start')?.[1]).toContain(f.executable);
+  });
+
   it('starts only the installed owner and uses the original Desktop backend without a CLI snapshot or adapter', async () => {
     const f = await windowsFixture(), before = structuredClone(f.target);
     expect(await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).toEqual({ ...f.target, transport: 'websocket', executable: f.executable, endpoint: f.receipt.endpoint });

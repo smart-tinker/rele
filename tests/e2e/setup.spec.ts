@@ -120,7 +120,7 @@ test('disconnected and failing Codex catalogs never appear as empty and can reco
     });
   });
   await page
-    .getByRole('button', { name: 'Переподключить', exact: true })
+    .getByRole('button', { name: 'Подключить', exact: true })
     .click();
   await expect(
     page.getByRole('heading', {
@@ -231,6 +231,8 @@ test('saved managed mode recommends a usable Desktop executable independently of
     .getByRole('navigation')
     .getByRole('button', { name: 'Codex', exact: true })
     .click();
+  await page.getByText('Настройки подключения', { exact: true }).click();
+  await page.getByText('Технические сведения', { exact: true }).click();
   await expect(page.getByLabel('Режим работы', { exact: true })).toHaveValue('managed');
   await expect(page.getByRole('radio', { name: /Находить Codex автоматически/ })).toBeChecked();
   await expect(page.getByRole('table')).toContainText(oldThread.name);
@@ -297,6 +299,7 @@ for (const transport of ['proxy', 'websocket'] as const) {
     const api = await installApi(page, state);
     await openPanel(page);
     await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+    await page.getByText('Настройки подключения', { exact: true }).click();
     await expect(page.getByLabel('Режим работы', { exact: true })).toHaveValue(transport);
     await expect(page.getByRole('radio', { name: /Указать параметры вручную/ })).toBeChecked();
     await expect(page.getByLabel('Исполняемый файл Codex', { exact: true })).toHaveValue(saved.executable);
@@ -355,6 +358,8 @@ test('an actual profile change clears the previous thread catalog even when save
   });
   await openPanel(page);
   await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  await page.getByText('Настройки подключения', { exact: true }).click();
+  await page.getByText('Технические сведения', { exact: true }).click();
   await expect(page.getByRole('table')).toContainText(firstThread.name);
   await expect(page.getByLabel('Папка профиля Codex', { exact: true })).toHaveValue('');
   state.codex.codexHome = '/profiles/second';
@@ -375,11 +380,15 @@ test('shared mode saves an automatic policy without a transient endpoint and pre
   const api = await installApi(page, state);
   await openPanel(page);
   await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  await page.getByText('Настройки подключения', { exact: true }).click();
   await expect(page.getByLabel('Режим работы', { exact: true })).toHaveValue('shared');
   await expect(page.getByRole('radio', { name: /Находить Codex автоматически/ })).toBeChecked();
   await expect(page.getByText('Rele подключается к общему Codex или запускает его.', { exact: false })).toBeVisible();
+  await expect(page.getByText('Rele использует работающий общий сервер, сохраняя его версию.', { exact: false })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Выбрать рекомендуемый', exact: true })).toHaveCount(0);
   expect(api.mutations).toEqual([]);
-  await page.getByRole('button', { name: 'Выбрать рекомендуемый', exact: true }).click();
+  await page.getByRole('radio', { name: /Указать параметры вручную/ }).check();
+  await page.getByRole('radio', { name: /Находить Codex автоматически/ }).check();
   await expect(page.getByRole('radio', { name: /Находить Codex автоматически/ })).toBeChecked();
   await page.getByRole('button', { name: 'Сохранить Codex', exact: true }).click();
   await expect.poll(() => api.mutations.at(-1)?.body).toEqual({ codex: { executable: 'codex', transport: 'shared', endpoint: '', codexHome: '/profiles/shared' } });
@@ -489,6 +498,7 @@ test('Desktop integration keeps failed actions retryable and can be disabled wit
   const integration = page.getByRole('region', { name: 'Обычный запуск Codex Desktop', exact: true });
   const enable = integration.getByRole('button', { name: 'Подключить обычный Codex Desktop', exact: true });
   const profile = page.getByLabel('Папка профиля Codex', { exact: true });
+  await page.getByText('Настройки подключения', { exact: true }).click();
   await expect(enable).toBeEnabled();
   await profile.fill('/profiles/unsaved');
   await expect(enable).toBeDisabled();
@@ -516,10 +526,162 @@ test('Desktop integration keeps failed actions retryable and can be disabled wit
   expect(api.mutations).toEqual([]);
 });
 
+test('connected Codex shows actual version and saved Desktop setup without a false verification warning', async ({ page }, testInfo) => {
+  const errors: string[] = [];
+  page.on('pageerror', error => errors.push(error.message));
+  const state = fixtureState(true);
+  state.codex = { ...state.codex, name: 'Codex 0.164.0-alpha.11.1', transport: 'shared' };
+  state.config.codex.transport = 'shared';
+  const api = await installApi(page, state);
+  let desktopReads = 0;
+  let desktop: DesktopIntegrationState = { available: true, enabled: true, lastCheckFailed: false };
+  await page.route('**/api/codex/desktop-integration', route => {
+    expect(route.request().method()).toBe('GET');
+    desktopReads++;
+    return route.fulfill({ json: desktop });
+  });
+  await openPanel(page);
+  await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  await expect(page.getByText('Подключён: Codex 0.164.0-alpha.11.1', { exact: true })).toBeVisible();
+  await expect(page.getByText('Desktop: подключение настроено', { exact: true })).toBeVisible();
+  await expect(page.getByText('Desktop: требуется проверка', { exact: true })).toHaveCount(0);
+  await expect(page.getByLabel('Режим работы', { exact: true })).toBeHidden();
+  await expect(page.getByLabel('Фактическое подключение Codex')).toBeHidden();
+  await expect(page.getByRole('table')).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath('codex-compact-desktop.png'), fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath('codex-compact-mobile.png'), fullPage: true });
+
+  desktop = { ...desktop, lastCheckFailed: true };
+  const before = desktopReads;
+  await page.getByRole('button', { name: 'Обновить статус', exact: true }).click();
+  await expect.poll(() => desktopReads).toBeGreaterThan(before);
+  await expect(page.getByText('Desktop: настройка требует внимания', { exact: true })).toBeVisible();
+  await expect(page.getByText('Состояние Codex обновлено. Работающий сервер сохранён.', { exact: true })).toBeVisible();
+  await expect(page.getByText('Подключён: Codex 0.164.0-alpha.11.1', { exact: true })).toBeVisible();
+  expect(api.mutations.map(({ method, path }) => ({ method, path }))).toEqual([{ method: 'POST', path: '/api/codex/connect' }]);
+
+  api.setMutationError('Пример: проверка соединения недоступна.');
+  await page.getByRole('button', { name: 'Обновить статус', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('Пример: проверка соединения недоступна.');
+  await expect(page.getByLabel('Режим работы', { exact: true })).toBeHidden();
+  expect(errors).toEqual([]);
+});
+
+test('Codex update requires closed-client confirmation and applies without reboot after panel reload', async ({ page }, testInfo) => {
+  const browserErrors: string[] = [];
+  page.on('pageerror', error => browserErrors.push(error.message));
+  page.on('console', message => { if (message.type() === 'error') browserErrors.push(message.text()); });
+  const state = fixtureState(true);
+  state.codex = { ...state.codex, transport: 'shared', name: 'Codex 0.164.0-alpha.11.1' };
+  state.config.codex = { ...state.config.codex, transport: 'shared', executable: 'codex', endpoint: '' };
+  await installApi(page, state);
+  let phase = 'available';
+  const actions: unknown[] = [];
+  await page.route('**/api/codex/update', async route => {
+    if (route.request().method() === 'POST') {
+      const body = route.request().postDataJSON();
+      actions.push(body);
+      if (body.action === 'apply') {
+        phase = 'current';
+        state.codex.name = 'Codex 0.165.0-alpha.1.2';
+      } else phase = 'ready';
+    }
+    await route.fulfill({ json: { available: true, phase,
+      currentVersion: phase === 'current' ? '0.165.0-alpha.1.2' : '0.164.0-alpha.11.1',
+      installedVersion: '0.165.0-alpha.1.2', ...(phase === 'ready' ? { pendingVersion: '0.165.0-alpha.1.2' } : {}) } });
+  });
+  await openPanel(page);
+  await expect(page).toHaveTitle(/Rele/u);
+  await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  await expect(page.getByText('Работающий сервер: 0.164.0-alpha.11.1. Установленный Desktop: 0.165.0-alpha.1.2.', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Подготовить обновление', exact: true }).click();
+  await expect(page.getByText('Подготовлена версия: 0.165.0-alpha.1.2.', { exact: true })).toBeVisible();
+  await expect(page.getByText('Завершите задачи, полностью закройте Desktop и CLI и не запускайте их до завершения обновления.', { exact: true })).toBeVisible();
+  await expect(page.getByText('Подключён: Codex 0.164.0-alpha.11.1', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Обновить Codex', exact: true })).toBeDisabled();
+  expect(actions).toEqual([{}]);
+  await page.screenshot({ path: testInfo.outputPath('codex-update-desktop.png'), fullPage: true });
+  await page.reload();
+  await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  await expect(page.getByText('Подготовлена версия: 0.165.0-alpha.1.2.', { exact: true })).toBeVisible();
+  await expect(page.getByRole('checkbox', { name: 'Я завершил задачи и полностью закрыл Codex Desktop и CLI.', exact: true })).not.toBeChecked();
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath('codex-update-mobile.png'), fullPage: true });
+  await page.getByRole('checkbox', { name: 'Я завершил задачи и полностью закрыл Codex Desktop и CLI.', exact: true }).check();
+  await page.getByRole('button', { name: 'Обновить Codex', exact: true }).click();
+  await expect(page.getByText('Codex обновлён. Можно открыть Desktop.', { exact: true })).toBeVisible();
+  await expect(page.getByText('Подключён: Codex 0.165.0-alpha.1.2', { exact: true })).toBeVisible();
+  await expect(page.getByText('Обновление Codex', { exact: true })).toHaveCount(0);
+  await expect(page.locator('vite-error-overlay')).toHaveCount(0);
+  expect(browserErrors).toEqual([]);
+  expect(actions).toEqual([{}, { action: 'apply', clientsClosed: true }]);
+});
+
+test('Codex update keeps native busy refusal retryable and requires a fresh closed-client confirmation', async ({ page }) => {
+  const state = fixtureState(true);
+  state.codex.name = 'Codex 0.164.0-alpha.11.1';
+  await installApi(page, state);
+  let attempts = 0;
+  await page.route('**/api/codex/update', async route => {
+    if (route.request().method() === 'POST') {
+      expect(route.request().postDataJSON()).toEqual({ action: 'apply', clientsClosed: true });
+      attempts++;
+      if (attempts === 1) {
+        await route.fulfill({ status: 409, json: { error: 'Codex занят или открыт другой клиент. Завершите задачи и закройте клиенты.' } });
+        return;
+      }
+      state.codex.name = 'Codex 0.165.0-alpha.1.2';
+    }
+    await route.fulfill({ json: { available: true, phase: attempts > 1 ? 'current' : 'ready',
+      currentVersion: attempts > 1 ? '0.165.0-alpha.1.2' : '0.164.0-alpha.11.1',
+      installedVersion: '0.165.0-alpha.1.2', ...(attempts > 1 ? {} : { pendingVersion: '0.165.0-alpha.1.2' }) } });
+  });
+  await openPanel(page);
+  await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  const apply = page.getByRole('button', { name: 'Обновить Codex', exact: true });
+  const confirm = page.getByRole('checkbox', { name: 'Я завершил задачи и полностью закрыл Codex Desktop и CLI.', exact: true });
+  await expect(apply).toBeDisabled();
+  await confirm.check(); await apply.click();
+  await expect(page.getByRole('alert')).toContainText('Codex занят или открыт другой клиент.');
+  await expect(confirm).not.toBeChecked();
+  await expect(apply).toBeDisabled();
+  expect(attempts).toBe(1);
+  await confirm.check(); await apply.click();
+  await expect(page.getByText('Codex обновлён. Можно открыть Desktop.', { exact: true })).toBeVisible();
+  await expect(page.getByText('Обновление Codex', { exact: true })).toHaveCount(0);
+  expect(attempts).toBe(2);
+});
+
+test('Codex update in progress disables reconnect and exposes no parallel update action', async ({ page }) => {
+  const api = await installApi(page, fixtureState(true));
+  await page.route('**/api/codex/update', route => route.fulfill({ json: { available: true, phase: 'applying', currentVersion: '0.164.0-alpha.11.1', installedVersion: '0.165.0-alpha.1.2', pendingVersion: '0.165.0-alpha.1.2' } }));
+  await openPanel(page);
+  await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  await expect(page.getByText('Проверяем простой и обновляем общий Codex. Не открывайте Desktop и CLI до завершения.', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Обновить статус', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Подготовить обновление', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Обновить Codex', exact: true })).toHaveCount(0);
+  expect(api.mutations).toEqual([]);
+});
+
+test('an unsupported installed Codex remains visible without an update action', async ({ page }) => {
+  await installApi(page, fixtureState(true));
+  await page.route('**/api/codex/update', route => route.fulfill({ json: { available: true, phase: 'unsupported', currentVersion: '0.164.0-alpha.11.1', installedVersion: '9.0.0' } }));
+  await openPanel(page);
+  await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  await expect(page.getByText('Установленный Desktop: 9.0.0.', { exact: false })).toBeVisible();
+  await expect(page.getByText('Эта версия ещё не поддерживается Rele.', { exact: false })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Подготовить обновление', exact: true })).toHaveCount(0);
+});
+
 test('unavailable Desktop integration exposes no action that changes ordinary Desktop startup', async ({ page }) => {
   const api = await installApi(page, fixtureState(true));
   await openPanel(page);
   await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
+  await page.getByText('Настройки подключения', { exact: true }).click();
   const integration = page.getByRole('region', { name: 'Обычный запуск Codex Desktop', exact: true });
   await expect(integration).toContainText('Управление интеграцией доступно в установленном Rele для Windows.');
   await expect(integration.getByRole('button', { name: 'Подключить обычный Codex Desktop', exact: true })).toHaveCount(0);

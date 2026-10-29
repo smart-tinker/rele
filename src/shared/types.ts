@@ -284,6 +284,15 @@ export interface DesktopIntegrationState {
   lastCheckFailed: boolean;
 }
 
+export interface CodexUpdateState {
+  available: boolean;
+  phase: 'current' | 'available' | 'unsupported' | 'preparing' | 'ready' | 'applying' | 'failed';
+  currentVersion?: string;
+  installedVersion?: string;
+  pendingVersion?: string;
+  error?: string;
+}
+
 export interface PublicConfig {
   autoLinkRules?: AutoLinkRule[];
   codex: CodexConnectionTarget & { tokenConfigured: boolean };

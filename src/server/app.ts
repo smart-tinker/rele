@@ -8,7 +8,7 @@ import { isLocalCodexHome, isLocalWorkspace, mergeConfig, publicConfig } from '.
 import type { Store } from './store.js';
 import type { Engine } from './engine.js';
 import type { CodexClient } from './codex.js';
-import type { DashboardState, DesktopIntegrationState, Endpoint, Platform, SlackSyncJournal } from '../shared/types.js';
+import type { CodexUpdateState, DashboardState, DesktopIntegrationState, Endpoint, Platform, SlackSyncJournal } from '../shared/types.js';
 import { ChannelError } from './channels/common.js';
 import { discoverCodex } from './codex-discovery.js';
 import { MessageToolValidationError } from '../shared/message-tool.js';
@@ -27,6 +27,11 @@ export interface AppServices {
     status(): Promise<DesktopIntegrationState>;
     shouldRetry(): Promise<boolean>;
     setEnabled(enabled: boolean, retry?: boolean): Promise<DesktopIntegrationState>;
+  };
+  codexUpdate?: {
+    status(): Promise<CodexUpdateState>;
+    prepare(): Promise<CodexUpdateState>;
+    apply(): Promise<CodexUpdateState>;
   };
 }
 
@@ -114,6 +119,7 @@ export function createApp(services: AppServices) {
     return { key: config.panelToken };
   });
   app.post('/api/shutdown', async (_request, reply) => {
+    if (configuring) throw new ApiError(409, 'Дождитесь завершения изменения Codex.');
     if (!services.shutdown) throw new ApiError(503, 'Управление завершением недоступно в этом режиме.');
     // Finish the authenticated response before closing the HTTP listener.
     reply.raw.once('finish', () => {
@@ -237,6 +243,19 @@ export function createApp(services: AppServices) {
   });
   app.get('/api/codex/desktop-integration', async (): Promise<DesktopIntegrationState> =>
     services.desktopIntegration?.status() ?? { available: false, enabled: false, lastCheckFailed: false });
+  app.get('/api/codex/update', async () =>
+    services.codexUpdate?.status() ?? { available: false, phase: 'current' });
+  app.post('/api/codex/update', async request => {
+    const input = object(request.body); fields(input, ['action', 'clientsClosed']);
+    const apply = input.action === 'apply';
+    if (input.action !== undefined && !apply || (apply ? input.clientsClosed !== true : input.clientsClosed !== undefined))
+      throw new ApiError(400, 'Для обновления подтвердите, что Desktop и CLI закрыты до завершения операции.');
+    if (configuring) throw new ApiError(409, 'Дождитесь завершения изменения подключения Codex.');
+    if (!services.codexUpdate) throw new ApiError(400, 'Обновление общего Codex доступно в установленном Rele для Windows.');
+    configuring = true;
+    try { return await (apply ? services.codexUpdate.apply() : services.codexUpdate.prepare()); }
+    finally { configuring = false; retryDesktopIntegration(); }
+  });
   app.post('/api/codex/desktop-integration', async request => {
     const body = object(request.body); fields(body, ['enabled']);
     if (typeof body.enabled !== 'boolean') throw new ApiError(400, 'enabled должен быть логическим значением.');
@@ -357,7 +376,9 @@ export function createApp(services: AppServices) {
   });
   app.post('/api/codex/connect', async () => {
     if (configuring) throw new ApiError(409, 'Настройки сохраняются. Дождитесь перезапуска подключения Codex.');
-    await services.codex().connect(); return { ok: true };
+    configuring = true;
+    try { await services.codex().connect(); return { ok: true }; }
+    finally { configuring = false; retryDesktopIntegration(); }
   });
   app.put('/api/config', async request => {
     if (configuring) throw new ApiError(409, 'Настройки уже сохраняются.');
@@ -420,6 +441,7 @@ export function createApp(services: AppServices) {
     return { platform: source, endpointId, allowedSenderIds: [...new Set(senders as string[])], ...(input.allowAllSenders !== undefined ? { allowAllSenders: input.allowAllSenders as boolean } : {}), ...(input.requireMention !== undefined ? { requireMention: input.requireMention as boolean } : {}) };
   }
   app.post('/api/conversations', async request => {
+    if (configuring) throw new ApiError(409, 'Дождитесь завершения изменения Codex.');
     const input = object(request.body);
     fields(input, ['name', 'threadId', 'cwd', 'bindings']);
     const name = string(input.name, 'название', 200);
@@ -511,11 +533,12 @@ export function createApp(services: AppServices) {
     if (selected.value) store.removeBinding(selected.conversation.id, selected.value.id);
     return { conversation: store.getConversation(selected.conversation.id) };
   });
-  app.post<{ Params: { id: string } }>('/api/requests/:id/cancel', async request => { await engine.cancel(request.params.id); return { ok: true }; });
-  app.post<{ Params: { id: string } }>('/api/requests/:id/resume', async request => { await engine.resume(request.params.id); return { ok: true }; });
-  app.post<{ Params: { id: string } }>('/api/requests/:id/reconcile', async request => { await engine.reconcile(request.params.id); return { ok: true }; });
+  app.post<{ Params: { id: string } }>('/api/requests/:id/cancel', async request => { if (configuring) throw new ApiError(409, 'Дождитесь завершения изменения Codex.'); await engine.cancel(request.params.id); return { ok: true }; });
+  app.post<{ Params: { id: string } }>('/api/requests/:id/resume', async request => { if (configuring) throw new ApiError(409, 'Дождитесь завершения изменения Codex.'); await engine.resume(request.params.id); return { ok: true }; });
+  app.post<{ Params: { id: string } }>('/api/requests/:id/reconcile', async request => { if (configuring) throw new ApiError(409, 'Дождитесь завершения изменения Codex.'); await engine.reconcile(request.params.id); return { ok: true }; });
   app.post<{ Params: { id: string } }>('/api/deliveries/:id/retry', async request => { engine.retryDelivery(request.params.id); return { ok: true }; });
   app.post<{ Params: { id: string } }>('/api/approvals/:id/resolve', async request => {
+    if (configuring) throw new ApiError(409, 'Дождитесь завершения изменения Codex.');
     const input = object(request.body); fields(input, ['decision', 'answers']);
     if (input.decision !== 'accept' && input.decision !== 'decline') throw new ApiError(400, 'Неизвестный ответ на подтверждение.');
     const answers = input.answers === undefined ? undefined : object(input.answers);

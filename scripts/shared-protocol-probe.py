@@ -25,7 +25,7 @@ import websockets
 from websockets.exceptions import ConnectionClosedError
 from websockets.protocol import State
 
-VERSIONS = ['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1']
+VERSIONS = ['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2']
 REPO = Path(__file__).resolve().parent.parent
 NODE = shutil.which('node')
 DRIVER = REPO / 'scripts/probe-shared-codex.ts'
@@ -228,7 +228,10 @@ async def gate(args, root):
             return web.json_response({'data': []})
         body = await request.json()
         index = len(records) + 1
-        action, event = actions.pop(0) if actions else ('final', None)
+        latest_user = next((item for item in reversed(body.get('input', [])) if item.get('role') == 'user'), {})
+        initial = any(part.get('text', '').endswith('На это сообщение ответь NOREPLY.')
+                      for part in latest_user.get('content', []) if isinstance(part, dict))
+        action, event = ('initial', None) if initial else actions.pop(0) if actions else ('final', None)
         records.append(body)
         response = web.StreamResponse(headers={'Content-Type': 'text/event-stream'})
         await response.prepare(request)
@@ -251,7 +254,7 @@ async def gate(args, root):
                                 {'label': 'No', 'description': 'Stop the fixture.'}]}]})}
             else:
                 item = {'type': 'message', 'role': 'assistant', 'id': f'msg-{index}', 'phase': 'final_answer',
-                        'content': [{'type': 'output_text', 'text': f'shared-answer-{index}'}]}
+                        'content': [{'type': 'output_text', 'text': 'NOREPLY' if initial else f'shared-answer-{index}'}]}
             await response.write(frame({'type': 'response.output_item.done', 'output_index': 0, 'item': item}))
             await response.write(frame({'type': 'response.completed', 'response': {'id': f'resp-{index}',
                 'usage': {'input_tokens': 10, 'output_tokens': 3, 'total_tokens': 13}}}))
@@ -717,7 +720,7 @@ trust_level="trusted"
             assert len(done['requests']) == 1 and done['requests'][0]['status'] == 'completed'
             assert len(done['deliveries']) == 1 and done['deliveries'][0]['origin']['platform'] == 'slack'
             assert done['deliveries'][0]['status'] == 'sent'
-            assert all(marker in json.dumps(records[before + 1]) for marker in
+            assert all(marker in json.dumps(records[-1]) for marker in
                        (f'{order}-desktop-prior-context', 'shared-passive-agent-context', f'{order}-slack-request'))
             report['checks'][f'{order}_slack_full_context_and_exact_origin'] = True
             if sys.platform == 'linux' and order == 'rele-first':
