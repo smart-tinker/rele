@@ -19,7 +19,7 @@ import websockets
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--codex-prefix', required=True)
-parser.add_argument('--expected-version', required=True, choices=['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2'])
+parser.add_argument('--expected-version', required=True, choices=['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1'])
 parser.add_argument('--report', type=Path, required=True)
 args = parser.parse_args()
 binary = 'codex.exe' if os.name == 'nt' else 'codex'

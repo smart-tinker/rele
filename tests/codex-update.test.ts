@@ -78,10 +78,10 @@ describe('controlled shared Codex update', () => {
     expect(f.run.mock.calls.some(([, args]) => args[0] === 'codex-update')).toBe(false);
   });
 
-  it('selects the highest supported genuine CLI across sources in automatic mode', async () => {
-    const f = await fixture(), cli = await addInstallation(f, 'cli-native.exe', '0.165.0-alpha.1.2');
+  it.each(['0.165.0-alpha.1.2', '0.166.0-alpha.5.1'])('selects supported %s across sources in automatic mode', async version => {
+    const f = await fixture(), cli = await addInstallation(f, 'cli-native.exe', version);
     await addInstallation(f, 'unverified-newer.exe', '9.0.0', 'desktop-install');
-    expect(await f.update.status()).toMatchObject({ selectionMode: 'auto', selectedVersion: '0.165.0-alpha.1.2', installedVersion: '9.0.0', phase: 'available' });
+    expect(await f.update.status()).toMatchObject({ selectionMode: 'auto', selectedVersion: version, installedVersion: '9.0.0', phase: 'available' });
     await f.update.prepare();
     expect(f.getNative().successorExe).toBe(cli);
   });
