@@ -206,7 +206,7 @@ test('connection forms keep saved secrets write-only and report real API failure
     .click();
   await expect(
     page.getByText('Desktop: требуется проверка', { exact: true }),
-  ).toBeVisible();
+  ).toHaveCount(0);
 });
 
 

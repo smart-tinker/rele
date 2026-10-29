@@ -434,6 +434,7 @@ export function CodexSettings({
   const [desktop, setDesktop] = useState<DesktopIntegrationState | null>(null);
   const [desktopError, setDesktopError] = useState('');
   const [desktopRevision, setDesktopRevision] = useState(0);
+  const [settingsOpen, setSettingsOpen] = useState(!state.codex.connected);
   const savedTarget = JSON.stringify([codexTargetKey(state.config.codex), state.config.codex.codexHome ?? '']);
   const pendingTarget = selection === 'auto'
     ? { ...automaticCodex, transport }
@@ -498,12 +499,13 @@ export function CodexSettings({
   const connect = async () => {
     const result = await action.run(
       () => api.request('/api/codex/connect', 'POST'),
-      'Переподключение Codex запрошено.',
+      state.codex.connected ? 'Состояние Codex обновлено. Работающий сервер сохранён.' : 'Подключение Codex запрошено.',
     );
     if (result.ok) {
       await refresh();
       loadThreads();
       setDiscoveryRevision((value) => value + 1);
+      setDesktopRevision((value) => value + 1);
     }
   };
   const filtered = threads.filter((thread) =>
@@ -515,31 +517,39 @@ export function CodexSettings({
     <>
       <PageHeading
         title="Codex"
-        description="Существующие разговоры Codex и сервер для Rele."
+        description="Подключение Rele к вашим разговорам Codex."
         actions={
           <Button
             icon="refresh"
             busy={action.busy}
             onClick={() => void connect()}
           >
-            Переподключить
+            {state.codex.connected ? 'Обновить статус' : 'Подключить'}
           </Button>
         }
       />
       <div className="diagnostic-strip">
         <ConnectionStatus value={state.codex} />
-        <Status tone={state.codex.queueSupported ? 'good' : 'warning'}>
-          {state.codex.queueSupported
-            ? 'Очередь сервера доступна'
-            : 'Очередь сервера недоступна'}
-        </Status>
-        <Status tone={state.codex.desktopVerified ? 'good' : 'warning'}>
-          {state.codex.desktopVerified
-            ? 'Desktop: проверен'
-            : 'Desktop: требуется проверка'}
-        </Status>
+        {state.codex.connected && !state.codex.queueSupported && <Status tone="warning">Очередь сервера недоступна</Status>}
+        {desktop?.available && (
+          <Status tone={desktop.lastCheckFailed ? 'warning' : desktop.enabled ? 'good' : 'muted'}>
+            {desktop.lastCheckFailed
+              ? 'Desktop: настройка требует внимания'
+              : desktop.enabled ? 'Desktop: подключение настроено' : 'Desktop: интеграция отключена'}
+          </Status>
+        )}
       </div>
       {state.codex.error && <Notice tone="warning">{state.codex.error}</Notice>}
+      {desktopError && <Notice>{desktopError}</Notice>}
+      <ActionMessages error={action.error} success={action.success} />
+      {state.codex.connected && state.codex.transport === 'shared' && (
+        <p className="field-hint codex-version-hint">
+          Здесь указана версия работающего сервера. Обновление Desktop и кнопка «Обновить статус»
+          не заменяют этот сервер и не прерывают задачи. Автоматической смены версии сервера пока нет.
+        </p>
+      )}
+      <details className="codex-details">
+        <summary>Технические сведения</summary>
       <dl className="codex-runtime" aria-label="Фактическое подключение Codex">
         <div>
           <dt>Подключённый сервер</dt>
@@ -577,8 +587,13 @@ export function CodexSettings({
           </dd>
         </div>
       </dl>
+        <Status tone={state.codex.queueSupported ? 'good' : 'warning'}>
+          {state.codex.queueSupported ? 'Очередь сервера доступна' : 'Очередь сервера недоступна'}
+        </Status>
+      </details>
+      <details className="codex-details" open={settingsOpen} onToggle={event => setSettingsOpen(event.currentTarget.open)}>
+        <summary>Настройки подключения</summary>
       <form className="settings-section codex-form" onSubmit={submit}>
-        <h2>Настройки Codex</h2>
         <div className="form-stack">
           <Field label="Режим работы">
             <select
@@ -723,7 +738,6 @@ export function CodexSettings({
             />
           </Field>
           <p className="field-hint">Изменения применятся после сохранения.</p>
-          <ActionMessages error={action.error} success={action.success} />
           <div>
             <Button type="submit" busy={action.busy}>
               Сохранить Codex
@@ -734,7 +748,7 @@ export function CodexSettings({
       <section className="settings-section" aria-labelledby="desktop-integration-title">
         <h2 id="desktop-integration-title">Обычный запуск Codex Desktop</h2>
         <div className="form-stack">
-          {desktopError ? <Notice>{desktopError}</Notice> : desktop ? (
+          {desktopError ? <p className="field-hint">Не удалось проверить настройки Desktop. Повторите проверку.</p> : desktop ? (
             desktop.available ? (
               <>
                 <Status tone={desktop.enabled ? 'good' : 'warning'}>
@@ -758,6 +772,7 @@ export function CodexSettings({
           <div><Button icon="refresh" disabled={action.busy || !desktop && !desktopError} onClick={() => setDesktopRevision(value => value + 1)}>Обновить статус Desktop</Button></div>
         </div>
       </section>
+      </details>
       <section className="threads-section" aria-labelledby="threads-title">
         <div className="section-heading">
           <h2 id="threads-title">Разговоры Codex</h2>
