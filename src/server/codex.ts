@@ -133,6 +133,8 @@ export class CodexClient extends EventEmitter {
   private releasing = new Map<string, Promise<void>>();
   private closedWaiters = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
   private reconnectTimer?: NodeJS.Timeout;
+  private heartbeatTimer?: NodeJS.Timeout;
+  private healthCheck?: { socket: WebSocket; queueSupported: boolean; error?: string; errorCode?: string };
   private connecting?: Promise<void>;
   private stopped = true;
   private retry = 0;
@@ -144,6 +146,7 @@ export class CodexClient extends EventEmitter {
 
   constructor(private readonly config: CodexConfig, private readonly options: { discover?: typeof discoverCodex; shared?: typeof ensureSharedCodex; releaseTimeoutMs?: number;
     expectedVersion?: string;
+    rpcTimeoutMs?: number; heartbeatIntervalMs?: number; heartbeatTimeoutMs?: number;
     setupPlugin?: (rpc: (method: string, params: Record<string, unknown>) => Promise<unknown>, runtime: CodexRuntime) => Promise<void> } = {}) {
     super();
     this.state = {
@@ -760,6 +763,7 @@ export class CodexClient extends EventEmitter {
     if (this.options.expectedVersion && this.version !== this.options.expectedVersion) throw new CodexTransportError(
       'Codex не подтвердил версию после обновления. Очередь сохранена; повторяется только подключение.', 'update-version-mismatch');
     this.setState({ name: this.version ? `Codex ${this.version}` : 'Codex', connected: true, codexHome: this.runtime.codexHome, error: undefined, errorCode: undefined });
+    if (this.socket) this.startHeartbeat(this.socket);
     if (!this.isVerifiedVersion()) {
       this.setState({ error: `Запись доступна для проверенного Codex ${SUPPORTED_CODEX_VERSIONS.join(' или ')}; подключён ${this.version || 'неизвестный runtime'}.` });
     } else {
@@ -816,13 +820,14 @@ export class CodexClient extends EventEmitter {
     return rows;
   }
 
-  private call<T = unknown>(method: string, params: Record<string, unknown>): Promise<T> {
-    const id = randomUUID();
+  private call<T = unknown>(method: string, params: Record<string, unknown>, timeoutMs = this.options.rpcTimeoutMs ?? 30_000, confirmHealth = true): Promise<T> {
+    const id = randomUUID(), socket = this.socket;
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new CodexTransportError(`Codex не подтвердил ${method} за 30 секунд; проверьте состояние перед повтором.`));
-      }, 30_000);
+        reject(new CodexTransportError(`Codex не подтвердил ${method} вовремя; проверьте состояние перед повтором.`, 'rpc-timeout'));
+        if (confirmHealth && socket && this.socket === socket && this.state.connected) this.checkSocketHealth(socket);
+      }, timeoutMs);
       timer.unref();
       this.pending.set(id, { resolve: value => resolve(value as T), reject, timer });
       void this.send({ id, method, params }).catch(error => {
@@ -883,7 +888,60 @@ export class CodexClient extends EventEmitter {
     else pending.resolve(message.result);
   }
 
+  private failSocket(socket: WebSocket, message: string, code: string): void {
+    if (this.socket !== socket) return;
+    void this.disconnect(message, code).catch(() => {});
+    this.scheduleReconnect();
+  }
+
+  private startHeartbeat(socket: WebSocket): void {
+    clearTimeout(this.heartbeatTimer);
+    let token: string | undefined;
+    const schedule = (timeout: number) => {
+      clearTimeout(this.heartbeatTimer);
+      this.heartbeatTimer = setTimeout(() => {
+        if (this.socket !== socket) return;
+        if (token) {
+          this.failSocket(socket, 'Codex не отвечает на проверку соединения. Неподтверждённые запросы требуют сверки; подключение будет повторено.', 'heartbeat-timeout');
+          return;
+        }
+        token = randomUUID();
+        try { socket.ping(token, undefined, error => { if (error) this.failSocket(socket, 'Codex не подтвердил проверку соединения.', 'heartbeat-failed'); }); }
+        catch { this.failSocket(socket, 'Codex не подтвердил проверку соединения.', 'heartbeat-failed'); }
+        if (this.socket === socket) schedule(this.options.heartbeatTimeoutMs ?? 5_000);
+      }, timeout);
+      this.heartbeatTimer.unref();
+    };
+    socket.on('pong', data => {
+      if (this.socket !== socket || !token || data.toString() !== token) return;
+      token = undefined;
+      schedule(this.options.heartbeatIntervalMs ?? 15_000);
+    });
+    schedule(this.options.heartbeatIntervalMs ?? 15_000);
+  }
+
+  private checkSocketHealth(socket: WebSocket): void {
+    if (this.healthCheck?.socket === socket) return;
+    const check = { socket, queueSupported: this.state.queueSupported, error: this.state.error, errorCode: this.state.errorCode };
+    this.healthCheck = check;
+    const pauseError = 'Codex не подтвердил запрос вовремя. Проверяется соединение; новые запросы приостановлены.';
+    this.setState({ queueSupported: false, error: pauseError, errorCode: 'rpc-timeout' });
+    void this.call<{ process?: { id?: number } }>('server/diagnostics', {}, this.options.heartbeatTimeoutMs ?? 5_000, false).then(result => {
+      if (this.socket !== socket) return;
+      const pid = result?.process?.id;
+      if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) throw new CodexTransportError('Codex не подтвердил проверку состояния.', 'rpc-health-unconfirmed');
+      if (this.healthCheck === check && !this.state.queueSupported && this.state.error === pauseError && this.state.errorCode === 'rpc-timeout') {
+        this.setState({ queueSupported: check.queueSupported, error: check.error, errorCode: check.errorCode });
+      }
+    }).catch(() => {
+      this.failSocket(socket, 'Codex не отвечает на проверку состояния. Неподтверждённые запросы требуют сверки; подключение будет повторено.', 'rpc-health-timeout');
+    }).finally(() => { if (this.healthCheck === check) this.healthCheck = undefined; });
+  }
+
   private disconnect(message: string, errorCode?: string): Promise<void> {
+    clearTimeout(this.heartbeatTimer);
+    this.heartbeatTimer = undefined;
+    this.healthCheck = undefined;
     const socket = this.socket;
     this.socket = undefined;
     socket?.terminate();

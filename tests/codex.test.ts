@@ -109,9 +109,9 @@ async function managedFixture(options: {
   return { client, executable, directory, discover, records, calls };
 }
 
-async function fixture(handlers: Record<string, Handler> = {}, codexHome?: string) {
+async function fixture(handlers: Record<string, Handler> = {}, codexHome?: string, options: NonNullable<ConstructorParameters<typeof CodexClient>[1]> = {}, autoPong = true) {
   const calls: Rpc[] = [], responses: Rpc[] = [], sockets: WebSocket[] = [];
-  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0, autoPong });
   await once(server, 'listening');
   cleanup.push(async () => {
     for (const socket of server.clients) socket.terminate();
@@ -140,7 +140,7 @@ async function fixture(handlers: Record<string, Handler> = {}, codexHome?: strin
     });
   });
   const endpoint = `ws://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  const client = new CodexClient({ transport: 'websocket', executable: 'codex', endpoint, codexHome });
+  const client = new CodexClient({ transport: 'websocket', executable: 'codex', endpoint, codexHome }, options);
   cleanup.push(() => client.close());
   return { client, calls, responses, sockets, handlers, endpoint };
 }
@@ -152,6 +152,103 @@ async function until(predicate: () => boolean): Promise<void> {
     await new Promise(resolve => setTimeout(resolve, 10));
   }
 }
+
+describe('Codex socket health', () => {
+  it('invalidates a socket without matching pongs, preserves another client and permits a fresh connection', async () => {
+    const f = await fixture({}, undefined, { heartbeatIntervalMs: 20, heartbeatTimeoutMs: 60 }, false);
+    await f.client.connect();
+    const first = f.sockets[0], peer = new WebSocket(f.endpoint); cleanup.push(() => peer.terminate()); await once(peer, 'open');
+    await until(() => !f.client.status().connected);
+    expect(f.client.status()).toMatchObject({ connected: false, queueSupported: false, errorCode: 'heartbeat-timeout' });
+    expect(peer.readyState).toBe(WebSocket.OPEN);
+    await f.client.connect();
+    expect(f.client.status()).toMatchObject({ connected: true, queueSupported: true, errorCode: undefined });
+    expect(f.sockets.at(-1)).not.toBe(first);
+    expect(f.calls.filter(call => call.method === 'initialize')).toHaveLength(2);
+    expect(f.calls.some(call => ['turn/start', 'turn/interrupt', 'thread/queue/add'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it('keeps a quiet long-running connection and pending question alive while pongs arrive, then cleans up on close', async () => {
+    const f = await fixture({}, undefined, { heartbeatIntervalMs: 20, heartbeatTimeoutMs: 60 }); await f.client.connect();
+    const socket = f.sockets[0]; let pings = 0; socket.on('ping', () => pings++);
+    socket.send(JSON.stringify({ id: 'long-turn-question', method: 'item/tool/requestUserInput', params: { threadId } }));
+    await until(() => f.client.hasPendingRequest('long-turn-question'));
+    await new Promise(resolve => setTimeout(resolve, 180));
+    expect(pings).toBeGreaterThanOrEqual(3); expect(f.sockets).toHaveLength(1);
+    expect(f.client.status()).toMatchObject({ connected: true, queueSupported: true });
+    await f.client.respond('long-turn-question', { answers: {} }); await until(() => f.responses.length === 1);
+    const closed = once(socket, 'close'); await f.client.close(); await closed; const count = pings;
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(pings).toBe(count); expect(f.sockets).toHaveLength(1); expect(f.client.status().connected).toBe(false);
+  });
+
+  it('marks an unanswered mutation uncertain and disconnects after one failed application probe even while pongs arrive', async () => {
+    const clientId = randomUUID(), f = await fixture({ 'thread/queue/add': () => noResponse, 'server/diagnostics': () => noResponse }, undefined,
+      { rpcTimeoutMs: 30, heartbeatIntervalMs: 15, heartbeatTimeoutMs: 80 });
+    await f.client.connect();
+    await expect(f.client.enqueue(threadId, 'Accepted input with lost ACK', clientId)).rejects.toMatchObject({ uncertain: true, code: 'rpc-timeout' });
+    expect(f.client.status()).toMatchObject({ connected: true, queueSupported: false, errorCode: 'rpc-timeout' });
+    await until(() => !f.client.status().connected);
+    expect(f.client.status().errorCode).toBe('rpc-health-timeout');
+    expect(f.calls.filter(call => call.method === 'server/diagnostics')).toHaveLength(1);
+    f.handlers['thread/queue/list'] = () => ({ data: [{ id: 'native-accepted', clientUserMessageId: clientId }], nextCursor: null });
+    await f.client.connect();
+    expect(await f.client.findRequest(threadId, clientId)).toEqual({ state: 'queued', queuedSubmissionId: 'native-accepted', soleQueuedSubmission: true });
+    expect(f.calls.filter(call => call.method === 'thread/queue/add')).toHaveLength(1);
+    expect(f.calls.some(call => ['turn/start', 'thread/queue/start', 'turn/interrupt'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it('preserves the same socket and pending question after a healthy timeout probe without replaying the mutation', async () => {
+    let confirm!: (value: unknown) => void;
+    const answer = new Promise(resolve => { confirm = resolve; });
+    const f = await fixture({ 'thread/queue/add': () => noResponse, 'server/diagnostics': () => answer }, undefined,
+      { rpcTimeoutMs: 30, heartbeatIntervalMs: 20, heartbeatTimeoutMs: 200 });
+    await f.client.connect(); const socket = f.sockets[0];
+    socket.send(JSON.stringify({ id: 'retained-question', method: 'item/tool/requestUserInput', params: { threadId } }));
+    await until(() => f.client.hasPendingRequest('retained-question'));
+    await expect(f.client.enqueue(threadId, 'Slow mutation', randomUUID())).rejects.toMatchObject({ code: 'rpc-timeout' });
+    expect(f.client.status().queueSupported).toBe(false);
+    await expect(f.client.enqueue(threadId, 'Next input', randomUUID())).rejects.toThrow('приостановлены');
+    confirm({ process: { id: 42 } });
+    await until(() => f.client.status().queueSupported);
+    expect(f.client.status()).toMatchObject({ connected: true, error: undefined, errorCode: undefined });
+    expect(f.client.hasPendingRequest('retained-question')).toBe(true);
+    await f.client.respond('retained-question', { answers: {} });
+    expect(f.sockets).toHaveLength(1); expect(socket.readyState).toBe(WebSocket.OPEN);
+    expect(f.calls.filter(call => call.method === 'thread/queue/add')).toHaveLength(1);
+    expect(f.calls.filter(call => call.method === 'server/diagnostics')).toHaveLength(1);
+  });
+
+  it('shares one bounded health probe across concurrent RPC timeouts', async () => {
+    const f = await fixture({ 'server/diagnostics': () => noResponse }, undefined,
+      { rpcTimeoutMs: 30, heartbeatIntervalMs: 15, heartbeatTimeoutMs: 80 });
+    await f.client.connect(); f.handlers['thread/read'] = f.handlers['thread/list'] = () => noResponse;
+    const outcomes = await Promise.allSettled([f.client.readThread(threadId), f.client.listThreads()]);
+    expect(outcomes.every(outcome => outcome.status === 'rejected' && outcome.reason instanceof CodexTransportError)).toBe(true);
+    await until(() => !f.client.status().connected);
+    expect(f.calls.filter(call => call.method === 'server/diagnostics')).toHaveLength(1);
+  });
+
+  it('preserves a newer capability failure on the same socket when the healthy probe completes', async () => {
+    let confirm!: (value: unknown) => void;
+    const answer = new Promise(resolve => { confirm = resolve; }), createdId = randomUUID();
+    const f = await fixture({ 'thread/read': () => noResponse, 'server/diagnostics': () => answer,
+      'thread/start': () => ({ thread: { ...rawThread, id: createdId } }),
+      'thread/queue/list': (message, socket) => {
+        if (message.params.threadId !== createdId) return { data: [], nextCursor: null };
+        socket.send(JSON.stringify({ id: message.id, error: { code: -32601, message: 'Queue unsupported for this runtime' } })); return noResponse;
+      },
+    }, undefined, { rpcTimeoutMs: 30, heartbeatIntervalMs: 20, heartbeatTimeoutMs: 200 });
+    await f.client.connect();
+    await expect(f.client.readThread(threadId)).rejects.toMatchObject({ code: 'rpc-timeout' });
+    expect(f.client.status().queueSupported).toBe(false);
+    expect(await f.client.createThread('/new-project')).toBe(createdId);
+    const newer = f.client.status();
+    expect(newer).toMatchObject({ connected: true, queueSupported: false, error: expect.stringContaining('не предоставляет очередь') });
+    confirm({ process: { id: 42 } }); await f.client.diagnostics();
+    expect(f.client.status()).toEqual(newer); expect(f.sockets).toHaveLength(1);
+  });
+});
 
 describe('Codex native shared policy', () => {
   async function sharedFixture(implicitProfile = false) {
