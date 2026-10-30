@@ -142,7 +142,7 @@ function fixture(options: { path?: string; start?: boolean; initialized?: boolea
     conversation: store.listConversations()[0],
     message(platform: Platform, eventId = '1', overrides: Partial<InboundMessage> = {}): InboundMessage {
       const endpoint = eps[platform];
-      return { eventId, endpoint, sender: endpoint.people[0], messageId: platform === 'slack' ? `170001.${String([...eventId].reduce((sum, char) => sum * 31 + char.charCodeAt(0), 0) >>> 0).slice(-6).padStart(6, '0')}` : `${platform}-message-${eventId}`, text: `${platform} task ${eventId}`, ...overrides };
+      return { eventId, endpoint, sender: endpoint.people[0], messageId: platform === 'slack' ? `170001.${String([...eventId].reduce((sum, char) => Math.imul(sum, 31) + char.charCodeAt(0), 0) >>> 0).slice(-6).padStart(6, '0')}` : `${platform}-message-${eventId}`, text: `${platform} task ${eventId}`, ...overrides };
     } };
 }
 
