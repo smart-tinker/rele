@@ -158,6 +158,22 @@ describe('installer-only shared Codex setup', () => {
     expect(f.verify).toHaveBeenCalledOnce();
   });
 
+  it('ignores retained uncertain legacy aliases after their canonical context was applied', async () => {
+    const f = await fixture(), db = inbox(f);
+    db.store.updateSlackSyncEntry(db.entry.id, { state: 'applied' }); db.store.close();
+    const raw = new DatabaseSync(db.file);
+    try {
+      raw.prepare(`INSERT INTO slack_sync_entries
+        (id,stream_id,message_id,message_order,revision,message,request_id,state,error,retry_at,created_at,updated_at,semantic_revision,canonical_entry_id)
+        SELECT 'legacy-context-alias',stream_id,message_id,message_order,'legacy-revision',message,request_id,'uncertain',NULL,NULL,created_at,updated_at,semantic_revision,id
+        FROM slack_sync_entries WHERE id=?`).run(db.entry.id);
+    } finally { raw.close(); }
+    const before = await readFile(db.file);
+    await setupSharedCodex(f.config, f.verify, f.env);
+    expect(f.verify).toHaveBeenCalledOnce();
+    expect(await readFile(db.file)).toEqual(before);
+  });
+
   it.each(['starting', 'running', 'transcribing', 'waiting_approval', 'uncertain', 'queued-submission', 'queued-turn', 'pending-approval',
     'auto-pending', 'auto-creating', 'auto-created', 'auto-uncertain', 'auto-failed', 'context-applying', 'context-uncertain', 'tool-sending', 'tool-uncertain'] as const)
   ('preserves all original bytes and refuses unresolved %s', async state => {
@@ -187,7 +203,7 @@ describe('installer-only shared Codex setup', () => {
     const f = await fixture(), db = inbox(f); db.store.close();
     const malformed = new DatabaseSync(db.file);
     try { malformed.exec(problem === 'foreign-owner' ? 'PRAGMA application_id=123;' : problem === 'future-schema'
-      ? 'PRAGMA user_version=8;' : 'ALTER TABLE requests RENAME COLUMN queued_submission_id TO unknown_submission;'); }
+      ? 'PRAGMA user_version=9;' : 'ALTER TABLE requests RENAME COLUMN queued_submission_id TO unknown_submission;'); }
     finally { malformed.close(); }
     const originalDatabase = await readFile(db.file);
     await expect(setupSharedCodex(f.config, f.verify, f.env)).rejects.toThrow();

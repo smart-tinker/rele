@@ -19,6 +19,10 @@ function open(path = join(directory(), 'rele.sqlite')): Store {
   stores.push(store);
   return store;
 }
+function dropSourceVersionSchema(database: DatabaseSync): void {
+  database.exec(`DROP TABLE inbound_source_versions; DROP INDEX slack_sync_semantic_source; DROP INDEX slack_sync_aliases;
+    ALTER TABLE slack_sync_entries DROP COLUMN canonical_entry_id; ALTER TABLE slack_sync_entries DROP COLUMN semantic_revision;`);
+}
 function endpoint(overrides: Partial<Endpoint> = {}): Endpoint {
   return { id: 'slack-1', platform: 'slack', accountId: 'workspace-1', chatId: 'channel-1', threadId: 'thread-1',
     title: '#Infrastructure', subtitle: 'Team / Backup', people: [{ id: 'user-1', name: 'Alex' }],
@@ -442,7 +446,7 @@ describe('Store durability and recovery', () => {
     const check = new DatabaseSync(path);
     try {
       expect(check.prepare('PRAGMA journal_mode').get()?.journal_mode).toBe('wal');
-      expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(7);
+      expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(8);
       expect(check.prepare('PRAGMA quick_check').get()?.quick_check).toBe('ok');
       expect(check.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     } finally { check.close(); }
@@ -456,6 +460,7 @@ describe('Store durability and recovery', () => {
     original.setMeta('endpoint-alias:slack-1', 'Мой разговор');
     original.close();
     const old = new DatabaseSync(path);
+    dropSourceVersionSchema(old);
     old.exec('DROP TABLE tool_outbox; DROP INDEX inbound_auto_link; ALTER TABLE inbound_events DROP COLUMN auto_link_intent_id; DROP TABLE auto_link_intents; DROP TABLE slack_sync_entries; DROP TABLE slack_sync_streams; ALTER TABLE endpoints DROP COLUMN catalog; PRAGMA user_version = 2;');
     old.close();
     const upgraded = open(path);
@@ -514,6 +519,7 @@ describe('durable Slack transcript sync', () => {
     const original = request(oldStore);
     oldStore.close();
     const old = new DatabaseSync(path);
+    dropSourceVersionSchema(old);
     old.exec('DROP TABLE tool_outbox; DROP INDEX inbound_auto_link; ALTER TABLE inbound_events DROP COLUMN auto_link_intent_id; DROP TABLE auto_link_intents; DROP TABLE slack_sync_entries; DROP TABLE slack_sync_streams; PRAGMA user_version = 3;');
     old.close();
     const upgraded = open(path);

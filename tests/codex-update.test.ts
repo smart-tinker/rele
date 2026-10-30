@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { CodexConnectionState, CodexConnectionTarget, CodexDiscoveryResult } from '../src/shared/types.js';
 import { CodexUpdate } from '../src/server/codex-update.js';
+import { LinuxCodexUpdateError, type LinuxCodexInspection, type LinuxCodexCandidate } from '../src/server/codex-linux-update.js';
 
 const directories: string[] = [];
 afterEach(async () => { await Promise.all(directories.splice(0).map(directory => rm(directory, { recursive: true, force: true }))); });
@@ -62,7 +63,142 @@ async function fixture() {
     service, update: service(), resolveNative, setNative: (value: Record<string, unknown>) => { native = value; }, getNative: () => native };
 }
 
+async function linuxFixture() {
+  const f = await fixture();
+  let inspection: LinuxCodexInspection = { available: true, owner: { kind: 'daemon', codexHome: f.home,
+    endpoint: f.current.endpoint!, executable: f.old, version: '0.163.0-alpha.11.2', sha256: 'a'.repeat(64),
+    pid: 12345, startTicks: '123', uid: 1000, pidRecordPath: path.join(f.home, 'daemon.pid'), pidRecordSha256: 'b'.repeat(64) } };
+  const linux = {
+    inspect: vi.fn(async () => inspection),
+    prepare: vi.fn(async (_target: CodexConnectionTarget, _current: CodexConnectionState, candidate: LinuxCodexCandidate) => {
+      inspection.pending = { candidate, owner: inspection.owner!, phase: 'ready' };
+      return inspection;
+    }),
+    apply: vi.fn(async () => {
+      const pending = inspection.pending!;
+      const result = { ...pending.candidate, codexHome: pending.owner.codexHome, endpoint: pending.owner.endpoint,
+        pid: 54321, startTicks: '456', uid: 1000, cleanup: 'native-managed' as const };
+      inspection = { available: true, owner: { ...pending.owner, ...result }, pending: { ...pending, phase: 'verified' } };
+      return result;
+    }),
+  };
+  const update = new CodexUpdate(f.root, f.data, () => f.target, () => f.current,
+    { platform: 'linux', linux, discover: f.discover, run: f.run, resolveNative: f.resolveNative });
+  return { ...f, update, linux, inspect: () => inspection };
+}
+
+describe('Linux controlled update API policy', () => {
+  it('recognizes the verified native-managed copy of a pinned source package instead of offering the same update again', async () => {
+    const f = await linuxFixture();
+    f.target.executable = f.installed;
+    await f.update.prepare();
+    await f.update.apply();
+    const state = f.inspect();
+    state.owner!.executable = path.join(f.home, 'packages/app-server-daemon/releases/verified-copy/bin/codex');
+    expect(await f.update.status()).toMatchObject({ phase: 'current', selectionMode: 'manual', currentVersion: '0.164.0-alpha.11.1' });
+    await expect(f.update.prepare()).rejects.toThrow('Подготовка обновления доступна');
+    expect(f.linux.apply).toHaveBeenCalledTimes(1);
+  });
+  it('selects and prepares the installed candidate, then applies after Rele closes its client', async () => {
+    const f = await linuxFixture();
+    expect(await f.update.status()).toMatchObject({ available: true, phase: 'available', selectedVersion: '0.164.0-alpha.11.1' });
+    expect(await f.update.prepare()).toMatchObject({ phase: 'ready', pendingVersion: '0.164.0-alpha.11.1' });
+    f.current.connected = false;
+    f.current.codexHome = undefined;
+    expect(await f.update.apply()).toMatchObject({ phase: 'current', currentVersion: '0.164.0-alpha.11.1' });
+    expect(f.linux.apply).toHaveBeenCalledTimes(1);
+    expect(await readFile(f.config, 'utf8')).toBe('protected synthetic settings; must not be read or changed');
+  });
+
+  it('explains an external owner without probing or changing a candidate', async () => {
+    const f = await linuxFixture();
+    f.linux.inspect.mockResolvedValue({ available: false, reason: 'Codex запущен внешней службой. Обновите его через владельца службы.' });
+    expect(await f.update.status()).toMatchObject({ available: false, error: expect.stringContaining('внешней службой') });
+    await expect(f.update.prepare()).rejects.toMatchObject({ statusCode: 409 });
+    expect(f.discover).not.toHaveBeenCalled();
+    expect(f.run).not.toHaveBeenCalled();
+    expect(f.linux.apply).not.toHaveBeenCalled();
+  });
+
+  it('preserves an uncertain native result without blind replay', async () => {
+    const f = await linuxFixture();
+    await f.update.prepare();
+    f.linux.apply.mockRejectedValue(new LinuxCodexUpdateError('Исход переключения требует сверки.', 503, 'uncertain'));
+    await expect(f.update.apply()).rejects.toMatchObject({ statusCode: 503, reasonCode: 'uncertain' });
+    expect(f.linux.apply).toHaveBeenCalledTimes(1);
+    expect((await f.update.status()).error).toContain('сверки');
+  });
+
+  it('rejects a manual selection that no longer matches the prepared candidate', async () => {
+    const f = await linuxFixture();
+    await f.update.prepare();
+    f.target.executable = f.old;
+    await expect(f.update.apply()).rejects.toThrow('Подготовлен другой файл');
+    expect(f.linux.apply).not.toHaveBeenCalled();
+  });
+});
+
 describe('controlled shared Codex update', () => {
+  it('cleans only after a verified connection and shares one in-flight postflight', async () => {
+    const f = await fixture();
+    const original = f.run.getMockImplementation()!;
+    let finish!: () => void;
+    f.run.mockImplementation(async (command, args) => {
+      if (args[0] !== 'codex-postflight') return original(command, args);
+      await new Promise<void>(resolve => { finish = resolve; });
+      return { code: 0, stdout: JSON.stringify({ status: 'verified', cleanup: { freedBytes: 4096, deletedCount: 2, keptCount: 1 } }) };
+    });
+    f.current.connected = false;
+    expect(await f.update.postflight()).toBeUndefined();
+    expect(f.run).not.toHaveBeenCalled();
+    f.current.connected = true;
+    const first = f.update.postflight(), second = f.update.postflight();
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'));
+    const save = vi.fn(async () => {});
+    await expect(f.update.changeSelection({ ...f.target, executable: f.installed }, save)).rejects.toMatchObject({ statusCode: 409 });
+    expect(save).not.toHaveBeenCalled();
+    finish();
+    expect(await first).toEqual({ status: 'partial', freedBytes: 4096, deletedCount: 2, keptCount: 1 });
+    expect(await second).toEqual(await first);
+    expect(f.run.mock.calls.filter(([, args]) => args[0] === 'codex-postflight')).toHaveLength(1);
+    expect((await f.update.status()).cleanup).toMatchObject({ freedBytes: 4096, keptCount: 1 });
+    expect(await readFile(f.config, 'utf8')).toBe('protected synthetic settings; must not be read or changed');
+  });
+
+  it('refuses cleanup when the target changes during installation-marker IO before launching a native command', async () => {
+    const f = await fixture();
+    const waiting = f.update.postflight();
+    f.target.executable = f.installed;
+    expect(await waiting).toMatchObject({ status: 'partial', freedBytes: 0 });
+    expect(f.run).not.toHaveBeenCalled();
+  });
+
+  it('reports deferred cleanup without turning a successful installed server into an update failure', async () => {
+    const f = await fixture();
+    const original = f.run.getMockImplementation()!;
+    f.run.mockImplementation((command, args) => args[0] === 'codex-postflight'
+      ? Promise.resolve({ code: 1, stdout: 'private-child-output' }) : original(command, args));
+    expect(await f.update.postflight()).toEqual({ status: 'partial', freedBytes: 0, deletedCount: 0, keptCount: 1 });
+    expect(f.current.connected).toBe(true);
+  });
+
+  it.each([
+    ['clients-open', 409, 'Закройте Desktop'],
+    ['busy', 409, 'В Codex ещё выполняется работа'],
+    ['unsupported-diagnostics', 503, 'безопасный простой'],
+    ['uncertain', 503, 'Исход операции'],
+  ] as const)('preserves safe native refusal %s without exposing child output or retrying apply', async (reasonCode, statusCode, text) => {
+    const f = await fixture();
+    await f.update.prepare();
+    const original = f.run.getMockImplementation()!;
+    f.run.mockImplementation((command, args) => args[0] === 'codex-apply-update'
+      ? Promise.resolve({ code: 1, stdout: JSON.stringify({ status: 'refused', reasonCode, raw: 'private-child-output' }) })
+      : original(command, args));
+    await expect(f.update.apply()).rejects.toMatchObject({ statusCode, reasonCode, message: expect.stringContaining(text) });
+    expect(f.run.mock.calls.filter(([, args]) => args[0] === 'codex-apply-update')).toHaveLength(1);
+    expect((await f.update.status()).error).not.toContain('private-child-output');
+    expect(await readFile(f.config, 'utf8')).toBe('protected synthetic settings; must not be read or changed');
+  });
   async function addInstallation(f: Awaited<ReturnType<typeof fixture>>, filename: string, version: string, source: 'path' | 'desktop-install' = 'path') {
     const executable = path.join(f.root, filename);
     await writeFile(executable, `synthetic native ${filename}; never executed`);
@@ -256,7 +392,7 @@ describe('controlled shared Codex update', () => {
   it.each(['platform', 'portable', 'profile', 'transport'] as const)('keeps an unavailable %s installation read-only', async kind => {
     const f = await fixture();
     let service = f.update;
-    if (kind === 'platform') service = new CodexUpdate(f.root, f.data, () => f.target, () => f.current, { platform: 'linux', discover: f.discover, run: f.run });
+    if (kind === 'platform') service = new CodexUpdate(f.root, f.data, () => f.target, () => f.current, { platform: 'darwin', discover: f.discover, run: f.run });
     if (kind === 'portable') await rm(path.join(f.root, 'rele-install.json'));
     if (kind === 'profile') { f.marker.DataDirectory = f.home; await f.save(); }
     if (kind === 'transport') f.target.transport = 'websocket';

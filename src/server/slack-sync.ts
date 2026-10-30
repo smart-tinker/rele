@@ -1,8 +1,10 @@
 import { CodexThreadBusyError, type CodexClient } from './codex.js';
+import { createHash } from 'node:crypto';
 import { ChannelError, type Channel } from './channels/common.js';
 import { Store, type SlackSyncEntry, type SlackSyncStream } from './store.js';
 import { attributionHeader } from './inbound-context.js';
-import type { Platform } from '../shared/types.js';
+import { slackSourceRevision } from './slack-source-version.js';
+import type { Platform, SlackTranscriptMessage } from '../shared/types.js';
 
 type SyncCodex = Pick<CodexClient, 'status' | 'injectContext' | 'releaseThread'>;
 const delay = 1500;
@@ -12,6 +14,11 @@ const timestampKey = (value: string) => {
 };
 const currentTimestamp = () => `${Math.floor(Date.now() / 1000)}.${String(Date.now() % 1000).padStart(3, '0')}000`;
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : 'Не удалось синхронизировать контекст Slack.';
+
+export function slackContextItemId(codexThreadId: string, message: SlackTranscriptMessage): string {
+  return `msg_${createHash('sha256').update(JSON.stringify([codexThreadId, message.platform ?? 'slack', message.accountId,
+    message.chatId, message.threadId, message.messageId, slackSourceRevision(message)])).digest('hex').slice(0, 48)}`;
+}
 
 export function quotedEntry(entry: SlackSyncEntry): string {
   const data = JSON.stringify({ releEntryId: entry.id, ...entry.message }, null, 2).replaceAll('<', '\\u003c').replaceAll('>', '\\u003e');
@@ -139,7 +146,10 @@ export class SlackSync {
         if (!entry) { failed = true; break; }
         owned.add(stream.codexThreadId);
         try {
-          await codex.injectContext(stream.codexThreadId, entry.id, quotedEntry(entry));
+          await codex.injectContext(stream.codexThreadId, entry.id, quotedEntry(entry), {
+            itemId: slackContextItemId(stream.codexThreadId, entry.message),
+            entries: this.store.listSlackSyncReceiptEntries(entry.id).map(alias => ({ entryId: alias.id, text: quotedEntry(alias) })),
+          });
           this.store.updateSlackSyncEntry(entry.id, { state: 'applied', error: undefined, retryAt: undefined });
           const current = this.store.getSlackSyncStream(stream.id);
           if (current && this.ready(current, cutoff)) this.store.updateSlackSyncStream(stream.id, { state: 'ready', error: undefined, retryAt: undefined });

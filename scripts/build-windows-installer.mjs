@@ -42,7 +42,7 @@ try {
   const assembly = path.join(temporary, 'AssemblyInfo.cs');
   await writeFile(assembly, `using System.Reflection;\n[assembly: AssemblyTitle("Rele")]\n[assembly: AssemblyProduct("Rele")]\n[assembly: AssemblyVersion("${nativeVersion}")]\n[assembly: AssemblyFileVersion("${nativeVersion}")]\n[assembly: AssemblyInformationalVersion("${metadata.version}")]\n`);
   run(compiler, ['/nologo', '/target:winexe', '/platform:x64', '/optimize+', '/codepage:65001',
-    '/r:System.Windows.Forms.dll', '/r:System.Web.Extensions.dll', '/r:Microsoft.CSharp.dll',
+    '/r:System.Windows.Forms.dll', '/r:System.Web.Extensions.dll', '/r:System.Management.dll', '/r:Microsoft.CSharp.dll',
     `/out:${path.join(stage, 'Rele.exe')}`, path.join(root, 'scripts', 'windows', 'Rele.cs'), assembly]);
   run(compiler, ['/nologo', '/target:exe', '/platform:x64', '/optimize+', '/codepage:65001',
     '/r:System.Web.Extensions.dll', `/out:${path.join(stage, 'Rele.Codex.exe')}`,

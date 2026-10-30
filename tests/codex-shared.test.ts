@@ -404,6 +404,19 @@ describe('local Desktop native package preparation', () => {
 });
 
 describe.skipIf(process.platform === 'win32')('native shared Codex UDS lifecycle', () => {
+  it.each(['signal-intent', 'draining', 'start-intent', 'uncertain'])('does not cold-start the previous daemon during a persisted %s update', async phase => {
+    const f = await fixture(); await mkdir(f.env.RELE_DATA_DIR);
+    const file = path.join(f.env.RELE_DATA_DIR, 'codex-linux-update.json'), raw = JSON.stringify({ schema: 1, pending: { phase, owner: { codexHome: f.home } } });
+    await writeFile(file, raw, { mode: 0o600 });
+    await expect(ensureSharedCodex(f.target, f.options)).rejects.toMatchObject({ code: 'shared-linux-update-pending' });
+    expect(f.run).not.toHaveBeenCalled(); expect(f.discover).not.toHaveBeenCalled(); expect(await readFile(file, 'utf8')).toBe(raw);
+  });
+  it.each(['ready', 'verified'])('keeps the ordinary daemon attachment for a same-home %s journal', async phase => {
+    const f = await fixture(); await mkdir(f.env.RELE_DATA_DIR);
+    await writeFile(path.join(f.env.RELE_DATA_DIR, 'codex-linux-update.json'), JSON.stringify({ schema: 1, pending: { phase, owner: { codexHome: f.home } } }), { mode: 0o600 });
+    expect(await ensureSharedCodex(f.target, f.options)).toMatchObject({ transport: 'proxy', endpoint: f.socketPath });
+    expect(f.run.mock.calls.some(([, args]) => args.at(-1) === 'start')).toBe(false);
+  });
   it.each(['read-only', 'healthy'])('keeps Desktop package preparation out of %s resolution', async operation => {
     const f = await fixture(), desktop = await desktopFixture(path.join(f.home, 'desktop'));
     f.discovery.recommendedManaged = { ...f.target, executable: desktop, transport: 'managed' };

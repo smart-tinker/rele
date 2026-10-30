@@ -1,9 +1,10 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname, posix, resolve, win32 } from 'node:path';
 import { DatabaseSync, backup as backupDatabase, type SQLOutputValue } from 'node:sqlite';
 import { isLocalWorkspace } from './config.js';
 import { messageToolOperationId, MessageToolValidationError } from '../shared/message-tool.js';
+import { inboundSourceRevision, slackSourceRevision } from './slack-source-version.js';
 import type { Approval, AutoLinkIntent, AutoLinkRule, Binding, Conversation, Delivery, Endpoint, InboundMessage, Origin, Person, Platform, ReleRequest, SlackTranscriptMessage, SourceAccess, SourceRoute } from '../shared/types.js';
 
 type Row = Record<string, SQLOutputValue>;
@@ -23,6 +24,7 @@ export interface SlackSyncEntry {
   requestId?: string;
   state: 'pending' | 'applying' | 'applied' | 'uncertain';
   error?: string; retryAt?: string; createdAt: string; updatedAt: string;
+  canonicalEntryId?: string;
 }
 export interface SteeringInput {
   id: string; parentRequestId: string; turnId: string; requestId?: string; entryId?: string; text: string;
@@ -160,6 +162,21 @@ const MIGRATIONS = [String.raw`
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(thread_id,call_id)
   ) STRICT;
   CREATE INDEX tool_outbox_pending ON tool_outbox(status,next_attempt_at);
+`, String.raw`
+  ALTER TABLE slack_sync_entries ADD COLUMN semantic_revision TEXT;
+  ALTER TABLE slack_sync_entries ADD COLUMN canonical_entry_id TEXT REFERENCES slack_sync_entries(id);
+  CREATE UNIQUE INDEX slack_sync_semantic_source ON slack_sync_entries(stream_id,message_id,semantic_revision)
+    WHERE canonical_entry_id IS NULL;
+  CREATE INDEX slack_sync_aliases ON slack_sync_entries(canonical_entry_id);
+  CREATE TABLE inbound_source_versions (
+    platform TEXT NOT NULL, account_id TEXT NOT NULL, event_id TEXT NOT NULL,
+    endpoint_id TEXT NOT NULL REFERENCES endpoints(id), message_id TEXT NOT NULL, revision TEXT NOT NULL,
+    canonical_event_id TEXT NOT NULL,
+    PRIMARY KEY(platform,account_id,event_id),
+    FOREIGN KEY(platform,account_id,canonical_event_id) REFERENCES inbound_events(platform,account_id,event_id)
+  ) STRICT;
+  CREATE UNIQUE INDEX inbound_semantic_source ON inbound_source_versions(platform,account_id,endpoint_id,message_id,revision)
+    WHERE event_id=canonical_event_id;
 `];
 
 function required(value: string, label: string): void {
@@ -220,11 +237,6 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value, (_key, item: unknown) => item && typeof item === 'object' && !Array.isArray(item)
     ? Object.fromEntries(Object.keys(item).sort().map(key => [key, (item as Record<string, unknown>)[key]])) : item);
 }
-function slackRevision(message: SlackTranscriptMessage): string {
-  return createHash('sha256').update(stableJson({ kind: message.kind === 'deleted' ? 'deleted' : 'message',
-    senderId: message.sender.id, text: message.text, edited: (message.payload.edited as { ts?: unknown } | undefined)?.ts,
-    files: message.payload.files, attachments: message.payload.attachments, blocks: message.payload.blocks })).digest('hex');
-}
 function slackMessageOrder(value: string): string {
   const match = /^(\d+)\.(\d+)$/u.exec(value);
   return match ? `${match[1].padStart(20, '0')}.${match[2].padEnd(12, '0')}` : value;
@@ -240,7 +252,8 @@ function toSlackSyncEntry(r: Row): SlackSyncEntry {
   return { id: r.id as string, streamId: r.stream_id as string, message: json(r.message), messageId: r.message_id as string,
     revision: r.revision as string, requestId: optional(r.request_id),
     state: r.state as SlackSyncEntry['state'], error: optional(r.error), retryAt: optional(r.retry_at),
-    createdAt: r.created_at as string, updatedAt: r.updated_at as string };
+    createdAt: r.created_at as string, updatedAt: r.updated_at as string,
+    ...(r.canonical_entry_id ? { canonicalEntryId: r.canonical_entry_id as string } : {}) };
 }
 function toApproval(r: Row): Approval {
   return { id: r.id as string, requestId: r.request_id as string, turnId: r.turn_id as string, itemId: r.item_id as string,
@@ -270,6 +283,7 @@ export class Store {
       this.transaction(() => {
         for (let index = version; index < MIGRATIONS.length; index++) {
           this.db.exec(MIGRATIONS[index]);
+          if (index === 7) this.migrateSourceVersions();
           this.db.exec(`PRAGMA user_version = ${index + 1};`);
         }
         this.db.exec(`PRAGMA application_id = ${APPLICATION_ID};`);
@@ -286,6 +300,35 @@ export class Store {
 
   close(): void {
     if (!this.closed) { this.db.close(); this.closed = true; }
+  }
+
+  /** Runs once inside the schema transaction: raw rows and their receipt text never change. */
+  private migrateSourceVersions(): void {
+    const groups = new Map<string, { revision: string; rows: Row[] }>();
+    for (const row of this.db.prepare(`SELECT e.*,s.endpoint_id,s.account_id,s.chat_id,s.thread_id FROM slack_sync_entries e
+      JOIN slack_sync_streams s ON s.id=e.stream_id ORDER BY CASE e.state WHEN 'applied' THEN 0 WHEN 'uncertain' THEN 1 WHEN 'applying' THEN 1 ELSE 2 END,e.rowid`).all()) {
+      const message = json<SlackTranscriptMessage>(row.message);
+      if (message.endpointId !== row.endpoint_id || message.accountId !== row.account_id || message.chatId !== row.chat_id
+        || message.threadId !== row.thread_id || message.messageId !== row.message_id) throw new Error('Slack source version origin does not match its stream');
+      const revision = slackSourceRevision(message), key = JSON.stringify([row.stream_id, row.message_id, revision]);
+      const group = groups.get(key) ?? { revision, rows: [] }; group.rows.push(row); groups.set(key, group);
+    }
+    const update = this.db.prepare('UPDATE slack_sync_entries SET semantic_revision=?,canonical_entry_id=? WHERE id=?');
+    for (const { revision, rows } of groups.values()) {
+      const winner = rows[0].id;
+      for (const row of rows.slice(1)) update.run(revision, winner, row.id);
+      update.run(revision, null, winner);
+    }
+    const canonical = new Map<string, string>();
+    const insert = this.db.prepare(`INSERT INTO inbound_source_versions(platform,account_id,event_id,endpoint_id,message_id,revision,canonical_event_id) VALUES (?,?,?,?,?,?,?)`);
+    for (const row of this.db.prepare('SELECT * FROM inbound_events ORDER BY rowid').all()) {
+      const message = json<InboundMessage>(row.payload), revision = inboundSourceRevision(message);
+      if (message.endpoint.platform !== row.platform || message.endpoint.accountId !== row.account_id || message.endpoint.id !== row.endpoint_id
+        || message.eventId !== row.event_id) throw new Error('Inbound source version origin does not match its receipt');
+      const key = JSON.stringify([row.platform, row.account_id, row.endpoint_id, message.messageId, revision]);
+      const event = canonical.get(key) ?? row.event_id as string; canonical.set(key, event);
+      insert.run(row.platform, row.account_id, row.event_id, row.endpoint_id, message.messageId, revision, event);
+    }
   }
 
   private transaction<T>(action: () => T): T {
@@ -643,14 +686,20 @@ export class Store {
     const stream = this.getSlackSyncStream(streamId);
     if (!stream || stream.endpointId !== message.endpointId || stream.accountId !== message.accountId || stream.chatId !== message.chatId || stream.threadId !== message.threadId) throw new Error('Slack transcript origin does not match the sync stream');
     if (requestId && this.getRequest(requestId)?.conversationId !== stream.conversationId) throw new Error('Slack transcript request belongs to another conversation');
-    const revision = slackRevision(message);
+    const revision = slackSourceRevision(message);
+    const previous = this.db.prepare('SELECT * FROM slack_sync_entries WHERE stream_id=? AND message_id=? AND semantic_revision=? AND canonical_entry_id IS NULL')
+      .get(streamId, message.messageId, revision);
+    if (previous) {
+      if (requestId && !previous.request_id) this.db.prepare('UPDATE slack_sync_entries SET request_id=? WHERE id=?').run(requestId, previous.id);
+      return this.getSlackSyncEntry(previous.id as string)!;
+    }
     const id = randomUUID(); const now = new Date().toISOString();
-    this.db.prepare(`INSERT INTO slack_sync_entries (id,stream_id,message_id,message_order,revision,message,request_id,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(stream_id,message_id,revision) DO UPDATE SET request_id=COALESCE(slack_sync_entries.request_id,excluded.request_id)`)
+    this.db.prepare(`INSERT INTO slack_sync_entries (id,stream_id,message_id,message_order,revision,semantic_revision,message,request_id,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`)
       .run(id, streamId, message.messageId, slackMessageOrder(message.platform === 'telegram'
         ? `${Math.floor(Date.parse(message.receivedAt ?? now) / 1000)}.${String(Date.parse(message.receivedAt ?? now) % 1000).padStart(3, '0')}000`
-        : message.messageId), revision, JSON.stringify(message), requestId ?? null, now, now);
-    return toSlackSyncEntry(this.db.prepare('SELECT * FROM slack_sync_entries WHERE stream_id=? AND message_id=? AND revision=?').get(streamId, message.messageId, revision)!);
+        : message.messageId), revision, revision, JSON.stringify(message), requestId ?? null, now, now);
+    return this.getSlackSyncEntry(id)!;
   }
   private recordSlackMessageInside(message: SlackTranscriptMessage, requestId?: string): SlackSyncEntry | undefined {
     this.ensureSlackSyncStreams();
@@ -679,9 +728,16 @@ export class Store {
     const row = this.db.prepare('SELECT * FROM slack_sync_entries WHERE id=?').get(id);
     return row ? toSlackSyncEntry(row) : undefined;
   }
+  listSlackSyncReceiptEntries(id: string): SlackSyncEntry[] {
+    const entry = this.getSlackSyncEntry(id);
+    if (!entry) return [];
+    const canonical = entry.canonicalEntryId ?? entry.id;
+    return this.db.prepare(`SELECT * FROM slack_sync_entries WHERE id=? OR canonical_entry_id=? ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END,rowid`)
+      .all(canonical, canonical, canonical).map(toSlackSyncEntry);
+  }
   listSlackSyncEntries(streamId: string, options: { pending?: boolean; beforeMessageId?: string; limit?: number; offset?: number } = {}): SlackSyncEntry[] {
     const before = options.beforeMessageId === undefined ? null : slackMessageOrder(options.beforeMessageId);
-    return this.db.prepare(`SELECT * FROM slack_sync_entries WHERE stream_id=?
+    return this.db.prepare(`SELECT * FROM slack_sync_entries WHERE stream_id=? AND canonical_entry_id IS NULL
       AND (?=0 OR (state IN ('pending','uncertain') AND (retry_at IS NULL OR retry_at<=?)))
       AND (? IS NULL OR message_order<=?) ORDER BY message_order,rowid LIMIT ? OFFSET ?`)
       .all(streamId, Number(!!options.pending), new Date().toISOString(), before, before, limitValue(options.limit ?? 100), limitValue(options.offset ?? 0)).map(toSlackSyncEntry);
@@ -689,9 +745,10 @@ export class Store {
   listPendingSlackSyncEntries(conversationId: string, beforeMessageId?: string, limit = 10): SlackSyncEntry[] {
     const before = beforeMessageId === undefined ? null : slackMessageOrder(beforeMessageId);
     return this.db.prepare(`SELECT e.* FROM slack_sync_entries e JOIN slack_sync_streams s ON s.id=e.stream_id
-      WHERE s.conversation_id=? AND e.state IN ('pending','uncertain') AND (e.retry_at IS NULL OR e.retry_at<=?)
+      WHERE s.conversation_id=? AND e.canonical_entry_id IS NULL AND e.state IN ('pending','uncertain') AND (e.retry_at IS NULL OR e.retry_at<=?)
       AND NOT EXISTS(SELECT 1 FROM meta m WHERE m.key LIKE 'steering-input:%'
-        AND json_extract(m.value,'$.entryId')=e.id AND json_extract(m.value,'$.state')<>'refused')
+        AND json_extract(m.value,'$.entryId') IN (SELECT id FROM slack_sync_entries WHERE id=e.id OR canonical_entry_id=e.id)
+        AND json_extract(m.value,'$.state')<>'refused')
       AND (? IS NULL OR e.message_order<=?) ORDER BY e.message_order,e.rowid LIMIT ?`)
       .all(conversationId, new Date().toISOString(), before, before, limitValue(limit)).map(toSlackSyncEntry);
   }
@@ -700,12 +757,12 @@ export class Store {
   }
   hasPendingSlackSyncEntries(streamId: string, beforeMessageId?: string): boolean {
     const before = beforeMessageId === undefined ? null : slackMessageOrder(beforeMessageId);
-    return !!this.db.prepare(`SELECT 1 FROM slack_sync_entries WHERE stream_id=?
+    return !!this.db.prepare(`SELECT 1 FROM slack_sync_entries WHERE stream_id=? AND canonical_entry_id IS NULL
       AND state<>'applied' AND (? IS NULL OR message_order<=?) LIMIT 1`).get(streamId, before, before);
   }
   getSlackSyncCounts(streamId: string): Record<SlackSyncEntry['state'], number> {
     const counts: Record<SlackSyncEntry['state'], number> = { pending: 0, applying: 0, applied: 0, uncertain: 0 };
-    for (const row of this.db.prepare('SELECT state,COUNT(*) AS count FROM slack_sync_entries WHERE stream_id=? GROUP BY state').all(streamId)) counts[row.state as SlackSyncEntry['state']] = Number(row.count);
+    for (const row of this.db.prepare('SELECT state,COUNT(*) AS count FROM slack_sync_entries WHERE stream_id=? AND canonical_entry_id IS NULL GROUP BY state').all(streamId)) counts[row.state as SlackSyncEntry['state']] = Number(row.count);
     return counts;
   }
   updateSlackSyncEntry(id: string, patch: Partial<Pick<SlackSyncEntry, 'state' | 'requestId' | 'error' | 'retryAt'>>): SlackSyncEntry {
@@ -726,9 +783,10 @@ export class Store {
     return this.transaction(() => {
       const now = new Date().toISOString();
       const result = this.db.prepare(`UPDATE slack_sync_entries SET state='applying',updated_at=? WHERE id=?
-        AND state IN ('pending','uncertain') AND (retry_at IS NULL OR retry_at<=?)
+        AND canonical_entry_id IS NULL AND state IN ('pending','uncertain') AND (retry_at IS NULL OR retry_at<=?)
         AND NOT EXISTS(SELECT 1 FROM meta m WHERE m.key LIKE 'steering-input:%'
-          AND json_extract(m.value,'$.entryId')=slack_sync_entries.id AND json_extract(m.value,'$.state')<>'refused')
+          AND json_extract(m.value,'$.entryId') IN (SELECT member.id FROM slack_sync_entries member WHERE member.id=slack_sync_entries.id OR member.canonical_entry_id=slack_sync_entries.id)
+          AND json_extract(m.value,'$.state')<>'refused')
         AND EXISTS(SELECT 1 FROM slack_sync_streams s JOIN conversations c ON c.id=s.conversation_id
           WHERE s.id=slack_sync_entries.stream_id AND c.paused=0)`).run(now, id, now);
       return result.changes ? this.getSlackSyncEntry(id) : undefined;
@@ -740,8 +798,23 @@ export class Store {
     const endpoint = message.endpoint;
     if (message.slack && (endpoint.platform !== 'slack' || message.slack.endpointId !== endpoint.id || message.slack.accountId !== endpoint.accountId
       || message.slack.chatId !== endpoint.chatId || message.slack.threadId !== endpoint.threadId || message.slack.messageId !== message.messageId || message.slack.sender.id !== message.sender.id)) throw new Error('Slack transcript origin does not match the inbound event');
-    const event = this.db.prepare('SELECT request_id,payload FROM inbound_events WHERE platform=? AND account_id=? AND event_id=?')
-      .get(endpoint.platform, endpoint.accountId, message.eventId);
+    let event = this.db.prepare('SELECT request_id,payload FROM inbound_events WHERE platform=? AND account_id=? AND event_id=?')
+      .get(endpoint.platform, endpoint.accountId, message.eventId)
+      ?? this.db.prepare(`SELECT e.request_id,e.payload FROM inbound_source_versions v JOIN inbound_events e
+        ON e.platform=v.platform AND e.account_id=v.account_id AND e.event_id=v.canonical_event_id
+        WHERE v.platform=? AND v.account_id=? AND v.event_id=?`).get(endpoint.platform, endpoint.accountId, message.eventId);
+    const revision = inboundSourceRevision(message);
+    if (!event) {
+      const canonical = this.db.prepare(`SELECT v.canonical_event_id,e.request_id,e.payload FROM inbound_source_versions v JOIN inbound_events e
+        ON e.platform=v.platform AND e.account_id=v.account_id AND e.event_id=v.canonical_event_id
+        WHERE v.platform=? AND v.account_id=? AND v.endpoint_id=? AND v.message_id=? AND v.revision=? AND v.event_id=v.canonical_event_id`)
+        .get(endpoint.platform, endpoint.accountId, endpoint.id, message.messageId, revision);
+      if (canonical) {
+        this.db.prepare(`INSERT INTO inbound_source_versions(platform,account_id,event_id,endpoint_id,message_id,revision,canonical_event_id) VALUES (?,?,?,?,?,?,?)`)
+          .run(endpoint.platform, endpoint.accountId, message.eventId, endpoint.id, message.messageId, revision, canonical.canonical_event_id);
+        event = canonical;
+      }
+    }
     if (event) {
       const requestId = optional(event.request_id);
       const original = json<InboundMessage>(event.payload).slack;
@@ -755,6 +828,8 @@ export class Store {
       ...(message.slack ? { slack: { ...message.slack, participants } } : {}) };
     this.db.prepare('INSERT INTO inbound_events (platform,account_id,event_id,endpoint_id,payload,created_at) VALUES (?,?,?,?,?,?)')
       .run(endpoint.platform, endpoint.accountId, message.eventId, endpoint.id, JSON.stringify(saved), now);
+    this.db.prepare(`INSERT INTO inbound_source_versions(platform,account_id,event_id,endpoint_id,message_id,revision,canonical_event_id) VALUES (?,?,?,?,?,?,?)`)
+      .run(endpoint.platform, endpoint.accountId, message.eventId, endpoint.id, message.messageId, revision, message.eventId);
     if (!message.control) this.recordSlackMessageInside(saved.slack ?? { platform: endpoint.platform, receivedAt: now,
       endpointId: endpoint.id, accountId: endpoint.accountId, chatId: endpoint.chatId, threadId: endpoint.threadId,
       messageId: message.messageId, sender: message.sender, participants, text: message.text,
@@ -1075,16 +1150,20 @@ export class Store {
         const original = saved.slack ?? { platform: saved.endpoint.platform, endpointId: saved.endpoint.id, accountId: saved.endpoint.accountId,
           chatId: saved.endpoint.chatId, threadId: saved.endpoint.threadId, messageId: saved.messageId, sender: saved.sender,
           text: saved.text, payload: { text: saved.text }, kind: 'message' as const };
-        const matches = (value: SlackSyncEntry) => value.state === 'pending' && value.requestId === child.id && sameEntrySource(value)
+        const matches = (value: SlackSyncEntry) => !value.canonicalEntryId && value.state === 'pending' && value.requestId === child.id && sameEntrySource(value)
           && value.messageId === child.origin.messageId && value.message.sender.id === child.origin.senderId
-          && value.message.text === child.text && value.revision === slackRevision(original);
+          && value.message.text === child.text && slackSourceRevision(value.message) === slackSourceRevision(original);
         if (candidate.entryId && (!entry || !matches(entry))) throw new Error('Steering journal entry does not match the immutable request revision');
-        if (!candidate.entryId) entry = this.db.prepare('SELECT * FROM slack_sync_entries WHERE request_id=? ORDER BY rowid').all(child.id).map(toSlackSyncEntry).find(matches);
-      } else if (!entry || entry.state !== 'pending' || entry.requestId || !sameEntrySource(entry)) {
+        if (!candidate.entryId) entry = this.db.prepare('SELECT * FROM slack_sync_entries WHERE request_id=? AND canonical_entry_id IS NULL ORDER BY rowid').all(child.id).map(toSlackSyncEntry).find(matches);
+      } else if (!entry || entry.canonicalEntryId || entry.state !== 'pending' || entry.requestId || !sameEntrySource(entry)) {
         throw new Error('Steering journal entry is not pending context from the same source');
       }
       const input: SteeringInput = { id: candidate.id, parentRequestId: parentId, turnId: parent.turnId, text: candidate.text, state: 'sending',
         ...(child ? { requestId: child.id } : {}), ...(entry ? { entryId: entry.id } : {}) };
+      if (entry && this.db.prepare(`SELECT 1 FROM meta m WHERE m.key LIKE 'steering-input:%' AND json_extract(m.value,'$.state')<>'refused'
+        AND json_extract(m.value,'$.entryId') IN (SELECT id FROM slack_sync_entries WHERE id=? OR canonical_entry_id=?) LIMIT 1`).get(entry.id, entry.id)) {
+        throw new Error('This source version already belongs to a steering operation; reconcile without replay');
+      }
       const index = this.steeringInputs(parentId).map(value => value.id);
       this.setMeta(`steering-input:${input.id}`, JSON.stringify(input));
       this.setMeta(`steering-inputs:${parentId}`, JSON.stringify([...index, input.id]));

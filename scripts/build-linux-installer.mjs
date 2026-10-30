@@ -16,6 +16,8 @@ await rm(packageRoot, { recursive: true, force: true });
 for (const directory of ['DEBIAN', 'opt', 'usr/bin', 'usr/lib/systemd/system']) await mkdir(path.join(packageRoot, directory), { recursive: true });
 await cp(stage, path.join(packageRoot, 'opt/rele'), { recursive: true, verbatimSymlinks: true });
 await copyFile(path.join(root, 'scripts/linux-service.mjs'), path.join(packageRoot, 'opt/rele/scripts/linux-service.mjs'));
+await mkdir(path.join(packageRoot, 'opt/rele/scripts/linux'), { recursive: true });
+await copyFile(path.join(root, 'scripts/linux/rele-codex-signal.py'), path.join(packageRoot, 'opt/rele/scripts/linux/rele-codex-signal.py'));
 for (const file of ['rele', 'rele-codex', 'rele.service', 'rele-codex.service', 'rele-codex.timer', 'postinst', 'prerm', 'postrm']) {
   const unit = /\.(service|timer)$/u.test(file);
   const destination = file.startsWith('rele') ? (unit ? `usr/lib/systemd/system/${file}` : `usr/bin/${file}`) : `DEBIAN/${file}`;
@@ -24,7 +26,7 @@ for (const file of ['rele', 'rele-codex', 'rele.service', 'rele-codex.service', 
 }
 const size = spawnSync('du', ['-sk', path.join(packageRoot, 'opt')], { encoding: 'utf8' });
 if (size.status !== 0) throw new Error('Cannot calculate Debian installed size.');
-await writeFile(path.join(packageRoot, 'DEBIAN/control'), `Package: rele\nVersion: ${version}\nSection: utils\nPriority: optional\nArchitecture: amd64\nMaintainer: smart-tinker <maintainers@example.invalid>\nDepends: libc6 (>= 2.28), libstdc++6, systemd, util-linux\nInstalled-Size: ${Number(size.stdout.split(/\s/u)[0])}\nHomepage: https://github.com/smart-tinker/rele\nDescription: Local Slack and Telegram gateway for shared Codex conversations\n Includes the Node.js runtime. Runs as the selected Codex owner.\n Application removal preserves that user's configuration and conversations.\n`);
+await writeFile(path.join(packageRoot, 'DEBIAN/control'), `Package: rele\nVersion: ${version}\nSection: utils\nPriority: optional\nArchitecture: amd64\nMaintainer: smart-tinker <maintainers@example.invalid>\nDepends: libc6 (>= 2.28), libstdc++6, systemd, util-linux, python3 (>= 3.9)\nInstalled-Size: ${Number(size.stdout.split(/\s/u)[0])}\nHomepage: https://github.com/smart-tinker/rele\nDescription: Local Slack and Telegram gateway for shared Codex conversations\n Includes the Node.js runtime. Runs as the selected Codex owner.\n Application removal preserves that user's configuration and conversations.\n`);
 // The public root-owned payload must not inherit private build-checkout permissions.
 const pending = [packageRoot];
 while (pending.length) {

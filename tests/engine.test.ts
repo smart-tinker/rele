@@ -142,7 +142,7 @@ function fixture(options: { path?: string; start?: boolean; initialized?: boolea
     conversation: store.listConversations()[0],
     message(platform: Platform, eventId = '1', overrides: Partial<InboundMessage> = {}): InboundMessage {
       const endpoint = eps[platform];
-      return { eventId, endpoint, sender: endpoint.people[0], messageId: platform === 'slack' ? `170001.${String([...eventId].reduce((sum, char) => sum * 31 + char.charCodeAt(0), 0) >>> 0).slice(-6).padStart(6, '0')}` : `${platform}-message-${eventId}`, text: `${platform} task ${eventId}`, ...overrides };
+      return { eventId, endpoint, sender: endpoint.people[0], messageId: platform === 'slack' ? `170001.${String([...eventId].reduce((sum, char) => Math.imul(sum, 31) + char.charCodeAt(0), 0) >>> 0).slice(-6).padStart(6, '0')}` : `${platform}-message-${eventId}`, text: `${platform} task ${eventId}`, ...overrides };
     } };
 }
 
@@ -828,6 +828,22 @@ describe('Engine correlation and queue', () => {
     expect(f.store.listDeliveries()).toMatchObject([{ kind: 'error', body: error }]);
     expect(JSON.stringify(f.store.listDeliveries())).not.toContain('synthetic-secret');
     expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['contextWindowExceeded', 'Контекст разговора превысил лимит модели.'],
+    ['contextCompactionFailed', 'Автоматическое сжатие контекста Codex завершилось ошибкой: превышен лимит модели.'],
+  ] as const)('reports %s without retrying, compacting or replacing the original conversation', async (failureReason, error) => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture(), request = await acceptRequest(f); await running(f, request);
+    f.codex.locations.set(request.id, { state: 'failed', turnId: 'turn-1', failureReason });
+    await f.engine.reconcile(request.id); await f.engine.pump();
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'failed', turnId: 'turn-1', error });
+    expect(f.store.listDeliveries()).toMatchObject([{ kind: 'error', body: error, status: 'sent' }]);
+    vi.setSystemTime(Date.now() + 300_000); await f.engine.pump();
+    expect(f.codex.retryOverloaded).not.toHaveBeenCalled(); expect(f.codex.createThread).not.toHaveBeenCalled();
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1); expect(f.codex.startQueued).not.toHaveBeenCalled();
+    expect(f.store.getMeta(`overload-retry:${request.id}`)).toBeUndefined();
   });
 
   it('never enqueues again after a lost acknowledgement and recovers accepted work by its UUID', async () => {

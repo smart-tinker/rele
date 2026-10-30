@@ -109,9 +109,9 @@ async function managedFixture(options: {
   return { client, executable, directory, discover, records, calls };
 }
 
-async function fixture(handlers: Record<string, Handler> = {}, codexHome?: string) {
+async function fixture(handlers: Record<string, Handler> = {}, codexHome?: string, options: NonNullable<ConstructorParameters<typeof CodexClient>[1]> = {}, autoPong = true) {
   const calls: Rpc[] = [], responses: Rpc[] = [], sockets: WebSocket[] = [];
-  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0, autoPong });
   await once(server, 'listening');
   cleanup.push(async () => {
     for (const socket of server.clients) socket.terminate();
@@ -140,7 +140,7 @@ async function fixture(handlers: Record<string, Handler> = {}, codexHome?: strin
     });
   });
   const endpoint = `ws://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  const client = new CodexClient({ transport: 'websocket', executable: 'codex', endpoint, codexHome });
+  const client = new CodexClient({ transport: 'websocket', executable: 'codex', endpoint, codexHome }, options);
   cleanup.push(() => client.close());
   return { client, calls, responses, sockets, handlers, endpoint };
 }
@@ -152,6 +152,103 @@ async function until(predicate: () => boolean): Promise<void> {
     await new Promise(resolve => setTimeout(resolve, 10));
   }
 }
+
+describe('Codex socket health', () => {
+  it('invalidates a socket without matching pongs, preserves another client and permits a fresh connection', async () => {
+    const f = await fixture({}, undefined, { heartbeatIntervalMs: 20, heartbeatTimeoutMs: 60 }, false);
+    await f.client.connect();
+    const first = f.sockets[0], peer = new WebSocket(f.endpoint); cleanup.push(() => peer.terminate()); await once(peer, 'open');
+    await until(() => !f.client.status().connected);
+    expect(f.client.status()).toMatchObject({ connected: false, queueSupported: false, errorCode: 'heartbeat-timeout' });
+    expect(peer.readyState).toBe(WebSocket.OPEN);
+    await f.client.connect();
+    expect(f.client.status()).toMatchObject({ connected: true, queueSupported: true, errorCode: undefined });
+    expect(f.sockets.at(-1)).not.toBe(first);
+    expect(f.calls.filter(call => call.method === 'initialize')).toHaveLength(2);
+    expect(f.calls.some(call => ['turn/start', 'turn/interrupt', 'thread/queue/add'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it('keeps a quiet long-running connection and pending question alive while pongs arrive, then cleans up on close', async () => {
+    const f = await fixture({}, undefined, { heartbeatIntervalMs: 20, heartbeatTimeoutMs: 60 }); await f.client.connect();
+    const socket = f.sockets[0]; let pings = 0; socket.on('ping', () => pings++);
+    socket.send(JSON.stringify({ id: 'long-turn-question', method: 'item/tool/requestUserInput', params: { threadId } }));
+    await until(() => f.client.hasPendingRequest('long-turn-question'));
+    await new Promise(resolve => setTimeout(resolve, 180));
+    expect(pings).toBeGreaterThanOrEqual(3); expect(f.sockets).toHaveLength(1);
+    expect(f.client.status()).toMatchObject({ connected: true, queueSupported: true });
+    await f.client.respond('long-turn-question', { answers: {} }); await until(() => f.responses.length === 1);
+    const closed = once(socket, 'close'); await f.client.close(); await closed; const count = pings;
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(pings).toBe(count); expect(f.sockets).toHaveLength(1); expect(f.client.status().connected).toBe(false);
+  });
+
+  it('marks an unanswered mutation uncertain and disconnects after one failed application probe even while pongs arrive', async () => {
+    const clientId = randomUUID(), f = await fixture({ 'thread/queue/add': () => noResponse, 'server/diagnostics': () => noResponse }, undefined,
+      { rpcTimeoutMs: 30, heartbeatIntervalMs: 15, heartbeatTimeoutMs: 80 });
+    await f.client.connect();
+    await expect(f.client.enqueue(threadId, 'Accepted input with lost ACK', clientId)).rejects.toMatchObject({ uncertain: true, code: 'rpc-timeout' });
+    expect(f.client.status()).toMatchObject({ connected: true, queueSupported: false, errorCode: 'rpc-timeout' });
+    await until(() => !f.client.status().connected);
+    expect(f.client.status().errorCode).toBe('rpc-health-timeout');
+    expect(f.calls.filter(call => call.method === 'server/diagnostics')).toHaveLength(1);
+    f.handlers['thread/queue/list'] = () => ({ data: [{ id: 'native-accepted', clientUserMessageId: clientId }], nextCursor: null });
+    await f.client.connect();
+    expect(await f.client.findRequest(threadId, clientId)).toEqual({ state: 'queued', queuedSubmissionId: 'native-accepted', soleQueuedSubmission: true });
+    expect(f.calls.filter(call => call.method === 'thread/queue/add')).toHaveLength(1);
+    expect(f.calls.some(call => ['turn/start', 'thread/queue/start', 'turn/interrupt'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it('preserves the same socket and pending question after a healthy timeout probe without replaying the mutation', async () => {
+    let confirm!: (value: unknown) => void;
+    const answer = new Promise(resolve => { confirm = resolve; });
+    const f = await fixture({ 'thread/queue/add': () => noResponse, 'server/diagnostics': () => answer }, undefined,
+      { rpcTimeoutMs: 30, heartbeatIntervalMs: 20, heartbeatTimeoutMs: 200 });
+    await f.client.connect(); const socket = f.sockets[0];
+    socket.send(JSON.stringify({ id: 'retained-question', method: 'item/tool/requestUserInput', params: { threadId } }));
+    await until(() => f.client.hasPendingRequest('retained-question'));
+    await expect(f.client.enqueue(threadId, 'Slow mutation', randomUUID())).rejects.toMatchObject({ code: 'rpc-timeout' });
+    expect(f.client.status().queueSupported).toBe(false);
+    await expect(f.client.enqueue(threadId, 'Next input', randomUUID())).rejects.toThrow('приостановлены');
+    confirm({ process: { id: 42 } });
+    await until(() => f.client.status().queueSupported);
+    expect(f.client.status()).toMatchObject({ connected: true, error: undefined, errorCode: undefined });
+    expect(f.client.hasPendingRequest('retained-question')).toBe(true);
+    await f.client.respond('retained-question', { answers: {} });
+    expect(f.sockets).toHaveLength(1); expect(socket.readyState).toBe(WebSocket.OPEN);
+    expect(f.calls.filter(call => call.method === 'thread/queue/add')).toHaveLength(1);
+    expect(f.calls.filter(call => call.method === 'server/diagnostics')).toHaveLength(1);
+  });
+
+  it('shares one bounded health probe across concurrent RPC timeouts', async () => {
+    const f = await fixture({ 'server/diagnostics': () => noResponse }, undefined,
+      { rpcTimeoutMs: 30, heartbeatIntervalMs: 15, heartbeatTimeoutMs: 80 });
+    await f.client.connect(); f.handlers['thread/read'] = f.handlers['thread/list'] = () => noResponse;
+    const outcomes = await Promise.allSettled([f.client.readThread(threadId), f.client.listThreads()]);
+    expect(outcomes.every(outcome => outcome.status === 'rejected' && outcome.reason instanceof CodexTransportError)).toBe(true);
+    await until(() => !f.client.status().connected);
+    expect(f.calls.filter(call => call.method === 'server/diagnostics')).toHaveLength(1);
+  });
+
+  it('preserves a newer capability failure on the same socket when the healthy probe completes', async () => {
+    let confirm!: (value: unknown) => void;
+    const answer = new Promise(resolve => { confirm = resolve; }), createdId = randomUUID();
+    const f = await fixture({ 'thread/read': () => noResponse, 'server/diagnostics': () => answer,
+      'thread/start': () => ({ thread: { ...rawThread, id: createdId } }),
+      'thread/queue/list': (message, socket) => {
+        if (message.params.threadId !== createdId) return { data: [], nextCursor: null };
+        socket.send(JSON.stringify({ id: message.id, error: { code: -32601, message: 'Queue unsupported for this runtime' } })); return noResponse;
+      },
+    }, undefined, { rpcTimeoutMs: 30, heartbeatIntervalMs: 20, heartbeatTimeoutMs: 200 });
+    await f.client.connect();
+    await expect(f.client.readThread(threadId)).rejects.toMatchObject({ code: 'rpc-timeout' });
+    expect(f.client.status().queueSupported).toBe(false);
+    expect(await f.client.createThread('/new-project')).toBe(createdId);
+    const newer = f.client.status();
+    expect(newer).toMatchObject({ connected: true, queueSupported: false, error: expect.stringContaining('не предоставляет очередь') });
+    confirm({ process: { id: 42 } }); await f.client.diagnostics();
+    expect(f.client.status()).toEqual(newer); expect(f.sockets).toHaveLength(1);
+  });
+});
 
 describe('Codex native shared policy', () => {
   async function sharedFixture(implicitProfile = false) {
@@ -166,6 +263,22 @@ describe('Codex native shared policy', () => {
     cleanup.push(() => client.close());
     return { ...f, client, peer: f.client, target, shared, home };
   }
+
+  it('keeps the post-update expected version enforced across reconnects before any catalog, plugin or queue work', async () => {
+    const f = await sharedFixture();
+    const setupPlugin = vi.fn(async () => {});
+    const client = new CodexClient(f.target, { shared: f.shared, expectedVersion: '0.166.0-alpha.5.1', setupPlugin });
+    cleanup.push(() => client.close());
+    await expect(client.connect()).rejects.toMatchObject({ code: 'update-version-mismatch' });
+    expect(client.status()).toMatchObject({ connected: false, queueSupported: false });
+    expect(f.calls.map(call => call.method)).toEqual(['initialize', 'initialized']);
+    expect(setupPlugin).not.toHaveBeenCalled();
+    f.handlers.initialize = () => ({ userAgent: 'codex/0.166.0-alpha.5.1 (Fixture)', codexHome: f.home,
+      platformFamily: process.platform === 'win32' ? 'windows' : 'unix', platformOs: process.platform === 'win32' ? 'windows' : process.platform });
+    await client.connect();
+    expect(client.status()).toMatchObject({ connected: true, queueSupported: true, name: 'Codex 0.166.0-alpha.5.1' });
+    expect(f.calls.some(call => ['thread/queue/add', 'turn/start'].includes(call.method ?? ''))).toBe(false);
+  });
 
   it.each([false, true])('keeps policy stable and closes only its connection (implicit profile: %s)', async implicitProfile => {
     const f = await sharedFixture(implicitProfile);
@@ -692,6 +805,7 @@ describe('Codex shared-runtime adapter', () => {
 
   it.each([
     ['failed', 'serverOverloaded', 'serverOverloaded'],
+    ['failed', 'contextWindowExceeded', 'contextWindowExceeded'],
     ['failed', 'unknown-synthetic-secret', undefined],
     ['failed', { serverOverloaded: 'synthetic-secret' }, undefined],
     ['completed', 'serverOverloaded', undefined],
@@ -706,6 +820,32 @@ describe('Codex shared-runtime adapter', () => {
     expect(found).toEqual({ state: status, turnId: 'own-turn', text: undefined, ...(failureReason ? { failureReason } : {}) });
     expect(JSON.stringify(found)).not.toContain('synthetic-secret');
     expect(f.calls.some(call => ['turn/interrupt', 'thread/queue/add', 'thread/queue/start'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it.each([
+    ['failed', 'other', 'Your input exceeds the context window of this model. Please adjust your input and try again.', null, 'contextWindowExceeded'],
+    ['failed', 'other', 'synthetic-provider-secret: Your input exceeds the context window of this model. Please adjust your input and try again. (provider wrapper)', null, 'contextWindowExceeded'],
+    ['failed', 'other', 'Error running remote compact task: HTTP400 synthetic-provider-secret: Your input exceeds the context window of this model. Please adjust your input and try again.', null, 'contextCompactionFailed'],
+    ['failed', 'other', 'Error running remote compact task: unrelated provider failure', null, undefined],
+    ['failed', 'other', 'Provider reported an unrelated context error', null, undefined],
+    ['failed', 'other', 'Unknown provider error', '{"error":{"code":"context_length_exceeded"}}', undefined],
+    ['failed', 'badRequest', 'Your input exceeds the context window of this model. Please adjust your input and try again.', null, undefined],
+    ['completed', 'other', 'Your input exceeds the context window of this model. Please adjust your input and try again.', null, undefined],
+  ])('classifies only a failed native context error (%s/%s)', async (status, codexErrorInfo, message, additionalDetails, failureReason) => {
+    const clientId = randomUUID();
+    const f = await fixture({ 'thread/turns/list': () => ({ data: [{ id: 'context-turn', status, error: { codexErrorInfo, message, additionalDetails },
+      items: [{ type: 'userMessage', clientId }, { type: 'agentMessage', phase: 'commentary', text: 'Assistant can mention context_length_exceeded without classifying an error.' }] }], nextCursor: null }) });
+    await f.client.connect(); const found = await f.client.findRequest(threadId, clientId);
+    expect(found.failureReason).toBe(failureReason); expect(JSON.stringify(found)).not.toContain('synthetic-provider-secret');
+    expect(f.calls.some(call => ['turn/start', 'thread/queue/add', 'thread/fork', 'thread/compact/start'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it('does not interpret assistant text as a native context error', async () => {
+    const clientId = randomUUID(), message = 'Error running remote compact task: Your input exceeds the context window of this model. Please adjust your input and try again.';
+    const f = await fixture({ 'thread/turns/list': () => ({ data: [{ id: 'generic-turn', status: 'failed', error: { codexErrorInfo: 'other', message: 'Unknown error' },
+      items: [{ type: 'userMessage', clientId }, { type: 'agentMessage', phase: 'final_answer', text: message }] }], nextCursor: null }) });
+    await f.client.connect(); expect(await f.client.findRequest(threadId, clientId)).toMatchObject({ state: 'failed', text: message });
+    expect((await f.client.findRequest(threadId, clientId)).failureReason).toBeUndefined();
   });
 
   it('recovers an accepted request from queue or paginated completed history without resending', async () => {
@@ -885,7 +1025,7 @@ describe('Codex passive context', () => {
     expect(original?.params).toEqual({ threadId, excludeTurns: true });
     expect(calls.find(call => call.method === 'thread/read')?.params).toEqual({ threadId });
     expect(calls.find(call => call.method === 'thread/inject_items')?.params).toEqual({
-      threadId, items: [{ type: 'message', id: 'rele_slack_slack-entry', role: 'user', content: [{ type: 'input_text', text: 'Passive Slack transcript' }] }],
+      threadId, items: [{ type: 'message', id: expect.stringMatching(/^msg_[a-f0-9]{48}$/u), role: 'user', content: [{ type: 'input_text', text: 'Passive Slack transcript' }] }],
     });
     const methods = calls.map(call => call.method);
     expect(methods.indexOf('thread/queue/list')).toBeLessThan(methods.indexOf('thread/resume'));
@@ -984,10 +1124,41 @@ describe('Codex shared passive context receipts', () => {
     await f.client.injectContext(threadId, 'entry', 'Context');
     expect(f.calls.filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
     expect(f.calls.find(call => call.method === 'thread/inject_items')?.params).toEqual({
-      threadId, items: [{ type: 'message', id: 'rele_slack_entry', role: 'user', content: [{ type: 'input_text', text: 'Context' }] }],
+      threadId, items: [{ type: 'message', id: expect.stringMatching(/^msg_[a-f0-9]{48}$/u), role: 'user', content: [{ type: 'input_text', text: 'Context' }] }],
     });
     expect(f.calls.some(call => ['thread/start', 'thread/fork', 'turn/start', 'thread/queue/add'].includes(call.method ?? ''))).toBe(false);
-    expect(await readFile(f.rolloutPath, 'utf8')).toContain('rele_slack_entry');
+    expect(await readFile(f.rolloutPath, 'utf8')).toContain('msg_');
+    expect(await readFile(f.rolloutPath, 'utf8')).not.toContain('rele_slack_entry');
+  });
+
+  it.each(['legacy', 'msg'])('reconciles a migrated %s alias before acquiring a writer or appending', async format => {
+    const f = await sharedContextFixture(), itemId = `msg_${'b'.repeat(48)}`, oldText = 'Original quote with the old journal provenance';
+    await appendFile(f.rolloutPath, JSON.stringify({ type: 'response_item', payload: { type: 'message', id: format === 'legacy' ? 'rele_slack_old-entry' : itemId,
+      role: 'user', content: [{ type: 'input_text', text: oldText }] } }) + '\n');
+    const beforeFile = await readFile(f.rolloutPath);
+    await f.client.connect(); const before = f.calls.length;
+    await f.client.injectContext(threadId, 'canonical-entry', 'Canonical quote', { itemId, entries: [{ entryId: 'old-entry', text: oldText }] });
+    expect(f.calls.slice(before).map(call => call.method)).toEqual(['thread/read']);
+    expect(await readFile(f.rolloutPath)).toEqual(beforeFile);
+  });
+
+  it('reconciles a new-ID lost ACK even when the canonical journal entry changes', async () => {
+    const f = await sharedContextFixture({ dropAck: true }), itemId = `msg_${'c'.repeat(48)}`;
+    await f.client.connect();
+    await expect(f.client.injectContext(threadId, 'old-entry', 'Old exact quote', { itemId, entries: [] })).rejects.toBeInstanceOf(CodexTransportError);
+    await f.client.connect(); const before = f.calls.length;
+    await f.client.injectContext(threadId, 'canonical-entry', 'Canonical quote', { itemId, entries: [{ entryId: 'old-entry', text: 'Old exact quote' }] });
+    expect(f.calls.slice(before).map(call => call.method)).toEqual(['thread/read']);
+    expect(f.calls.filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
+  });
+
+  it('does not accept legacy alias provenance with another exact text', async () => {
+    const f = await sharedContextFixture(), itemId = `msg_${'d'.repeat(48)}`;
+    await appendFile(f.rolloutPath, JSON.stringify({ type: 'response_item', payload: { type: 'message', id: 'rele_slack_old-entry', role: 'user', content: [{ type: 'input_text', text: 'Another source version' }] } }) + '\n');
+    await f.client.connect();
+    await f.client.injectContext(threadId, 'canonical-entry', 'Current quote', { itemId, entries: [{ entryId: 'old-entry', text: 'Expected exact old quote' }] });
+    expect(f.calls.filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
+    expect((f.pending[0] as { id: string }).id).toBe(itemId);
   });
 
   it('reconciles a persisted injection after a lost ACK without appending it again', async () => {
@@ -1043,7 +1214,7 @@ describe('Codex shared passive context receipts', () => {
     await f.client.injectContext(threadId, 'new-slack-entry', 'New agent context');
     expect(f.calls.find(call => call.method === 'thread/turns/list')?.params).toEqual({ threadId, limit: 1, itemsView: 'summary', sortDirection: 'desc' });
     expect(f.calls.filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
-    expect(await readFile(f.rolloutPath, 'utf8')).toContain('rele_slack_new-slack-entry');
+    expect(await readFile(f.rolloutPath, 'utf8')).toContain('msg_');
     expect(previous).toEqual({ id: 'previous-turn', status, completedAt: 1793004647, error: { codexErrorInfo: 'serverOverloaded' } });
     expect(f.calls.some(call => ['thread/start', 'thread/fork', 'turn/start', 'turn/interrupt', 'thread/queue/add', 'thread/queue/start', 'thread/queue/delete'].includes(call.method ?? ''))).toBe(false);
   });

@@ -29,13 +29,17 @@ export interface CodexConfig {
 export type RpcId = string | number;
 export interface CodexNotification { method: string; params: Record<string, unknown> }
 export interface CodexServerRequest extends CodexNotification { id: RpcId }
+export interface CodexContextReceiptCandidates {
+  itemId: string;
+  entries: { entryId: string; text: string }[];
+}
 export interface RequestLocation {
   state: 'queued' | 'running' | 'completed' | 'failed' | 'interrupted' | 'not_found';
   queuedSubmissionId?: string;
   soleQueuedSubmission?: boolean;
   turnId?: string;
   text?: string;
-  failureReason?: 'serverOverloaded';
+  failureReason?: 'serverOverloaded' | 'contextWindowExceeded' | 'contextCompactionFailed';
   commentary?: { id: string; text: string }[];
   retryCount?: number;
   retryBlocked?: boolean;
@@ -59,7 +63,7 @@ export function codexCommandItem(value: unknown): CodexCommandItem | undefined {
 export interface CodexRuntime { userAgent: string; codexHome: string; platformFamily: string; platformOs: string }
 interface QueueEntry { id: string; clientUserMessageId: string }
 interface HistoryItem { type: string; id?: string; clientId?: string | null; text?: string; phase?: string | null }
-interface HistoryTurn { id: string; rootTurnId?: string | null; status: string; completedAt?: number | null; items: HistoryItem[]; error?: { codexErrorInfo?: unknown } | null }
+interface HistoryTurn { id: string; rootTurnId?: string | null; status: string; completedAt?: number | null; items: HistoryItem[]; error?: { codexErrorInfo?: unknown; message?: unknown } | null }
 interface Page<T> { data: T[]; nextCursor: string | null }
 interface RawThread {
   id: string; name?: string | null; cwd: string; preview: string; updatedAt: number;
@@ -74,6 +78,14 @@ interface PendingCall {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
+}
+
+function nativeFailureReason(error: HistoryTurn['error']): RequestLocation['failureReason'] {
+  if (error?.codexErrorInfo === 'serverOverloaded') return 'serverOverloaded';
+  const message = typeof error?.message === 'string' ? error.message : '';
+  const contextExceeded = error?.codexErrorInfo === 'contextWindowExceeded' || error?.codexErrorInfo === 'other'
+    && message.includes('Your input exceeds the context window of this model. Please adjust your input and try again.');
+  if (contextExceeded) return message.startsWith('Error running remote compact task:') ? 'contextCompactionFailed' : 'contextWindowExceeded';
 }
 
 export class CodexRpcError extends Error {
@@ -133,6 +145,8 @@ export class CodexClient extends EventEmitter {
   private releasing = new Map<string, Promise<void>>();
   private closedWaiters = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
   private reconnectTimer?: NodeJS.Timeout;
+  private heartbeatTimer?: NodeJS.Timeout;
+  private healthCheck?: { socket: WebSocket; queueSupported: boolean; error?: string; errorCode?: string };
   private connecting?: Promise<void>;
   private stopped = true;
   private retry = 0;
@@ -143,6 +157,8 @@ export class CodexClient extends EventEmitter {
   private discovery?: { at: number; result: CodexDiscoveryResult };
 
   constructor(private readonly config: CodexConfig, private readonly options: { discover?: typeof discoverCodex; shared?: typeof ensureSharedCodex; releaseTimeoutMs?: number;
+    expectedVersion?: string;
+    rpcTimeoutMs?: number; heartbeatIntervalMs?: number; heartbeatTimeoutMs?: number;
     setupPlugin?: (rpc: (method: string, params: Record<string, unknown>) => Promise<unknown>, runtime: CodexRuntime) => Promise<void> } = {}) {
     super();
     this.state = {
@@ -321,10 +337,19 @@ export class CodexClient extends EventEmitter {
   }
 
   /** Passive user context only; caller serializes this with requests and releases our writer. */
-  async injectContext(threadId: string, entryId: string, text: string): Promise<void> {
+  async injectContext(threadId: string, entryId: string, text: string, candidates?: CodexContextReceiptCandidates): Promise<void> {
     const shared = this.config.transport !== 'managed';
     if (!shared && !this.stdio) throw new Error('Управляемый Codex Rele не подключён.');
     if (!entryId.trim() || !text.trim()) throw new Error('Фоновому контексту нужны постоянный идентификатор и непустой текст.');
+    // Model-facing message IDs must use msg_; journal and legacy provenance stay unchanged.
+    const itemId = candidates?.itemId ?? `msg_${createHash('sha256').update(JSON.stringify([threadId, entryId])).digest('hex').slice(0, 48)}`;
+    if (!/^msg_[a-f0-9]{48}$/u.test(itemId) || candidates && (!Array.isArray(candidates.entries)
+      || candidates.entries.some(entry => typeof entry.entryId !== 'string' || !entry.entryId.trim() || typeof entry.text !== 'string' || !entry.text.trim()))) {
+      throw new Error('Не удалось проверить идентификаторы сохранённого контекста Codex.');
+    }
+    const receipts = [{ entryId, text }, ...(candidates?.entries ?? [])].flatMap(entry => [
+      { itemId, text: entry.text }, { itemId: `rele_slack_${entry.entryId}`, text: entry.text },
+    ]);
     this.requireQueue();
     if (!this.isVerifiedVersion()) throw new Error(`Для фонового контекста нужен проверенный Codex ${SUPPORTED_CODEX_VERSION}.`);
     const runtime = this.runtime;
@@ -347,7 +372,7 @@ export class CodexClient extends EventEmitter {
     const receipt = async () => {
       const thread = await read(); // Re-read: archive/compression can change the persisted rollout path.
       if (!home || typeof thread.path !== 'string') throw new Error('Не удалось подтвердить сохранение контекста Codex.');
-      const found = await this.contextReceipts.has({ codexHome: home, rolloutPath: thread.path, threadId, itemId: `rele_slack_${entryId}`, text });
+      const found = await this.contextReceipts.has({ codexHome: home, rolloutPath: thread.path, threadId, itemId, text, alternatives: receipts });
       current();
       return found;
     };
@@ -378,7 +403,7 @@ export class CodexClient extends EventEmitter {
     current();
     // Raw item IDs are attribution, not server idempotency keys. Never retry the RPC here.
     await this.call('thread/inject_items', {
-      threadId, items: [{ type: 'message', id: `rele_slack_${entryId}`, role: 'user', content: [{ type: 'input_text', text }] }],
+      threadId, items: [{ type: 'message', id: itemId, role: 'user', content: [{ type: 'input_text', text }] }],
     });
     if (shared && !await receipt()) throw new Error('Codex принял контекст, но сохранённая запись пока не подтверждена. Контекст остаётся в ожидании.');
   }
@@ -601,6 +626,7 @@ export class CodexClient extends EventEmitter {
     const mixed = turn.items.some(item => item.type === 'userMessage' && (typeof item.clientId !== 'string' || !known.has(item.clientId)));
     const state = turn.status === 'inProgress' ? 'running' : turn.status;
     if (!['running', 'completed', 'failed', 'interrupted'].includes(state)) throw new Error('Неизвестное состояние хода Codex.');
+    const failureReason = state === 'failed' ? nativeFailureReason(turn.error) : undefined;
     // Native history can normalize a live snapshot to interrupted without a terminal event.
     if (state === 'interrupted' && (typeof turn.completedAt !== 'number' || !Number.isFinite(turn.completedAt))) {
       throw new CodexTransportError('Codex пока не подтвердил прерывание запроса. Ожидается сверка завершения без повторной отправки.', 'turn-interruption-unconfirmed');
@@ -614,7 +640,7 @@ export class CodexClient extends EventEmitter {
       ...(mixed ? { mixed: true } : {
         ...(commentary.length ? { commentary } : {}),
         text: answers.length ? answers.map(item => item.text || '').join('\n\n') : legacy.at(-1)?.text,
-        ...(state === 'failed' && turn.error?.codexErrorInfo === 'serverOverloaded' ? { failureReason: 'serverOverloaded' as const } : {}),
+        ...(failureReason ? { failureReason } : {}),
         ...(turn.items.some(item => codexCommandItem(item)) ? { commandItems: turn.items.flatMap(item => { const command = codexCommandItem(item); return command ? [command] : []; }) } : {}),
       }),
     };
@@ -756,7 +782,10 @@ export class CodexClient extends EventEmitter {
       catch { throw new SharedCodexError('Общий Codex использует другой профиль или платформу. Выберите исходный локальный профиль; запись остановлена.', 'shared-profile-mismatch'); }
     }
     this.version = this.runtime.userAgent.match(/\/(\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?)(?=\s|$)/u)?.[1];
+    if (this.options.expectedVersion && this.version !== this.options.expectedVersion) throw new CodexTransportError(
+      'Codex не подтвердил версию после обновления. Очередь сохранена; повторяется только подключение.', 'update-version-mismatch');
     this.setState({ name: this.version ? `Codex ${this.version}` : 'Codex', connected: true, codexHome: this.runtime.codexHome, error: undefined, errorCode: undefined });
+    if (this.socket) this.startHeartbeat(this.socket);
     if (!this.isVerifiedVersion()) {
       this.setState({ error: `Запись доступна для проверенного Codex ${SUPPORTED_CODEX_VERSIONS.join(' или ')}; подключён ${this.version || 'неизвестный runtime'}.` });
     } else {
@@ -813,13 +842,14 @@ export class CodexClient extends EventEmitter {
     return rows;
   }
 
-  private call<T = unknown>(method: string, params: Record<string, unknown>): Promise<T> {
-    const id = randomUUID();
+  private call<T = unknown>(method: string, params: Record<string, unknown>, timeoutMs = this.options.rpcTimeoutMs ?? 30_000, confirmHealth = true): Promise<T> {
+    const id = randomUUID(), socket = this.socket;
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new CodexTransportError(`Codex не подтвердил ${method} за 30 секунд; проверьте состояние перед повтором.`));
-      }, 30_000);
+        reject(new CodexTransportError(`Codex не подтвердил ${method} вовремя; проверьте состояние перед повтором.`, 'rpc-timeout'));
+        if (confirmHealth && socket && this.socket === socket && this.state.connected) this.checkSocketHealth(socket);
+      }, timeoutMs);
       timer.unref();
       this.pending.set(id, { resolve: value => resolve(value as T), reject, timer });
       void this.send({ id, method, params }).catch(error => {
@@ -880,7 +910,60 @@ export class CodexClient extends EventEmitter {
     else pending.resolve(message.result);
   }
 
+  private failSocket(socket: WebSocket, message: string, code: string): void {
+    if (this.socket !== socket) return;
+    void this.disconnect(message, code).catch(() => {});
+    this.scheduleReconnect();
+  }
+
+  private startHeartbeat(socket: WebSocket): void {
+    clearTimeout(this.heartbeatTimer);
+    let token: string | undefined;
+    const schedule = (timeout: number) => {
+      clearTimeout(this.heartbeatTimer);
+      this.heartbeatTimer = setTimeout(() => {
+        if (this.socket !== socket) return;
+        if (token) {
+          this.failSocket(socket, 'Codex не отвечает на проверку соединения. Неподтверждённые запросы требуют сверки; подключение будет повторено.', 'heartbeat-timeout');
+          return;
+        }
+        token = randomUUID();
+        try { socket.ping(token, undefined, error => { if (error) this.failSocket(socket, 'Codex не подтвердил проверку соединения.', 'heartbeat-failed'); }); }
+        catch { this.failSocket(socket, 'Codex не подтвердил проверку соединения.', 'heartbeat-failed'); }
+        if (this.socket === socket) schedule(this.options.heartbeatTimeoutMs ?? 5_000);
+      }, timeout);
+      this.heartbeatTimer.unref();
+    };
+    socket.on('pong', data => {
+      if (this.socket !== socket || !token || data.toString() !== token) return;
+      token = undefined;
+      schedule(this.options.heartbeatIntervalMs ?? 15_000);
+    });
+    schedule(this.options.heartbeatIntervalMs ?? 15_000);
+  }
+
+  private checkSocketHealth(socket: WebSocket): void {
+    if (this.healthCheck?.socket === socket) return;
+    const check = { socket, queueSupported: this.state.queueSupported, error: this.state.error, errorCode: this.state.errorCode };
+    this.healthCheck = check;
+    const pauseError = 'Codex не подтвердил запрос вовремя. Проверяется соединение; новые запросы приостановлены.';
+    this.setState({ queueSupported: false, error: pauseError, errorCode: 'rpc-timeout' });
+    void this.call<{ process?: { id?: number } }>('server/diagnostics', {}, this.options.heartbeatTimeoutMs ?? 5_000, false).then(result => {
+      if (this.socket !== socket) return;
+      const pid = result?.process?.id;
+      if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) throw new CodexTransportError('Codex не подтвердил проверку состояния.', 'rpc-health-unconfirmed');
+      if (this.healthCheck === check && !this.state.queueSupported && this.state.error === pauseError && this.state.errorCode === 'rpc-timeout') {
+        this.setState({ queueSupported: check.queueSupported, error: check.error, errorCode: check.errorCode });
+      }
+    }).catch(() => {
+      this.failSocket(socket, 'Codex не отвечает на проверку состояния. Неподтверждённые запросы требуют сверки; подключение будет повторено.', 'rpc-health-timeout');
+    }).finally(() => { if (this.healthCheck === check) this.healthCheck = undefined; });
+  }
+
   private disconnect(message: string, errorCode?: string): Promise<void> {
+    clearTimeout(this.heartbeatTimer);
+    this.heartbeatTimer = undefined;
+    this.healthCheck = undefined;
     const socket = this.socket;
     this.socket = undefined;
     socket?.terminate();

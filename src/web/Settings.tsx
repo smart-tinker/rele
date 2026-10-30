@@ -473,7 +473,7 @@ export function CodexSettings({
   const applyUpdate = async () => {
     if (!clientsClosed) return;
     setClientsClosed(false);
-    const result = await action.run(() => api.request<CodexUpdateState>('/api/codex/update', 'POST', { action: 'apply', clientsClosed: true }), 'Codex обновлён. Можно открыть Desktop.');
+    const result = await action.run(() => api.request<CodexUpdateState>('/api/codex/update', 'POST', { action: 'apply', clientsClosed: true }), 'Codex обновлён. Можно снова открыть клиенты Codex.');
     if (result.ok) {
       setUpdate(result.value); setUpdateError('');
       await refresh(); loadThreads();
@@ -582,9 +582,11 @@ export function CodexSettings({
       {state.config.codex.transport === 'shared' && (
         <div className="codex-mode-copy" role="region" aria-label="Сохранённый выбор версии Codex">
           <p><strong>Выбор версии: </strong>{savedSelectionMode === 'auto' ? 'Максимальная поддерживаемая версия' : 'Конкретная версия'}.</p>
+          {update?.phase === 'current' && <p>Работающий сервер: {state.codex.connected ? state.codex.name || update.currentVersion || 'версия не указана' : 'нет соединения'}.</p>}
           {update?.selectedVersion && <p>Выбрана версия: {update.selectedVersion}.</p>}
+          {update?.phase === 'current' && update.installedVersion && <p>Новейшая найденная установка Codex: {update.installedVersion}.</p>}
           {savedSelectionMode === 'auto'
-            ? <p className="field-hint">Среди найденных установленных версий. Работающий сервер сохраняется до подготовки и применения обновления после завершения задач.</p>
+            ? <p className="field-hint">Среди найденных установленных версий. Работающий сервер сохраняется до подготовки и применения обновления после завершения задач. Windows Store может предложить новый пакет позже; Rele не скачивает и не устанавливает пакеты Desktop.</p>
             : <><p className="field-hint">Установка закреплена. Новые версии автоматически не выбираются.</p><p className="discovery-path">{state.config.codex.executable}</p></>}
         </div>
       )}
@@ -597,17 +599,17 @@ export function CodexSettings({
         <Notice tone={update.phase === 'failed' || update.phase === 'unsupported' ? 'warning' : 'info'}>
           <strong>Обновление Codex</strong>
           <p>Работающий сервер: {update.currentVersion || 'не подключён'}. Выбрана версия: {update.selectedVersion || 'версия не определена'}.</p>
-          {update.installedVersion && update.installedVersion !== update.selectedVersion && <p>Новейший установленный Desktop: {update.installedVersion}.</p>}
+          {update.installedVersion && <p>Новейшая найденная установка Codex: {update.installedVersion}.</p>}
           {update.pendingVersion && <p>Подготовлена версия: {update.pendingVersion}.</p>}
           {update.phase === 'ready' || update.phase === 'failed' && update.pendingVersion
-            ? <p>Завершите задачи, полностью закройте Desktop и CLI и не запускайте их до завершения обновления.</p>
+            ? <p>Завершите задачи и закройте остальные клиенты Codex. Не открывайте их до завершения обновления.</p>
             : update.phase === 'preparing'
               ? <p>Подготавливаем обновление. Работающие задачи продолжаются…</p>
             : update.phase === 'applying'
-              ? <p>Проверяем простой и обновляем общий Codex. Не открывайте Desktop и CLI до завершения.</p>
+              ? <p>Проверяем простой и обновляем общий Codex. Не открывайте другие клиенты Codex до завершения.</p>
             : update.phase === 'unsupported'
               ? <p>Переход на выбранную версию недоступен. Работающий сервер сохраняется.</p>
-              : <p>Rele подготовит обновление общего сервера. Затем завершите задачи и полностью закройте Desktop и CLI. Чаты, профиль и очередь Rele сохранятся.</p>}
+              : <p>Rele подготовит обновление общего сервера из выбранной установки. Затем завершите задачи и закройте остальные клиенты Codex. Чаты, профиль и очередь Rele сохранятся.</p>}
           {update.error && <p>{update.error}</p>}
           {unsavedCodex && <p>Сначала сохраните настройки подключения Codex.</p>}
           {(update.phase === 'available' || update.phase === 'failed' && !update.pendingVersion) && (
@@ -619,7 +621,7 @@ export function CodexSettings({
             <>
               <label className="check-row">
                 <input type="checkbox" checked={clientsClosed} disabled={action.busy || unsavedCodex} onChange={event => setClientsClosed(event.target.checked)} />
-                <span>Я завершил задачи и полностью закрыл Codex Desktop и CLI.</span>
+                <span>Я завершил задачи и закрыл остальные клиенты Codex.</span>
               </label>
               <div className="form-actions">
                 <Button busy={action.busy} disabled={!clientsClosed || unsavedCodex || !update.pendingVersion} onClick={() => void applyUpdate()}>
@@ -672,6 +674,11 @@ export function CodexSettings({
         <Status tone={state.codex.queueSupported ? 'good' : 'warning'}>
           {state.codex.queueSupported ? 'Очередь сервера доступна' : 'Очередь сервера недоступна'}
         </Status>
+        {update?.cleanup && <div aria-label="Очистка файлов Rele">
+          <p>Очистка Rele: освобождено {update.cleanup.freedBytes.toLocaleString('ru-RU')} байт; удалено {update.cleanup.deletedCount}; сохранено {update.cleanup.keptCount}.</p>
+          {update.cleanup.status === 'partial' && <p className="field-hint">Часть файлов сохранена: используется или требует проверки.</p>}
+        </div>}
+        {desktop?.available && <p className="field-hint">Windows: если установка пакета завершается ошибкой 0x80073D02, одного закрытия Desktop может быть недостаточно: пакет может удерживать sandbox service. Используйте штатное обновление Windows или пакета. Rele сам не обновляет MSIX.</p>}
       </details>
       <details className="codex-details" open={settingsOpen} onToggle={event => setSettingsOpen(event.currentTarget.open)}>
         <summary>Настройки подключения</summary>

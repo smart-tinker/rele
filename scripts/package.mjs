@@ -44,6 +44,10 @@ for (const file of ['install-user-service.mjs', 'install-autostart.mjs']) {
 for (const file of ['transcribe.py', 'voice-requirements.txt']) {
   await copyFile(path.join(root, 'scripts', file), path.join(stage, 'scripts', file));
 }
+if (process.platform === 'linux') {
+  await mkdir(path.join(stage, 'scripts/linux'), { recursive: true });
+  await copyFile(path.join(root, 'scripts/linux/rele-codex-signal.py'), path.join(stage, 'scripts/linux/rele-codex-signal.py'));
+}
 const nodeBinary = path.join(stage, 'runtime', process.platform === 'win32' ? 'node.exe' : 'node');
 await copyFile(process.execPath, nodeBinary);
 if (process.platform !== 'win32') await chmod(nodeBinary, 0o755);

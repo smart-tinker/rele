@@ -202,12 +202,49 @@ try {
   await copyFile(path.join(application, 'Rele.Codex.exe'), path.join(legacyAdapter, 'Rele.Codex.exe'));
   const legacySettings = JSON.parse(await readFile(path.join(application, 'rele-install.json'), 'utf8'));
   await writeFile(path.join(legacyAdapter, 'rele-install.json'), JSON.stringify({ DesktopAdapterVersion: 1, OwnerSid: legacySettings.OwnerSid, DataDirectory: data }));
+  const previousAdapter = path.join(data, 'codex-adapters', 'b'.repeat(64));
+  await mkdir(previousAdapter, { recursive: true });
+  await writeFile(path.join(previousAdapter, 'rele-install.json'), JSON.stringify({ DesktopAdapterVersion: 1, OwnerSid: legacySettings.OwnerSid, DataDirectory: data }));
   Object.assign(legacySettings, { DesktopIntegrationOwned: true, InstalledCodexWebSocketUrl: null,
-    DesktopCliPath: path.join(legacyAdapter, 'Rele.Codex.exe'), PreviousCodexCliPath: null, PreviousForceCli: null });
+    DesktopCliPath: path.join(legacyAdapter, 'Rele.Codex.exe'), PreviousCodexCliPath: path.join(previousAdapter, 'Rele.Codex.exe'), PreviousForceCli: '1' });
   await writeFile(path.join(application, 'rele-install.json'), JSON.stringify(legacySettings));
   desktopEnvironment({ ...emptyDesktopEnvironment, CODEX_CLI_PATH: legacySettings.DesktopCliPath, CODEX_APP_SERVER_FORCE_CLI: '1' });
   run(launcher, ['desktop-integrate', '--quiet']);
   await assertOwnedDesktopEnvironment();
+  await sharedBackendPid(codexFixture, sharedPid);
+  const flattened = JSON.parse(await readFile(path.join(application, 'rele-install.json'), 'utf8'));
+  assert.equal(flattened.PreviousCodexCliPath, null, 'Never restore a previous Rele adapter as the Desktop backend.');
+  assert.equal(flattened.PreviousForceCli, null);
+  assert.equal(flattened.DesktopCliPath, null);
+
+  console.log('Windows installer smoke: postflight deletes only unchanged, unreferenced legacy adapter code');
+  async function oldAdapter(label) {
+    const marker = JSON.stringify({ DesktopAdapterVersion: 1, OwnerSid: legacySettings.OwnerSid, DataDirectory: data, CodexHome: codexHome });
+    const files = ['Rele.Codex.exe', 'runtime/node.exe', 'dist/native/Rele.Process.exe', 'package.json'].sort();
+    let identity = marker;
+    const contents = name => Buffer.from(`synthetic obsolete program ${label}: ${name}\n`);
+    for (const name of files) identity += `\n${name.replaceAll('/', '\\')}:${createHash('sha256').update(contents(name)).digest('hex').match(/../gu).join('-').toUpperCase()}`;
+    const directory = path.join(data, 'codex-adapters', createHash('sha256').update(identity).digest('hex'));
+    await mkdir(directory);
+    await writeFile(path.join(directory, 'rele-install.json'), marker);
+    for (const name of files) { await mkdir(path.dirname(path.join(directory, name)), { recursive: true }); await writeFile(path.join(directory, name), contents(name)); }
+    return directory;
+  }
+  const removableAdapter = await oldAdapter('unreferenced');
+  const retainedAdapter = await oldAdapter('selected');
+  const modifiedAdapter = await oldAdapter('modified');
+  await writeFile(path.join(modifiedAdapter, 'Rele.Codex.exe'), 'changed program must remain\n');
+  const postflightArgs = ['codex-postflight', '--quiet', '--codex-home', codexHome, '--codex-executable', path.join(retainedAdapter, 'Rele.Codex.exe')];
+  const cleanup = JSON.parse(run(launcher, postflightArgs));
+  assert.equal(cleanup.status, 'verified');
+  assert.equal(cleanup.cleanup.deletedCount, 1);
+  assert.ok(cleanup.cleanup.freedBytes > 0);
+  assert.equal(await exists(removableAdapter), false);
+  for (const directory of [retainedAdapter, modifiedAdapter, legacyAdapter, previousAdapter]) assert.equal(await exists(directory), true);
+  assert.equal(cleanup.cleanup.reasonCounts['settings-reference'], 1);
+  assert.equal(cleanup.cleanup.reasonCounts['modified-tree'], 1);
+  assert.equal(JSON.parse(run(launcher, postflightArgs)).cleanup.deletedCount, 0);
+  assert.equal(await readFile(path.join(data, 'preserve-me.txt'), 'utf8'), 'installer smoke data\n');
   await sharedBackendPid(codexFixture, sharedPid);
 
   console.log('Windows installer smoke: foreign Desktop settings are preserved without blocking installation');
