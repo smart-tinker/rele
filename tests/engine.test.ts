@@ -830,6 +830,20 @@ describe('Engine correlation and queue', () => {
     expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
   });
 
+  it('reports a context limit without retrying, compacting or replacing the original conversation', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture(), request = await acceptRequest(f); await running(f, request);
+    f.codex.locations.set(request.id, { state: 'failed', turnId: 'turn-1', failureReason: 'contextWindowExceeded' });
+    await f.engine.reconcile(request.id); await f.engine.pump();
+    const error = 'Контекст разговора превысил лимит модели. Перед повтором нужно сжать контекст.';
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'failed', turnId: 'turn-1', error });
+    expect(f.store.listDeliveries()).toMatchObject([{ kind: 'error', body: error, status: 'sent' }]);
+    vi.setSystemTime(Date.now() + 300_000); await f.engine.pump();
+    expect(f.codex.retryOverloaded).not.toHaveBeenCalled(); expect(f.codex.createThread).not.toHaveBeenCalled();
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1); expect(f.codex.startQueued).not.toHaveBeenCalled();
+    expect(f.store.getMeta(`overload-retry:${request.id}`)).toBeUndefined();
+  });
+
   it('never enqueues again after a lost acknowledgement and recovers accepted work by its UUID', async () => {
     const f = fixture();
     f.codex.enqueue.mockImplementationOnce(async (_thread, _text, clientId) => {

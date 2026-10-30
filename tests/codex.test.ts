@@ -805,6 +805,7 @@ describe('Codex shared-runtime adapter', () => {
 
   it.each([
     ['failed', 'serverOverloaded', 'serverOverloaded'],
+    ['failed', 'contextWindowExceeded', 'contextWindowExceeded'],
     ['failed', 'unknown-synthetic-secret', undefined],
     ['failed', { serverOverloaded: 'synthetic-secret' }, undefined],
     ['completed', 'serverOverloaded', undefined],
@@ -819,6 +820,30 @@ describe('Codex shared-runtime adapter', () => {
     expect(found).toEqual({ state: status, turnId: 'own-turn', text: undefined, ...(failureReason ? { failureReason } : {}) });
     expect(JSON.stringify(found)).not.toContain('synthetic-secret');
     expect(f.calls.some(call => ['turn/interrupt', 'thread/queue/add', 'thread/queue/start'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it.each([
+    ['failed', 'other', 'Your input exceeds the context window of this model. Please adjust your input and try again.', null, 'contextWindowExceeded'],
+    ['failed', 'other', 'synthetic-provider-secret: Your input exceeds the context window of this model. Please adjust your input and try again. (provider wrapper)', null, 'contextWindowExceeded'],
+    ['failed', 'other', 'Provider reported an unrelated context error', null, undefined],
+    ['failed', 'other', 'Unknown provider error', '{"error":{"code":"context_length_exceeded"}}', undefined],
+    ['failed', 'badRequest', 'Your input exceeds the context window of this model. Please adjust your input and try again.', null, undefined],
+    ['completed', 'other', 'Your input exceeds the context window of this model. Please adjust your input and try again.', null, undefined],
+  ])('classifies only a failed native context error (%s/%s)', async (status, codexErrorInfo, message, additionalDetails, failureReason) => {
+    const clientId = randomUUID();
+    const f = await fixture({ 'thread/turns/list': () => ({ data: [{ id: 'context-turn', status, error: { codexErrorInfo, message, additionalDetails },
+      items: [{ type: 'userMessage', clientId }, { type: 'agentMessage', phase: 'commentary', text: 'Assistant can mention context_length_exceeded without classifying an error.' }] }], nextCursor: null }) });
+    await f.client.connect(); const found = await f.client.findRequest(threadId, clientId);
+    expect(found.failureReason).toBe(failureReason); expect(JSON.stringify(found)).not.toContain('synthetic-provider-secret');
+    expect(f.calls.some(call => ['turn/start', 'thread/queue/add', 'thread/fork', 'thread/compact/start'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it('does not interpret assistant text as a native context error', async () => {
+    const clientId = randomUUID(), message = 'Your input exceeds the context window of this model. Please adjust your input and try again.';
+    const f = await fixture({ 'thread/turns/list': () => ({ data: [{ id: 'generic-turn', status: 'failed', error: { codexErrorInfo: 'other', message: 'Unknown error' },
+      items: [{ type: 'userMessage', clientId }, { type: 'agentMessage', phase: 'final_answer', text: message }] }], nextCursor: null }) });
+    await f.client.connect(); expect(await f.client.findRequest(threadId, clientId)).toMatchObject({ state: 'failed', text: message });
+    expect((await f.client.findRequest(threadId, clientId)).failureReason).toBeUndefined();
   });
 
   it('recovers an accepted request from queue or paginated completed history without resending', async () => {

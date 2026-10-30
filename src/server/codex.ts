@@ -35,7 +35,7 @@ export interface RequestLocation {
   soleQueuedSubmission?: boolean;
   turnId?: string;
   text?: string;
-  failureReason?: 'serverOverloaded';
+  failureReason?: 'serverOverloaded' | 'contextWindowExceeded';
   commentary?: { id: string; text: string }[];
   retryCount?: number;
   retryBlocked?: boolean;
@@ -59,7 +59,7 @@ export function codexCommandItem(value: unknown): CodexCommandItem | undefined {
 export interface CodexRuntime { userAgent: string; codexHome: string; platformFamily: string; platformOs: string }
 interface QueueEntry { id: string; clientUserMessageId: string }
 interface HistoryItem { type: string; id?: string; clientId?: string | null; text?: string; phase?: string | null }
-interface HistoryTurn { id: string; rootTurnId?: string | null; status: string; completedAt?: number | null; items: HistoryItem[]; error?: { codexErrorInfo?: unknown } | null }
+interface HistoryTurn { id: string; rootTurnId?: string | null; status: string; completedAt?: number | null; items: HistoryItem[]; error?: { codexErrorInfo?: unknown; message?: unknown } | null }
 interface Page<T> { data: T[]; nextCursor: string | null }
 interface RawThread {
   id: string; name?: string | null; cwd: string; preview: string; updatedAt: number;
@@ -74,6 +74,12 @@ interface PendingCall {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
+}
+
+function nativeFailureReason(error: HistoryTurn['error']): RequestLocation['failureReason'] {
+  if (error?.codexErrorInfo === 'serverOverloaded' || error?.codexErrorInfo === 'contextWindowExceeded') return error.codexErrorInfo;
+  if (error?.codexErrorInfo !== 'other') return;
+  if (typeof error.message === 'string' && error.message.includes('Your input exceeds the context window of this model. Please adjust your input and try again.')) return 'contextWindowExceeded';
 }
 
 export class CodexRpcError extends Error {
@@ -605,6 +611,7 @@ export class CodexClient extends EventEmitter {
     const mixed = turn.items.some(item => item.type === 'userMessage' && (typeof item.clientId !== 'string' || !known.has(item.clientId)));
     const state = turn.status === 'inProgress' ? 'running' : turn.status;
     if (!['running', 'completed', 'failed', 'interrupted'].includes(state)) throw new Error('Неизвестное состояние хода Codex.');
+    const failureReason = state === 'failed' ? nativeFailureReason(turn.error) : undefined;
     // Native history can normalize a live snapshot to interrupted without a terminal event.
     if (state === 'interrupted' && (typeof turn.completedAt !== 'number' || !Number.isFinite(turn.completedAt))) {
       throw new CodexTransportError('Codex пока не подтвердил прерывание запроса. Ожидается сверка завершения без повторной отправки.', 'turn-interruption-unconfirmed');
@@ -618,7 +625,7 @@ export class CodexClient extends EventEmitter {
       ...(mixed ? { mixed: true } : {
         ...(commentary.length ? { commentary } : {}),
         text: answers.length ? answers.map(item => item.text || '').join('\n\n') : legacy.at(-1)?.text,
-        ...(state === 'failed' && turn.error?.codexErrorInfo === 'serverOverloaded' ? { failureReason: 'serverOverloaded' as const } : {}),
+        ...(failureReason ? { failureReason } : {}),
         ...(turn.items.some(item => codexCommandItem(item)) ? { commandItems: turn.items.flatMap(item => { const command = codexCommandItem(item); return command ? [command] : []; }) } : {}),
       }),
     };
