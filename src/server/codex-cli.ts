@@ -280,6 +280,10 @@ async function main(args: string[]): Promise<void> {
   if (mode !== 'passthrough' && config.config.codex.transport !== 'shared') throw new CodexShimError('Подключение Desktop требует режима «Общий Codex» в Rele. Прежние адрес сервера и профиль сохранены; перейдите на общий режим после завершения текущих запросов.');
   const env = codexEnvironment(config.config.codex.codexHome);
   if (mode === 'daemon') delete env.RELE_CODEX_DAEMON_EXTERNAL;
+  if (mode === 'daemon' && process.platform === 'linux') {
+    const { LinuxCodexUpdate } = await import('./codex-linux-update.js');
+    if (await new LinuxCodexUpdate(config.directory, { env }).startPrepared(config.config.codex)) return;
+  }
   if (mode === 'desktop') {
     if (process.platform !== 'win32') throw new CodexShimError('Этот launcher предназначен для Windows Desktop.');
     const discovery = await discoverCodex(config.config.codex.codexHome ? { codexHome: config.config.codex.codexHome } : undefined);

@@ -167,6 +167,22 @@ describe('Codex native shared policy', () => {
     return { ...f, client, peer: f.client, target, shared, home };
   }
 
+  it('keeps the post-update expected version enforced across reconnects before any catalog, plugin or queue work', async () => {
+    const f = await sharedFixture();
+    const setupPlugin = vi.fn(async () => {});
+    const client = new CodexClient(f.target, { shared: f.shared, expectedVersion: '0.166.0-alpha.5.1', setupPlugin });
+    cleanup.push(() => client.close());
+    await expect(client.connect()).rejects.toMatchObject({ code: 'update-version-mismatch' });
+    expect(client.status()).toMatchObject({ connected: false, queueSupported: false });
+    expect(f.calls.map(call => call.method)).toEqual(['initialize', 'initialized']);
+    expect(setupPlugin).not.toHaveBeenCalled();
+    f.handlers.initialize = () => ({ userAgent: 'codex/0.166.0-alpha.5.1 (Fixture)', codexHome: f.home,
+      platformFamily: process.platform === 'win32' ? 'windows' : 'unix', platformOs: process.platform === 'win32' ? 'windows' : process.platform });
+    await client.connect();
+    expect(client.status()).toMatchObject({ connected: true, queueSupported: true, name: 'Codex 0.166.0-alpha.5.1' });
+    expect(f.calls.some(call => ['thread/queue/add', 'turn/start'].includes(call.method ?? ''))).toBe(false);
+  });
+
   it.each([false, true])('keeps policy stable and closes only its connection (implicit profile: %s)', async implicitProfile => {
     const f = await sharedFixture(implicitProfile);
     await f.client.connect();

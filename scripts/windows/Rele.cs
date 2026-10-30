@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Management;
 using System.Net;
 using System.Net.Sockets;
 using System.Net.WebSockets;
@@ -49,6 +50,11 @@ internal static class Rele
     private static string AppDirectory;
     private static string MaintenanceDirectory;
     private static Settings Config;
+    private sealed class MaintenanceException : InvalidOperationException
+    {
+        public readonly string ReasonCode;
+        public MaintenanceException(string reason, string message) : base(message) { ReasonCode = reason; }
+    }
 
     [STAThread]
     private static int Main(string[] args)
@@ -57,7 +63,7 @@ internal static class Rele
         var options = new Dictionary<string, string>(StringComparer.Ordinal);
         try
         {
-            if (command == "codex-start" || command == "codex-status" || command == "codex-update" || command == "codex-apply-update")
+            if (command == "codex-start" || command == "codex-status" || command == "codex-update" || command == "codex-apply-update" || command == "codex-postflight")
             {
                 // This GUI launcher has redirected pipes, not an attached console/code page.
                 Console.SetOut(new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true });
@@ -139,6 +145,12 @@ internal static class Rele
                 if (!File.Exists(settingsPath) || !options.ContainsKey("--codex-home"))
                     throw new InvalidOperationException("Применение обновления Codex требует существующую установку и исходный профиль.");
                 Console.Out.WriteLine(Json.Serialize(ApplyCodexUpdate(options["--codex-home"])));
+                return 0;
+            }
+            if (command == "codex-postflight")
+            {
+                if (!File.Exists(settingsPath) || !options.ContainsKey("--codex-home")) throw new InvalidOperationException("Проверка Codex требует существующую установку и исходный профиль.");
+                Console.Out.WriteLine(Json.Serialize(CodexPostflight(options["--codex-home"], Value(options, "--codex-executable", "codex"))));
                 return 0;
             }
             if (command == "desktop-check")
@@ -246,7 +258,13 @@ internal static class Rele
                 try { File.WriteAllText(options["--error-file"], message, new UTF8Encoding(false)); } catch { }
             }
             if (command == "serve") Log(message);
-            else if (command == "codex-start" || command == "codex-status" || command == "codex-update" || command == "codex-apply-update") Console.Error.WriteLine(message);
+            else if (command == "codex-start" || command == "codex-status" || command == "codex-update" || command == "codex-apply-update" || command == "codex-postflight")
+            {
+                var refusal = error as MaintenanceException;
+                string reason = refusal == null ? "uncertain" : refusal.ReasonCode;
+                Console.Out.WriteLine(Json.Serialize(new Dictionary<string, object> { { "status", reason == "uncertain" ? "uncertain" : "refused" }, { "reasonCode", reason } }));
+                Console.Error.WriteLine(message);
+            }
             else if (!options.ContainsKey("--quiet")) MessageBox.Show(message, "Rele", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1;
         }
@@ -521,6 +539,223 @@ internal static class Rele
             return Convert.ToInt32(marker["DesktopAdapterVersion"]) == 1 && (string)marker["OwnerSid"] == Config.OwnerSid && SamePath((string)marker["DataDirectory"], Config.DataDirectory);
         }
         catch { return false; }
+    }
+
+    private static void OrdinaryPath(string value)
+    {
+        string current = Path.GetFullPath(value);
+        while (!String.IsNullOrEmpty(current))
+        {
+            if ((File.Exists(current) || Directory.Exists(current)) && (File.GetAttributes(current) & (FileAttributes.ReparsePoint | FileAttributes.Device | FileAttributes.Offline)) != 0)
+                throw new InvalidOperationException("Кэш адаптера перенаправлен или недоступен.");
+            current = Path.GetDirectoryName(current);
+        }
+    }
+
+    private static Dictionary<string, object> OwnedAdapterMarker(string executable)
+    {
+        if (!Path.IsPathRooted(executable)) return null;
+        string directory = Path.GetDirectoryName(Path.GetFullPath(executable));
+        if (!String.Equals(Path.GetFileName(executable), "Rele.Codex.exe", StringComparison.OrdinalIgnoreCase) ||
+            !SamePath(Path.GetDirectoryName(directory), Path.Combine(Config.DataDirectory, "codex-adapters")) || !Regex.IsMatch(Path.GetFileName(directory), "^[a-f0-9]{64}$")) return null;
+        return ReadAdapterMarker(directory);
+    }
+
+    private static Dictionary<string, object> ReadAdapterMarker(string directory)
+    {
+        OrdinaryPath(directory); string file = Path.Combine(directory, "rele-install.json"); OrdinaryPath(file);
+        if (!File.Exists(file) || new FileInfo(file).Length > 65536 || Directory.GetAccessControl(directory).GetOwner(typeof(SecurityIdentifier)).Value != Config.OwnerSid)
+            throw new InvalidOperationException("Владелец старого адаптера не подтверждён.");
+        var marker = Json.Deserialize<Dictionary<string, object>>(File.ReadAllText(file));
+        if (!marker.ContainsKey("DesktopAdapterVersion") || Convert.ToInt32(marker["DesktopAdapterVersion"]) != 1 ||
+            !marker.ContainsKey("OwnerSid") || !Object.Equals(marker["OwnerSid"], Config.OwnerSid) ||
+            !marker.ContainsKey("DataDirectory") || !(marker["DataDirectory"] is string) || !SamePath((string)marker["DataDirectory"], Config.DataDirectory))
+            throw new InvalidOperationException("Старый адаптер принадлежит другой установке.");
+        return marker;
+    }
+
+    private static bool FlattenLegacyPrevious()
+    {
+        string cli = Config.PreviousCodexCliPath, force = Config.PreviousForceCli;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase); bool changed = false;
+        while (!String.IsNullOrEmpty(cli))
+        {
+            if (Path.IsPathRooted(cli) && SamePath(cli, Path.Combine(AppDirectory, "Rele.Codex.exe")))
+                throw new InvalidOperationException("Цепочка прежних адаптеров Rele не подтверждена; автоматическое восстановление остановлено.");
+            var marker = OwnedAdapterMarker(cli); if (marker == null) break;
+            if (!seen.Add(CanonicalPath(cli)) || seen.Count > 32)
+                throw new InvalidOperationException("Цепочка прежних адаптеров Rele не подтверждена; автоматическое восстановление остановлено.");
+            object previous, previousForce;
+            if (marker.TryGetValue("PreviousCodexCliPath", out previous) && previous != null && !(previous is string)) throw new InvalidOperationException("Неизвестная прежняя настройка адаптера.");
+            if (marker.TryGetValue("PreviousForceCli", out previousForce) && previousForce != null && !(previousForce is string)) throw new InvalidOperationException("Неизвестная прежняя настройка адаптера.");
+            // Original v1 code snapshots contain no restoration fields: remove their owned hook, never restore an adapter as the backend.
+            cli = previous as string; force = previousForce as string; changed = true;
+        }
+        if (changed) { Config.PreviousCodexCliPath = cli; Config.PreviousForceCli = force; }
+        return changed;
+    }
+
+    private sealed class AdapterTree
+    {
+        public string Fingerprint;
+        public long Bytes;
+    }
+
+    private static AdapterTree AdapterSnapshot(string directory)
+    {
+        ReadAdapterMarker(directory);
+        var files = new SortedDictionary<string, string>(StringComparer.Ordinal); var pending = new Stack<string>(); pending.Push(directory); long bytes = 0;
+        while (pending.Count != 0)
+            foreach (string entry in Directory.GetFileSystemEntries(pending.Pop()))
+            {
+                OrdinaryPath(entry); var attributes = File.GetAttributes(entry);
+                string relative = entry.Substring(directory.TrimEnd('\\').Length + 1);
+                if ((attributes & FileAttributes.Directory) != 0)
+                {
+                    if (relative != "runtime" && relative != "dist" && relative != "dist\\native" && relative != "dist\\server" && relative != "dist\\shared" && relative != "node_modules" && relative != "node_modules\\ws" &&
+                        !relative.StartsWith("dist\\server\\", StringComparison.Ordinal) && !relative.StartsWith("dist\\shared\\", StringComparison.Ordinal) && !relative.StartsWith("node_modules\\ws\\", StringComparison.Ordinal))
+                        throw new InvalidOperationException("В кэше найдены неизвестные каталоги.");
+                    pending.Push(entry); continue;
+                }
+                if (relative != "rele-install.json" && relative != "Rele.Codex.exe" && relative != "runtime\\node.exe" && relative != "dist\\native\\Rele.Process.exe" && relative != "package.json" &&
+                    !relative.StartsWith("dist\\server\\", StringComparison.Ordinal) && !relative.StartsWith("dist\\shared\\", StringComparison.Ordinal) && !relative.StartsWith("node_modules\\ws\\", StringComparison.Ordinal))
+                    throw new InvalidOperationException("В кэше найдены неизвестные файлы.");
+                bytes += new FileInfo(entry).Length; if (bytes > 1024L * 1024 * 1024 || files.Count > 10000) throw new InvalidOperationException("Неизвестный размер кэша адаптера.");
+                if (relative != "rele-install.json") files.Add(relative, entry);
+            }
+        foreach (string required in new[] { "Rele.Codex.exe", "runtime\\node.exe", "dist\\native\\Rele.Process.exe", "package.json" })
+            if (!files.ContainsKey(required)) throw new InvalidOperationException("Кэш адаптера неполон.");
+        var identity = new StringBuilder(File.ReadAllText(Path.Combine(directory, "rele-install.json")));
+        using (var hash = SHA256.Create())
+            foreach (var file in files) using (var input = File.OpenRead(file.Value)) identity.Append('\n').Append(file.Key).Append(':').Append(BitConverter.ToString(hash.ComputeHash(input)));
+        return new AdapterTree { Fingerprint = TextHash(identity.ToString()), Bytes = bytes };
+    }
+
+    private sealed class AdapterAliasException : InvalidOperationException { }
+
+    private static bool PathRefers(string text, string directory)
+    {
+        if (!String.IsNullOrEmpty(text) && Regex.IsMatch(text, @"~[0-9]+"))
+        {
+            // A whole existing path can be expanded safely; opaque command/config text cannot prove what a DOS alias names.
+            string path = text.Trim().Trim('"');
+            if (!Path.IsPathRooted(path) || (!File.Exists(path) && !Directory.Exists(path))) throw new AdapterAliasException();
+            try { text = CanonicalPath(path); } catch { throw new AdapterAliasException(); }
+            if (Regex.IsMatch(text, @"~[0-9]+")) throw new AdapterAliasException();
+        }
+        return !String.IsNullOrEmpty(text) && text.IndexOf(Path.GetFileName(directory), StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static bool AdapterTaskReference(dynamic folder, string directory)
+    {
+        foreach (dynamic task in folder.GetTasks(0))
+        {
+            string user = null;
+            try
+            {
+                dynamic definition = task.Definition; user = (string)definition.Principal.UserId;
+                foreach (dynamic action in definition.Actions)
+                    if ((int)action.Type == 0 && (PathRefers((string)action.Path, directory) || PathRefers((string)action.Arguments, directory) || PathRefers((string)action.WorkingDirectory, directory))) return true;
+            }
+            catch (AdapterAliasException) { throw; }
+            catch { if (String.IsNullOrEmpty(user) || IsCurrentUser(user)) throw; }
+        }
+        foreach (dynamic child in folder.GetFolders(0))
+            try { if (AdapterTaskReference(child, directory)) return true; }
+            catch (Exception error) { if (error.HResult != unchecked((int)0x80070005)) throw; } // Unreadable system task folders cannot contain this unelevated user's writable tasks.
+        return false;
+    }
+
+    private static string AdapterReference(string directory, string retainedExecutable, string codexHome)
+    {
+        if (PathRefers(retainedExecutable, directory) || PathRefers(Config.PreviousCodexCliPath, directory) || PathRefers(Config.DesktopCliPath, directory)) return "settings-reference";
+        foreach (var scope in new[] { EnvironmentVariableTarget.Process, EnvironmentVariableTarget.User, EnvironmentVariableTarget.Machine })
+            if (PathRefers(Environment.GetEnvironmentVariable("CODEX_CLI_PATH", scope), directory)) return "environment-reference";
+        string nativeConfig = Path.Combine(codexHome, "config.toml"); OrdinaryPath(nativeConfig);
+        if (File.Exists(nativeConfig))
+        {
+            if (new FileInfo(nativeConfig).Length > 2 * 1024 * 1024) return "config-unknown";
+            if (PathRefers(File.ReadAllText(nativeConfig), directory)) return "native-config-reference";
+        }
+        string owners = Path.Combine(Config.DataDirectory, "codex-websocket-owners"); OrdinaryPath(owners);
+        foreach (string owner in Directory.Exists(owners) ? Directory.GetDirectories(owners) : new string[0])
+        {
+            if (!Regex.IsMatch(Path.GetFileName(owner), "^[a-f0-9]{64}$")) continue;
+            OrdinaryPath(owner); string marker = Path.Combine(owner, "owner.json"); OrdinaryPath(marker);
+            if (!File.Exists(marker) || new FileInfo(marker).Length > 65536) return "owner-reference-unknown";
+            if (PathRefers(File.ReadAllText(marker), directory)) return "retained-owner-reference";
+        }
+        using (var query = new ManagementObjectSearcher("SELECT Name,ExecutablePath,CommandLine,ProcessId,SessionId FROM Win32_Process"))
+        using (var rows = query.Get())
+            foreach (ManagementObject process in rows)
+            using (process)
+            {
+                if (PathRefers(process["ExecutablePath"] as string, directory) || PathRefers(process["CommandLine"] as string, directory)) return "process-reference";
+                string name = process["Name"] as string;
+                if (!String.Equals(name, "codex.exe", StringComparison.OrdinalIgnoreCase) && !String.Equals(name, "Rele.Codex.exe", StringComparison.OrdinalIgnoreCase) && !String.Equals(name, "node.exe", StringComparison.OrdinalIgnoreCase)) continue;
+                if (process["ExecutablePath"] != null && process["CommandLine"] != null) continue;
+                try
+                {
+                    using (var who = process.InvokeMethod("GetOwnerSid", null, null))
+                    {
+                        if (Convert.ToInt32(who["ReturnValue"]) == 0)
+                        { if (Object.Equals(who["Sid"], Config.OwnerSid)) return "process-unknown"; }
+                        else if (Convert.ToInt32(process["SessionId"]) == Process.GetCurrentProcess().SessionId) return "process-unknown";
+                    }
+                }
+                catch { if (Convert.ToInt32(process["SessionId"]) == Process.GetCurrentProcess().SessionId) return "process-unknown"; }
+            }
+        if (AdapterTaskReference(TaskFolder(), directory)) return "task-reference";
+        return null;
+    }
+
+    private static Dictionary<string, object> CleanupLegacyAdapters(string retainedExecutable, string codexHome, Dictionary<string, object> active)
+    {
+        int deleted = 0, kept = 0; long bytes = 0; var reasons = new Dictionary<string, int>(); string cache = Path.Combine(Config.DataDirectory, "codex-adapters");
+        Action<string> keep = reason => { kept++; reasons[reason] = reasons.ContainsKey(reason) ? reasons[reason] + 1 : 1; };
+        if (!Directory.Exists(cache)) return new Dictionary<string, object> { { "deletedCount", 0 }, { "keptCount", 0 }, { "freedBytes", 0 }, { "reasonCounts", reasons } };
+        OrdinaryPath(cache);
+        foreach (string directory in Directory.GetDirectories(cache))
+        {
+            if (!Regex.IsMatch(Path.GetFileName(directory), "^[a-f0-9]{64}$")) continue;
+            string renamed = null;
+            try
+            {
+                var before = AdapterSnapshot(directory); if (before.Fingerprint != Path.GetFileName(directory)) { keep("modified-tree"); continue; }
+                string reference = AdapterReference(directory, retainedExecutable, codexHome); if (reference != null) { keep(reference); continue; }
+                var again = AdapterSnapshot(directory); if (before.Fingerprint != again.Fingerprint || before.Bytes != again.Bytes) { keep("tree-changed"); continue; }
+                var current = CodexWebSocketStatus(codexHome);
+                if (!Object.Equals(current["status"], "alreadyRunning") || current.ContainsKey("pendingUpdate") || !current.ContainsKey("processId") ||
+                    !Object.Equals(current["processId"], active["processId"]) || !Object.Equals(current["processStartTime"], active["processStartTime"]) || !Object.Equals(current["executableSha256"], active["executableSha256"]))
+                    throw new InvalidOperationException("Работающий Codex изменился; очистка остановлена.");
+                // shortcut: cleanup requires no concurrent cache writers; immutable snapshots and rename guard the known old code tree.
+                renamed = Path.Combine(cache, ".cleanup-" + Path.GetFileName(directory) + "-" + Guid.NewGuid().ToString("N"));
+                Directory.Move(directory, renamed);
+                // The marker's ownership remains tied to its original immutable namespace; verify contents using that same source definition.
+                var after = AdapterSnapshot(renamed);
+                if (after.Fingerprint != before.Fingerprint || after.Bytes != before.Bytes || AdapterReference(directory, retainedExecutable, codexHome) != null) throw new InvalidOperationException("Кэш изменился после переноса.");
+                Directory.Delete(renamed, true); renamed = null; deleted++; bytes += before.Bytes;
+            }
+            catch (AdapterAliasException) { keep("alias-reference-unknown"); if (renamed != null) break; }
+            catch { keep(renamed == null ? "unconfirmed" : "quarantined"); if (renamed != null) break; }
+        }
+        return new Dictionary<string, object> { { "deletedCount", deleted }, { "keptCount", kept }, { "freedBytes", bytes }, { "reasonCounts", reasons } };
+    }
+
+    private static Dictionary<string, object> CodexPostflight(string codexHome, string retainedExecutable)
+    {
+        var active = CodexWebSocketStatus(codexHome);
+        if (!Object.Equals(active["status"], "alreadyRunning") || active.ContainsKey("pendingUpdate")) throw new MaintenanceException("uncertain", "Общий Codex ещё не подтвердил завершение обновления.");
+        using (var operation = CodexOperationLock("integration.lock"))
+        {
+            ReloadOwnedInstallation(new Dictionary<string, string>());
+            try
+            {
+                if (FlattenLegacyPrevious()) SaveDesktopSettings();
+                return new Dictionary<string, object> { { "status", "verified" }, { "cleanup", CleanupLegacyAdapters(retainedExecutable, codexHome, active) } };
+            }
+            catch { return new Dictionary<string, object> { { "status", "verified" }, { "cleanup", new Dictionary<string, object> { { "deletedCount", 0 }, { "keptCount", 0 }, { "freedBytes", 0 }, { "reasonCounts", new Dictionary<string, int> { { "cleanup-unconfirmed", 1 } } } } } }; }
+        }
     }
 
     private sealed class CodexWebSocketOwner
@@ -1095,7 +1330,56 @@ internal static class Rele
                 throw new InvalidOperationException("Прежний адрес Codex ещё используется.");
     }
 
-    private static void RequireExternalCodexClosed(int ownNativePid)
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CommandLineToArgvW(string commandLine, out int count);
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr LocalFree(IntPtr memory);
+
+    private static string[] ProcessArguments(string commandLine)
+    {
+        if (String.IsNullOrWhiteSpace(commandLine) || commandLine.Length > 32768) throw new InvalidOperationException("Unknown process arguments.");
+        int count; IntPtr values = CommandLineToArgvW(commandLine, out count);
+        if (values == IntPtr.Zero) throw new InvalidOperationException("Unknown process arguments.");
+        try { var args = new string[count]; for (int i = 0; i < count; i++) args[i] = Marshal.PtrToStringUni(Marshal.ReadIntPtr(values, i * IntPtr.Size)); return args; }
+        finally { LocalFree(values); }
+    }
+
+    private static bool IndependentCodexClient(Process process, string codexHome)
+    {
+        try
+        {
+            long birth = process.StartTime.ToUniversalTime().Ticks; IntPtr retained = process.Handle;
+            using (var query = new ManagementObjectSearcher("SELECT CommandLine,CreationDate FROM Win32_Process WHERE ProcessId=" + process.Id))
+            using (var rows = query.Get())
+            {
+                foreach (ManagementObject row in rows)
+                using (row)
+                {
+                    if (Math.Abs(ManagementDateTimeConverter.ToDateTime((string)row["CreationDate"]).ToUniversalTime().Ticks - birth) >= 10) return false;
+                    string[] args = ProcessArguments((string)row["CommandLine"]);
+                    if (args.Length == 0 || !SamePath(args[0], process.MainModule.FileName) || process.HasExited) return false;
+                    if (args.Length == 2 && args[1] == "--version") return true;
+                    int server = Array.IndexOf(args, "app-server");
+                    if (server < 1 || args.Length != server + 3 || args[server + 1] != "--listen") return false;
+                    string endpoint = args[server + 2]; WebSocketPort(endpoint);
+                    using (var socket = new ClientWebSocket())
+                    using (var deadline = new CancellationTokenSource(2000))
+                    {
+                        socket.Options.Proxy = null; socket.ConnectAsync(new Uri(endpoint), deadline.Token).GetAwaiter().GetResult();
+                        var info = MaintenanceCall(socket, "initialize", new Dictionary<string, object> { { "clientInfo", new Dictionary<string, object> { { "name", "rele_profile_check" }, { "version", "0.0.0" } } }, { "capabilities", new Dictionary<string, object> { { "experimentalApi", true } } } }, deadline.Token);
+                        MaintenanceSend(socket, new Dictionary<string, object> { { "method", "initialized" } }, deadline.Token);
+                        var diagnostic = MaintenanceCall(socket, "server/diagnostics", new Dictionary<string, object>(), deadline.Token);
+                        var native = diagnostic.ContainsKey("process") ? diagnostic["process"] as Dictionary<string, object> : null;
+                        return native != null && native.ContainsKey("id") && Convert.ToInt32(native["id"]) == process.Id && info.ContainsKey("codexHome") && info["codexHome"] is string && Path.IsPathRooted((string)info["codexHome"]) && !SamePath((string)info["codexHome"], codexHome) && !process.HasExited && process.StartTime.ToUniversalTime().Ticks == birth;
+                    }
+                }
+            }
+        }
+        catch { }
+        return false; // --profile/-C are not proof of a different CODEX_HOME; unknown clients remain blocked.
+    }
+
+    private static void RequireExternalCodexClosed(int ownNativePid, string codexHome)
     {
         foreach (string name in new[] { "ChatGPT", "codex" })
             foreach (Process process in Process.GetProcessesByName(name))
@@ -1113,8 +1397,8 @@ internal static class Rele
                         if (!OpenProcessToken(handle, 8, out token))
                             throw new InvalidOperationException("Не удалось подтвердить владельца другого клиента Codex; обновление не применено.");
                         using (var identity = new WindowsIdentity(token))
-                            if (identity.User.Value == Config.OwnerSid)
-                                throw new InvalidOperationException("Полностью закройте Codex Desktop и другие Codex CLI перед применением обновления.");
+                            if (identity.User.Value == Config.OwnerSid && !(name == "codex" && IndependentCodexClient(process, codexHome)))
+                                throw new MaintenanceException("clients-open", "Полностью закройте Codex Desktop и клиенты этого профиля перед применением обновления; неизвестные CLI также требуют закрытия.");
                     }
                     finally { if (token != IntPtr.Zero) CloseHandle(token); CloseHandle(handle); }
                 }
@@ -1174,25 +1458,99 @@ internal static class Rele
                 {
                     frame = socket.ReceiveAsync(new ArraySegment<byte>(buffer), token).GetAwaiter().GetResult();
                     if (frame.MessageType != WebSocketMessageType.Text || body.Length + frame.Count > 2 * 1024 * 1024)
-                        throw new InvalidOperationException("Неизвестный ответ проверки простоя Codex.");
+                        throw new MaintenanceException("unsupported-diagnostics", "Неизвестный ответ проверки простоя Codex.");
                     body.Write(buffer, 0, frame.Count);
                 } while (!frame.EndOfMessage);
                 var item = Json.Deserialize<Dictionary<string, object>>(Encoding.UTF8.GetString(body.ToArray()));
+                if (item == null) throw new MaintenanceException("unsupported-diagnostics", "Пустой ответ проверки простоя Codex.");
                 if (item.ContainsKey("method") && item.ContainsKey("id"))
-                    throw new InvalidOperationException("Codex ожидает действия клиента; обновление не применено.");
+                    throw new MaintenanceException("busy", "Codex ожидает действия клиента; обновление не применено.");
                 if (!item.ContainsKey("id") || !(item["id"] is string) || (string)item["id"] != id) continue;
                 if (item.ContainsKey("error") || !item.ContainsKey("result") || !(item["result"] is Dictionary<string, object>))
-                    throw new InvalidOperationException("Codex не подтвердил проверку простоя.");
+                    throw new MaintenanceException("unsupported-diagnostics", "Codex не подтвердил поддерживаемую проверку простоя.");
                 return (Dictionary<string, object>)item["result"];
             }
         }
-        throw new InvalidOperationException("Проверка простоя Codex получила слишком много уведомлений.");
+        throw new MaintenanceException("unsupported-diagnostics", "Проверка простоя Codex получила слишком много уведомлений.");
+    }
+
+    private static System.Collections.IList MaintenanceList(Dictionary<string, object> item, string field)
+    {
+        var rows = item.ContainsKey(field) ? item[field] as System.Collections.IList : null;
+        if (rows == null) throw new MaintenanceException("unsupported-diagnostics", "Codex вернул неизвестную структуру проверки простоя.");
+        return rows;
+    }
+
+    private static void ValidateIdleGauges(Dictionary<string, object> diagnostics, int nativePid)
+    {
+        var process = diagnostics.ContainsKey("process") ? diagnostics["process"] as Dictionary<string, object> : null;
+        if (process == null || !process.ContainsKey("id") || !(process["id"] is int || process["id"] is long) || Convert.ToInt64(process["id"]) != nativePid)
+            throw new MaintenanceException("uncertain", "Проверка простоя не подтвердила PID общего Codex.");
+        var allowed = new Dictionary<string, long> { { "app.requests.in_flight", 1 }, { "app.requests.queued", 0 },
+            { "app.server_requests.pending", 0 }, { "core.mailbox.pending", 0 }, { "core.threads.live", -1 },
+            { "core.turns.active", 0 }, { "mcp.connections.live", -1 } };
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (object value in MaintenanceList(diagnostics, "gauges"))
+        {
+            var gauge = value as Dictionary<string, object>;
+            if (gauge == null || !gauge.ContainsKey("name") || !(gauge["name"] is string) || !gauge.ContainsKey("value"))
+                throw new MaintenanceException("unsupported-diagnostics", "Codex сообщил неизвестные показатели простоя.");
+            string name = (string)gauge["name"]; object count = gauge["value"];
+            if (!allowed.ContainsKey(name) || !seen.Add(name) || !(count is int || count is long || count is double || count is decimal))
+                throw new MaintenanceException("unsupported-diagnostics", "Codex сообщил неизвестные или повторные показатели простоя.");
+            double measured = Convert.ToDouble(count);
+            if (Double.IsNaN(measured) || Double.IsInfinity(measured) || measured < 0 || measured > 9007199254740991d || Math.Truncate(measured) != measured)
+                throw new MaintenanceException("unsupported-diagnostics", "Codex сообщил некорректный показатель простоя.");
+            if (allowed[name] >= 0 && measured != allowed[name]) throw new MaintenanceException("busy", "Codex занят; обновление не применено.");
+        }
+        // Native omits lazy zero counters. Loaded thread/queue/terminal checks below provide the missing semantic evidence.
+        if (!seen.Contains("app.requests.in_flight")) throw new MaintenanceException("unsupported-diagnostics", "Codex не подтвердил проверочный запрос.");
+    }
+
+    private static List<string> LoadedMaintenanceThreads(ClientWebSocket socket, CancellationToken token)
+    {
+        var ids = new List<string>(); var seen = new HashSet<string>(StringComparer.Ordinal); string cursor = null;
+        for (int pages = 0; pages < 100; pages++)
+        {
+            var parameters = new Dictionary<string, object> { { "limit", 100 } }; if (cursor != null) parameters["cursor"] = cursor;
+            var page = MaintenanceCall(socket, "thread/loaded/list", parameters, token);
+            foreach (object id in MaintenanceList(page, "data"))
+                if (!(id is string) || String.IsNullOrWhiteSpace((string)id) || !seen.Add((string)id) || ids.Count >= 1000)
+                    throw new MaintenanceException("unsupported-diagnostics", "Codex не подтвердил список загруженных разговоров.");
+                else ids.Add((string)id);
+            object next; if (!page.TryGetValue("nextCursor", out next) || next == null) { ids.Sort(StringComparer.Ordinal); return ids; }
+            if (!(next is string) || String.IsNullOrEmpty((string)next) || (string)next == cursor) break;
+            cursor = (string)next;
+        }
+        throw new MaintenanceException("unsupported-diagnostics", "Список загруженных разговоров Codex не завершён.");
+    }
+
+    private static void RequireEmptyMaintenancePage(ClientWebSocket socket, string method, string threadId, CancellationToken token)
+    {
+        var page = MaintenanceCall(socket, method, new Dictionary<string, object> { { "threadId", threadId }, { "limit", 1 } }, token);
+        if (MaintenanceList(page, "data").Count != 0 || page.ContainsKey("nextCursor") && page["nextCursor"] != null)
+            throw new MaintenanceException("busy", "В Codex остались очередь или фоновые команды; обновление не применено.");
+    }
+
+    private static void RequireMaintenanceThreadIdle(ClientWebSocket socket, string id, CancellationToken token)
+    {
+        var result = MaintenanceCall(socket, "thread/read", new Dictionary<string, object> { { "threadId", id }, { "includeTurns", false } }, token);
+        var thread = result.ContainsKey("thread") ? result["thread"] as Dictionary<string, object> : null;
+        var status = thread != null && thread.ContainsKey("status") ? thread["status"] as Dictionary<string, object> : null;
+        if (thread == null || !thread.ContainsKey("id") || !Object.Equals(thread["id"], id) || !thread.ContainsKey("ephemeral") || !(thread["ephemeral"] is bool) || status == null)
+            throw new MaintenanceException("unsupported-diagnostics", "Codex не подтвердил состояние загруженного разговора.");
+        if (!status.ContainsKey("type") || !Object.Equals(status["type"], "idle") || status.ContainsKey("activeFlags") && MaintenanceList(status, "activeFlags").Count != 0)
+            throw new MaintenanceException("busy", "Загруженный разговор Codex ещё занят; обновление не применено.");
+        foreach (string name in new[] { "pendingRequests", "requests" })
+            if (thread.ContainsKey(name) && MaintenanceList(thread, name).Count != 0) throw new MaintenanceException("busy", "Codex ожидает ответа клиента.");
+        if (!(bool)thread["ephemeral"]) RequireEmptyMaintenancePage(socket, "thread/queue/list", id, token);
+        RequireEmptyMaintenancePage(socket, "thread/backgroundTerminals/list", id, token);
     }
 
     private static void RequireCodexIdle(CodexWebSocketOwner owner, int nativePid)
     {
         using (var socket = new ClientWebSocket())
-        using (var deadline = new CancellationTokenSource(10000))
+        using (var deadline = new CancellationTokenSource(30000))
         {
             socket.Options.Proxy = null;
             socket.ConnectAsync(new Uri(owner.Endpoint), deadline.Token).GetAwaiter().GetResult();
@@ -1203,33 +1561,15 @@ internal static class Rele
                 throw new InvalidOperationException("Проверка простоя подключилась к другому профилю Codex.");
             MaintenanceSend(socket, new Dictionary<string, object> { { "method", "initialized" } }, deadline.Token);
             if (CodexPeerConnections(owner.Endpoint, nativePid) != 1)
-                throw new InvalidOperationException("У общего Codex есть другие подключения; обновление не применено.");
-            var diagnostics = MaintenanceCall(socket, "server/diagnostics", new Dictionary<string, object>(), deadline.Token);
-            var process = diagnostics.ContainsKey("process") ? diagnostics["process"] as Dictionary<string, object> : null;
-            if (process == null || !process.ContainsKey("id") || Convert.ToInt32(process["id"]) != nativePid || !diagnostics.ContainsKey("gauges"))
-                throw new InvalidOperationException("Проверка простоя не подтвердила PID общего Codex.");
-            var expected = new Dictionary<string, double> { { "app.requests.in_flight", 1 }, { "app.requests.queued", 0 },
-                { "core.threads.live", 0 }, { "core.turns.active", 0 } };
-            var gauges = diagnostics["gauges"] as System.Collections.IEnumerable;
-            if (gauges == null) throw new InvalidOperationException("Codex не сообщил состояние работы.");
-            foreach (object value in gauges)
-            {
-                var gauge = value as Dictionary<string, object>;
-                if (gauge == null || !gauge.ContainsKey("name") || !(gauge["name"] is string) || !gauge.ContainsKey("value"))
-                    throw new InvalidOperationException("Неизвестное состояние работы Codex.");
-                string name = (string)gauge["name"];
-                object count = gauge["value"];
-                if (!expected.ContainsKey(name) || !(count is int || count is long || count is double || count is decimal))
-                    throw new InvalidOperationException("Codex занят или его состояние неизвестно; обновление не применено.");
-                double measured = Convert.ToDouble(count);
-                // A cached idle thread can remain after its turn and client have ended; it is not an active turn.
-                if (Double.IsNaN(measured) || Double.IsInfinity(measured) || measured < 0 || Math.Truncate(measured) != measured ||
-                    (name != "core.threads.live" && measured != expected[name]))
-                    throw new InvalidOperationException("Codex занят или его состояние неизвестно; обновление не применено.");
-                expected.Remove(name);
-            }
-            if (expected.Count != 0 || CodexPeerConnections(owner.Endpoint, nativePid) != 1)
-                throw new InvalidOperationException("Codex не подтвердил исключительный простой.");
+                throw new MaintenanceException("clients-open", "У общего Codex есть другие подключения; обновление не применено.");
+            ValidateIdleGauges(MaintenanceCall(socket, "server/diagnostics", new Dictionary<string, object>(), deadline.Token), nativePid);
+            var loaded = LoadedMaintenanceThreads(socket, deadline.Token);
+            foreach (string id in loaded) RequireMaintenanceThreadIdle(socket, id, deadline.Token);
+            var after = LoadedMaintenanceThreads(socket, deadline.Token);
+            if (!String.Equals(String.Join("\n", loaded), String.Join("\n", after), StringComparison.Ordinal))
+                throw new MaintenanceException("busy", "Список загруженных разговоров изменился; повторите обновление позже.");
+            ValidateIdleGauges(MaintenanceCall(socket, "server/diagnostics", new Dictionary<string, object>(), deadline.Token), nativePid);
+            if (CodexPeerConnections(owner.Endpoint, nativePid) != 1) throw new MaintenanceException("clients-open", "К Codex подключился другой клиент.");
             socket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, String.Empty, deadline.Token).GetAwaiter().GetResult();
         }
         var wait = Stopwatch.StartNew();
@@ -1307,7 +1647,7 @@ internal static class Rele
                             throw new InvalidOperationException("Задача Codex ещё работает без подтверждённого нового receipt; остановка не выполняется.");
                         Thread.Sleep(100);
                     }
-                    RequireExternalCodexClosed(-1);
+                    RequireExternalCodexClosed(-1, codexHome);
                     RequireCodexOwnerAbsent(previous, previousDirectory);
                     return WaitForCodexSuccessor(successor, successorDirectory, task);
                 }
@@ -1315,7 +1655,7 @@ internal static class Rele
                 {
                     string instanceGuid;
                     dynamic runningInstance = SingleCodexTaskInstance(task, out instanceGuid);
-                    RequireExternalCodexClosed(runtime.Native.Id);
+                    RequireExternalCodexClosed(runtime.Native.Id, codexHome);
                     RequireCodexIdle(previous, runtime.Native.Id);
                     string scheduledDirectory;
                     task = OwnedCodexWebSocketTask(TaskFolder(), previous, previousDirectory, out scheduledDirectory);
@@ -1325,9 +1665,9 @@ internal static class Rele
                         (string)runningInstance.InstanceGuid != instanceGuid)
                         throw new InvalidOperationException("Задача Codex изменилась во время проверки простоя.");
                     ConfirmCodexRuntime(runtime, previous, previousDirectory);
-                    RequireExternalCodexClosed(runtime.Native.Id);
+                    RequireExternalCodexClosed(runtime.Native.Id, codexHome);
                     if (CodexPeerConnections(previous.Endpoint, runtime.Native.Id) != 0)
-                        throw new InvalidOperationException("К Codex подключился другой клиент; обновление не применено.");
+                        throw new MaintenanceException("clients-open", "К Codex подключился другой клиент; обновление не применено.");
                     // shortcut: independent clients must remain closed through this MVP maintenance window.
                     // Replace this operational fence with a native atomic drain when Codex exposes one.
                     try { runningInstance.Stop(); } catch { /* Reconcile only the old instance through its retained process handles. */ }
@@ -1600,13 +1940,17 @@ internal static class Rele
 
     private static void RemoveLegacyDesktopIntegration()
     {
-        if (!Config.DesktopIntegrationOwned || !String.IsNullOrEmpty(Config.InstalledCodexWebSocketUrl)) return;
+        bool flattened = FlattenLegacyPrevious();
+        if (!Config.DesktopIntegrationOwned || !String.IsNullOrEmpty(Config.InstalledCodexWebSocketUrl))
+        { if (flattened) SaveDesktopSettings(); return; }
         string cli = UserEnvironment("CODEX_CLI_PATH");
-        if (!String.IsNullOrEmpty(cli) && OwnedDesktopAdapter(cli))
+        if (!String.IsNullOrEmpty(cli) && (SamePath(cli, Path.Combine(AppDirectory, "Rele.Codex.exe")) || OwnedAdapterMarker(cli) != null))
         {
             SetUserEnvironment("CODEX_CLI_PATH", Config.PreviousCodexCliPath);
             if (UserEnvironment("CODEX_APP_SERVER_FORCE_CLI") == "1") SetUserEnvironment("CODEX_APP_SERVER_FORCE_CLI", Config.PreviousForceCli);
         }
+        if (!String.IsNullOrEmpty(Config.DesktopCliPath) && (SamePath(Config.DesktopCliPath, Path.Combine(AppDirectory, "Rele.Codex.exe")) || OwnedAdapterMarker(Config.DesktopCliPath) != null))
+            Config.DesktopCliPath = null;
         Config.DesktopIntegrationOwned = false;
         SaveDesktopSettings();
         BroadcastEnvironment();

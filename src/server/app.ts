@@ -81,7 +81,10 @@ export function createApp(services: AppServices) {
       reply.header('Retry-After', String(seconds));
       return reply.code(status).send({ error: `${message} Повторите через ${seconds} с.`, retryAfterSeconds: seconds });
     }
-    reply.code(status).send({ error: duplicate ? 'Этот тред или чат уже используется в другой связке.' : message });
+    const reason = (error as { reasonCode?: unknown }).reasonCode;
+    const reasonCode = typeof reason === 'string' && ['clients-open', 'busy', 'unsupported-diagnostics', 'uncertain'].includes(reason) ? reason : undefined;
+    reply.code(status).send({ error: duplicate ? 'Этот тред или чат уже используется в другой связке.' : message,
+      ...(reasonCode ? { reasonCode } : {}) });
   });
 
   app.get('/api/health', async () => ({ ok: true, version: services.version }));
@@ -251,7 +254,7 @@ export function createApp(services: AppServices) {
     if (input.action !== undefined && !apply || (apply ? input.clientsClosed !== true : input.clientsClosed !== undefined))
       throw new ApiError(400, 'Для обновления подтвердите, что Desktop и CLI закрыты до завершения операции.');
     if (configuring) throw new ApiError(409, 'Дождитесь завершения изменения подключения Codex.');
-    if (!services.codexUpdate) throw new ApiError(400, 'Обновление общего Codex доступно в установленном Rele для Windows.');
+    if (!services.codexUpdate) throw new ApiError(400, 'Управляемое обновление недоступно для этого подключения Codex.');
     configuring = true;
     try { return await (apply ? services.codexUpdate.apply() : services.codexUpdate.prepare()); }
     finally { configuring = false; retryDesktopIntegration(); }

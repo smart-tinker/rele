@@ -13,7 +13,8 @@ import { SlackChannel } from './channels/slack.js';
 import type { ChannelCallbacks } from './channels/common.js';
 import { instanceDiagnostics, openPanel, serverStatus, stopServer } from './lifecycle.js';
 import { DesktopIntegration } from './desktop-integration.js';
-import { CodexUpdate } from './codex-update.js';
+import { CodexUpdate, CodexUpdateError } from './codex-update.js';
+import { waitForCodexReconnect } from './codex-reconnect.js';
 import { runReleMcp } from './rele-mcp.js';
 import { registerRelePlugin } from './rele-plugin.js';
 
@@ -100,7 +101,8 @@ async function main(): Promise<void> {
     };
     for (const channel of Object.values(engine.channels)) void channel.start().catch(() => {});
   }
-  async function configure(next: AppConfig): Promise<void> {
+  let changingConfiguration = false;
+  async function configureNow(next: AppConfig): Promise<void> {
     if (shuttingDown) throw new Error('Rele завершает работу.');
     const previousCodex = JSON.stringify(config.config.codex);
     const codexChanged = JSON.stringify(next.codex) !== previousCodex;
@@ -140,26 +142,50 @@ async function main(): Promise<void> {
     try { await save(); } finally { engine.suspend(false); }
   }
   const codexUpdate = new CodexUpdate(root, config.directory, () => config.config.codex, () => codex.status());
+  let cleanupIdentity: string | undefined;
+  const cleanupAfterConnect = () => {
+    const state = codex.status();
+    if (shuttingDown || changingConfiguration || !state.connected || !state.queueSupported || state.error || !codex.isVerifiedVersion()) return;
+    const identity = JSON.stringify([state.name, state.executable, state.codexHome, state.endpoint]);
+    if (cleanupIdentity === identity) return;
+    cleanupIdentity = identity;
+    const client = codex;
+    void client.connect().then(async () => {
+      if (client !== codex || changingConfiguration || shuttingDown || client.status().error) {
+        if (cleanupIdentity === identity) cleanupIdentity = undefined;
+        return;
+      }
+      await codexUpdate.postflight();
+    }).catch(() => {
+      if (cleanupIdentity === identity) cleanupIdentity = undefined;
+      process.stderr.write('Rele: часть программных остатков сохранена; очистка будет проверена при следующем запуске.\n');
+    });
+  };
+  engine.on('change', cleanupAfterConnect);
+  async function configure(next: AppConfig): Promise<void> {
+    if (changingConfiguration) throw new Error('Настройки уже сохраняются.');
+    changingConfiguration = true;
+    try { await codexUpdate.waitForPostflight(); await configureNow(next); }
+    finally { changingConfiguration = false; cleanupAfterConnect(); }
+  }
   async function applyCodexUpdate() {
     return engine.maintainCodex(async () => {
-      const previousHome = codex.status().codexHome;
+      await codexUpdate.waitForPostflight();
+      const previous = codex.status();
       let result: Awaited<ReturnType<CodexUpdate['apply']>> | undefined, failure: unknown;
       try { await codex.close(); result = await codexUpdate.apply(); } catch (error) { failure = error; }
       // A fresh client must not replay the old client's native subscriptions during maintenance.
-      codex = new CodexClient(config.config.codex, codexOptions);
+      codex = new CodexClient(config.config.codex, { ...codexOptions, expectedVersion: result?.currentVersion });
       engine.replaceCodex(codex);
       try {
+        await waitForCodexReconnect(codex, { version: result?.currentVersion, home: previous.codexHome, queueSupported: previous.queueSupported });
         await codex.connect();
-        const status = codex.status();
-        if (result && (!codex.isVerifiedVersion() || status.name !== `Codex ${result.currentVersion}`
-          || previousHome && path.resolve(status.codexHome ?? '').toLowerCase() !== path.resolve(previousHome).toLowerCase())) {
-          await codex.close();
-          throw new Error('Codex не подтвердил новую версию и исходный профиль. Очередь сохранена.');
-        }
       } catch (error) {
-        if (!failure) throw new Error('Сервер обновлён, но Rele не подтвердил подключение. Очередь сохранена; проверьте состояние Codex.', { cause: error });
+        if (!failure) throw error instanceof CodexUpdateError ? error
+          : new CodexUpdateError('Сервер обновлён, но Rele не подтвердил подключение. Очередь сохранена; проверьте состояние Codex.', 503, 'uncertain');
       }
       if (failure) throw failure;
+      await codexUpdate.postflight();
       return codexUpdate.status();
     });
   }

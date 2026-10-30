@@ -109,7 +109,7 @@ export async function nativeCodexExecutable(executable: string, platform = proce
 }
 
 /** Return the complete supported package's version; native code verifies copied contents. */
-async function completeCodexPackage(executable: string): Promise<string | undefined> {
+export async function completeCodexPackage(executable: string): Promise<string | undefined> {
   try {
     const architecture = process.arch === 'x64' ? 'x86_64' : process.arch === 'arm64' ? 'aarch64' : '';
     const suffix = process.platform === 'win32' ? 'pc-windows-msvc' : process.platform === 'linux' ? 'unknown-linux-musl' : '';
@@ -427,6 +427,17 @@ export async function ensureSharedCodex(target: CodexConnectionTarget, options: 
   if (process.platform === 'win32') return ensureWindowsSharedCodex(target, options);
   const env = codexEnvironment(target.codexHome, options.env ?? process.env);
   const home = sharedHome(env), selectedHome = await canonicalDirectory(home);
+  const pendingFile = path.join(path.resolve(env.RELE_DATA_DIR || defaultDataDirectory()), 'codex-linux-update.json');
+  try {
+    const info = await lstat(pendingFile);
+    if (!info.isFile() || info.isSymbolicLink() || info.size > 8 * 1024 * 1024 || info.uid !== process.getuid?.() || info.mode & 0o077) throw new Error('invalid update journal');
+    const saved = JSON.parse(await readFile(pendingFile, 'utf8'));
+    if (saved?.schema !== 1 || saved.pending?.owner?.codexHome !== selectedHome || !['ready', 'verified'].includes(saved.pending?.phase)) {
+      throw new SharedCodexError('Обновление Linux Codex требует завершения или сверки. Запросы сохранены; прежний сервер не запускается.', 'shared-linux-update-pending');
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error instanceof SharedCodexError ? error : new SharedCodexError('Журнал обновления Linux Codex требует проверки; другой сервер не запускается.', 'shared-linux-update-pending');
+  }
   const expectedSocket = path.join(selectedHome, 'app-server-control', 'app-server-control.sock');
   const run = options.run ?? runSharedCommand;
   const timeoutMs = options.timeoutMs ?? 15_000;

@@ -143,6 +143,7 @@ export class CodexClient extends EventEmitter {
   private discovery?: { at: number; result: CodexDiscoveryResult };
 
   constructor(private readonly config: CodexConfig, private readonly options: { discover?: typeof discoverCodex; shared?: typeof ensureSharedCodex; releaseTimeoutMs?: number;
+    expectedVersion?: string;
     setupPlugin?: (rpc: (method: string, params: Record<string, unknown>) => Promise<unknown>, runtime: CodexRuntime) => Promise<void> } = {}) {
     super();
     this.state = {
@@ -756,6 +757,8 @@ export class CodexClient extends EventEmitter {
       catch { throw new SharedCodexError('Общий Codex использует другой профиль или платформу. Выберите исходный локальный профиль; запись остановлена.', 'shared-profile-mismatch'); }
     }
     this.version = this.runtime.userAgent.match(/\/(\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?)(?=\s|$)/u)?.[1];
+    if (this.options.expectedVersion && this.version !== this.options.expectedVersion) throw new CodexTransportError(
+      'Codex не подтвердил версию после обновления. Очередь сохранена; повторяется только подключение.', 'update-version-mismatch');
     this.setState({ name: this.version ? `Codex ${this.version}` : 'Codex', connected: true, codexHome: this.runtime.codexHome, error: undefined, errorCode: undefined });
     if (!this.isVerifiedVersion()) {
       this.setState({ error: `Запись доступна для проверенного Codex ${SUPPORTED_CODEX_VERSIONS.join(' или ')}; подключён ${this.version || 'неизвестный runtime'}.` });

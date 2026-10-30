@@ -293,6 +293,7 @@ export interface CodexUpdateState {
   installedVersion?: string;
   pendingVersion?: string;
   error?: string;
+  cleanup?: { status: 'complete' | 'partial'; freedBytes: number; deletedCount: number; keptCount: number };
 }
 
 export interface PublicConfig {
