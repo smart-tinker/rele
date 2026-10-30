@@ -825,6 +825,8 @@ describe('Codex shared-runtime adapter', () => {
   it.each([
     ['failed', 'other', 'Your input exceeds the context window of this model. Please adjust your input and try again.', null, 'contextWindowExceeded'],
     ['failed', 'other', 'synthetic-provider-secret: Your input exceeds the context window of this model. Please adjust your input and try again. (provider wrapper)', null, 'contextWindowExceeded'],
+    ['failed', 'other', 'Error running remote compact task: HTTP400 synthetic-provider-secret: Your input exceeds the context window of this model. Please adjust your input and try again.', null, 'contextCompactionFailed'],
+    ['failed', 'other', 'Error running remote compact task: unrelated provider failure', null, undefined],
     ['failed', 'other', 'Provider reported an unrelated context error', null, undefined],
     ['failed', 'other', 'Unknown provider error', '{"error":{"code":"context_length_exceeded"}}', undefined],
     ['failed', 'badRequest', 'Your input exceeds the context window of this model. Please adjust your input and try again.', null, undefined],
@@ -839,7 +841,7 @@ describe('Codex shared-runtime adapter', () => {
   });
 
   it('does not interpret assistant text as a native context error', async () => {
-    const clientId = randomUUID(), message = 'Your input exceeds the context window of this model. Please adjust your input and try again.';
+    const clientId = randomUUID(), message = 'Error running remote compact task: Your input exceeds the context window of this model. Please adjust your input and try again.';
     const f = await fixture({ 'thread/turns/list': () => ({ data: [{ id: 'generic-turn', status: 'failed', error: { codexErrorInfo: 'other', message: 'Unknown error' },
       items: [{ type: 'userMessage', clientId }, { type: 'agentMessage', phase: 'final_answer', text: message }] }], nextCursor: null }) });
     await f.client.connect(); expect(await f.client.findRequest(threadId, clientId)).toMatchObject({ state: 'failed', text: message });

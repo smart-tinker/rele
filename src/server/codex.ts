@@ -35,7 +35,7 @@ export interface RequestLocation {
   soleQueuedSubmission?: boolean;
   turnId?: string;
   text?: string;
-  failureReason?: 'serverOverloaded' | 'contextWindowExceeded';
+  failureReason?: 'serverOverloaded' | 'contextWindowExceeded' | 'contextCompactionFailed';
   commentary?: { id: string; text: string }[];
   retryCount?: number;
   retryBlocked?: boolean;
@@ -77,9 +77,11 @@ interface PendingCall {
 }
 
 function nativeFailureReason(error: HistoryTurn['error']): RequestLocation['failureReason'] {
-  if (error?.codexErrorInfo === 'serverOverloaded' || error?.codexErrorInfo === 'contextWindowExceeded') return error.codexErrorInfo;
-  if (error?.codexErrorInfo !== 'other') return;
-  if (typeof error.message === 'string' && error.message.includes('Your input exceeds the context window of this model. Please adjust your input and try again.')) return 'contextWindowExceeded';
+  if (error?.codexErrorInfo === 'serverOverloaded') return 'serverOverloaded';
+  const message = typeof error?.message === 'string' ? error.message : '';
+  const contextExceeded = error?.codexErrorInfo === 'contextWindowExceeded' || error?.codexErrorInfo === 'other'
+    && message.includes('Your input exceeds the context window of this model. Please adjust your input and try again.');
+  if (contextExceeded) return message.startsWith('Error running remote compact task:') ? 'contextCompactionFailed' : 'contextWindowExceeded';
 }
 
 export class CodexRpcError extends Error {

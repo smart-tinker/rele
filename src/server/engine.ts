@@ -1362,8 +1362,9 @@ export class Engine extends EventEmitter {
     } else if (found.state === 'failed' || found.state === 'interrupted') {
       const error = found.state === 'interrupted' ? 'Выполнение запроса остановлено в Codex.'
         : found.failureReason === 'serverOverloaded' ? found.retryBlocked ? 'Codex временно перегружен. В чате уже началась другая задача; автоматические повторы этого запроса остановлены.' : 'Codex остаётся перегружен после автоматических повторов. Запрос завершён с ошибкой.'
-          : found.failureReason === 'contextWindowExceeded' ? 'Контекст разговора превысил лимит модели. Перед повтором нужно сжать контекст.'
-            : 'Codex завершил запрос с ошибкой. Подробности доступны в Codex.';
+          : found.failureReason === 'contextCompactionFailed' ? 'Автоматическое сжатие контекста Codex завершилось ошибкой: превышен лимит модели.'
+            : found.failureReason === 'contextWindowExceeded' ? 'Контекст разговора превысил лимит модели.'
+              : 'Codex завершил запрос с ошибкой. Подробности доступны в Codex.';
       this.store.finishRequest(request.id, { status: found.state, turnId: found.turnId, error }, [{ key: 'terminal:error', ordinal: 0, kind: 'error', body: error }]);
       this.recordProgress(request.id, { terminal: found.state });
     }
