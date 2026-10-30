@@ -2,9 +2,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { SlackSync } from '../src/server/slack-sync.js';
+import { SlackSync, quotedEntry, slackContextItemId } from '../src/server/slack-sync.js';
 import { Store } from '../src/server/store.js';
-import { CodexThreadBusyError } from '../src/server/codex.js';
+import { CodexThreadBusyError, type CodexClient } from '../src/server/codex.js';
 import { ChannelError, type Channel } from '../src/server/channels/common.js';
 import type { CodexConnectionState, Endpoint, SlackTranscriptMessage } from '../src/shared/types.js';
 
@@ -23,7 +23,7 @@ function fixture() {
   const readThreadPage = vi.fn<NonNullable<Channel['readThreadPage']>>().mockResolvedValue({ messages: [] });
   const channel: Channel = { state: { configured: true, connected: true, accountId: endpoint.accountId }, start: vi.fn(), stop: vi.fn(), deliver: vi.fn(), download: vi.fn(), readThreadPage };
   const status: CodexConnectionState = { configured: true, connected: true, queueSupported: true, desktopVerified: false, transport: 'managed' };
-  const codex = { status: () => ({ ...status }), injectContext: vi.fn<(threadId: string, entryId: string, text: string) => Promise<void>>().mockResolvedValue(undefined), releaseThread: vi.fn<(threadId: string) => Promise<void>>().mockResolvedValue(undefined) };
+  const codex = { status: () => ({ ...status }), injectContext: vi.fn<CodexClient['injectContext']>().mockResolvedValue(undefined), releaseThread: vi.fn<(threadId: string) => Promise<void>>().mockResolvedValue(undefined) };
   let currentChannel: Channel | undefined = channel;
   const sync = new SlackSync(store, () => currentChannel, () => codex);
   const message = (messageId = '110.000000', text = 'Full Slack text', extra: Partial<SlackTranscriptMessage> = {}): SlackTranscriptMessage => ({ endpointId: endpoint.id, accountId: endpoint.accountId, chatId: endpoint.chatId, threadId: endpoint.threadId, messageId, sender: endpoint.people[0], kind: 'message', text, payload: { text, ts: messageId }, ...extra });
@@ -32,6 +32,28 @@ function fixture() {
 }
 
 describe('durable Slack passive sync', () => {
+  it('uses stable valid native IDs for a semantic source version and separates edits and origins', () => {
+    const f = fixture(), original = f.message('110.000000', 'Original text', { payload: { text: 'Original text', blocks: [{ block_id: 'delivery-a', text: { type: 'plain_text', text: 'Original text' } }] } });
+    const id = slackContextItemId('native-original', original);
+    expect(id).toMatch(/^msg_[a-f0-9]{48}$/u);
+    expect(slackContextItemId('native-original', { ...original, kind: 'edit', receivedAt: 'another-delivery', payload: { ...original.payload, blocks: [{ block_id: 'delivery-b', text: { type: 'plain_text', text: 'Original text' } }] } })).toBe(id);
+    for (const changed of [{ text: 'Edited text' }, { accountId: 'T2:U2' }, { chatId: 'C2' }, { threadId: '200.000000' }, { messageId: '120.000000' }, { platform: 'telegram' as const }, { kind: 'deleted' as const }]) {
+      expect(slackContextItemId('native-original', { ...original, ...changed })).not.toBe(id);
+    }
+    expect(slackContextItemId('another-native', original)).not.toBe(id);
+  });
+
+  it('passes canonical and legacy alias receipts with each original exact quote', async () => {
+    const f = fixture(), entry = f.store.recordSlackMessage(f.message())!;
+    const alias = { ...entry, id: 'old-delivery-entry', message: { ...entry.message, receivedAt: 'previous-delivery' } };
+    vi.spyOn(f.store, 'listSlackSyncReceiptEntries').mockReturnValue([entry, alias]);
+    await f.sync.backfill(); expect(await f.sync.drain(f.conversation.id)).toBe(true);
+    expect(f.codex.injectContext).toHaveBeenCalledExactlyOnceWith('original-codex', entry.id, quotedEntry(entry), {
+      itemId: slackContextItemId('original-codex', entry.message), entries: [{ entryId: entry.id, text: quotedEntry(entry) }, { entryId: alias.id, text: quotedEntry(alias) }],
+    });
+    expect(quotedEntry(alias)).not.toBe(quotedEntry(entry));
+  });
+
   it('projects observed Telegram context with attribution and no history fetch or model task', async () => {
     const f = fixture();
     await f.sync.backfill();
@@ -216,7 +238,7 @@ describe('durable Slack passive sync', () => {
     expect(f.store.getSlackSyncStream(old.streamId)).toMatchObject({ active: false, codexThreadId: 'original-codex' });
     expect(f.store.getSlackSyncStream(fresh.streamId)?.conversationId).toBe(next.id);
     expect(await f.sync.drain(f.conversation.id)).toBe(true);
-    expect(f.codex.injectContext).toHaveBeenCalledExactlyOnceWith('original-codex', old.id, expect.any(String));
+    expect(f.codex.injectContext).toHaveBeenCalledExactlyOnceWith('original-codex', old.id, expect.any(String), expect.objectContaining({ itemId: expect.stringMatching(/^msg_[a-f0-9]{48}$/u) }));
     expect(f.store.getSlackSyncEntry(fresh.id)?.state).toBe('pending');
     expect(f.readThreadPage).not.toHaveBeenCalled();
   });
@@ -263,7 +285,7 @@ describe('durable Slack passive sync', () => {
     advance(); await f.sync.backfill();
     expect(f.readThreadPage.mock.calls.at(-1)?.[1]?.oldest).toBeUndefined();
     expect(await f.sync.drain(f.conversation.id)).toBe(true);
-    expect(f.codex.injectContext).toHaveBeenCalledExactlyOnceWith('original-codex', expect.any(String), expect.stringContaining('Fresh full history'));
+    expect(f.codex.injectContext).toHaveBeenCalledExactlyOnceWith('original-codex', expect.any(String), expect.stringContaining('Fresh full history'), expect.objectContaining({ itemId: expect.stringMatching(/^msg_[a-f0-9]{48}$/u) }));
   });
 
   it.each(['proxy', 'websocket'] as const)('allows %s after Slack is detached and fully applied, but retains pending original-destination context', async transport => {
@@ -286,7 +308,7 @@ describe('durable Slack passive sync', () => {
     expect(f.codex.injectContext).toHaveBeenCalledTimes(1);
     advance(5001);
     expect(await f.sync.drain(f.conversation.id)).toBe(true);
-    expect(f.codex.injectContext.mock.calls[1]).toEqual(['original-codex', pending.id, expect.stringContaining('Captured before detach')]);
+    expect(f.codex.injectContext.mock.calls[1]).toEqual(['original-codex', pending.id, expect.stringContaining('Captured before detach'), expect.objectContaining({ itemId: expect.stringMatching(/^msg_[a-f0-9]{48}$/u) })]);
     expect(f.store.getSlackSyncEntry(pending.id)?.state).toBe('applied');
     expect(f.readThreadPage).toHaveBeenCalledTimes(1);
     f.status.transport = transport;
@@ -410,7 +432,7 @@ it('stops new source context while off but drains prior captured entries and res
   await f.sync.backfill();
   expect(f.readThreadPage).not.toHaveBeenCalled();
   expect(await f.sync.drain(f.conversation.id)).toBe(true);
-  expect(f.codex.injectContext).toHaveBeenCalledExactlyOnceWith('original-codex', accepted.id, expect.stringContaining('Captured before off'));
+  expect(f.codex.injectContext).toHaveBeenCalledExactlyOnceWith('original-codex', accepted.id, expect.stringContaining('Captured before off'), expect.objectContaining({ itemId: expect.stringMatching(/^msg_[a-f0-9]{48}$/u) }));
   expect(f.store.listSlackSyncEntries(accepted.streamId)).toHaveLength(1);
   f.store.setSourceAccess(f.endpoint.id, { mode: 'all' });
   f.readThreadPage.mockResolvedValueOnce({ messages: [f.message('120.000000', 'Full context after explicit enabling')] });

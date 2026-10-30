@@ -42,12 +42,12 @@ async function requireUnsentQueue(directory: string): Promise<void> {
   try {
     database.exec('PRAGMA busy_timeout=500; BEGIN;');
     const version = Number(database.prepare('PRAGMA user_version').get()!.user_version);
-    if (database.prepare('PRAGMA application_id').get()!.application_id !== 0x52454c45 || !Number.isSafeInteger(version) || version < 1 || version > 7) throw new Error('Неизвестная версия базы Rele; настройки сохранены.');
+    if (database.prepare('PRAGMA application_id').get()!.application_id !== 0x52454c45 || !Number.isSafeInteger(version) || version < 1 || version > 8) throw new Error('Неизвестная версия базы Rele; настройки сохранены.');
     const blocked = database.prepare(`SELECT 1 FROM requests WHERE status IS NULL
       OR status NOT IN ('queued','completed','failed','interrupted','cancelled')
       OR (status='queued' AND (queued_submission_id IS NOT NULL OR turn_id IS NOT NULL)) LIMIT 1`).get()
       || database.prepare("SELECT 1 FROM approvals WHERE status IS NULL OR status NOT IN ('answered','expired') LIMIT 1").get()
-      || version >= 4 && database.prepare("SELECT 1 FROM slack_sync_entries WHERE state IS NULL OR state NOT IN ('pending','applied') LIMIT 1").get()
+      || version >= 4 && database.prepare(`SELECT 1 FROM slack_sync_entries WHERE ${version >= 8 ? 'canonical_entry_id IS NULL AND ' : ''}(state IS NULL OR state NOT IN ('pending','applied')) LIMIT 1`).get()
       || version >= 5 && database.prepare("SELECT 1 FROM auto_link_intents WHERE status IS NULL OR status<>'completed' LIMIT 1").get()
       || version >= 7 && database.prepare("SELECT 1 FROM tool_outbox WHERE status IS NULL OR status NOT IN ('pending','sent','failed','cancelled') LIMIT 1").get();
     if (blocked) throw new Error('В Rele остались активные или неподтверждённые операции Codex. Автоматическая смена подключения отложена; запросы сохранены.');

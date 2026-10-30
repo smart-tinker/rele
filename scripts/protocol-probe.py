@@ -235,7 +235,7 @@ supports_websockets=false
         assert all(item['source'] in normal_sources and not item.get('parentThreadId') for item in catalog['data']),catalog
         report['checks']['indexed_normal_source_catalog']=True
         # Passive Slack transcript must persist without starting a model or a UI turn.
-        context_id='rele_slack_'+str(uuid.uuid4())
+        context_id='msg_'+uuid.uuid4().hex
         context_canary='Rele passive Slack context canary '+str(uuid.uuid4())
         context_item={'type':'message','id':context_id,'role':'user',
                       'content':[{'type':'input_text','text':context_canary}]}
@@ -278,7 +278,7 @@ supports_websockets=false
         receipt_turn=result(await a.call('turn/start',{'threadId':thread,
             'input':[{'type':'text','text':'hold the native injection receipt race'}]}))['turn']['id']
         await asyncio.wait_for(wait_len(records,before+1),20)
-        raw_item={'type':'message','id':'rele_slack_'+str(uuid.uuid4()),'role':'user',
+        raw_item={'type':'message','id':'msg_'+uuid.uuid4().hex,'role':'user',
             'content':[{'type':'input_text','text':'<quoted_slack_transcript author="UOTHER">'
                 +'Synthetic source '+str(uuid.uuid4())+'</quoted_slack_transcript>'}]}
         assert result(await b.call('thread/inject_items',{'threadId':thread,'items':[raw_item]}))=={}
@@ -375,7 +375,7 @@ supports_websockets=false
         # A brand-new thread must persist passive context before its first model turn.
         fresh=result(await c.call('thread/start',{'cwd':str(workspace)}))['thread']['id']
         fresh_before=len(records)
-        fresh_item={'type':'message','id':'rele_slack_'+str(uuid.uuid4()),'role':'user',
+        fresh_item={'type':'message','id':'msg_'+uuid.uuid4().hex,'role':'user',
             'content':[{'type':'input_text','text':'First-turn passive Slack canary '+str(uuid.uuid4())}]}
         assert result(await c.call('thread/inject_items',{'threadId':fresh,'items':[fresh_item]}))=={}
         fresh_rollout=pathlib.Path(result(await c.call('thread/read',{'threadId':fresh}))['thread']['path']).resolve()

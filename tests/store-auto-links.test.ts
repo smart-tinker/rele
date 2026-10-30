@@ -19,6 +19,10 @@ function open(file = path()) {
   stores.push(store);
   return store;
 }
+function dropSourceVersionSchema(database: DatabaseSync): void {
+  database.exec(`DROP TABLE inbound_source_versions; DROP INDEX slack_sync_semantic_source; DROP INDEX slack_sync_aliases;
+    ALTER TABLE slack_sync_entries DROP COLUMN canonical_entry_id; ALTER TABLE slack_sync_entries DROP COLUMN semantic_revision;`);
+}
 function endpoint(id = 'slack-1', platform: 'slack' | 'telegram' = 'slack'): Endpoint {
   return { id, platform, accountId: platform === 'slack' ? 'T1:BOT' : 'telegram-bot',
     chatId: platform === 'slack' ? `C${id.replaceAll('-', '')}` : '-100', threadId: id,
@@ -66,6 +70,7 @@ describe('multiple origin bindings and v5 migration', () => {
     const entries = store.listSlackSyncEntries(streams[0].id);
     store.close();
     const old = new DatabaseSync(file);
+    dropSourceVersionSchema(old);
     old.exec(`DROP TABLE tool_outbox; CREATE TABLE bindings_v4 (
       id TEXT PRIMARY KEY NOT NULL, conversation_id TEXT NOT NULL REFERENCES conversations(id),
       platform TEXT NOT NULL CHECK(platform IN ('slack','telegram')), endpoint_id TEXT NOT NULL UNIQUE,
@@ -91,7 +96,7 @@ describe('multiple origin bindings and v5 migration', () => {
     expect(upgraded.getConversation(original.id)?.bindings).toHaveLength(4);
     expect(upgraded.getConversation(original.id)?.threadId).toBe('native-original');
     const check = new DatabaseSync(file);
-    expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(7);
+    expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(8);
     expect(check.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(check.prepare('PRAGMA quick_check').get()?.quick_check).toBe('ok');
     check.close();
@@ -381,6 +386,7 @@ describe('source access and routing', () => {
     const access = store.getSourceAccess(ep.id);
     store.close();
     const old = new DatabaseSync(file);
+    dropSourceVersionSchema(old);
     old.exec("DROP TABLE tool_outbox; DELETE FROM meta WHERE key='source-policy-version'; PRAGMA user_version=5;"); old.close();
     const upgraded = open(file);
     expect(upgraded.getConversation(conversation.id)).toEqual(conversation);
@@ -388,7 +394,7 @@ describe('source access and routing', () => {
     expect(upgraded.getSourceAccess(ep.id)).toEqual(access);
     expect(upgraded.getMeta('source-policy-version')).toBe('1');
     const check = new DatabaseSync(file);
-    expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(7);
+    expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(8);
     expect(check.prepare('PRAGMA foreign_key_check').all()).toEqual([]); check.close();
     expect(upgraded.ingest(message(ep, 'still-off')).request).toBeNull();
   });

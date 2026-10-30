@@ -7,7 +7,11 @@ const READ_BYTES = 64 * 1024;
 const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 const RECEIPT_ERROR = 'Не удалось подтвердить сохранение контекста Codex.';
 
-interface ReceiptQuery { codexHome: string; rolloutPath: string; threadId: string; itemId: string; text: string }
+export interface CodexContextReceipt { itemId: string; text: string }
+interface ReceiptQuery extends CodexContextReceipt {
+  codexHome: string; rolloutPath: string; threadId: string;
+  alternatives?: CodexContextReceipt[];
+}
 interface ScanState {
   dev: bigint;
   ino: bigint;
@@ -21,6 +25,10 @@ interface ScanState {
 
 function textHash(text: string): string {
   return createHash('sha256').update(JSON.stringify(text)).digest('hex');
+}
+
+function contextItemId(id: string): boolean {
+  return /^msg_[a-f0-9]{48}$/u.test(id) || id.startsWith('rele_slack_') && id.length > 'rele_slack_'.length;
 }
 
 function inside(directory: string, file: string): boolean {
@@ -44,8 +52,10 @@ export class CodexContextReceipts {
   private async scan(query: ReceiptQuery): Promise<boolean> {
     let key: string | undefined;
     try {
+      const candidates = [query, ...(query.alternatives ?? [])];
       if (!path.isAbsolute(query.codexHome) || !path.isAbsolute(query.rolloutPath)
-        || path.extname(query.rolloutPath) !== '.jsonl' || !query.threadId || !query.itemId.startsWith('rele_slack_')) throw new Error();
+        || path.extname(query.rolloutPath) !== '.jsonl' || !query.threadId
+        || candidates.some(candidate => typeof candidate.itemId !== 'string' || !contextItemId(candidate.itemId) || typeof candidate.text !== 'string')) throw new Error();
       const home = await realpath(query.codexHome);
       const file = await realpath(query.rolloutPath);
       if (path.extname(file) !== '.jsonl'
@@ -89,7 +99,7 @@ export class CodexContextReceipts {
         const current = await stat(file, { bigint: true });
         if (after.size < info.size || current.dev !== info.dev || current.ino !== info.ino
           || await realpath(query.rolloutPath) !== file || await realpath(file) !== file) throw new Error();
-        return state.verified && state.receipts.get(query.itemId)?.has(textHash(query.text)) === true;
+        return state.verified && candidates.some(candidate => state.receipts.get(candidate.itemId)?.has(textHash(candidate.text)) === true);
       } finally {
         await handle.close();
       }
@@ -108,7 +118,7 @@ export class CodexContextReceipts {
     }
     const item = row?.payload;
     if (row?.type !== 'response_item' || item?.type !== 'message' || item.role !== 'user'
-      || typeof item.id !== 'string' || !item.id.startsWith('rele_slack_') || !Array.isArray(item.content)
+      || typeof item.id !== 'string' || !contextItemId(item.id) || !Array.isArray(item.content)
       || item.content.length !== 1 || item.content[0]?.type !== 'input_text' || typeof item.content[0].text !== 'string') return;
     const hashes = state.receipts.get(item.id) ?? new Set<string>();
     hashes.add(textHash(item.content[0].text));

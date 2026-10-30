@@ -1,7 +1,7 @@
 /** Fixture driver: real Rele engine/SQLite/managed transport, synthetic channels only. */
 import { parseArgs } from 'node:util';
 import { createInterface } from 'node:readline';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { copyFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -83,7 +83,7 @@ async function freshContextProof() {
     await fresh.injectContext(thread, entryId, text);
     const metadata = await fresh.readThread(thread) as { thread: { path: string } };
     const receipt = await new CodexContextReceipts().has({ codexHome: home, rolloutPath: metadata.thread.path,
-      threadId: thread, itemId: `rele_slack_${entryId}`, text });
+      threadId: thread, itemId: `msg_${createHash('sha256').update(JSON.stringify([thread, entryId])).digest('hex').slice(0, 48)}`, text });
     const passiveTurnsStarted = startedTurns.size;
     if (!receipt || passiveTurnsStarted !== 0) throw new Error('Fresh passive context created a turn or has no persisted receipt');
     const clientId = randomUUID();

@@ -29,6 +29,10 @@ export interface CodexConfig {
 export type RpcId = string | number;
 export interface CodexNotification { method: string; params: Record<string, unknown> }
 export interface CodexServerRequest extends CodexNotification { id: RpcId }
+export interface CodexContextReceiptCandidates {
+  itemId: string;
+  entries: { entryId: string; text: string }[];
+}
 export interface RequestLocation {
   state: 'queued' | 'running' | 'completed' | 'failed' | 'interrupted' | 'not_found';
   queuedSubmissionId?: string;
@@ -333,10 +337,19 @@ export class CodexClient extends EventEmitter {
   }
 
   /** Passive user context only; caller serializes this with requests and releases our writer. */
-  async injectContext(threadId: string, entryId: string, text: string): Promise<void> {
+  async injectContext(threadId: string, entryId: string, text: string, candidates?: CodexContextReceiptCandidates): Promise<void> {
     const shared = this.config.transport !== 'managed';
     if (!shared && !this.stdio) throw new Error('Управляемый Codex Rele не подключён.');
     if (!entryId.trim() || !text.trim()) throw new Error('Фоновому контексту нужны постоянный идентификатор и непустой текст.');
+    // Model-facing message IDs must use msg_; journal and legacy provenance stay unchanged.
+    const itemId = candidates?.itemId ?? `msg_${createHash('sha256').update(JSON.stringify([threadId, entryId])).digest('hex').slice(0, 48)}`;
+    if (!/^msg_[a-f0-9]{48}$/u.test(itemId) || candidates && (!Array.isArray(candidates.entries)
+      || candidates.entries.some(entry => typeof entry.entryId !== 'string' || !entry.entryId.trim() || typeof entry.text !== 'string' || !entry.text.trim()))) {
+      throw new Error('Не удалось проверить идентификаторы сохранённого контекста Codex.');
+    }
+    const receipts = [{ entryId, text }, ...(candidates?.entries ?? [])].flatMap(entry => [
+      { itemId, text: entry.text }, { itemId: `rele_slack_${entry.entryId}`, text: entry.text },
+    ]);
     this.requireQueue();
     if (!this.isVerifiedVersion()) throw new Error(`Для фонового контекста нужен проверенный Codex ${SUPPORTED_CODEX_VERSION}.`);
     const runtime = this.runtime;
@@ -359,7 +372,7 @@ export class CodexClient extends EventEmitter {
     const receipt = async () => {
       const thread = await read(); // Re-read: archive/compression can change the persisted rollout path.
       if (!home || typeof thread.path !== 'string') throw new Error('Не удалось подтвердить сохранение контекста Codex.');
-      const found = await this.contextReceipts.has({ codexHome: home, rolloutPath: thread.path, threadId, itemId: `rele_slack_${entryId}`, text });
+      const found = await this.contextReceipts.has({ codexHome: home, rolloutPath: thread.path, threadId, itemId, text, alternatives: receipts });
       current();
       return found;
     };
@@ -390,7 +403,7 @@ export class CodexClient extends EventEmitter {
     current();
     // Raw item IDs are attribution, not server idempotency keys. Never retry the RPC here.
     await this.call('thread/inject_items', {
-      threadId, items: [{ type: 'message', id: `rele_slack_${entryId}`, role: 'user', content: [{ type: 'input_text', text }] }],
+      threadId, items: [{ type: 'message', id: itemId, role: 'user', content: [{ type: 'input_text', text }] }],
     });
     if (shared && !await receipt()) throw new Error('Codex принял контекст, но сохранённая запись пока не подтверждена. Контекст остаётся в ожидании.');
   }

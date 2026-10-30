@@ -29,6 +29,25 @@ async function fixture(lines = [meta(), item()], directory = 'sessions') {
 afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
 
 describe('persisted Codex passive context receipts', () => {
+  it('recognizes valid model-facing msg IDs while keeping legacy receipts readable', async () => {
+    const id = `msg_${'a'.repeat(48)}`;
+    const f = await fixture([meta(), item({ id })]);
+    expect(await f.receipts.has({ ...f.query, itemId: id })).toBe(true);
+    expect(await f.receipts.has(f.query)).toBe(false);
+    await appendFile(f.rolloutPath, `${item()}\n`);
+    expect(await f.receipts.has(f.query)).toBe(true);
+    await expect(f.receipts.has({ ...f.query, itemId: 'msg_arbitrary' })).rejects.toThrow('Не удалось подтвердить сохранение контекста Codex.');
+  });
+
+  it.each(['legacy', 'msg'])('matches an equivalent %s receipt only with its exact paired text', async format => {
+    const current = `msg_${'a'.repeat(48)}`, legacy = 'rele_slack_old-entry', oldText = 'Exact original quote and old provenance';
+    const persisted = format === 'legacy' ? legacy : current;
+    const f = await fixture([meta(), item({ id: persisted, text: oldText })]);
+    const query = { ...f.query, itemId: current, text: 'New canonical quote' };
+    expect(await f.receipts.has({ ...query, alternatives: [{ itemId: persisted, text: 'Different quote' }] })).toBe(false);
+    expect(await f.receipts.has({ ...query, alternatives: [{ itemId: persisted, text: oldText }] })).toBe(true);
+  });
+
   it.each(['sessions', 'archived_sessions'])('matches exact persisted user ID and text under %s without changing the file', async directory => {
     const f = await fixture(undefined, directory);
     const before = await readFile(f.rolloutPath);

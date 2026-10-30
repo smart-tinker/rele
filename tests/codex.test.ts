@@ -1025,7 +1025,7 @@ describe('Codex passive context', () => {
     expect(original?.params).toEqual({ threadId, excludeTurns: true });
     expect(calls.find(call => call.method === 'thread/read')?.params).toEqual({ threadId });
     expect(calls.find(call => call.method === 'thread/inject_items')?.params).toEqual({
-      threadId, items: [{ type: 'message', id: 'rele_slack_slack-entry', role: 'user', content: [{ type: 'input_text', text: 'Passive Slack transcript' }] }],
+      threadId, items: [{ type: 'message', id: expect.stringMatching(/^msg_[a-f0-9]{48}$/u), role: 'user', content: [{ type: 'input_text', text: 'Passive Slack transcript' }] }],
     });
     const methods = calls.map(call => call.method);
     expect(methods.indexOf('thread/queue/list')).toBeLessThan(methods.indexOf('thread/resume'));
@@ -1124,10 +1124,41 @@ describe('Codex shared passive context receipts', () => {
     await f.client.injectContext(threadId, 'entry', 'Context');
     expect(f.calls.filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
     expect(f.calls.find(call => call.method === 'thread/inject_items')?.params).toEqual({
-      threadId, items: [{ type: 'message', id: 'rele_slack_entry', role: 'user', content: [{ type: 'input_text', text: 'Context' }] }],
+      threadId, items: [{ type: 'message', id: expect.stringMatching(/^msg_[a-f0-9]{48}$/u), role: 'user', content: [{ type: 'input_text', text: 'Context' }] }],
     });
     expect(f.calls.some(call => ['thread/start', 'thread/fork', 'turn/start', 'thread/queue/add'].includes(call.method ?? ''))).toBe(false);
-    expect(await readFile(f.rolloutPath, 'utf8')).toContain('rele_slack_entry');
+    expect(await readFile(f.rolloutPath, 'utf8')).toContain('msg_');
+    expect(await readFile(f.rolloutPath, 'utf8')).not.toContain('rele_slack_entry');
+  });
+
+  it.each(['legacy', 'msg'])('reconciles a migrated %s alias before acquiring a writer or appending', async format => {
+    const f = await sharedContextFixture(), itemId = `msg_${'b'.repeat(48)}`, oldText = 'Original quote with the old journal provenance';
+    await appendFile(f.rolloutPath, JSON.stringify({ type: 'response_item', payload: { type: 'message', id: format === 'legacy' ? 'rele_slack_old-entry' : itemId,
+      role: 'user', content: [{ type: 'input_text', text: oldText }] } }) + '\n');
+    const beforeFile = await readFile(f.rolloutPath);
+    await f.client.connect(); const before = f.calls.length;
+    await f.client.injectContext(threadId, 'canonical-entry', 'Canonical quote', { itemId, entries: [{ entryId: 'old-entry', text: oldText }] });
+    expect(f.calls.slice(before).map(call => call.method)).toEqual(['thread/read']);
+    expect(await readFile(f.rolloutPath)).toEqual(beforeFile);
+  });
+
+  it('reconciles a new-ID lost ACK even when the canonical journal entry changes', async () => {
+    const f = await sharedContextFixture({ dropAck: true }), itemId = `msg_${'c'.repeat(48)}`;
+    await f.client.connect();
+    await expect(f.client.injectContext(threadId, 'old-entry', 'Old exact quote', { itemId, entries: [] })).rejects.toBeInstanceOf(CodexTransportError);
+    await f.client.connect(); const before = f.calls.length;
+    await f.client.injectContext(threadId, 'canonical-entry', 'Canonical quote', { itemId, entries: [{ entryId: 'old-entry', text: 'Old exact quote' }] });
+    expect(f.calls.slice(before).map(call => call.method)).toEqual(['thread/read']);
+    expect(f.calls.filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
+  });
+
+  it('does not accept legacy alias provenance with another exact text', async () => {
+    const f = await sharedContextFixture(), itemId = `msg_${'d'.repeat(48)}`;
+    await appendFile(f.rolloutPath, JSON.stringify({ type: 'response_item', payload: { type: 'message', id: 'rele_slack_old-entry', role: 'user', content: [{ type: 'input_text', text: 'Another source version' }] } }) + '\n');
+    await f.client.connect();
+    await f.client.injectContext(threadId, 'canonical-entry', 'Current quote', { itemId, entries: [{ entryId: 'old-entry', text: 'Expected exact old quote' }] });
+    expect(f.calls.filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
+    expect((f.pending[0] as { id: string }).id).toBe(itemId);
   });
 
   it('reconciles a persisted injection after a lost ACK without appending it again', async () => {
@@ -1183,7 +1214,7 @@ describe('Codex shared passive context receipts', () => {
     await f.client.injectContext(threadId, 'new-slack-entry', 'New agent context');
     expect(f.calls.find(call => call.method === 'thread/turns/list')?.params).toEqual({ threadId, limit: 1, itemsView: 'summary', sortDirection: 'desc' });
     expect(f.calls.filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
-    expect(await readFile(f.rolloutPath, 'utf8')).toContain('rele_slack_new-slack-entry');
+    expect(await readFile(f.rolloutPath, 'utf8')).toContain('msg_');
     expect(previous).toEqual({ id: 'previous-turn', status, completedAt: 1793004647, error: { codexErrorInfo: 'serverOverloaded' } });
     expect(f.calls.some(call => ['thread/start', 'thread/fork', 'turn/start', 'turn/interrupt', 'thread/queue/add', 'thread/queue/start', 'thread/queue/delete'].includes(call.method ?? ''))).toBe(false);
   });
