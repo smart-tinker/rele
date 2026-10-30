@@ -88,6 +88,17 @@ async function linuxFixture() {
 }
 
 describe('Linux controlled update API policy', () => {
+  it('recognizes the verified native-managed copy of a pinned source package instead of offering the same update again', async () => {
+    const f = await linuxFixture();
+    f.target.executable = f.installed;
+    await f.update.prepare();
+    await f.update.apply();
+    const state = f.inspect();
+    state.owner!.executable = path.join(f.home, 'packages/app-server-daemon/releases/verified-copy/bin/codex');
+    expect(await f.update.status()).toMatchObject({ phase: 'current', selectionMode: 'manual', currentVersion: '0.164.0-alpha.11.1' });
+    await expect(f.update.prepare()).rejects.toThrow('Подготовка обновления доступна');
+    expect(f.linux.apply).toHaveBeenCalledTimes(1);
+  });
   it('selects and prepares the installed candidate, then applies after Rele closes its client', async () => {
     const f = await linuxFixture();
     expect(await f.update.status()).toMatchObject({ available: true, phase: 'available', selectedVersion: '0.164.0-alpha.11.1' });

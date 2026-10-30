@@ -263,8 +263,12 @@ export class CodexUpdate {
       state.error = 'Выбранный файл Codex не подтверждён как поддерживаемая версия Rele.';
     } else {
       const comparison = compareCodexVersions(candidate.version, inspection.owner.version);
+      // Native Linux selects a managed copy, so its path differs from the requested package.
+      const selectedCopy = pending?.phase === 'verified' && pending.candidate.executable === candidate.executable
+        && pending.candidate.version === candidate.version && pending.candidate.sha256 === inspection.owner.sha256
+        && await executableDigest(candidate.executable) === pending.candidate.sha256;
       if (comparison < 0) { state.phase = 'unsupported'; state.error = downgrade; }
-      else if (comparison > 0 || selectionMode === 'manual' && candidate.executable !== inspection.owner.executable) state.phase = 'available';
+      else if (comparison > 0 || selectionMode === 'manual' && candidate.executable !== inspection.owner.executable && !selectedCopy) state.phase = 'available';
     }
     return { state, identity, inspection, candidate, home };
   }
