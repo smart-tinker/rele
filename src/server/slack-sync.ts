@@ -16,7 +16,7 @@ const currentTimestamp = () => `${Math.floor(Date.now() / 1000)}.${String(Date.n
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : 'Не удалось синхронизировать контекст Slack.';
 
 export function slackContextItemId(codexThreadId: string, message: SlackTranscriptMessage): string {
-  return `msg_${createHash('sha256').update(JSON.stringify([codexThreadId, message.platform ?? 'slack', message.accountId,
+  return `rele-context-${createHash('sha256').update(JSON.stringify([codexThreadId, message.platform ?? 'slack', message.accountId,
     message.chatId, message.threadId, message.messageId, slackSourceRevision(message)])).digest('hex').slice(0, 48)}`;
 }
 

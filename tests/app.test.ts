@@ -1200,6 +1200,21 @@ describe('automatic group access and private chat boundaries', () => {
     expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [slack] } })).statusCode).toBe(400);
     expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [{ ...slack, allowedSenderIds: ['human'] }] } })).statusCode).toBe(200);
   });
+
+  it('uses an explicit Slack profile classification to repair the cached DM rule identity', async () => {
+    const f = makeApp();
+    const listPeople = vi.fn().mockResolvedValue({ items: [{ id: 'UANNA', name: 'Participant', isBot: true }] });
+    f.engine.channels.slack = { state: { configured: true, connected: true, accountId: 'TEAM:BOT' }, listChats: vi.fn(), listThreads: vi.fn(), listPeople } as unknown as Channel;
+    const selected = { id: 'identity-rule', platform: 'slack', accountId: 'TEAM:BOT', chatId: 'DEXAMPLE', cwd: '/work/example', enabled: true,
+      allowedSenderIds: ['UANNA'], requireMention: false };
+    expect((await f.app.inject({ url: '/api/catalog/slack/people?chatId=DEXAMPLE', headers })).statusCode).toBe(200);
+    listPeople.mockResolvedValueOnce({ items: [{ id: 'UANNA', name: 'Unclassified refresh' }] });
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [selected] } })).statusCode).toBe(400);
+    listPeople.mockResolvedValueOnce({ items: [{ id: 'UANNA', name: 'Verified human', isBot: false }] });
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [selected] } })).statusCode).toBe(200);
+    listPeople.mockResolvedValueOnce({ items: [{ id: 'UANNA', name: 'Verified bot', isBot: true }] });
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [{ ...selected, id: 'new-identity-rule' }] } })).statusCode).toBe(400);
+  });
 });
 
 
@@ -1320,6 +1335,14 @@ describe('source access and native thread routing', () => {
     expect(f.store.getSourceAccess(endpoint.id)).toEqual({ endpointId: endpoint.id, mode: 'all', allowedSenderIds: [humanId], legacy: false });
     expect((await put(f, endpoint, 'access', { mode: 'mention' })).statusCode).toBe(200);
     expect(f.store.getSourceAccess(endpoint.id).allowedSenderIds).toEqual([humanId]);
+  });
+
+  it('repairs a stale Slack DM bot flag from the live participant catalog before enabling human access', async () => {
+    const f = makeApp();
+    const { endpoint, channel } = attachSource(f, { platform: 'slack', chatId: 'DEXAMPLE', people: [{ id: 'UANNA', name: 'Stale bot flag', isBot: true }] });
+    channel.listPeople.mockResolvedValueOnce({ items: [{ id: 'UANNA', name: 'Verified human', isBot: false }] });
+    expect((await put(f, endpoint, 'access', { mode: 'all', allowedSenderIds: ['UANNA'] })).statusCode).toBe(200);
+    expect(f.store.getEndpoint(endpoint.id)?.people).toEqual([{ id: 'UANNA', name: 'Verified human', isBot: false }]);
   });
 
   it.each([{ available: false }, { accountId: 'previous-bot' }])('blocks enabling a stale source but permits disabling it offline: %j', async patch => {

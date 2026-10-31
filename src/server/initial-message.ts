@@ -22,7 +22,8 @@ export function initialMessageKey(codexHome: string, threadId: string): string {
 export class InitialMessages {
   private readonly working = new Set<string>();
 
-  constructor(private readonly store: Store, private readonly getCodex: () => Gateway, private readonly canWork: () => boolean = () => true) {}
+  constructor(private readonly store: Store, private readonly getCodex: () => Gateway, private readonly canWork: () => boolean = () => true,
+    private readonly redact: (error: unknown) => string = () => '') {}
 
   private scope(conversationId: string) {
     const conversation = this.store.getConversation(conversationId);
@@ -121,7 +122,7 @@ export class InitialMessages {
       if (op) {
         let found;
         try { found = await client.findRequest(threadId, op.id); }
-        catch { op.error = 'Квитанция начального сообщения пока не подтверждена. Ожидается сверка.'; this.write(key, state); return false; }
+        catch (error) { op.error = `Квитанция начального сообщения пока не подтверждена. Ожидается сверка. ${this.redact(error)}`.trim(); this.write(key, state); return false; }
         if (!allowed()) return false;
         if (op.turnId && found.turnId && op.turnId !== found.turnId) {
           op.status = 'uncertain'; op.error = 'Ход начального сообщения изменился. Повторная отправка заблокирована.';

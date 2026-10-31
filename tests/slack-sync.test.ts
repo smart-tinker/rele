@@ -32,10 +32,11 @@ function fixture() {
 }
 
 describe('durable Slack passive sync', () => {
-  it('uses stable valid native IDs for a semantic source version and separates edits and origins', () => {
+  it('uses stable local IDs without underscores for a semantic source version and separates edits and origins', () => {
     const f = fixture(), original = f.message('110.000000', 'Original text', { payload: { text: 'Original text', blocks: [{ block_id: 'delivery-a', text: { type: 'plain_text', text: 'Original text' } }] } });
     const id = slackContextItemId('native-original', original);
-    expect(id).toMatch(/^msg_[a-f0-9]{48}$/u);
+    expect(id).toMatch(/^rele-context-[a-f0-9]{48}$/u);
+    expect(id).not.toContain('_');
     expect(slackContextItemId('native-original', { ...original, kind: 'edit', receivedAt: 'another-delivery', payload: { ...original.payload, blocks: [{ block_id: 'delivery-b', text: { type: 'plain_text', text: 'Original text' } }] } })).toBe(id);
     for (const changed of [{ text: 'Edited text' }, { accountId: 'T2:U2' }, { chatId: 'C2' }, { threadId: '200.000000' }, { messageId: '120.000000' }, { platform: 'telegram' as const }, { kind: 'deleted' as const }]) {
       expect(slackContextItemId('native-original', { ...original, ...changed })).not.toBe(id);
@@ -238,7 +239,7 @@ describe('durable Slack passive sync', () => {
     expect(f.store.getSlackSyncStream(old.streamId)).toMatchObject({ active: false, codexThreadId: 'original-codex' });
     expect(f.store.getSlackSyncStream(fresh.streamId)?.conversationId).toBe(next.id);
     expect(await f.sync.drain(f.conversation.id)).toBe(true);
-    expect(f.codex.injectContext).toHaveBeenCalledExactlyOnceWith('original-codex', old.id, expect.any(String), expect.objectContaining({ itemId: expect.stringMatching(/^msg_[a-f0-9]{48}$/u) }));
+    expect(f.codex.injectContext).toHaveBeenCalledExactlyOnceWith('original-codex', old.id, expect.any(String), expect.objectContaining({ itemId: expect.stringMatching(/^rele-context-[a-f0-9]{48}$/u) }));
     expect(f.store.getSlackSyncEntry(fresh.id)?.state).toBe('pending');
     expect(f.readThreadPage).not.toHaveBeenCalled();
   });
@@ -285,7 +286,7 @@ describe('durable Slack passive sync', () => {
     advance(); await f.sync.backfill();
     expect(f.readThreadPage.mock.calls.at(-1)?.[1]?.oldest).toBeUndefined();
     expect(await f.sync.drain(f.conversation.id)).toBe(true);
-    expect(f.codex.injectContext).toHaveBeenCalledExactlyOnceWith('original-codex', expect.any(String), expect.stringContaining('Fresh full history'), expect.objectContaining({ itemId: expect.stringMatching(/^msg_[a-f0-9]{48}$/u) }));
+    expect(f.codex.injectContext).toHaveBeenCalledExactlyOnceWith('original-codex', expect.any(String), expect.stringContaining('Fresh full history'), expect.objectContaining({ itemId: expect.stringMatching(/^rele-context-[a-f0-9]{48}$/u) }));
   });
 
   it.each(['proxy', 'websocket'] as const)('allows %s after Slack is detached and fully applied, but retains pending original-destination context', async transport => {
@@ -308,7 +309,7 @@ describe('durable Slack passive sync', () => {
     expect(f.codex.injectContext).toHaveBeenCalledTimes(1);
     advance(5001);
     expect(await f.sync.drain(f.conversation.id)).toBe(true);
-    expect(f.codex.injectContext.mock.calls[1]).toEqual(['original-codex', pending.id, expect.stringContaining('Captured before detach'), expect.objectContaining({ itemId: expect.stringMatching(/^msg_[a-f0-9]{48}$/u) })]);
+    expect(f.codex.injectContext.mock.calls[1]).toEqual(['original-codex', pending.id, expect.stringContaining('Captured before detach'), expect.objectContaining({ itemId: expect.stringMatching(/^rele-context-[a-f0-9]{48}$/u) })]);
     expect(f.store.getSlackSyncEntry(pending.id)?.state).toBe('applied');
     expect(f.readThreadPage).toHaveBeenCalledTimes(1);
     f.status.transport = transport;
@@ -432,7 +433,7 @@ it('stops new source context while off but drains prior captured entries and res
   await f.sync.backfill();
   expect(f.readThreadPage).not.toHaveBeenCalled();
   expect(await f.sync.drain(f.conversation.id)).toBe(true);
-  expect(f.codex.injectContext).toHaveBeenCalledExactlyOnceWith('original-codex', accepted.id, expect.stringContaining('Captured before off'), expect.objectContaining({ itemId: expect.stringMatching(/^msg_[a-f0-9]{48}$/u) }));
+  expect(f.codex.injectContext).toHaveBeenCalledExactlyOnceWith('original-codex', accepted.id, expect.stringContaining('Captured before off'), expect.objectContaining({ itemId: expect.stringMatching(/^rele-context-[a-f0-9]{48}$/u) }));
   expect(f.store.listSlackSyncEntries(accepted.streamId)).toHaveLength(1);
   f.store.setSourceAccess(f.endpoint.id, { mode: 'all' });
   f.readThreadPage.mockResolvedValueOnce({ messages: [f.message('120.000000', 'Full context after explicit enabling')] });

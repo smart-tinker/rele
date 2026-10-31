@@ -187,9 +187,9 @@ function progressFixture() {
   return { origin, endpoint, meta, progressStore };
 }
 
-function questionApproval(): Approval {
+function questionApproval(method = 'item/tool/requestUserInput'): Approval {
   return { id: '12345678-1234-1234-1234-123456789abc', requestId: 'request-example', turnId: 'turn-example', itemId: 'question-item',
-    rpcId: 'question-rpc', method: 'item/tool/requestUserInput', title: 'Codex ждёт уточнения', details: 'Выберите ветку', status: 'pending',
+    rpcId: method === 'rele/asyncUserInput' ? null : 'question-rpc', method, title: 'Codex ждёт уточнения', details: 'Выберите ветку', status: 'pending',
     questions: [{ id: 'branch', header: 'Ветка', question: 'С какой веткой работать?', options: [
       { label: 'main', description: 'Основная ветка' }, { label: 'develop', description: 'Ветка разработки' },
     ] }], createdAt: '2026-10-27T00:00:00Z', updatedAt: '2026-10-27T00:00:00Z' };
@@ -207,9 +207,55 @@ const questionApi = (method: string, body: Record<string, unknown>) => method ==
     : method === 'chat.update' ? Response.json({ ok: true, channel: body.channel, ts: body.ts }) : undefined;
 
 describe('Slack question choices and forms', () => {
-  it('shows short in-thread choices, keeps full long labels/descriptions and maps index to the stored label', async () => {
-    const approval = questionApproval();
-    approval.questions![0].options![0] = { label: '🙂'.repeat(45), description: 'Полное описание <@UPEER> & подробности' };
+  it('repairs a stale bot account and accepts its human question action after an app-assisted file share', async () => {
+    const known: Endpoint = { id: endpointId('slack', 'TEXAMPLE:UBOT', 'CEXAMPLE', '1000.1000'), platform: 'slack', accountId: 'TEXAMPLE:UBOT',
+      chatId: 'CEXAMPLE', threadId: '1000.1000', title: 'Thread', subtitle: 'Slack', people: [{ id: 'UANNA', name: 'Stale bot flag', isBot: true }], updatedAt: '2026-10-20T00:00:00Z' };
+    const approval = questionApproval(), action = vi.fn<ChannelCallbacks['action']>().mockResolvedValue(undefined);
+    const { channel, calls, socket, message } = await makeChannel({ knownEndpoints: [known], question: () => approval, action,
+      api: (method, body) => method === 'users.info' ? Response.json({ ok: true, user: { id: 'UANNA', is_bot: false, is_app_user: false,
+        profile: { display_name: 'Verified human' } } }) : method === 'users.conversations' ? Response.json({ ok: true, channels: [{ id: 'CEXAMPLE', is_member: true }] })
+          : method === 'conversations.members' ? Response.json({ ok: true, members: ['UANNA'] }) : questionApi(method, body) });
+    socket.receive(envelope('human-before', 'message', { ts: '1000.1001' }));
+    socket.receive(envelope('human-file', 'message', { ts: '1000.1002', subtype: 'file_share', app_id: 'AHELPER' }));
+    socket.receive(envelope('human-after', 'message', { ts: '1000.1003' }));
+    await vi.waitFor(() => expect(message).toHaveBeenCalledTimes(3));
+    const received = vi.mocked(message).mock.calls.map(([value]) => value);
+    expect(received.map(value => value.sender.isBot)).toEqual([false, true, false]);
+    for (const value of received) expect(value.endpoint.people).toContainEqual({ id: 'UANNA', name: 'Verified human', isBot: false });
+    expect((await channel.listPeople('CEXAMPLE')).items).toEqual([{ id: 'UANNA', name: 'Verified human', isBot: false }]);
+    await channel.deliver(questionDelivery(approval), approval);
+    const post = JSON.parse(String(calls.find(call => call.url.endsWith('/chat.postMessage'))!.init!.body));
+    socket.receive(questionInteraction('human-choice', post.blocks.at(-1).elements[0]));
+    await vi.waitFor(() => expect(action).toHaveBeenCalledOnce());
+    expect(action).toHaveBeenCalledWith(expect.objectContaining({ senderId: 'UANNA', senderIsBot: false, answers: { branch: ['main'] } }));
+  });
+
+  it.each([
+    ['verified bot', { is_bot: true, is_app_user: false }, false, true],
+    ['verified app user', { is_bot: false, is_app_user: true }, false, true],
+    ['unknown profile with a remembered bot', {}, true, true],
+    ['unknown profile without a classification', {}, undefined, undefined],
+  ] as const)('never grants human question authority to %s', async (_name, flags, rememberedBot, expectedBot) => {
+    const known: Endpoint = { id: endpointId('slack', 'TEXAMPLE:UBOT', 'CEXAMPLE', '1000.1000'), platform: 'slack', accountId: 'TEXAMPLE:UBOT',
+      chatId: 'CEXAMPLE', threadId: '1000.1000', title: 'Thread', subtitle: 'Slack', people: [{ id: 'UANNA', name: 'Known participant',
+        ...(rememberedBot === undefined ? {} : { isBot: rememberedBot }) }], updatedAt: '2026-10-20T00:00:00Z' };
+    const approval = questionApproval(), action = vi.fn<ChannelCallbacks['action']>().mockResolvedValue(undefined);
+    const { channel, calls, socket, message } = await makeChannel({ knownEndpoints: [known], question: () => approval, action,
+      api: (method, body) => method === 'users.info' ? Response.json({ ok: true, user: { id: 'UANNA', ...flags,
+        profile: { display_name: 'Participant' } } }) : questionApi(method, body) });
+    socket.receive(envelope('classified-account'));
+    await vi.waitFor(() => expect(message).toHaveBeenCalledOnce());
+    expect(vi.mocked(message).mock.calls[0][0].sender.isBot).toBe(expectedBot);
+    await channel.deliver(questionDelivery(approval), approval);
+    const post = JSON.parse(String(calls.find(call => call.url.endsWith('/chat.postMessage'))!.init!.body));
+    socket.receive(questionInteraction('rejected-account-choice', post.blocks.at(-1).elements[0]));
+    await vi.waitFor(() => expect(calls.some(call => call.url.endsWith('/chat.postEphemeral'))).toBe(true));
+    expect(action).not.toHaveBeenCalled();
+  });
+
+  it.each(['item/tool/requestUserInput', 'rele/asyncUserInput'])('shows in-thread choices with exact stored labels for %s', async method => {
+    const approval = questionApproval(method);
+    approval.questions![0].options![0] = { label: 'Основная ветка', description: 'Полное описание <@UPEER> & подробности' };
     const question = vi.fn<NonNullable<ChannelCallbacks['question']>>().mockReturnValue(approval);
     let finish!: () => void;
     const action = vi.fn<ChannelCallbacks['action']>().mockImplementation(() => new Promise<void>(resolve => { finish = resolve; }));
@@ -219,9 +265,7 @@ describe('Slack question choices and forms', () => {
     const post = JSON.parse(String(calls.find(call => call.url.endsWith('/chat.postMessage'))!.init!.body));
     expect(post.blocks.filter((block: { type: string }) => block.type === 'section').map((block: { text: { text: string } }) => block.text.text).join('')).toBe(input.body);
     const buttons = post.blocks.at(-1).elements;
-    expect(buttons.map((button: { text: { text: string } }) => button.text.text)).toEqual([expect.any(String), 'develop', 'Свой ответ']);
-    expect(buttons[0].text.text.length).toBeLessThanOrEqual(75);
-    expect(buttons[0].text.text).not.toMatch(/[\uD800-\uDBFF]$/u);
+    expect(buttons.map((button: { text: { text: string } }) => button.text.text)).toEqual(['Основная ветка', 'develop', 'Свой ответ']);
     socket.receive(questionInteraction('choice', { ...buttons[0], text: { type: 'plain_text', text: 'FORGED LABEL' } }));
     await vi.waitFor(() => expect(action).toHaveBeenCalledOnce());
     expect(socket.sent.map(value => JSON.parse(value).envelope_id)).toContain('choice');
@@ -231,8 +275,32 @@ describe('Slack question choices and forms', () => {
     finish();
   });
 
-  it('opens a bound own-answer modal, ACKs before the native write and submits the exact custom answer', async () => {
-    const approval = questionApproval(), question = vi.fn<NonNullable<ChannelCallbacks['question']>>().mockReturnValue(approval);
+  it('opens the existing form for long labels, keeps full wording readable and submits the exact stored choice', async () => {
+    const approval = questionApproval('rele/asyncUserInput');
+    const label = 'Установить исправление и перезапустить только Rele на Home';
+    approval.questions![0].options![0] = { label, description: 'Сохранить исходный разговор и настройки' };
+    const action = vi.fn<ChannelCallbacks['action']>().mockResolvedValue(undefined);
+    const { channel, calls, socket } = await makeChannel({ question: () => approval, action, api: questionApi });
+    await channel.deliver(questionDelivery(approval), approval);
+    const post = JSON.parse(String(calls.find(call => call.url.endsWith('/chat.postMessage'))!.init!.body));
+    const buttons = post.blocks.at(-1).elements;
+    expect(buttons.map((button: { text: { text: string } }) => button.text.text)).toEqual(['Ответить']);
+    expect(post.blocks.filter((block: { type: string }) => block.type === 'section').map((block: { text: { text: string } }) => block.text.text).join('')).toContain(label);
+    socket.receive(questionInteraction('open-long-choice', buttons[0]));
+    await vi.waitFor(() => expect(calls.some(call => call.url.endsWith('/views.open'))).toBe(true));
+    const view = JSON.parse(String(calls.find(call => call.url.endsWith('/views.open'))!.init!.body)).view;
+    expect(view.blocks.filter((block: { type: string }) => block.type === 'section').map((block: { text: { text: string } }) => block.text.text).join('')).toContain(`${label} — Сохранить исходный разговор и настройки`);
+    const choice = view.blocks.find((block: { block_id?: string }) => block.block_id === 'q0-choice');
+    expect(choice.element.options.at(-1)).toEqual({ text: { type: 'plain_text', text: 'Свой ответ' }, value: 'custom' });
+    expect(view.blocks.some((block: { block_id?: string }) => block.block_id === 'q0-text')).toBe(true);
+    socket.receive({ envelope_id: 'submit-long-choice', type: 'interactive', payload: { type: 'view_submission', team: { id: 'TEXAMPLE' }, user: { id: 'UANNA' },
+      view: { ...view, state: { values: { 'q0-choice': { answer: { selected_option: { value: '0', text: { text: 'FORGED LABEL' } } } } } } } } });
+    await vi.waitFor(() => expect(action).toHaveBeenCalledOnce());
+    expect(action).toHaveBeenCalledWith(expect.objectContaining({ senderId: 'UANNA', senderIsBot: false, answers: { branch: [label] } }));
+  });
+
+  it.each(['item/tool/requestUserInput', 'rele/asyncUserInput'])('opens a bound own-answer modal and submits exact answers for %s', async method => {
+    const approval = questionApproval(method), question = vi.fn<NonNullable<ChannelCallbacks['question']>>().mockReturnValue(approval);
     approval.questions![0].id = '__proto__';
     let finish!: () => void;
     const action = vi.fn<ChannelCallbacks['action']>().mockImplementation(() => new Promise<void>(resolve => { finish = resolve; }));
@@ -379,6 +447,28 @@ describe('Slack question choices and forms', () => {
     expect(JSON.stringify(closed[2])).not.toContain('SECRET ANSWER MUST STAY LOCAL');
     await expect(channel.updateApproval({ ...input, remoteMessageId: undefined }, approval)).rejects.toThrow('Некорректная карточка');
     await expect(channel.updateApproval({ ...input, origin: { ...input.origin, accountId: 'TOTHER:UBOT' } }, approval)).rejects.toThrow('Подключение Slack изменилось');
+  });
+
+  it('keeps an async answer visibly queued or uncertain until its delivery receipt and removes active controls', async () => {
+    const approval = questionApproval('rele/asyncUserInput');
+    expect(approval.rpcId).toBeNull();
+    const input = { ...questionDelivery(approval), status: 'sent' as const, remoteMessageId: '1000.2000' };
+    const { channel, calls } = await makeChannel({ api: questionApi });
+    for (const decision of ['queued', 'sending', 'uncertain', 'accept']) await channel.updateApproval(input,
+      { ...approval, status: 'answered', decision }, { source: 'slack', senderName: 'Анна', answers: { branch: ['main'] } });
+    const updates = calls.filter(call => call.url.endsWith('/chat.update')).map(call => JSON.parse(String(call.init!.body)));
+    expect(updates).toHaveLength(4);
+    expect(updates[0].text).toContain('Ответ ожидает отправки в Codex');
+    expect(updates[1].text).toContain('Ответ отправляется в Codex');
+    expect(updates[2].text).toContain('Результат отправки ответа неизвестен');
+    for (const update of updates.slice(0, 3)) expect(update.text).not.toContain('Ответ отправлен в Codex');
+    expect(updates[3].text).toContain('Ответ отправлен в Codex');
+    expect(updates[3].text).toContain('Ветка: main');
+    for (const update of updates) {
+      expect(update).toMatchObject({ channel: 'CEXAMPLE', ts: '1000.2000' });
+      expect(update.blocks.every((block: { type: string; text: { type: string } }) => block.type === 'section' && block.text.type === 'plain_text')).toBe(true);
+    }
+    expect(calls.some(call => call.url.endsWith('/chat.postMessage'))).toBe(false);
   });
 });
 
@@ -811,14 +901,16 @@ describe('Slack Socket Mode durability and identity', () => {
     expect(vi.mocked(message).mock.calls[0][0]).toMatchObject({ directMention: false, contextOnly: false });
   });
 
-  it('recognizes app traffic and remembered bot roles even without a bot_message subtype', async () => {
+  it('recognizes remembered bot roles without persisting an app event as the account identity', async () => {
     const known: Endpoint = { id: endpointId('slack', 'TEXAMPLE:UBOT', 'CEXAMPLE', '1000.1000'), platform: 'slack', accountId: 'TEXAMPLE:UBOT', chatId: 'CEXAMPLE', threadId: '1000.1000', title: 'Thread', subtitle: 'Slack', people: [{ id: 'UPEER', name: 'Другой агент', isBot: true }], updatedAt: '2026-10-20T00:00:00Z' };
     const { socket, message } = await makeChannel({ knownEndpoints: [known] });
     socket.receive(envelope('remembered-peer', 'message', { user: 'UPEER', text: 'Сводка' }));
     socket.receive(envelope('app-peer', 'message', { user: 'UAPP', app_id: 'AOTHER', text: 'Сводка', ts: '1000.1002' }));
     socket.receive(envelope('remember-app-role', 'message', { user: 'UAPP', text: 'Сводка в другом треде', ts: '1000.1003', thread_ts: '1000.0999' }));
     await vi.waitFor(() => expect(message).toHaveBeenCalledTimes(3));
-    for (const [received] of vi.mocked(message).mock.calls) expect(received).toMatchObject({ sender: { isBot: true }, directMention: false, contextOnly: false });
+    const received = vi.mocked(message).mock.calls.map(([value]) => value);
+    for (const value of received) expect(value).toMatchObject({ directMention: false, contextOnly: false });
+    expect(received.map(value => value.sender.isBot)).toEqual([true, true, undefined]);
   });
 
   it('persists unknown message subtypes as context without making them task candidates', async () => {

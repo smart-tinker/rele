@@ -481,8 +481,10 @@ export class SlackChannel implements Channel {
       this.profiles.set(userId, user);
     }
     if (user.deleted) return;
+    const isBot = user.is_bot === true || user.is_app_user === true ? true
+      : user.is_bot === false && (user.is_app_user === undefined || user.is_app_user === false) ? false : this.people.get(userId)?.isBot;
     const person: Person = { id: userId, name: readableTitle(user.profile?.display_name || user.profile?.real_name || user.real_name || user.name, 'Участник Slack'),
-      ...(user.is_bot || user.is_app_user || this.people.get(userId)?.isBot ? { isBot: true } : user.is_bot === false ? { isBot: false } : {}) };
+      ...(isBot === undefined ? {} : { isBot }) };
     this.people.set(userId, person);
     return person;
   }
@@ -767,10 +769,10 @@ export class SlackChannel implements Channel {
     const userId = typeof event.user === 'string' && SLACK_USER.test(event.user) ? event.user : '';
     const cached = this.people.get(userId);
     const remembered = this.endpoints.get(id)?.people.find(person => person.id === userId);
-    const profile = this.profiles.get(userId);
-    const isBot = userId === this.botUserId || !!(event.bot_id || event.app_id || event.subtype === 'bot_message' || cached?.isBot || remembered?.isBot || profile?.is_bot || profile?.is_app_user);
+    const accountIsBot = cached?.isBot ?? remembered?.isBot;
+    const isBot = userId === this.botUserId || !!(event.bot_id || event.app_id || event.subtype === 'bot_message' || accountIsBot);
     const sender: Person = { id: userId || (typeof event.bot_id === 'string' && SLACK_BOT.test(event.bot_id) ? `bot:${event.bot_id}` : 'slack:unknown'), name: cached?.name || remembered?.name || readableTitle(event.username, isBot ? 'Бот Slack' : 'Участник Slack'),
-      ...(isBot ? { isBot: true } : cached?.isBot === false || profile?.is_bot === false ? { isBot: false } : {}) };
+      ...(isBot ? { isBot: true } : accountIsBot === false ? { isBot: false } : {}) };
     return { endpointId: id, accountId: this.accountId, chatId: event.channel, threadId: event.thread_ts || event.ts, messageId: event.ts, sender, text: messageText(event), payload: transcriptPayload(event), kind };
   }
 
@@ -785,14 +787,14 @@ export class SlackChannel implements Channel {
     const stableUser = typeof event.user === 'string' && SLACK_USER.test(event.user);
     const stableBot = typeof event.bot_id === 'string' && SLACK_BOT.test(event.bot_id);
     const self = person.id === this.botUserId || stableBot && event.bot_id === this.botId;
-    if (stableUser && person.isBot) this.people.set(person.id, person);
     const endpoint: Endpoint = {
       ...previous,
       id, platform: 'slack', accountId: this.accountId, chatId: event.channel, threadId,
       title: previous?.title ?? readableTitle(text.replaceAll(`<@${this.botUserId}>`, '').trim(), 'Обсуждение Slack'),
       subtitle: previous?.subtitle ?? `${this.teamName} · ${this.channelNames.get(event.channel) ?? 'Канал Slack'}`,
       url: `slack://channel?team=${encodeURIComponent(this.teamId)}&id=${encodeURIComponent(event.channel)}&message=${encodeURIComponent(threadId)}`,
-      people: [...new Map([...(previous?.people ?? []), ...(stableUser ? [person] : [])].filter(value => SLACK_USER.test(value.id) && value.id !== this.botUserId && value.id !== 'USLACKBOT').map(value => [value.id, value])).values()], updatedAt: new Date().toISOString(),
+      // An app-assisted event may be bot-authored without changing its user's canonical account profile.
+      people: [...new Map([...(previous?.people ?? []), ...(stableUser ? [this.people.get(person.id) ?? person] : [])].filter(value => SLACK_USER.test(value.id) && value.id !== this.botUserId && value.id !== 'USLACKBOT').map(value => [value.id, value])).values()], updatedAt: new Date().toISOString(),
     };
     this.endpoints.set(id, endpoint);
     const file = (Array.isArray(event.files) ? event.files : []).find((entry: Json) => String(entry.mimetype).startsWith('audio/') && entry.url_private_download);

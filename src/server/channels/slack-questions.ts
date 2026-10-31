@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { Approval, Delivery } from '../../shared/types.js';
 import { splitReply, type ApprovalContext, type ApprovalResolution } from './common.js';
+import { ASYNC_QUESTION_METHOD } from '../async-questions.js';
 
 type Block = Record<string, any>;
 export const QUESTION_VIEW = 'rele_questions';
@@ -21,7 +22,7 @@ const questionText = (question: NonNullable<Approval['questions']>[number]) => [
 
 export function supportsQuestionForm(approval: Approval): boolean {
   const questions = approval.questions;
-  return approval.method === 'item/tool/requestUserInput' && !!questions?.length
+  return ['item/tool/requestUserInput', ASYNC_QUESTION_METHOD].includes(approval.method) && !!questions?.length
     && questions.every(question => !question.isSecret && question.id && question.question?.trim()
       && (question.options?.length ?? 0) <= 9 && question.options?.every(option => option.label?.trim()) !== false)
     && new Set(questions.map(question => question.id)).size === questions.length
@@ -48,7 +49,9 @@ export function questionCard(delivery: Delivery, approval: Approval): Block[] | 
   const questions = approval.questions!, first = questions[0], hash = questionHash(approval);
   const button = (text: string, action: string) => ({ type: 'button', action_id: `rele_question_${action}`,
     text: plain(short(text)), value: `releq:${approval.id}:${hash}:${action}` });
+  // Slack clips button labels before its 75-character API limit; full options remain readable in the form.
   const shortQuestion = questions.length === 1 && !!first.options?.length && first.options.length <= 5
+    && first.options.every(option => option.label.length <= 30)
     && questionText(first).length <= 1500 && delivery.body.length <= 2900;
   const elements = shortQuestion ? [...first.options!.map((option, index) => button(option.label, String(index))), button('Свой ответ', 'custom')]
     : [button('Ответить', 'all')];
@@ -98,6 +101,8 @@ export function resolvedQuestion(delivery: Delivery, approval: Approval, resolut
   if (delivery.ordinal !== 0) return { text: delivery.body, blocks: sections };
   const uncertain = approval.decision === 'uncertain', secret = approval.questions?.some(question => question.isSecret);
   const title = uncertain ? 'Результат отправки ответа неизвестен. Проверьте в Codex.'
+    : approval.decision === 'sending' ? 'Ответ отправляется в Codex'
+    : approval.decision === 'queued' ? 'Ответ ожидает отправки в Codex'
     : resolution?.source === 'codex' ? 'Вопрос закрыт в Codex' : approval.decision === 'decline' ? 'Вопрос отклонён'
       : secret ? 'Вопрос закрыт' : approval.status === 'expired' ? 'Вопрос больше не актуален' : 'Ответ отправлен в Codex';
   const actor = !uncertain && !secret && resolution?.source !== 'codex' ? resolution?.senderName || resolution?.senderId : undefined;

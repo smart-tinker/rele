@@ -15,6 +15,7 @@ import { codexEnvironment, environmentValue, resolveCodexLaunch } from './codex-
 import { CodexContextReceipts } from './codex-context-receipts.js';
 import { CodexStdioError, CodexStdioTransport } from './codex-stdio.js';
 import { ensureSharedCodex, SharedCodexError } from './codex-shared.js';
+import { asyncQuestions, matchAsyncAnswer, parseAsyncAnswers, type AsyncAnswer, type AsyncQuestion } from './async-questions.js';
 
 export { SUPPORTED_CODEX_VERSION } from '../shared/codex-runtime.js';
 // Keep user conversations from every normal client; technical subagents are not binding targets.
@@ -46,6 +47,8 @@ export interface RequestLocation {
   rootTurnId?: string;
   mixed?: boolean;
   commandItems?: CodexCommandItem[];
+  asyncQuestions?: AsyncQuestion[];
+  asyncAnswers?: AsyncAnswer[];
 }
 export interface CodexCommandItem { id: string; processId: string | null; completed?: true }
 export interface CodexTerminal { itemId: string; processId: string }
@@ -62,7 +65,7 @@ export function codexCommandItem(value: unknown): CodexCommandItem | undefined {
 }
 export interface CodexRuntime { userAgent: string; codexHome: string; platformFamily: string; platformOs: string }
 interface QueueEntry { id: string; clientUserMessageId: string }
-interface HistoryItem { type: string; id?: string; clientId?: string | null; text?: string; phase?: string | null }
+interface HistoryItem { type: string; id?: string; clientId?: string | null; text?: string; phase?: string | null; delivery?: string | null; questions?: unknown; content?: unknown }
 interface HistoryTurn { id: string; rootTurnId?: string | null; status: string; completedAt?: number | null; items: HistoryItem[]; error?: { codexErrorInfo?: unknown; message?: unknown } | null }
 interface Page<T> { data: T[]; nextCursor: string | null }
 interface RawThread {
@@ -341,14 +344,15 @@ export class CodexClient extends EventEmitter {
     const shared = this.config.transport !== 'managed';
     if (!shared && !this.stdio) throw new Error('Управляемый Codex Rele не подключён.');
     if (!entryId.trim() || !text.trim()) throw new Error('Фоновому контексту нужны постоянный идентификатор и непустой текст.');
-    // Model-facing message IDs must use msg_; journal and legacy provenance stay unchanged.
-    const itemId = candidates?.itemId ?? `msg_${createHash('sha256').update(JSON.stringify([threadId, entryId])).digest('hex').slice(0, 48)}`;
-    if (!/^msg_[a-f0-9]{48}$/u.test(itemId) || candidates && (!Array.isArray(candidates.entries)
+    // Native 166 omits unprefixed IDs from provider requests while retaining the exact local receipt.
+    const itemId = candidates?.itemId ?? `rele-context-${createHash('sha256').update(JSON.stringify([threadId, entryId])).digest('hex').slice(0, 48)}`;
+    if (!/^rele-context-[a-f0-9]{48}$/u.test(itemId) || candidates && (!Array.isArray(candidates.entries)
       || candidates.entries.some(entry => typeof entry.entryId !== 'string' || !entry.entryId.trim() || typeof entry.text !== 'string' || !entry.text.trim()))) {
       throw new Error('Не удалось проверить идентификаторы сохранённого контекста Codex.');
     }
+    const previousItemId = `msg_${itemId.slice('rele-context-'.length)}`;
     const receipts = [{ entryId, text }, ...(candidates?.entries ?? [])].flatMap(entry => [
-      { itemId, text: entry.text }, { itemId: `rele_slack_${entry.entryId}`, text: entry.text },
+      { itemId, text: entry.text }, { itemId: previousItemId, text: entry.text }, { itemId: `rele_slack_${entry.entryId}`, text: entry.text },
     ]);
     this.requireQueue();
     if (!this.isVerifiedVersion()) throw new Error(`Для фонового контекста нужен проверенный Codex ${SUPPORTED_CODEX_VERSION}.`);
@@ -525,8 +529,9 @@ export class CodexClient extends EventEmitter {
     let cursor: string | undefined;
     const seen = new Set<string>();
     do {
+      // shortcut: page full turns separately; use item pagination if one turn exceeds the frame limit.
       const page = await this.call<Page<HistoryTurn>>('thread/turns/list', {
-        threadId, limit: 50, itemsView: 'full', sortDirection: 'desc', ...(cursor ? { cursor } : {}),
+        threadId, limit: 1, itemsView: 'full', sortDirection: 'desc', ...(cursor ? { cursor } : {}),
       });
       const matches = page.data.filter(turn => turn.items.some(item => item.type === 'userMessage' && item.clientId === clientId));
       if (matches.length > 1) throw new Error('В истории Codex несколько ходов с одним clientId; требуется ручная сверка.');
@@ -598,7 +603,7 @@ export class CodexClient extends EventEmitter {
     const seen = new Set<string>();
     do {
       const page = await this.call<Page<HistoryTurn>>('thread/turns/list', {
-        threadId, limit: 50, itemsView: 'full', sortDirection: 'desc', ...(cursor ? { cursor } : {}),
+        threadId, limit: 1, itemsView: 'full', sortDirection: 'desc', ...(cursor ? { cursor } : {}),
       });
       const matches = page.data.filter(turn => turn.items.some(item => item.type === 'userMessage' && item.clientId === clientId));
       if (matches.length) {
@@ -622,8 +627,58 @@ export class CodexClient extends EventEmitter {
     return new Set([clientId, ...ownInputIds]);
   }
 
+  /** Read individual items: a long historical turn must not overflow one WebSocket frame. */
+  async asyncQuestionState(threadId: string, questionId: string): Promise<{
+    turnId: string; question: AsyncQuestion['question']; answer?: { answer: string; clientId?: string };
+  } | undefined> {
+    if (!threadId.trim() || !questionId.trim()) throw new Error('Сверке вопроса нужны исходные идентификаторы Codex.');
+    const runtime = this.runtime, replies: AsyncAnswer[] = [], seen = new Set<string>();
+    let cursor: string | undefined;
+    for (let count = 0; count < 1_000; count++) {
+      const page = await this.call<Page<{ turnId: string; item: HistoryItem }>>('thread/items/list', {
+        threadId, limit: 1, sortDirection: 'desc', ...(cursor ? { cursor } : {}),
+      });
+      if (runtime !== this.runtime || !this.state.connected || !page || !Array.isArray(page.data) || page.data.length > 1
+        || page.nextCursor != null && (typeof page.nextCursor !== 'string' || !page.nextCursor)) {
+        throw new CodexTransportError('Codex не подтвердил историю вопроса. Ожидается сверка без повторной отправки.', 'async-question-history-unconfirmed');
+      }
+      for (const entry of page.data) {
+        if (!entry || typeof entry.turnId !== 'string' || !entry.turnId || !entry.item || typeof entry.item.type !== 'string') {
+          throw new CodexTransportError('Codex не подтвердил запись вопроса.', 'async-question-history-unconfirmed');
+        }
+        if (entry.item.type === 'userMessage') {
+          for (const answer of parseAsyncAnswers(entry.item.content) ?? []) if (answer.questionItemId === questionId) {
+            replies.push({ ...answer, ...(typeof entry.item.clientId === 'string' && entry.item.clientId ? { clientId: entry.item.clientId } : {}) });
+          }
+        }
+        const found = asyncQuestions(entry.item).find(({ question }) => question.id === questionId);
+        if (found) {
+          const answer = replies.find(reply => matchAsyncAnswer(reply, found.question));
+          return { turnId: entry.turnId, question: found.question,
+            ...(answer ? { answer: { answer: answer.answer, ...(answer.clientId ? { clientId: answer.clientId } : {}) } } : {}) };
+        }
+      }
+      cursor = nextPage(page.nextCursor, seen);
+      if (!cursor) return;
+    }
+    throw new CodexTransportError('История вопроса превышает предел сверки. Повторная отправка не разрешена.', 'async-question-history-limit');
+  }
+
   private historyLocation(turn: HistoryTurn, known: Set<string>): RequestLocation {
-    const mixed = turn.items.some(item => item.type === 'userMessage' && (typeof item.clientId !== 'string' || !known.has(item.clientId)));
+    const questions = new Map<string, AsyncQuestion>(), asyncAnswers: AsyncAnswer[] = [];
+    let mixed = false;
+    for (const item of turn.items) {
+      for (const question of asyncQuestions(item)) questions.set(question.question.id, question);
+      if (item.type !== 'userMessage') continue;
+      const answers = parseAsyncAnswers(item.content);
+      const matching = answers?.every(answer => {
+        const question = questions.get(answer.questionItemId);
+        return question && matchAsyncAnswer(answer, question.question);
+      });
+      if (matching) asyncAnswers.push(...answers!.map(answer => ({ ...answer,
+        ...(typeof item.clientId === 'string' && item.clientId ? { clientId: item.clientId } : {}) })));
+      if ((typeof item.clientId !== 'string' || !known.has(item.clientId)) && !matching) mixed = true;
+    }
     const state = turn.status === 'inProgress' ? 'running' : turn.status;
     if (!['running', 'completed', 'failed', 'interrupted'].includes(state)) throw new Error('Неизвестное состояние хода Codex.');
     const failureReason = state === 'failed' ? nativeFailureReason(turn.error) : undefined;
@@ -631,10 +686,11 @@ export class CodexClient extends EventEmitter {
     if (state === 'interrupted' && (typeof turn.completedAt !== 'number' || !Number.isFinite(turn.completedAt))) {
       throw new CodexTransportError('Codex пока не подтвердил прерывание запроса. Ожидается сверка завершения без повторной отправки.', 'turn-interruption-unconfirmed');
     }
-    const commentary = turn.items.filter(item => item.type === 'agentMessage' && item.phase === 'commentary' && item.text?.trim())
+    const commentary = turn.items.filter(item => item.type === 'agentMessage' && item.delivery !== 'async' && item.phase === 'commentary' && item.text?.trim())
       .map(item => ({ id: `${turn.id}:${item.id ?? createHash('sha256').update(item.text!).digest('hex')}`, text: item.text! }));
-    const answers = turn.items.filter(item => item.type === 'agentMessage' && item.phase === 'final_answer');
-    const legacy = turn.items.filter(item => item.type === 'agentMessage' && item.phase == null);
+    const answers = turn.items.filter(item => item.type === 'agentMessage' && item.delivery !== 'async' && item.phase === 'final_answer');
+    const legacy = turn.items.filter(item => item.type === 'agentMessage' && item.delivery !== 'async' && item.phase == null);
+    const unanswered = [...questions.values()].filter(({ question }) => !asyncAnswers.some(answer => answer.questionItemId === question.id));
     return {
       state: state as RequestLocation['state'], turnId: turn.id,
       ...(mixed ? { mixed: true } : {
@@ -642,6 +698,8 @@ export class CodexClient extends EventEmitter {
         text: answers.length ? answers.map(item => item.text || '').join('\n\n') : legacy.at(-1)?.text,
         ...(failureReason ? { failureReason } : {}),
         ...(turn.items.some(item => codexCommandItem(item)) ? { commandItems: turn.items.flatMap(item => { const command = codexCommandItem(item); return command ? [command] : []; }) } : {}),
+        ...(['running', 'completed'].includes(state) && unanswered.length ? { asyncQuestions: unanswered } : {}),
+        ...(asyncAnswers.length ? { asyncAnswers } : {}),
       }),
     };
   }

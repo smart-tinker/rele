@@ -206,7 +206,7 @@ export interface Approval {
   requestId: string;
   turnId: string;
   itemId: string;
-  rpcId: string | number;
+  rpcId: string | number | null;
   method: string;
   title: string;
   details: string;

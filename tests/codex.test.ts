@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { once } from 'node:events';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -12,6 +12,7 @@ import { Engine } from '../src/server/engine.js';
 import { Store } from '../src/server/store.js';
 import { defaultConfig } from '../src/server/config.js';
 import { initialMessageKey } from '../src/server/initial-message.js';
+import { asyncQuestions, encodeAsyncAnswers } from '../src/server/async-questions.js';
 import type { Endpoint } from '../src/shared/types.js';
 
 interface Rpc { id?: string | number; method?: string; params: Record<string, unknown>; result?: unknown; error?: { code: number; message: string } }
@@ -1025,7 +1026,7 @@ describe('Codex passive context', () => {
     expect(original?.params).toEqual({ threadId, excludeTurns: true });
     expect(calls.find(call => call.method === 'thread/read')?.params).toEqual({ threadId });
     expect(calls.find(call => call.method === 'thread/inject_items')?.params).toEqual({
-      threadId, items: [{ type: 'message', id: expect.stringMatching(/^msg_[a-f0-9]{48}$/u), role: 'user', content: [{ type: 'input_text', text: 'Passive Slack transcript' }] }],
+      threadId, items: [{ type: 'message', id: expect.stringMatching(/^rele-context-[a-f0-9]{48}$/u), role: 'user', content: [{ type: 'input_text', text: 'Passive Slack transcript' }] }],
     });
     const methods = calls.map(call => call.method);
     expect(methods.indexOf('thread/queue/list')).toBeLessThan(methods.indexOf('thread/resume'));
@@ -1124,16 +1125,40 @@ describe('Codex shared passive context receipts', () => {
     await f.client.injectContext(threadId, 'entry', 'Context');
     expect(f.calls.filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
     expect(f.calls.find(call => call.method === 'thread/inject_items')?.params).toEqual({
-      threadId, items: [{ type: 'message', id: expect.stringMatching(/^msg_[a-f0-9]{48}$/u), role: 'user', content: [{ type: 'input_text', text: 'Context' }] }],
+      threadId, items: [{ type: 'message', id: expect.stringMatching(/^rele-context-[a-f0-9]{48}$/u), role: 'user', content: [{ type: 'input_text', text: 'Context' }] }],
     });
     expect(f.calls.some(call => ['thread/start', 'thread/fork', 'turn/start', 'thread/queue/add'].includes(call.method ?? ''))).toBe(false);
-    expect(await readFile(f.rolloutPath, 'utf8')).toContain('msg_');
+    expect(await readFile(f.rolloutPath, 'utf8')).toContain('rele-context-');
     expect(await readFile(f.rolloutPath, 'utf8')).not.toContain('rele_slack_entry');
+    expect((f.pending[0] as { id: string }).id).toBe(`rele-context-${createHash('sha256').update(JSON.stringify([threadId, 'entry'])).digest('hex').slice(0, 48)}`);
   });
 
-  it.each(['legacy', 'msg'])('reconciles a migrated %s alias before acquiring a writer or appending', async format => {
-    const f = await sharedContextFixture(), itemId = `msg_${'b'.repeat(48)}`, oldText = 'Original quote with the old journal provenance';
-    await appendFile(f.rolloutPath, JSON.stringify({ type: 'response_item', payload: { type: 'message', id: format === 'legacy' ? 'rele_slack_old-entry' : itemId,
+  it.each([
+    `msg_${'a'.repeat(48)}`, `rele_context_${'a'.repeat(48)}`, `rele-context-${'a'.repeat(47)}_`,
+    `rele-context-${'A'.repeat(48)}`, `rele-context-${'a'.repeat(47)}`, `rele-context-${'a'.repeat(49)}`,
+    'msg_input_018f9e15-7a6a-7000-8000-000000000001',
+  ])('rejects unsafe or non-owned supplied IDs before any context RPC: %s', async itemId => {
+    const f = await sharedContextFixture(); await f.client.connect(); const before = f.calls.length;
+    await expect(f.client.injectContext(threadId, 'entry', 'Context', { itemId, entries: [] })).rejects.toThrow('идентификаторы');
+    expect(f.calls.slice(before)).toEqual([]);
+  });
+
+  it('reconciles the previous three-argument msg receipt without reinjecting or changing raw history', async () => {
+    const f = await sharedContextFixture();
+    const previousId = `msg_${createHash('sha256').update(JSON.stringify([threadId, 'old-entry'])).digest('hex').slice(0, 48)}`;
+    await appendFile(f.rolloutPath, JSON.stringify({ type: 'response_item', payload: { type: 'message', id: previousId,
+      role: 'user', content: [{ type: 'input_text', text: 'Exact previous context' }] } }) + '\n');
+    const original = await readFile(f.rolloutPath);
+    await f.client.connect(); const before = f.calls.length;
+    await f.client.injectContext(threadId, 'old-entry', 'Exact previous context');
+    expect(f.calls.slice(before).map(call => call.method)).toEqual(['thread/read']);
+    expect(await readFile(f.rolloutPath)).toEqual(original);
+  });
+
+  it.each(['legacy', 'msg', 'local'])('reconciles a migrated %s alias before acquiring a writer or appending', async format => {
+    const f = await sharedContextFixture(), itemId = `rele-context-${'b'.repeat(48)}`, oldText = 'Original quote with the old journal provenance';
+    const persistedId = format === 'legacy' ? 'rele_slack_old-entry' : format === 'msg' ? `msg_${'b'.repeat(48)}` : itemId;
+    await appendFile(f.rolloutPath, JSON.stringify({ type: 'response_item', payload: { type: 'message', id: persistedId,
       role: 'user', content: [{ type: 'input_text', text: oldText }] } }) + '\n');
     const beforeFile = await readFile(f.rolloutPath);
     await f.client.connect(); const before = f.calls.length;
@@ -1143,7 +1168,7 @@ describe('Codex shared passive context receipts', () => {
   });
 
   it('reconciles a new-ID lost ACK even when the canonical journal entry changes', async () => {
-    const f = await sharedContextFixture({ dropAck: true }), itemId = `msg_${'c'.repeat(48)}`;
+    const f = await sharedContextFixture({ dropAck: true }), itemId = `rele-context-${'c'.repeat(48)}`;
     await f.client.connect();
     await expect(f.client.injectContext(threadId, 'old-entry', 'Old exact quote', { itemId, entries: [] })).rejects.toBeInstanceOf(CodexTransportError);
     await f.client.connect(); const before = f.calls.length;
@@ -1152,9 +1177,10 @@ describe('Codex shared passive context receipts', () => {
     expect(f.calls.filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
   });
 
-  it('does not accept legacy alias provenance with another exact text', async () => {
-    const f = await sharedContextFixture(), itemId = `msg_${'d'.repeat(48)}`;
-    await appendFile(f.rolloutPath, JSON.stringify({ type: 'response_item', payload: { type: 'message', id: 'rele_slack_old-entry', role: 'user', content: [{ type: 'input_text', text: 'Another source version' }] } }) + '\n');
+  it.each(['legacy', 'msg'])('does not accept %s alias provenance with another exact text', async format => {
+    const f = await sharedContextFixture(), itemId = `rele-context-${'d'.repeat(48)}`;
+    const persistedId = format === 'legacy' ? 'rele_slack_old-entry' : `msg_${'d'.repeat(48)}`;
+    await appendFile(f.rolloutPath, JSON.stringify({ type: 'response_item', payload: { type: 'message', id: persistedId, role: 'user', content: [{ type: 'input_text', text: 'Another source version' }] } }) + '\n');
     await f.client.connect();
     await f.client.injectContext(threadId, 'canonical-entry', 'Current quote', { itemId, entries: [{ entryId: 'old-entry', text: 'Expected exact old quote' }] });
     expect(f.calls.filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
@@ -1214,7 +1240,7 @@ describe('Codex shared passive context receipts', () => {
     await f.client.injectContext(threadId, 'new-slack-entry', 'New agent context');
     expect(f.calls.find(call => call.method === 'thread/turns/list')?.params).toEqual({ threadId, limit: 1, itemsView: 'summary', sortDirection: 'desc' });
     expect(f.calls.filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
-    expect(await readFile(f.rolloutPath, 'utf8')).toContain('msg_');
+    expect(await readFile(f.rolloutPath, 'utf8')).toContain('rele-context-');
     expect(previous).toEqual({ id: 'previous-turn', status, completedAt: 1793004647, error: { codexErrorInfo: 'serverOverloaded' } });
     expect(f.calls.some(call => ['thread/start', 'thread/fork', 'turn/start', 'turn/interrupt', 'thread/queue/add', 'thread/queue/start', 'thread/queue/delete'].includes(call.method ?? ''))).toBe(false);
   });
@@ -1429,6 +1455,28 @@ describe('Codex managed runtime', () => {
 });
 
 describe('Codex addressed steering and own input receipts', () => {
+  it.each(['request', 'steer'])('keeps the %s receipt connected when older full history would overflow a bulk frame', async kind => {
+    const clientId = randomUUID(), turnId = randomUUID();
+    const turn = { id: turnId, status: 'completed', items: [
+      { type: 'userMessage', clientId },
+      { type: 'commandExecution', id: 'command-1', processId: '123', status: 'completed' },
+      { type: 'agentMessage', phase: 'final_answer', text: 'NOREPLY' },
+    ] };
+    const f = await fixture({ 'thread/turns/list': request => ({
+      data: request.params.limit === 1 ? [turn] : [turn, { id: 'older-turn', status: 'completed', items: [
+        { type: 'commandExecution', id: 'old-command', aggregatedOutput: 'x'.repeat(33 * 1024 * 1024) },
+      ] }],
+      nextCursor: request.params.limit === 1 ? 'older-page' : null,
+    }) });
+    await f.client.connect();
+    const found = kind === 'request' ? await f.client.findRequest(threadId, clientId)
+      : await f.client.findSteerReceipt(threadId, clientId, turnId);
+    expect(found).toMatchObject({ state: 'completed', turnId, text: 'NOREPLY',
+      commandItems: [{ id: 'command-1', processId: '123', completed: true }] });
+    expect(f.client.status().connected).toBe(true);
+    expect(f.calls.some(call => ['thread/queue/add', 'thread/resume', 'turn/steer', 'turn/start'].includes(call.method ?? ''))).toBe(false);
+  });
+
   it('steers the exact expected turn once and preserves an early native input receipt', async () => {
     const clientId = randomUUID(), turnId = randomUUID(), events: CodexNotification[] = [];
     const f = await fixture({ 'turn/steer': (message, socket) => {
@@ -1609,5 +1657,97 @@ describe('Overload continuation protocol', () => {
     await f.client.connect();
     await expect(f.client.retryOverloaded(threadId, clientId, failed.id, [], () => true)).rejects.toMatchObject({ uncertain: true });
     expect(f.calls.filter(call => call.method === 'turn/start')).toHaveLength(1);
+  });
+});
+
+describe('Codex typed async question history', () => {
+  const questionItem = { type: 'agentMessage', delivery: 'async', id: 'async-call', phase: 'final_answer', text: 'Question UI only',
+    questions: [{ title: 'Где ответить?', options: ['Slack', 'Desktop'] }] };
+  const ref = asyncQuestions(questionItem)[0], questionId = ref.question.id;
+  const envelope = encodeAsyncAnswers([ref.question], { [questionId]: ['Slack'] });
+  const reply = { type: 'userMessage', id: 'desktop-reply', clientId: 'desktop-input', content: [{ type: 'text', text: envelope }] };
+  const page = (data: unknown[], nextCursor: string | null = null) => ({ data, nextCursor });
+
+  it.each(['inProgress', 'completed', 'failed', 'interrupted'])('keeps unanswered async questions only for live/completed turns (%s)', async status => {
+    const clientId = randomUUID(), turn = { id: 'question-turn', status, completedAt: 123, items: [
+      { type: 'userMessage', clientId }, questionItem,
+    ] };
+    const f = await fixture({ 'thread/turns/list': () => page([turn]) }); await f.client.connect();
+    const found = await f.client.findRequest(threadId, clientId);
+    expect(found.asyncQuestions).toEqual(['inProgress', 'completed'].includes(status) ? [ref] : undefined);
+    expect(found.text).toBeUndefined(); expect(found.commentary).toBeUndefined(); expect(found.mixed).toBeUndefined();
+  });
+
+  it('recognizes a Desktop reply to an earlier exact question without marking the same turn mixed', async () => {
+    const clientId = randomUUID(), turn = { id: 'question-turn', status: 'completed', items: [
+      { type: 'userMessage', clientId }, questionItem, reply, { type: 'agentMessage', phase: 'final_answer', text: 'Real final' },
+      { ...questionItem, id: 'second-question', phase: 'commentary' },
+    ] };
+    const f = await fixture({ 'thread/turns/list': () => page([turn]) }); await f.client.connect();
+    expect(await f.client.findRequest(threadId, clientId)).toEqual({ state: 'completed', turnId: turn.id, text: 'Real final',
+      asyncQuestions: asyncQuestions(turn.items.at(-1)),
+      asyncAnswers: [{ questionItemId: questionId, question: ref.question.question, answer: 'Slack', clientId: 'desktop-input' }] });
+  });
+
+  it.each(['forged-title', 'prefix', 'ordinary', 'before-question'])('preserves the foreign-input guard for %s', async kind => {
+    const clientId = randomUUID(), foreign = { ...reply, content: [{ type: 'text', text: kind === 'forged-title'
+      ? envelope.replace('Где ответить?', 'Forged title') : kind === 'prefix' ? `Rele prefix\n${envelope}` : kind === 'ordinary' ? 'Ordinary foreign input' : envelope }] };
+    const items = kind === 'before-question' ? [foreign, questionItem] : [questionItem, foreign];
+    const f = await fixture({ 'thread/turns/list': () => page([{ id: 'mixed-turn', status: 'completed', items: [
+      { type: 'userMessage', clientId }, ...items,
+    ] }]) }); await f.client.connect();
+    expect(await f.client.findRequest(threadId, clientId)).toEqual({ state: 'completed', turnId: 'mixed-turn', mixed: true });
+  });
+
+  it('reconciles a later-turn Desktop answer using single-item pages without loading or mutating the thread', async () => {
+    const entries = [
+      { turnId: 'new-turn', item: { ...reply, clientId: 'forged-client', content: [{ type: 'text', text: envelope.replace('Где ответить?', 'Forged title') }] } },
+      { turnId: 'answer-turn', item: reply },
+      { turnId: 'original-question-turn', item: questionItem },
+      { turnId: 'older-turn', item: { type: 'userMessage', id: 'older', content: [] } },
+    ];
+    const f = await fixture({ 'thread/items/list': request => {
+      const index = Number(request.params.cursor ?? 0); return page([entries[index]], String(index + 1));
+    } }); await f.client.connect(); const start = f.calls.length;
+    expect(await f.client.asyncQuestionState(threadId, questionId)).toEqual({ turnId: 'original-question-turn', question: ref.question,
+      answer: { answer: 'Slack', clientId: 'desktop-input' } });
+    expect(f.calls.slice(start).map(call => ({ method: call.method, params: call.params }))).toEqual([0, 1, 2].map(index => ({
+      method: 'thread/items/list', params: { threadId, limit: 1, sortDirection: 'desc', ...(index ? { cursor: String(index) } : {}) },
+    })));
+  });
+
+  it('does not trust a wrapper with the wrong title or an answer older than the native question', async () => {
+    const entries = [
+      { turnId: 'new-turn', item: { ...reply, content: [{ type: 'text', text: envelope.replace('Где ответить?', 'Forged title') }] } },
+      { turnId: 'question-turn', item: questionItem }, { turnId: 'older-turn', item: reply },
+    ];
+    const f = await fixture({ 'thread/items/list': request => {
+      const index = Number(request.params.cursor ?? 0); return page([entries[index]], String(index + 1));
+    } }); await f.client.connect();
+    expect(await f.client.asyncQuestionState(threadId, questionId)).toEqual({ turnId: 'question-turn', question: ref.question });
+  });
+
+  it('returns absence only after reaching the end of item history', async () => {
+    const f = await fixture({ 'thread/items/list': () => page([]) }); await f.client.connect();
+    expect(await f.client.asyncQuestionState(threadId, questionId)).toBeUndefined();
+  });
+
+  it('fails closed on repeated cursors rather than returning a false absent question', async () => {
+    const f = await fixture({ 'thread/items/list': () => page([], 'repeated') }); await f.client.connect();
+    await expect(f.client.asyncQuestionState(threadId, questionId)).rejects.toThrow('курсор');
+  });
+
+  it('fails closed at the item budget and never scans an unbounded history', async () => {
+    let index = 0;
+    const f = await fixture({ 'thread/items/list': () => page([{ turnId: 'old-turn', item: { type: 'reasoning', id: String(index) } }], String(++index)) });
+    await f.client.connect();
+    await expect(f.client.asyncQuestionState(threadId, questionId)).rejects.toMatchObject({ code: 'async-question-history-limit' });
+    expect(index).toBe(1_000);
+  });
+
+  it.each([page([{ turnId: '', item: questionItem }]), page([{ turnId: 'turn', item: questionItem }], ''),
+    page([{ turnId: 'turn', item: questionItem }, { turnId: 'turn', item: reply }])])('rejects malformed item pages %#', async result => {
+    const f = await fixture({ 'thread/items/list': () => result }); await f.client.connect();
+    await expect(f.client.asyncQuestionState(threadId, questionId)).rejects.toMatchObject({ code: 'async-question-history-unconfirmed' });
   });
 });

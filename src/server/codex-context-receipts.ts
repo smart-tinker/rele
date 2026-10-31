@@ -28,7 +28,8 @@ function textHash(text: string): string {
 }
 
 function contextItemId(id: string): boolean {
-  return /^msg_[a-f0-9]{48}$/u.test(id) || id.startsWith('rele_slack_') && id.length > 'rele_slack_'.length;
+  return /^rele-context-[a-f0-9]{48}$/u.test(id) || /^msg_[a-f0-9]{48}$/u.test(id)
+    || id.startsWith('rele_slack_') && id.length > 'rele_slack_'.length;
 }
 
 function inside(directory: string, file: string): boolean {

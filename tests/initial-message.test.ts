@@ -39,6 +39,20 @@ function fixture(bound = true) {
 }
 
 describe('durable standalone initial Rele message', () => {
+  it('keeps a redacted lookup cause without resubmitting an uncertain initial message', async () => {
+    const f = fixture(), id = randomUUID();
+    f.store.setMeta(f.key(), JSON.stringify({ applied: false, operation: { id, status: 'queued', queuedSubmissionId: 'queue-1' } }));
+    const failure = new Error('sensitive diagnostic');
+    f.codex.findRequest.mockRejectedValue(failure);
+    const redact = vi.fn(() => 'safe diagnostic');
+    const initial = new InitialMessages(f.store, () => f.codex, () => true, redact);
+    await expect(initial.ensure(f.conversation.id)).rejects.toThrow(/safe diagnostic/u);
+    expect(redact).toHaveBeenCalledWith(failure);
+    expect(f.state().operation.error).not.toContain('sensitive');
+    expect(f.codex.enqueue).not.toHaveBeenCalled();
+    expect(f.codex.startQueued).not.toHaveBeenCalled();
+  });
+
   it('persists submission intent before one visible native turn and applies only its completed NOREPLY', async () => {
     const f = fixture();
     f.codex.enqueue.mockImplementation(async (thread, text, id) => {

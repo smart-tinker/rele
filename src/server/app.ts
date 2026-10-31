@@ -164,7 +164,7 @@ export function createApp(services: AppServices) {
     const key = JSON.stringify([accountId, chatId]);
     const known = peopleCatalog.get(key);
     const entry = known && known.channel === channel ? known : { channel, people: new Map<string, boolean>() };
-    people.forEach(person => entry.people.set(person.id, !!person.isBot || !!entry.people.get(person.id)));
+    people.forEach(person => entry.people.set(person.id, person.isBot ?? entry.people.get(person.id) ?? false));
     peopleCatalog.set(key, entry);
     while (peopleCatalog.size > 100) peopleCatalog.delete(peopleCatalog.keys().next().value!);
   }
@@ -317,7 +317,7 @@ export function createApp(services: AppServices) {
         checkSource(source);
         rememberPeople(channel, endpoint.accountId, endpoint.chatId, page.items);
         const people = new Map(store.getEndpoint(endpoint.id)!.people.map(person => [person.id, person]));
-        for (const person of page.items) people.set(person.id, { ...person, isBot: !!person.isBot || !!people.get(person.id)?.isBot });
+        for (const person of page.items) people.set(person.id, { ...person, isBot: person.isBot ?? people.get(person.id)?.isBot });
         store.upsertEndpoint({ ...store.getEndpoint(endpoint.id)!, people: [...people.values()] });
       }
       const people = new Map(store.getEndpoint(endpoint.id)!.people.map(person => [person.id, !!person.isBot]));
