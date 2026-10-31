@@ -668,6 +668,28 @@ describe('durable Slack transcript sync', () => {
 
 
 describe('Slack transcript identity guards', () => {
+  it('corrects stale bot profiles and rosters from verified human metadata without trusting event bot flags', () => {
+    const path = join(directory(), 'human-profile.sqlite'), store = open(path);
+    const ep = endpoint({ chatId: 'DPRIVATE', people: [{ id: 'user-1', name: 'Human', isBot: true }] });
+    conversation(store, ep);
+    store.recordInbound(message(ep, 'old-bot-event', { sender: { id: 'user-1', name: 'Human', isBot: true } }));
+    expect(store.getThreadParticipants(ep.id)[0].isBot).toBe(true);
+    const verified = { ...ep, people: [{ id: 'user-1', name: 'Human', isBot: false }] };
+    store.upsertEndpoint(verified);
+    expect(store.getEndpoint(ep.id)?.people[0].isBot).toBe(false);
+    expect(store.getThreadParticipants(ep.id)[0].isBot).toBe(false);
+    const accepted = store.ingest(message(verified, 'bot-assisted-file', { sender: { id: 'user-1', name: 'Human', isBot: true } })).request;
+    expect(accepted).not.toBeNull();
+    expect(accepted?.origin.participants?.[0].isBot).toBe(false);
+    store.upsertEndpoint({ ...verified, people: [{ id: 'user-1', name: 'Human' }] });
+    expect(store.getEndpoint(ep.id)?.people[0].isBot).toBe(false);
+    store.close(); const restarted = open(path);
+    expect(restarted.getThreadParticipants(ep.id)[0].isBot).toBe(false);
+    restarted.upsertEndpoint(ep);
+    expect(restarted.getThreadParticipants(ep.id)[0].isBot).toBe(true);
+    expect(restarted.ingest(message({ ...ep, people: [{ id: 'user-1', name: 'Human' }] }, 'real-bot-now')).request).toBeNull();
+  });
+
   it('keeps a known bot classified as a bot when later events omit its profile', () => {
     const store = open();
     const ep = endpoint({ people: [{ id: 'UBOT', name: 'Agent', isBot: true }] });
@@ -860,5 +882,194 @@ describe('durable addressed steering inputs', () => {
     expect(store.getSlackSyncEntry(entry.id)?.state).toBe('applied');
     expect(store.listRequests()).toHaveLength(1);
     expect(store.listDeliveries()).toEqual([]);
+  });
+});
+
+describe('durable async question answers', () => {
+  function fixture(status: 'running' | 'waiting_approval' | 'completed' = 'running', path?: string) {
+    const store = open(path), ep = endpoint(), conv = conversation(store, ep), parent = request(store, ep);
+    store.claimNextRequest(conv.id, parent.id);
+    store.updateRequest(parent.id, { status, turnId: 'turn-1' });
+    const approval = store.addApproval({ ...approvalInput(parent.id), rpcId: null, method: 'rele/asyncUserInput',
+      questions: [{ id: 'question-1', header: 'Choice', question: 'Which option?' }] });
+    return { store, ep, conv, parent, approval };
+  }
+
+  it.each(['running', 'waiting_approval'] as const)('durably steers a %s parent without a fake inbound request', status => {
+    const path = join(directory(), 'async-steering.sqlite'), { store, parent, approval } = fixture(status, path);
+    store.addApproval({ ...approvalInput(parent.id), itemId: 'sibling', rpcId: null, method: 'rele/asyncUserInput' });
+    const { input, request: queued } = store.beginAsyncQuestionAnswer(approval.id, 'Exact answer');
+    expect(input).toEqual({ id: approval.id, approvalId: approval.id, parentRequestId: parent.id,
+      turnId: 'turn-1', text: 'Exact answer', state: 'sending' });
+    expect(queued).toBeUndefined();
+    expect(store.steeringInputs(parent.id)).toEqual([input]);
+    expect(store.listRequests()).toHaveLength(1);
+    expect(store.listDeliveries()).toEqual([]);
+    store.updateApproval(approval.id, { status: 'answered', decision: 'sending' });
+    store.setMeta(`async-question-decision:${approval.id}`, 'accept');
+    expect(store.beginAsyncQuestionAnswer(approval.id, 'Exact answer').input).toEqual(input);
+    expect(() => store.beginAsyncQuestionAnswer(approval.id, 'Changed answer')).toThrow(/different content/);
+    store.close(); const restarted = open(path); restarted.recoverInterrupted();
+    expect(restarted.getSteeringInput(approval.id)).toMatchObject({ state: 'uncertain' });
+    expect(restarted.getApproval(approval.id)).toMatchObject({ status: 'expired', decision: 'uncertain' });
+    expect(restarted.getMeta(`async-question-decision:${approval.id}`)).toBe('accept');
+    expect(() => restarted.beginAsyncQuestionAnswer(approval.id, 'Exact answer')).toThrow(/original authorized source/);
+    expect(restarted.listRequests()).toHaveLength(1);
+    expect(restarted.hasUnfinishedCodexOperations()).toBe(true);
+  });
+
+  it('queues a completed parent answer once with its exact text and trusted origin', () => {
+    const path = join(directory(), 'async-completed.sqlite'), { store, parent, approval } = fixture('completed', path);
+    const { request: answer, input } = store.beginAsyncQuestionAnswer(approval.id, 'Question wrapper\nExact answer');
+    expect(input).toBeUndefined();
+    expect(answer).toMatchObject({ id: approval.id, conversationId: parent.conversationId,
+      eventId: `async-question-answer:${approval.id}`, text: 'Question wrapper\nExact answer', origin: parent.origin, status: 'queued' });
+    expect(store.getAsyncQuestionAnswerApproval(answer!.id)?.id).toBe(approval.id);
+    expect(store.getAsyncQuestionAnswerApproval(parent.id)).toBeUndefined();
+    store.updateApproval(approval.id, { status: 'answered' });
+    store.close(); const restarted = open(path);
+    expect(restarted.beginAsyncQuestionAnswer(approval.id, answer!.text).request?.id).toBe(answer!.id);
+    expect(() => restarted.beginAsyncQuestionAnswer(approval.id, 'Different')).toThrow(/different content/);
+    expect(restarted.listRequests()).toHaveLength(2);
+    expect(restarted.claimNextRequest(parent.conversationId)?.id).toBe(answer!.id);
+  });
+
+  it.each(['failed', 'cancelled', 'interrupted', 'uncertain'] as const)('rejects answers to a %s parent', status => {
+    const { store, parent, approval } = fixture();
+    store.updateRequest(parent.id, { status });
+    expect(() => store.beginAsyncQuestionAnswer(approval.id, 'Answer')).toThrow(/original authorized source/);
+    expect(store.getSteeringInput(approval.id)).toBeUndefined();
+    expect(store.getRequest(approval.id)).toBeUndefined();
+  });
+
+  it.each(['mixed', 'cancel', 'paused', 'off', 'native-approval', 'wrong-turn', 'wrong-binding'] as const)('rejects stale or unavailable scope: %s', reason => {
+    const { store, parent, conv, ep, approval } = fixture();
+    if (reason === 'mixed') store.setMeta(`mixed:${parent.id}`, '1');
+    if (reason === 'cancel') store.setMeta(`cancel-requested:${parent.id}`, '1');
+    if (reason === 'paused') store.updateConversation(conv.id, { paused: true });
+    if (reason === 'off') store.setSourceAccess(ep.id, { mode: 'off' });
+    if (reason === 'native-approval') store.addApproval({ ...approvalInput(parent.id), itemId: 'native-other' });
+    if (reason === 'wrong-turn') store.updateRequest(parent.id, { turnId: 'another-turn' });
+    if (reason === 'wrong-binding') {
+      store.updateApproval(approval.id, { status: 'expired' });
+      store.removeBinding(conv.id, conv.bindings[0].id);
+      store.updateApproval(approval.id, { status: 'pending' });
+    }
+    expect(() => store.beginAsyncQuestionAnswer(approval.id, 'Answer')).toThrow();
+    expect(store.getSteeringInput(approval.id)).toBeUndefined();
+    expect(store.getRequest(approval.id)).toBeUndefined();
+  });
+
+  it('allows null RPC IDs only for async questions and requires nonempty exact answer text', () => {
+    const { store, parent, approval } = fixture();
+    expect(() => store.addApproval({ ...approvalInput(parent.id), itemId: 'invalid', rpcId: null })).toThrow(/RPC ID/);
+    expect(() => store.addApproval({ ...approvalInput(parent.id), itemId: 'invalid-async', method: 'rele/asyncUserInput' })).toThrow(/RPC ID/);
+    expect(() => store.updateApproval(approval.id, { rpcId: 1 })).toThrow(/RPC ID/);
+    expect(() => store.beginAsyncQuestionAnswer(approval.id, ' \n ')).toThrow(/Async question answer/);
+    const native = store.addApproval({ ...approvalInput(parent.id), itemId: 'native' });
+    expect(() => store.beginAsyncQuestionAnswer(native.id, 'Answer')).toThrow(/original request turn/);
+  });
+
+  it('keeps unanswered async cards across completed turns and restart, while native cards expire', () => {
+    const path = join(directory(), 'async-restart.sqlite'), { store, parent, approval } = fixture('running', path);
+    const sibling = store.addApproval({ ...approvalInput(parent.id), itemId: 'async-sibling', rpcId: null, method: 'rele/asyncUserInput' });
+    const native = store.addApproval({ ...approvalInput(parent.id), itemId: 'native' });
+    const deliveries = store.addDeliveries(parent.id, [approval, sibling, native].map((item, ordinal) => ({ key: `approval:${item.id}`,
+      ordinal, kind: 'approval' as const, body: item.id, approvalId: item.id })));
+    store.finishRequest(parent.id, { status: 'completed' }, []);
+    expect([approval, sibling].map(item => store.getApproval(item.id)?.status)).toEqual(['pending', 'pending']);
+    expect(store.getApproval(native.id)?.status).toBe('expired');
+    expect(deliveries.map(item => store.getDelivery(item.id)?.status)).toEqual(['pending', 'pending', 'cancelled']);
+    store.close(); const restarted = open(path); restarted.recoverInterrupted(); restarted.expirePendingApprovals();
+    expect(restarted.getApproval(approval.id)?.status).toBe('pending');
+    expect(restarted.getDelivery(deliveries[0].id)?.status).toBe('pending');
+    expect(restarted.hasUnfinishedCodexOperations()).toBe(true);
+    expect(restarted.beginAsyncQuestionAnswer(approval.id, 'Late answer').request?.status).toBe('queued');
+  });
+
+  it.each(['failed', 'cancelled', 'interrupted'] as const)('expires pending async cards on %s', status => {
+    const { store, parent, approval } = fixture();
+    const [card] = store.addDeliveries(parent.id, [{ key: 'async-card', ordinal: 0, kind: 'approval', body: 'Question', approvalId: approval.id }]);
+    store.finishRequest(parent.id, { status }, []);
+    expect(store.getApproval(approval.id)?.status).toBe('expired');
+    expect(store.getDelivery(card.id)?.status).toBe('cancelled');
+    expect(store.hasUnfinishedCodexOperations()).toBe(false);
+  });
+
+  it('blocks retargeting/removing a pending async source after the parent completed', () => {
+    const { store, ep, conv, approval } = fixture('completed');
+    const other = store.createConversation({ name: 'Other', threadId: 'other-native', cwd: '/other' });
+    const anotherEndpoint = store.upsertEndpoint(endpoint({ id: 'slack-other', threadId: 'different' }));
+    expect(() => store.routeSource(ep.id, other.id)).toThrow(/ожидающий вопрос/);
+    expect(() => store.removeBinding(conv.id, conv.bindings[0].id)).toThrow(/ожидающий вопрос/);
+    expect(() => store.updateBinding(conv.id, conv.bindings[0].id, anotherEndpoint.id, ['user-1'])).toThrow(/ожидающий вопрос/);
+    expect(store.bindingForEndpoint(ep.id)?.conversationId).toBe(conv.id);
+    store.updateApproval(approval.id, { status: 'expired' });
+    expect(store.routeSource(ep.id, other.id).mode).toBe('manual');
+  });
+
+  it('keeps the source bound while an answered async steering acknowledgement is uncertain', () => {
+    const { store, ep, conv, parent, approval } = fixture();
+    const { input } = store.beginAsyncQuestionAnswer(approval.id, 'Answer');
+    store.updateApproval(approval.id, { status: 'answered', decision: 'Answer' });
+    store.finishSteeringInput(input!.id, 'uncertain');
+    store.finishRequest(parent.id, { status: 'completed' }, []);
+    expect(() => store.removeBinding(conv.id, conv.bindings[0].id)).toThrow(/ожидающий вопрос/);
+    expect(() => store.routeSource(ep.id, null)).toThrow(/ожидающий вопрос/);
+    store.finishSteeringInput(input!.id, 'applied');
+    expect(store.routeSource(ep.id, null).mode).toBe('none');
+  });
+
+  it('expires a crash before the async wire intent was marked sending without expiring an untouched sibling', () => {
+    const { store, parent, approval } = fixture();
+    const sibling = store.addApproval({ ...approvalInput(parent.id), itemId: 'untouched', rpcId: null, method: 'rele/asyncUserInput' });
+    store.beginAsyncQuestionAnswer(approval.id, 'Answer');
+    store.recoverInterrupted();
+    expect(store.getApproval(approval.id)).toMatchObject({ status: 'expired', decision: 'uncertain' });
+    expect(store.getSteeringInput(approval.id)?.state).toBe('uncertain');
+    expect(store.getApproval(sibling.id)).toMatchObject({ status: 'pending', decision: undefined });
+  });
+
+  it.each(['queued', 'starting', 'uncertain'] as const)('keeps a %s synthetic async answer bound until it reaches a terminal state', status => {
+    const { store, ep, conv, approval } = fixture('completed');
+    const { request: answer } = store.beginAsyncQuestionAnswer(approval.id, 'Answer');
+    store.updateApproval(approval.id, { status: 'answered', decision: 'queued' });
+    store.updateRequest(answer!.id, { status });
+    const anotherEndpoint = store.upsertEndpoint(endpoint({ id: 'replacement-source', threadId: 'replacement' }));
+    expect(() => store.removeBinding(conv.id, conv.bindings[0].id)).toThrow(/ожидающий вопрос/);
+    expect(() => store.updateBinding(conv.id, conv.bindings[0].id, anotherEndpoint.id, ['user-1'])).toThrow(/ожидающий вопрос/);
+    expect(() => store.routeSource(ep.id, null)).toThrow(/ожидающий вопрос/);
+    expect(store.bindingForEndpoint(ep.id)?.conversationId).toBe(conv.id);
+    store.finishRequest(answer!.id, { status: 'completed' }, []);
+    expect(store.routeSource(ep.id, null).mode).toBe('none');
+  });
+
+  it.each(['starting', 'running', 'uncertain'] as const)('mirrors an interrupted %s synthetic answer into its exact original async card', status => {
+    const path = join(directory(), 'async-child-restart.sqlite'), { store, parent, approval } = fixture('completed', path);
+    const { request: child } = store.beginAsyncQuestionAnswer(approval.id, 'Exact answer');
+    store.updateApproval(approval.id, { status: 'answered', decision: status === 'running' ? 'sending' : 'queued' });
+    store.updateRequest(child!.id, { status });
+    store.setMeta(`async-question-decision:${approval.id}`, 'decline');
+    const native = store.addApproval({ ...approvalInput(parent.id), itemId: 'untouched-native' });
+    store.close(); const restarted = open(path); restarted.recoverInterrupted();
+    expect(restarted.getRequest(child!.id)).toMatchObject({ status: 'uncertain', text: child!.text, origin: child!.origin });
+    expect(restarted.getApproval(approval.id)).toMatchObject({ status: 'expired', decision: 'uncertain' });
+    expect(restarted.getMeta(`async-question-decision:${approval.id}`)).toBe('decline');
+    expect(restarted.getApproval(native.id)?.status).toBe('pending');
+    expect(restarted.listPendingRequests()).toEqual([]);
+    expect(() => restarted.beginAsyncQuestionAnswer(approval.id, child!.text)).toThrow();
+    restarted.recoverInterrupted();
+    expect(restarted.getApproval(approval.id)).toMatchObject({ status: 'expired', decision: 'uncertain' });
+  });
+
+  it.each(['queued', 'confirmed', 'unlinked'] as const)('preserves %s async answer state during recovery', kind => {
+    const { store, approval } = fixture('completed');
+    const { request: child } = store.beginAsyncQuestionAnswer(approval.id, 'Answer');
+    store.updateApproval(approval.id, { status: 'answered', decision: kind === 'confirmed' ? 'accept' : 'queued' });
+    if (kind !== 'queued') store.updateRequest(child!.id, { status: 'starting' });
+    if (kind === 'unlinked') store.setMeta(`async-question-answer:${child!.id}`, 'different-approval');
+    store.recoverInterrupted();
+    expect(store.getApproval(approval.id)).toMatchObject({ status: 'answered', decision: kind === 'confirmed' ? 'accept' : 'queued' });
+    expect(store.getRequest(child!.id)?.status).toBe(kind === 'queued' ? 'queued' : 'uncertain');
   });
 });

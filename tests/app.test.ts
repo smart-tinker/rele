@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
+import { resolve } from 'node:path';
 import { createApp } from '../src/server/app.js';
 import {
   ConfigStore,
@@ -1200,13 +1201,29 @@ describe('automatic group access and private chat boundaries', () => {
     expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [slack] } })).statusCode).toBe(400);
     expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [{ ...slack, allowedSenderIds: ['human'] }] } })).statusCode).toBe(200);
   });
+
+  it('uses an explicit Slack profile classification to repair the cached DM rule identity', async () => {
+    const f = makeApp();
+    const listPeople = vi.fn().mockResolvedValue({ items: [{ id: 'UANNA', name: 'Participant', isBot: true }] });
+    f.engine.channels.slack = { state: { configured: true, connected: true, accountId: 'TEAM:BOT' }, listChats: vi.fn(), listThreads: vi.fn(), listPeople } as unknown as Channel;
+    const selected = { id: 'identity-rule', platform: 'slack', accountId: 'TEAM:BOT', chatId: 'DEXAMPLE', cwd: '/work/example', enabled: true,
+      allowedSenderIds: ['UANNA'], requireMention: false };
+    expect((await f.app.inject({ url: '/api/catalog/slack/people?chatId=DEXAMPLE', headers })).statusCode).toBe(200);
+    listPeople.mockResolvedValueOnce({ items: [{ id: 'UANNA', name: 'Unclassified refresh' }] });
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [selected] } })).statusCode).toBe(400);
+    listPeople.mockResolvedValueOnce({ items: [{ id: 'UANNA', name: 'Verified human', isBot: false }] });
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [selected] } })).statusCode).toBe(200);
+    listPeople.mockResolvedValueOnce({ items: [{ id: 'UANNA', name: 'Verified bot', isBot: true }] });
+    expect((await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { autoLinkRules: [{ ...selected, id: 'new-identity-rule' }] } })).statusCode).toBe(400);
+  });
 });
 
 
 describe('automatic rules remain scoped to the selected Codex target', () => {
+  const codexHome = resolve('synthetic-codex-home');
   it.each(['global rule', 'source route'])('preserves an enabled unchanged automatic %s during an executable-only shared selection change', async automatic => {
     const f = makeApp();
-    f.config.config.codex = { transport: 'shared', executable: '/opt/codex-old', endpoint: '', codexHome: '/home/example/.codex' };
+    f.config.config.codex = { transport: 'shared', executable: '/opt/codex-old', endpoint: '', codexHome };
     if (automatic === 'global rule') f.config.config = mergeConfig(f.config.config, { autoLinkRules: [{ id: 'same-profile-rule', platform: 'telegram', accountId: f.endpoint.accountId,
       chatId: f.endpoint.chatId, cwd: '/work/example', enabled: true, allowedSenderIds: ['sender-anna'], allowAllSenders: false, requireMention: true }] });
     else {
@@ -1217,21 +1234,22 @@ describe('automatic rules remain scoped to the selected Codex target', () => {
     const response = await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { codex: { executable: 'codex' } } });
     expect(response.statusCode).toBe(200);
     expect(f.configure).toHaveBeenCalledOnce();
-    expect(f.config.config.codex).toEqual({ transport: 'shared', executable: 'codex', endpoint: '', codexHome: '/home/example/.codex' });
+    expect(f.config.config.codex).toEqual({ transport: 'shared', executable: 'codex', endpoint: '', codexHome });
     expect(f.config.config.autoLinkRules).toEqual(rules);
     expect(f.store.getSourceRoute(f.endpoint.id)).toEqual(route);
     expect(f.store.getSourceAccess(f.endpoint.id)).toEqual(access);
     expect(f.codex.connect).not.toHaveBeenCalled();
   });
 
-  it.each([{ codexHome: '/different-profile' }, { token: 'replacement-synthetic-token' }])('does not exempt a selection change combined with changed shared scope %j', async changed => {
+  it.each([{ codexHome: resolve('synthetic-other-codex-home') }, { token: 'replacement-synthetic-token' }])('does not exempt a selection change combined with changed shared scope %j', async changed => {
     const f = makeApp();
-    f.config.config.codex = { transport: 'shared', executable: '/opt/codex-old', endpoint: '', codexHome: '/home/example/.codex' };
+    f.config.config.codex = { transport: 'shared', executable: '/opt/codex-old', endpoint: '', codexHome };
     f.store.routeSource(f.endpoint.id, null, '/work/example');
     f.store.setSourceAccess(f.endpoint.id, { mode: 'all', allowedSenderIds: [] });
     const before = structuredClone(f.config.config);
     const response = await f.app.inject({ method: 'PUT', url: '/api/config', headers, payload: { codex: { executable: 'codex', ...changed } } });
     expect(response.statusCode).toBe(400);
+    expect(response.json().error).toContain('Отключите правила');
     expect(f.configure).not.toHaveBeenCalled();
     expect(f.config.config).toEqual(before);
   });
@@ -1320,6 +1338,14 @@ describe('source access and native thread routing', () => {
     expect(f.store.getSourceAccess(endpoint.id)).toEqual({ endpointId: endpoint.id, mode: 'all', allowedSenderIds: [humanId], legacy: false });
     expect((await put(f, endpoint, 'access', { mode: 'mention' })).statusCode).toBe(200);
     expect(f.store.getSourceAccess(endpoint.id).allowedSenderIds).toEqual([humanId]);
+  });
+
+  it('repairs a stale Slack DM bot flag from the live participant catalog before enabling human access', async () => {
+    const f = makeApp();
+    const { endpoint, channel } = attachSource(f, { platform: 'slack', chatId: 'DEXAMPLE', people: [{ id: 'UANNA', name: 'Stale bot flag', isBot: true }] });
+    channel.listPeople.mockResolvedValueOnce({ items: [{ id: 'UANNA', name: 'Verified human', isBot: false }] });
+    expect((await put(f, endpoint, 'access', { mode: 'all', allowedSenderIds: ['UANNA'] })).statusCode).toBe(200);
+    expect(f.store.getEndpoint(endpoint.id)?.people).toEqual([{ id: 'UANNA', name: 'Verified human', isBot: false }]);
   });
 
   it.each([{ available: false }, { accountId: 'previous-bot' }])('blocks enabling a stale source but permits disabling it offline: %j', async patch => {

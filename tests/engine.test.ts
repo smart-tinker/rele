@@ -8,8 +8,9 @@ import { Engine, type CodexGateway, type EngineOptions } from '../src/server/eng
 import { Store } from '../src/server/store.js';
 import { INITIAL_RELE_MESSAGE, requestInput } from '../src/server/inbound-context.js';
 import { initialMessageKey } from '../src/server/initial-message.js';
+import { ASYNC_QUESTION_METHOD, asyncQuestions, encodeAsyncAnswers } from '../src/server/async-questions.js';
 import { defaultConfig } from '../src/server/config.js';
-import { CodexSteerRefusedError, CodexThreadBusyError, CodexTransportError, type CodexNotification, type CodexServerRequest, type RequestLocation } from '../src/server/codex.js';
+import { CodexRpcError, CodexSteerRefusedError, CodexThreadBusyError, CodexTransportError, type CodexNotification, type CodexServerRequest, type RequestLocation } from '../src/server/codex.js';
 import { ChannelError, type ApprovalAction, type Channel } from '../src/server/channels/common.js';
 import type { Approval, CodexConnectionState, Delivery, Endpoint, InboundMessage, MessageToolReceipt, Platform, ReleRequest } from '../src/shared/types.js';
 
@@ -34,6 +35,8 @@ class FakeCodex extends EventEmitter implements CodexGateway {
   pendingRequests = new Set<string | number>();
   hasPendingRequest = (id: string | number) => this.pendingRequests.has(id);
   locations = new Map<string, RequestLocation>();
+  asyncStates = new Map<string, NonNullable<Awaited<ReturnType<import('../src/server/codex.js').CodexClient['asyncQuestionState']>>>>();
+  asyncQuestionState = vi.fn(async (_threadId: string, questionId: string) => this.asyncStates.get(questionId));
   transport: CodexConnectionState['transport'] = 'managed';
   status = vi.fn(() => ({ configured: true, connected: this.connected, queueSupported: this.queueSupported, desktopVerified: false, transport: this.transport, codexHome: '/test/codex-home' }));
   createThread = vi.fn<(_cwd: string) => Promise<string>>().mockResolvedValue('auto-created-thread');
@@ -104,6 +107,279 @@ function fakeChannel(platform: Platform) {
   } satisfies Channel;
   return channel;
 }
+
+async function asyncQuestion(f: ReturnType<typeof fixture>, request: ReleRequest, count = 1) {
+  await running(f, request);
+  const item = { id: 'call-async-question', type: 'agentMessage', delivery: 'async', text: 'Question',
+    questions: Array.from({ length: count }, (_, index) => ({ title: `Which branch ${index + 1}?`, options: ['main', 'release'] })) };
+  const questions = asyncQuestions(item);
+  for (const { question } of questions) f.codex.asyncStates.set(question.id, { turnId: 'turn-1', question });
+  f.codex.locations.set(request.id, { state: 'running', turnId: 'turn-1', asyncQuestions: questions });
+  f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1', item } });
+  await f.engine.settled();
+  return { item, questions, approval: f.store.listApprovals().find(a => a.itemId === questions[0].question.id)! };
+}
+
+function asyncAction(f: ReturnType<typeof fixture>, approval: Approval, answer = 'main'): ApprovalAction {
+  const delivery = f.store.listDeliveries().find(row => row.approvalId === approval.id)!;
+  const ep = f.eps.slack;
+  return { platform: 'slack', accountId: ep.accountId, chatId: ep.chatId, threadId: ep.threadId,
+    messageId: delivery.remoteMessageId, senderId: 'U1', senderIsBot: false,
+    approvalId: approval.id, decision: 'accept', answers: { [approval.questions![0].id]: [answer] } };
+}
+
+describe('Engine asynchronous Desktop questions', () => {
+  it('publishes typed questions and returns one Slack answer to the exact active question without a fake RPC', async () => {
+    const f = fixture(), request = await acceptRequest(f);
+    const { approval, questions, item } = await asyncQuestion(f, request);
+    expect(approval).toMatchObject({ method: ASYNC_QUESTION_METHOD, rpcId: null, status: 'pending' });
+    expect(f.store.listDeliveries().find(row => row.approvalId === approval.id)).toMatchObject({ status: 'sent' });
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1', item } });
+    await f.engine.settled(); expect(f.store.listApprovals()).toHaveLength(1);
+    await f.engine.action(asyncAction(f, approval)); await f.engine.settled();
+    expect(f.codex.steer).toHaveBeenCalledExactlyOnceWith(THREAD,
+      encodeAsyncAnswers([questions[0].question], { [questions[0].question.id]: ['main'] }), approval.id, 'turn-1');
+    expect(f.store.getSteeringInput(approval.id)).toMatchObject({ state: 'applied', approvalId: approval.id });
+    expect(f.store.getMeta(`mixed:${request.id}`)).toBeUndefined();
+    expect(f.codex.respond).not.toHaveBeenCalled();
+    await expect(f.engine.action(asyncAction(f, approval))).rejects.toThrow();
+    expect(f.codex.steer).toHaveBeenCalledTimes(1);
+  });
+
+  it('supports several independent async questions and a partial answer in Desktop without marking the turn mixed', async () => {
+    const f = fixture(), request = await acceptRequest(f);
+    const { questions } = await asyncQuestion(f, request, 2);
+    const first = f.store.listApprovals().find(a => a.itemId === questions[0].question.id)!;
+    const second = f.store.listApprovals().find(a => a.itemId === questions[1].question.id)!;
+    const reply = { questionItemId: first.questions![0].id, question: first.questions![0].question, answer: 'release', clientId: 'desktop-user-input' };
+    f.codex.locations.set(request.id, { state: 'running', turnId: 'turn-1', asyncQuestions: [questions[1]], asyncAnswers: [reply] });
+    f.codex.asyncStates.set(reply.questionItemId, { turnId: 'turn-1', question: first.questions![0], answer: { answer: reply.answer, clientId: reply.clientId } });
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1', item: { type: 'userMessage', clientId: reply.clientId,
+      content: [{ type: 'text', text: encodeAsyncAnswers(first.questions!, { [reply.questionItemId]: [reply.answer] }) }] } } });
+    await f.engine.settled();
+    expect(f.store.getApproval(first.id)?.status).toBe('answered');
+    expect(f.store.getApproval(second.id)?.status).toBe('pending');
+    expect(f.store.getMeta(`mixed:${request.id}`)).toBeUndefined();
+    await f.engine.action(asyncAction(f, second)); await f.engine.settled();
+    expect(f.codex.steer).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a completed turn question actionable and queues its exact reply as a new owned request', async () => {
+    const f = fixture(), request = await acceptRequest(f);
+    const { approval, questions } = await asyncQuestion(f, request);
+    f.codex.locations.set(request.id, { state: 'completed', turnId: 'turn-1', text: 'NOREPLY', asyncQuestions: questions });
+    f.codex.notification({ method: 'turn/completed', params: { threadId: THREAD, turn: { id: 'turn-1', status: 'completed' } } });
+    await f.engine.settled(); expect(f.store.getRequest(request.id)?.status).toBe('completed');
+    expect(f.store.getApproval(approval.id)?.status).toBe('pending');
+    await f.engine.action(asyncAction(f, approval)); await f.engine.settled();
+    expect(f.codex.steer).not.toHaveBeenCalled();
+    const child = f.store.getRequest(approval.id)!;
+    expect(child.eventId).toBe(`async-question-answer:${approval.id}`);
+    expect(f.codex.enqueue).toHaveBeenCalledWith(THREAD, encodeAsyncAnswers(approval.questions!, { [approval.questions![0].id]: ['main'] }), child.id);
+    expect(f.store.getAsyncQuestionAnswerApproval(child.id)?.id).toBe(approval.id);
+  });
+
+  it.each([false, true])('closes a deleted native-queued answer while preserving confirmed Desktop proof (%s)', async confirmed => {
+    const f = fixture(), request = await acceptRequest(f);
+    const { approval, questions } = await asyncQuestion(f, request);
+    f.codex.locations.set(request.id, { state: 'completed', turnId: 'turn-1', text: 'NOREPLY', asyncQuestions: questions });
+    await f.engine.reconcile(request.id); await f.engine.settled();
+    await f.engine.action(asyncAction(f, approval)); await f.engine.settled();
+    const child = f.store.getRequest(approval.id)!;
+    expect(child.queuedSubmissionId).toBe(`queue-${approval.id}`);
+    expect(f.store.getApproval(approval.id)?.decision).toBe('sending');
+    const deletion = deferred<{ deleted: boolean }>();
+    f.codex.deleteQueued.mockImplementationOnce(() => deletion.promise);
+    const cancel = f.engine.cancel(child.id);
+    await vi.waitFor(() => expect(f.codex.deleteQueued).toHaveBeenCalledExactlyOnceWith(THREAD, child.queuedSubmissionId));
+    if (confirmed) {
+      f.codex.asyncStates.set(questions[0].question.id, { turnId: 'turn-1', question: questions[0].question,
+        answer: { answer: 'release', clientId: 'desktop-answer' } });
+      f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'desktop-answer-turn', item: { type: 'userMessage', clientId: 'desktop-answer',
+        content: [{ type: 'text', text: encodeAsyncAnswers(approval.questions!, { [questions[0].question.id]: ['release'] }) }] } } });
+      await vi.waitFor(() => expect(f.store.getApproval(approval.id)?.decision).toBe('accept'));
+    }
+    deletion.resolve({ deleted: true }); await cancel; await f.engine.settled();
+    expect(f.store.getRequest(child.id)?.status).toBe('cancelled');
+    expect(f.store.getApproval(approval.id)).toMatchObject({ status: confirmed ? 'answered' : 'expired', decision: confirmed ? 'accept' : undefined });
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['lost enqueue ACK', 'explicit RPC refusal'] as const)('mirrors a queued async answer outcome after %s without retry or a sent claim', async failure => {
+    const f = fixture(), request = await acceptRequest(f);
+    const { approval, questions } = await asyncQuestion(f, request);
+    f.codex.locations.set(request.id, { state: 'completed', turnId: 'turn-1', text: 'NOREPLY', asyncQuestions: questions });
+    await f.engine.reconcile(request.id); await f.engine.settled();
+    const wire = deferred<{ queuedSubmissionId: string }>();
+    f.codex.enqueue.mockImplementationOnce(() => wire.promise);
+    await f.engine.action(asyncAction(f, approval));
+    await vi.waitFor(() => expect(f.codex.enqueue).toHaveBeenCalledTimes(2));
+    expect(f.store.getApproval(approval.id)).toMatchObject({ status: 'answered', decision: 'sending' });
+    wire.reject(failure === 'lost enqueue ACK' ? new CodexTransportError('ACK lost') : new CodexRpcError(-32602, 'Queue refused'));
+    await f.engine.settled();
+    expect(f.store.getRequest(approval.id)?.status).toBe(failure === 'lost enqueue ACK' ? 'uncertain' : 'failed');
+    expect(f.store.getApproval(approval.id)).toMatchObject({ status: 'expired', decision: failure === 'lost enqueue ACK' ? 'uncertain' : undefined });
+    await expect(f.engine.action(asyncAction(f, approval))).rejects.toThrow();
+    await f.engine.pump(); await f.engine.settled();
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(2);
+    expect(f.codex.steer).not.toHaveBeenCalled();
+  });
+
+  it('keeps an already verified queued answer accepted when its enqueue ACK subsequently fails', async () => {
+    const f = fixture(), request = await acceptRequest(f);
+    const { approval, questions } = await asyncQuestion(f, request);
+    f.codex.locations.set(request.id, { state: 'completed', turnId: 'turn-1', text: 'NOREPLY', asyncQuestions: questions });
+    await f.engine.reconcile(request.id); await f.engine.settled();
+    const wire = deferred<{ queuedSubmissionId: string }>();
+    f.codex.enqueue.mockImplementationOnce(() => wire.promise);
+    await f.engine.action(asyncAction(f, approval));
+    await vi.waitFor(() => expect(f.codex.enqueue).toHaveBeenCalledTimes(2));
+    f.codex.asyncStates.set(questions[0].question.id, { turnId: 'turn-1', question: questions[0].question,
+      answer: { answer: 'main', clientId: approval.id } });
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'answer-turn', item: { type: 'userMessage', clientId: approval.id,
+      content: [{ type: 'text', text: encodeAsyncAnswers(approval.questions!, { [questions[0].question.id]: ['main'] }) }] } } });
+    await vi.waitFor(() => expect(f.store.getApproval(approval.id)?.decision).toBe('accept'));
+    wire.reject(new CodexTransportError('Late ACK loss')); await f.engine.settled();
+    expect(f.store.getApproval(approval.id)).toMatchObject({ status: 'answered', decision: 'accept' });
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(2);
+  });
+
+  it('closes an unsent queued answer card when that synthetic request is cancelled before the wire write', async () => {
+    const f = fixture(), request = await acceptRequest(f);
+    const { approval, questions } = await asyncQuestion(f, request);
+    f.codex.locations.set(request.id, { state: 'completed', turnId: 'turn-1', text: 'NOREPLY', asyncQuestions: questions });
+    await f.engine.reconcile(request.id); await f.engine.settled();
+    const finalRead = deferred<ReturnType<typeof f.codex.asyncStates.get>>();
+    const state = f.codex.asyncStates.get(questions[0].question.id);
+    f.codex.asyncQuestionState.mockResolvedValueOnce(state).mockImplementationOnce(() => finalRead.promise);
+    await f.engine.action(asyncAction(f, approval));
+    await vi.waitFor(() => expect(f.store.getMeta(`request-terminal-baseline:${approval.id}`)).toBeTruthy());
+    expect(f.store.getMeta(`async-answer-submitting:${approval.id}`)).toBeUndefined();
+    await f.engine.cancel(approval.id);
+    finalRead.resolve(state); await f.engine.settled();
+    expect(f.store.getRequest(approval.id)?.status).toBe('cancelled');
+    expect(f.store.getApproval(approval.id)).toMatchObject({ status: 'expired', decision: undefined });
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('never replays a lost answer acknowledgement or falls back to a new turn', async () => {
+    const f = fixture(), request = await acceptRequest(f);
+    const { approval } = await asyncQuestion(f, request);
+    f.codex.steer.mockRejectedValueOnce(new CodexTransportError('lost acknowledgement'));
+    await expect(f.engine.action(asyncAction(f, approval))).rejects.toThrow('lost acknowledgement');
+    expect(f.store.getSteeringInput(approval.id)?.state).toBe('uncertain');
+    expect(f.store.getApproval(approval.id)).toMatchObject({ status: 'expired', decision: 'uncertain' });
+    await expect(f.engine.action(asyncAction(f, approval))).rejects.toThrow();
+    expect(f.codex.steer).toHaveBeenCalledTimes(1);
+    expect(f.store.listRequests()).toHaveLength(1);
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps an answer sending until native receipt, including an explicit decline', async () => {
+    const f = fixture(), request = await acceptRequest(f);
+    const { approval } = await asyncQuestion(f, request);
+    const wire = deferred<{ turnId: string }>();
+    f.codex.steer.mockImplementationOnce(() => wire.promise);
+    const send = f.engine.action({ ...asyncAction(f, approval), decision: 'decline', answers: undefined });
+    await vi.waitFor(() => expect(f.codex.steer).toHaveBeenCalledOnce());
+    expect(f.store.getApproval(approval.id)).toMatchObject({ status: 'answered', decision: 'sending' });
+    expect(f.store.getMeta(`async-question-decision:${approval.id}`)).toBe('decline');
+    f.codex.locations.set(approval.id, { state: 'running', turnId: 'turn-1' });
+    wire.resolve({ turnId: 'turn-1' }); await send;
+    expect(f.store.getApproval(approval.id)).toMatchObject({ status: 'answered', decision: 'decline' });
+  });
+
+  it('cancels an unsent queued answer when Desktop answers during the final pre-enqueue await', async () => {
+    const f = fixture(), request = await acceptRequest(f);
+    const { approval, questions } = await asyncQuestion(f, request);
+    f.codex.locations.set(request.id, { state: 'completed', turnId: 'turn-1', text: 'NOREPLY', asyncQuestions: questions });
+    await f.engine.reconcile(request.id); await f.engine.settled();
+    const baseline = deferred<{ serverId: number; terminals: Array<{ itemId: string; processId: string }> }>();
+    f.codex.backgroundTerminals.mockImplementationOnce(() => baseline.promise);
+    await f.engine.action(asyncAction(f, approval));
+    await vi.waitFor(() => expect(f.store.getRequest(approval.id)?.status).toBe('starting'));
+    f.codex.asyncStates.set(questions[0].question.id, { turnId: 'turn-1', question: questions[0].question,
+      answer: { answer: 'release', clientId: 'desktop-answer' } });
+    baseline.resolve({ serverId: 42, terminals: [] }); await f.engine.settled();
+    expect(f.store.getRequest(approval.id)?.status).toBe('cancelled');
+    expect(f.store.getApproval(approval.id)).toMatchObject({ status: 'answered', decision: 'accept' });
+    expect(JSON.parse(f.store.getMeta(`approval-resolution:${approval.id}`)!)).toMatchObject({ source: 'codex' });
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+    expect(f.codex.steer).not.toHaveBeenCalled();
+  });
+
+  it('holds a queued answer when the last question lookup fails without claiming delivery', async () => {
+    const f = fixture(), request = await acceptRequest(f);
+    const { approval, questions } = await asyncQuestion(f, request);
+    f.codex.locations.set(request.id, { state: 'completed', turnId: 'turn-1', text: 'NOREPLY', asyncQuestions: questions });
+    await f.engine.reconcile(request.id); await f.engine.settled();
+    f.codex.asyncQuestionState.mockResolvedValueOnce(f.codex.asyncStates.get(questions[0].question.id));
+    f.codex.asyncQuestionState.mockRejectedValueOnce(new Error('question lookup unavailable'));
+    await f.engine.action(asyncAction(f, approval)); await f.engine.settled();
+    expect(f.store.getRequest(approval.id)).toMatchObject({ status: 'queued', error: 'question lookup unavailable' });
+    expect(f.store.getApproval(approval.id)).toMatchObject({ status: 'answered', decision: 'queued' });
+    expect(f.store.getMeta(`async-answer-submitting:${approval.id}`)).toBeUndefined();
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('restores the same active turn and question after Rele restart without enqueue or bootstrap replay', async () => {
+    const f = fixture(), request = await acceptRequest(f);
+    const { approval, questions } = await asyncQuestion(f, request);
+    await f.engine.stop();
+    const restarted = fixture({ path: f.path, start: false });
+    restarted.codex.locations.set(request.id, { state: 'running', turnId: 'turn-1', asyncQuestions: questions });
+    restarted.codex.asyncStates.set(questions[0].question.id, { turnId: 'turn-1', question: questions[0].question });
+    restarted.engine.start(); await restarted.engine.settled(); await restarted.engine.pump();
+    expect(restarted.store.getRequest(request.id)).toMatchObject({ status: 'running', turnId: 'turn-1', origin: request.origin });
+    expect(restarted.store.listApprovals()).toHaveLength(1);
+    expect(restarted.store.getApproval(approval.id)?.status).toBe('pending');
+    expect(restarted.codex.enqueue).not.toHaveBeenCalled();
+    await restarted.engine.action(asyncAction(restarted, approval)); await restarted.engine.settled();
+    expect(restarted.codex.steer).toHaveBeenCalledExactlyOnceWith(THREAD, expect.any(String), approval.id, 'turn-1');
+    expect(restarted.store.getSteeringInput(approval.id)?.state).toBe('applied');
+  });
+
+  it('reconciles a lost answer acknowledgement from native proof without sending again', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture(), request = await acceptRequest(f);
+    const { approval, questions } = await asyncQuestion(f, request);
+    f.codex.steer.mockRejectedValueOnce(new CodexTransportError('lost acknowledgement'));
+    await expect(f.engine.action(asyncAction(f, approval))).rejects.toThrow();
+    f.codex.asyncStates.set(questions[0].question.id, { turnId: 'turn-1', question: questions[0].question,
+      answer: { answer: 'main', clientId: approval.id } });
+    vi.setSystemTime(Date.now() + 5001); await f.engine.pump(); await f.engine.settled();
+    expect(f.store.getSteeringInput(approval.id)?.state).toBe('applied');
+    expect(f.store.getApproval(approval.id)).toMatchObject({ status: 'answered', decision: 'accept' });
+    expect(f.codex.steer).toHaveBeenCalledTimes(1);
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects bot, foreign sender, changed target and stale question without writing an answer', async () => {
+    const f = fixture(), request = await acceptRequest(f);
+    const { approval } = await asyncQuestion(f, request);
+    await expect(f.engine.action({ ...asyncAction(f, approval), senderIsBot: true })).rejects.toThrow();
+    await expect(f.engine.action({ ...asyncAction(f, approval), senderId: 'U2' })).rejects.toThrow();
+    f.config.codex.endpoint = 'ws://127.0.0.1:9999';
+    await expect(f.engine.action(asyncAction(f, approval))).rejects.toThrow();
+    f.config.codex.endpoint = defaultConfig.codex.endpoint;
+    f.codex.asyncStates.delete(approval.questions![0].id);
+    await expect(f.engine.action(asyncAction(f, approval))).rejects.toThrow('Исходный вопрос');
+    expect(f.codex.steer).not.toHaveBeenCalled(); expect(f.codex.respond).not.toHaveBeenCalled();
+  });
+
+  it('preserves the ordinary foreign-input guard for a forged answer envelope', async () => {
+    const f = fixture(), request = await acceptRequest(f);
+    const { approval } = await asyncQuestion(f, request);
+    const fake = { ...approval.questions![0], question: 'A different question' };
+    f.codex.locations.set(request.id, { state: 'running', turnId: 'turn-1', mixed: true });
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1', item: { type: 'userMessage', clientId: 'foreign-input',
+      content: [{ type: 'text', text: encodeAsyncAnswers([fake], { [fake.id]: ['main'] }) }] } } });
+    await f.engine.settled();
+    expect(f.store.getMeta(`mixed:${request.id}`)).toBe('1');
+    expect(f.store.getApproval(approval.id)?.status).toBe('expired');
+    expect(f.codex.steer).not.toHaveBeenCalled();
+  });
+});
 
 function endpoints(): Record<Platform, Endpoint> {
   const updatedAt = new Date().toISOString();
@@ -2556,7 +2832,7 @@ describe('Engine interactive Slack questions', () => {
     const f = await questionFixture();
     for (let i = 0; i < 1001; i++) f.store.addApproval({ requestId: f.request.id, turnId: 'turn-1', itemId: `history-${i}`,
       rpcId: `history-${i}`, method: 'item/commandExecution/requestApproval', title: 'History', details: '', status: 'answered' });
-    const next = new FakeCodex(); next.pendingRequests.add(f.approval.rpcId);
+    const next = new FakeCodex(); next.pendingRequests.add(f.approval.rpcId!);
     next.locations.set(f.request.id, { state: 'running', turnId: 'turn-1' });
     f.engine.replaceCodex(next); await f.engine.settled();
     expect(f.store.getApproval(f.approval.id)?.status).toBe('expired');

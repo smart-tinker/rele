@@ -27,11 +27,12 @@ export interface SlackSyncEntry {
   canonicalEntryId?: string;
 }
 export interface SteeringInput {
-  id: string; parentRequestId: string; turnId: string; requestId?: string; entryId?: string; text: string;
+  id: string; parentRequestId: string; turnId: string; requestId?: string; entryId?: string; approvalId?: string; text: string;
   state: 'sending' | 'uncertain' | 'applied' | 'refused'; error?: string;
 }
 const APPLICATION_ID = 0x52454c45;
 const BLOCKING_REQUESTS = "'starting','running','transcribing','waiting_approval','uncertain'";
+const ASYNC_USER_INPUT = 'rele/asyncUserInput';
 const MIGRATIONS = [String.raw`
   CREATE TABLE endpoints (
     id TEXT PRIMARY KEY NOT NULL, platform TEXT NOT NULL CHECK(platform IN ('slack','telegram')),
@@ -261,6 +262,10 @@ function toApproval(r: Row): Approval {
     questions: r.questions === null ? undefined : json(r.questions), status: r.status as Approval['status'],
     decision: optional(r.decision), createdAt: r.created_at as string, updatedAt: r.updated_at as string };
 }
+function personRole(person: Person, previous?: Person, profile?: Person): Person {
+  const isBot = profile?.isBot ?? person.isBot ?? previous?.isBot;
+  return { ...person, ...(isBot === undefined ? {} : { isBot }) };
+}
 
 export class Store {
   private readonly db: DatabaseSync;
@@ -349,8 +354,9 @@ export class Store {
     if (existing && (existing.platform !== endpoint.platform || existing.accountId !== endpoint.accountId || existing.chatId !== endpoint.chatId || existing.threadId !== endpoint.threadId)) {
       throw new Error('Endpoint identity cannot be changed');
     }
-    const knownBots = new Set(existing?.people.filter(person => person.isBot).map(person => person.id));
-    const people = [...new Map([...(existing?.people ?? []), ...endpoint.people].map(person => [person.id, knownBots.has(person.id) ? { ...person, isBot: true } : person])).values()];
+    const knownPeople = new Map(existing?.people.map(person => [person.id, person]));
+    for (const person of endpoint.people) knownPeople.set(person.id, personRole(person, knownPeople.get(person.id)));
+    const people = [...knownPeople.values()];
     const catalog: Record<string, unknown> = {};
     for (const key of ['chatTitle', 'topicTitle', 'isForum', 'generalTopic', 'available'] as const) {
       const value = endpoint[key] ?? existing?.[key];
@@ -525,6 +531,7 @@ export class Store {
     const route = this.getSourceRoute(endpointId);
     const unchanged = (previous?.conversationId ?? null) === conversationId && route.mode === mode && route.cwd === automaticCwd &&
       (mode !== 'none' || this.getMeta(`source-route:${endpointId}`) !== undefined);
+    if (!unchanged) this.assertNoPendingAsyncQuestion(endpointId);
     if (!unchanged && this.db.prepare(`SELECT 1 FROM requests WHERE json_extract(origin,'$.endpointId')=?
       AND status IN ('queued',${BLOCKING_REQUESTS}) LIMIT 1`).get(endpointId)) {
       throw Object.assign(new Error('Завершите или отмените принятые запросы этого источника перед сменой разговора Codex.'), { statusCode: 409 });
@@ -561,6 +568,17 @@ export class Store {
     return this.getSourceRoute(endpointId);
   }
   private sourceContextEnabled(endpointId: string): boolean { return this.getSourceAccess(endpointId).mode !== 'off'; }
+  private assertNoPendingAsyncQuestion(endpointId: string): void {
+    if (this.db.prepare(`SELECT 1 FROM approvals a JOIN requests r ON r.id=a.request_id
+      WHERE a.method=? AND json_extract(r.origin,'$.endpointId')=? AND (a.status='pending' OR EXISTS
+        (SELECT 1 FROM meta m WHERE m.key='steering-input:'||a.id AND json_extract(m.value,'$.approvalId')=a.id
+          AND json_extract(m.value,'$.state') IN ('sending','uncertain')) OR EXISTS
+        (SELECT 1 FROM requests child JOIN meta m ON m.key='async-question-answer:'||child.id AND m.value=a.id
+          WHERE child.id=a.id AND child.event_id='async-question-answer:'||a.id AND child.conversation_id=r.conversation_id
+            AND child.status IN ('queued',${BLOCKING_REQUESTS}))) LIMIT 1`).get(ASYNC_USER_INPUT, endpointId)) {
+      throw Object.assign(new Error('Ответьте на ожидающий вопрос Codex перед сменой связки этого источника.'), { statusCode: 409 });
+    }
+  }
   private sourceSyncStream(row: Row): SlackSyncStream {
     const stream = toSlackSyncStream({ ...row, platform: this.getEndpoint(row.endpoint_id as string)!.platform });
     if (stream.active && !this.sourceContextEnabled(stream.endpointId)) stream.active = false;
@@ -571,6 +589,7 @@ export class Store {
     const previous = bindingId ? this.getBinding(conversationId, bindingId) : undefined;
     if (bindingId && !previous) throw new Error('Binding not found');
     if (previous && previous.platform !== platform) throw new Error('Binding platform is immutable');
+    if (previous && previous.endpointId !== endpointId) this.assertNoPendingAsyncQuestion(previous.endpointId);
     const endpoint = this.getEndpoint(endpointId);
     if (!endpoint) throw new Error('Endpoint not found');
     if (endpoint.platform !== platform) throw new Error('Endpoint platform does not match the binding');
@@ -617,6 +636,7 @@ export class Store {
       if (!this.getConversation(conversationId)) throw new Error('Conversation not found');
       const binding = this.getBinding(conversationId, bindingId);
       if (!binding) throw new Error('Binding not found');
+      this.assertNoPendingAsyncQuestion(binding.endpointId);
       this.db.prepare('DELETE FROM bindings WHERE conversation_id=? AND id=?').run(conversationId, bindingId);
       if (binding.platform === 'slack') this.resetSlackSyncStream(conversationId, binding.endpointId);
       this.db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(new Date().toISOString(), conversationId);
@@ -848,7 +868,7 @@ export class Store {
     const observe = (person: Person, id: string) => {
       if (person.id === 'slack:unknown') return;
       const previous = people.get(person.id);
-      people.set(person.id, { person: { ...person, ...(previous?.person.isBot ? { isBot: true } : {}) },
+      people.set(person.id, { person: personRole(person, previous?.person, endpoint.people.find(profile => profile.id === person.id)),
         first: previous && previous.first < order(id) ? previous.first : order(id) });
     };
     if (!stored) {
@@ -863,14 +883,16 @@ export class Store {
     }
     observe(sender, messageId);
     this.setMeta(key, JSON.stringify([...people]));
-    return [...people.values()].filter(person => person.first <= order(messageId)).map(person => ({ ...person.person }));
+    return [...people.values()].filter(person => person.first <= order(messageId))
+      .map(value => personRole(value.person, undefined, endpoint.people.find(profile => profile.id === value.person.id)));
   }
   getThreadParticipants(endpointId: string): Person[] {
+    const profiles = this.getEndpoint(endpointId)?.people ?? [];
     const stored = this.getMeta(`thread-participants:${endpointId}`);
-    if (stored) return (JSON.parse(stored) as Array<[string, { person: Person }]>).map(([, value]) => ({ ...value.person }));
+    if (stored) return (JSON.parse(stored) as Array<[string, { person: Person }]>).map(([, value]) => personRole(value.person, undefined, profiles.find(profile => profile.id === value.person.id)));
     const people = new Map<string, Person>();
     const observe = (person: Person) => {
-      if (person.id !== 'slack:unknown') people.set(person.id, { ...person, ...(people.get(person.id)?.isBot ? { isBot: true } : {}) });
+      if (person.id !== 'slack:unknown') people.set(person.id, personRole(person, people.get(person.id), profiles.find(profile => profile.id === person.id)));
     };
     for (const row of this.db.prepare('SELECT payload FROM inbound_events WHERE endpoint_id=? ORDER BY rowid').all(endpointId)) {
       const message = json<InboundMessage>(row.payload); if (!message.control) observe(message.sender);
@@ -882,7 +904,8 @@ export class Store {
     return this.transaction(() => ({ duplicate: this.recordEvent(message).duplicate }));
   }
   private isBotMessage(message: InboundMessage): boolean {
-    return !!(message.sender.isBot || message.slack?.sender.isBot || this.getEndpoint(message.endpoint.id)?.people.some(person => person.id === message.sender.id && person.isBot));
+    return this.getEndpoint(message.endpoint.id)?.people.find(person => person.id === message.sender.id)?.isBot
+      ?? message.sender.isBot ?? message.slack?.sender.isBot ?? false;
   }
   private isDirectMessage(endpoint: Endpoint): boolean {
     return endpoint.platform === 'slack' ? endpoint.chatId.startsWith('D') : /^\d+$/u.test(endpoint.chatId);
@@ -1066,6 +1089,7 @@ export class Store {
   }
   hasUnfinishedCodexOperations(): boolean {
     return !!this.db.prepare(`SELECT 1 FROM auto_link_intents WHERE status<>'completed'
+      UNION ALL SELECT 1 FROM approvals WHERE method='rele/asyncUserInput' AND status='pending'
       UNION ALL SELECT 1 FROM meta WHERE
         (key LIKE 'cancel-cleanup:%' AND COALESCE(json_extract(value,'$.done'),0)<>1)
         OR (key LIKE 'steering-input:%' AND json_extract(value,'$.state') IN ('sending','uncertain'))
@@ -1114,6 +1138,60 @@ export class Store {
     if (!input || input.id !== id || !input.parentRequestId || !input.turnId || typeof input.text !== 'string'
       || !['sending', 'uncertain', 'applied', 'refused'].includes(input.state)) throw new Error('Invalid steering input receipt');
     return input;
+  }
+  beginAsyncQuestionAnswer(approvalId: string, text: string): { input?: SteeringInput; request?: ReleRequest } {
+    return this.transaction(() => {
+      required(text, 'Async question answer');
+      const approval = this.getApproval(approvalId);
+      const parent = approval && this.getRequest(approval.requestId);
+      if (!approval || approval.method !== ASYNC_USER_INPUT || approval.rpcId !== null || !parent
+        || !parent.turnId || parent.turnId !== approval.turnId) throw new Error('Async question does not match its original request turn');
+      const existingInput = this.getSteeringInput(approval.id);
+      const existingRequest = this.getRequest(approval.id);
+      const conversation = this.getConversation(parent.conversationId), endpoint = this.getEndpoint(parent.origin.endpointId);
+      const binding = endpoint && this.bindingForEndpoint(endpoint.id);
+      if (approval.status !== 'pending' && !(approval.status === 'answered' && (existingInput || existingRequest))
+        || !['running', 'waiting_approval', 'completed'].includes(parent.status)
+          && !(parent.status === 'uncertain' && existingInput?.state === 'uncertain')
+        || !conversation || conversation.paused || !endpoint || !binding || binding.conversationId !== parent.conversationId
+        || endpoint.platform !== parent.origin.platform || endpoint.accountId !== parent.origin.accountId
+        || endpoint.chatId !== parent.origin.chatId || endpoint.threadId !== parent.origin.threadId
+        || this.getSourceAccess(endpoint.id).mode === 'off' || this.getMeta(`mixed:${parent.id}`) === '1'
+        || this.getMeta(`cancel-requested:${parent.id}`)
+        || this.db.prepare("SELECT 1 FROM approvals WHERE request_id=? AND status='pending' AND method<>? LIMIT 1").get(parent.id, ASYNC_USER_INPUT)) {
+        throw new Error('Async question is not available in its original authorized source');
+      }
+      if (existingInput || existingRequest) {
+        if (existingInput && !existingRequest && existingInput.approvalId === approval.id && existingInput.parentRequestId === parent.id
+          && existingInput.turnId === approval.turnId && existingInput.text === text && !existingInput.requestId && !existingInput.entryId) return { input: existingInput };
+        if (existingRequest && !existingInput && this.getAsyncQuestionAnswerApproval(existingRequest.id)?.id === approval.id
+          && existingRequest.text === text) return { request: existingRequest };
+        throw new Error('Async question answer already exists with different content');
+      }
+      if (parent.status !== 'completed') {
+        const input: SteeringInput = { id: approval.id, approvalId: approval.id, parentRequestId: parent.id,
+          turnId: approval.turnId, text, state: 'sending' };
+        const index = this.steeringInputs(parent.id).map(value => value.id);
+        this.setMeta(`steering-input:${input.id}`, JSON.stringify(input));
+        this.setMeta(`steering-inputs:${parent.id}`, JSON.stringify([...index, input.id]));
+        return { input };
+      }
+      const now = new Date().toISOString();
+      this.db.prepare(`INSERT INTO requests (id,conversation_id,event_id,origin,text,status,created_at,updated_at)
+        VALUES (?,?,?,?,?,'queued',?,?)`).run(approval.id, parent.conversationId, `async-question-answer:${approval.id}`,
+          JSON.stringify(parent.origin), text, now, now);
+      this.setMeta(`async-question-answer:${approval.id}`, approval.id);
+      return { request: this.getRequest(approval.id)! };
+    });
+  }
+  getAsyncQuestionAnswerApproval(requestId: string): Approval | undefined {
+    if (this.getMeta(`async-question-answer:${requestId}`) !== requestId) return;
+    const approval = this.getApproval(requestId), request = this.getRequest(requestId);
+    const parent = approval && this.getRequest(approval.requestId);
+    if (!approval || approval.method !== ASYNC_USER_INPUT || approval.rpcId !== null || !request || !parent
+      || parent.turnId !== approval.turnId || request.eventId !== `async-question-answer:${approval.id}` || request.conversationId !== parent.conversationId
+      || stableJson(request.origin) !== stableJson(parent.origin)) return;
+    return approval;
   }
   beginSteeringInput(parentId: string, candidate: { id: string; requestId?: string; entryId?: string; text: string }): SteeringInput {
     return this.transaction(() => {
@@ -1233,8 +1311,11 @@ export class Store {
         this.setMeta(`suppressed-final:${id}`, JSON.stringify({ reason: 'NOREPLY', turnId: next.turnId, at: now }));
       }
       this.db.prepare('UPDATE requests SET status=?,turn_id=?,error=?,updated_at=? WHERE id=?').run(next.status, next.turnId ?? null, next.error ?? null, now, id);
-      this.db.prepare("UPDATE approvals SET status='expired',updated_at=? WHERE request_id=? AND status='pending'").run(now, id);
-      this.db.prepare("UPDATE deliveries SET status='cancelled',updated_at=? WHERE request_id=? AND kind='approval' AND status IN ('pending','failed')").run(now, id);
+      this.db.prepare("UPDATE approvals SET status='expired',updated_at=? WHERE request_id=? AND status='pending' AND (?<>'completed' OR method<>?)")
+        .run(now, id, patch.status, ASYNC_USER_INPUT);
+      this.db.prepare(`UPDATE deliveries SET status='cancelled',updated_at=? WHERE request_id=? AND kind='approval' AND status IN ('pending','failed')
+        AND (?<>'completed' OR approval_id IS NULL OR approval_id NOT IN (SELECT id FROM approvals WHERE method=? AND status='pending'))`)
+        .run(now, id, patch.status, ASYNC_USER_INPUT);
       this.writeDeliveries(id, parts);
       return this.getRequest(id)!;
     });
@@ -1311,8 +1392,8 @@ export class Store {
     this.transaction(() => {
       const now = new Date().toISOString();
       this.db.prepare(`UPDATE deliveries SET status='cancelled',updated_at=? WHERE kind='approval' AND status IN ('pending','failed')
-        AND approval_id IN (SELECT id FROM approvals WHERE status='pending')`).run(now);
-      this.db.prepare("UPDATE approvals SET status='expired',updated_at=? WHERE status='pending'").run(now);
+        AND approval_id IN (SELECT id FROM approvals WHERE status='pending' AND method<>?)`).run(now, ASYNC_USER_INPUT);
+      this.db.prepare("UPDATE approvals SET status='expired',updated_at=? WHERE status='pending' AND method<>?").run(now, ASYNC_USER_INPUT);
     });
   }
   claimDelivery(now: string | number | Date = new Date()): Delivery | undefined {
@@ -1351,7 +1432,9 @@ export class Store {
   addApproval(input: ApprovalInput): Approval {
     return this.transaction(() => {
       if (!this.getRequest(input.requestId)) throw new Error('Request not found');
-      if (typeof input.rpcId !== 'string' && (typeof input.rpcId !== 'number' || !Number.isFinite(input.rpcId))) throw new Error('Approval RPC ID must be a string or finite number');
+      if (input.method === ASYNC_USER_INPUT ? input.rpcId !== null : typeof input.rpcId !== 'string' && (typeof input.rpcId !== 'number' || !Number.isFinite(input.rpcId))) {
+        throw new Error('Approval RPC ID must be null only for async questions, otherwise a string or finite number');
+      }
       const existing = this.db.prepare('SELECT * FROM approvals WHERE request_id=? AND turn_id=? AND item_id=? AND method=?')
         .get(input.requestId, input.turnId, input.itemId, input.method);
       const id = existing ? existing.id as string : input.id ?? randomUUID(); const now = new Date().toISOString();
@@ -1377,7 +1460,9 @@ export class Store {
       const current = this.getApproval(id);
       if (!current) throw new Error('Approval not found');
       const next = { ...current, ...patch };
-      if (typeof next.rpcId !== 'string' && (typeof next.rpcId !== 'number' || !Number.isFinite(next.rpcId))) throw new Error('Approval RPC ID must be a string or finite number');
+      if (next.method === ASYNC_USER_INPUT ? next.rpcId !== null : typeof next.rpcId !== 'string' && (typeof next.rpcId !== 'number' || !Number.isFinite(next.rpcId))) {
+        throw new Error('Approval RPC ID must be null only for async questions, otherwise a string or finite number');
+      }
       this.db.prepare('UPDATE approvals SET status=?,decision=?,rpc_id=?,title=?,details=?,questions=?,updated_at=? WHERE id=?')
         .run(next.status, next.decision ?? null, JSON.stringify(next.rpcId), next.title, next.details, next.questions ? JSON.stringify(next.questions) : null, new Date().toISOString(), id);
       return this.getApproval(id)!;
@@ -1393,10 +1478,19 @@ export class Store {
         const error = 'Steering acknowledgement interrupted; reconcile without replay';
         this.setMeta(`steering-input:${input.id}`, JSON.stringify({ ...input, state: 'uncertain', error }));
         if (input.entryId) this.db.prepare("UPDATE slack_sync_entries SET state='uncertain',error=?,updated_at=? WHERE id=?").run(error, now, input.entryId);
+        if (input.approvalId === input.id) this.db.prepare(`UPDATE approvals SET status='expired',decision='uncertain',updated_at=?
+          WHERE id=? AND request_id=? AND turn_id=? AND method=? AND rpc_id='null' AND status IN ('pending','answered')`)
+          .run(now, input.approvalId, input.parentRequestId, input.turnId, ASYNC_USER_INPUT);
       }
       this.db.prepare("UPDATE auto_link_intents SET status='uncertain',error=COALESCE(error,'Native creation acknowledgement was interrupted; reconcile before retrying'),updated_at=? WHERE status='creating'").run(now);
       this.db.prepare("UPDATE slack_sync_entries SET state='pending',error=COALESCE(error,'Passive append acknowledgement was interrupted; replay may duplicate context'),updated_at=? WHERE state='applying'").run(now);
       const execution = this.db.prepare("UPDATE requests SET status='uncertain',error=COALESCE(error,'Execution interrupted; reconcile with Codex before retrying'),updated_at=? WHERE status IN ('starting','running')").run(now);
+      for (const row of this.db.prepare("SELECT id FROM requests WHERE status='uncertain' AND event_id='async-question-answer:'||id").all()) {
+        const approval = this.getAsyncQuestionAnswerApproval(row.id as string);
+        if (approval && (approval.status === 'pending' || approval.status === 'answered' && ['queued', 'sending'].includes(approval.decision ?? ''))) {
+          this.db.prepare("UPDATE approvals SET status='expired',decision='uncertain',updated_at=? WHERE id=?").run(now, approval.id);
+        }
+      }
       const transcription = this.db.prepare("UPDATE requests SET status='queued',updated_at=? WHERE status='transcribing'").run(now);
       const deliveries = this.db.prepare("UPDATE deliveries SET status='uncertain',error=COALESCE(error,'Delivery interrupted; verify receipt before retrying'),updated_at=? WHERE status='sending'").run(now);
       const tool = this.db.prepare("UPDATE tool_outbox SET status='uncertain',error=COALESCE(error,'Delivery interrupted; verify receipt before retrying'),updated_at=? WHERE status='sending'").run(now);
