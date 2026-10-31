@@ -294,7 +294,7 @@ export function createApp(services: AppServices) {
   }
   function automaticWorkspace(codex: ReturnType<AppServices['codex']>, cwd: string) {
     const status = codex.status();
-    if (!status.connected || !status.queueSupported) throw new ApiError(400, 'Для автосоздания подключите Codex с поддержкой штатной очереди.');
+    if (!status.connected || !codex.isVerifiedVersion()) throw new ApiError(400, 'Для автосоздания подключите проверенный Codex.');
     if (!validWorkspace(codex, cwd)) throw new ApiError(400, 'Укажите абсолютную локальную рабочую папку операционной системы Codex.');
   }
   app.put<{ Params: { id: string } }>('/api/endpoints/:id/access', async request => {

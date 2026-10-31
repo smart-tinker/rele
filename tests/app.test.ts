@@ -1628,15 +1628,28 @@ describe('source access and native thread routing', () => {
     expect(f.store.listConversations()).toEqual([]);
   });
 
-  it('requires native queue support both when selecting automatic routing and when enabling it later', async () => {
+  it('allows automatic routing and source access on a verified fresh profile before its queue can be probed', async () => {
     const f = makeApp(); const { endpoint } = attachSource(f);
-    const status = f.codex.status();
-    const supported = vi.spyOn(f.codex, 'status').mockReturnValue({ ...status, queueSupported: false });
+    const status = { ...f.codex.status(), queueSupported: false };
+    vi.spyOn(f.codex, 'status').mockReturnValue(status);
+    f.codex.listThreads.mockResolvedValue([]);
+    expect((await put(f, endpoint, 'route', { autoCreateCwd: '/work/example' })).statusCode).toBe(200);
+    expect(f.store.getSourceRoute(endpoint.id)).toEqual({ endpointId: endpoint.id, mode: 'auto', cwd: '/work/example' });
+    expect((await put(f, endpoint, 'access', { mode: 'all' })).statusCode).toBe(200);
+    expect(f.store.getSourceAccess(endpoint.id).mode).toBe('all');
+    expect(status.queueSupported).toBe(false);
+    expect(f.codex.listThreads).not.toHaveBeenCalled();
+    expect(f.store.listConversations()).toEqual([]);
+    expect(f.store.listRequests()).toEqual([]);
+  });
+
+  it.each(['connection', 'verified version'] as const)('requires a native %s when selecting automatic routing and enabling it later', async missing => {
+    const f = makeApp(); const { endpoint } = attachSource(f);
+    vi.spyOn(f.codex, 'status').mockReturnValue({ ...f.codex.status(), connected: missing !== 'connection', queueSupported: false });
+    f.codex.isVerifiedVersion.mockReturnValue(missing !== 'verified version');
     expect((await put(f, endpoint, 'route', { autoCreateCwd: '/work/example' })).statusCode).toBe(400);
     expect(f.store.getSourceRoute(endpoint.id).mode).toBe('none');
-    supported.mockReturnValue(status);
-    expect((await put(f, endpoint, 'route', { autoCreateCwd: '/work/example' })).statusCode).toBe(200);
-    supported.mockReturnValue({ ...status, queueSupported: false });
+    f.store.routeSource(endpoint.id, null, '/work/example');
     expect((await put(f, endpoint, 'access', { mode: 'all' })).statusCode).toBe(400);
     expect(f.store.getSourceAccess(endpoint.id).mode).toBe('off');
   });
