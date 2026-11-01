@@ -228,6 +228,29 @@ supports_websockets=false
         history=result(await b.call('thread/turns/list',{'threadId':thread,'limit':10,'itemsView':'full'}))
         assert any(any(it.get('clientId')==qid for it in turn.get('items',[])) for turn in history['data'])
         report['checks']['history_has_recovery_client_id']=True
+        # Summary still contains message text; receipts need headers without items.
+        summary=result(await b.call('thread/turns/list',{'threadId':thread,'limit':1,
+            'itemsView':'notLoaded','sortDirection':'desc'}))
+        assert len(summary['data'])==1 and not summary['data'][0].get('items'),summary
+        summary_turn=summary['data'][0]
+        full_turn=next(turn for turn in history['data'] if turn['id']==summary_turn['id'])
+        assert all(summary_turn.get(key)==full_turn.get(key)
+            for key in ('status','completedAt','rootTurnId','error')),summary_turn
+        paged_items=[]; cursor=None; seen=set()
+        while True:
+            params={'threadId':thread,'turnId':summary_turn['id'],'limit':1,'sortDirection':'asc'}
+            if cursor: params['cursor']=cursor
+            item_page=result(await b.call('thread/items/list',params))
+            assert len(item_page['data'])<=1,item_page
+            assert all(entry['turnId']==summary_turn['id'] for entry in item_page['data']),item_page
+            paged_items.extend(entry['item'] for entry in item_page['data'])
+            cursor=item_page.get('nextCursor')
+            if cursor is None: break
+            assert isinstance(cursor,str) and cursor and cursor not in seen,item_page
+            seen.add(cursor)
+        assert paged_items==full_turn['items'],paged_items
+        assert any(item.get('clientId')==qid for item in paged_items),paged_items
+        report['checks']['receipt_headers_and_single_item_ascending_turn_pages']=True
         normal_sources=['cli','vscode','exec','appServer']
         catalog=result(await b.call('thread/list',{'limit':100,'modelProviders':[],
             'sourceKinds':normal_sources,'useStateDbOnly':True,'archived':False}))

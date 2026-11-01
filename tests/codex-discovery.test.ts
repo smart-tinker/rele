@@ -41,6 +41,17 @@ function windowsFixture(metadata: object = { processes: [], packages: [], issues
 }
 
 describe('Codex installation and existing Desktop discovery', () => {
+  it('reports a missing CLI without recommending or launching a nonexistent installation', async () => {
+    const f = windowsFixture();
+    const result = await discoverCodex(f.options);
+    expect(result.installations).toEqual([]);
+    expect(result.recommended).toBeUndefined();
+    expect(result.recommendedManaged).toBeUndefined();
+    expect(result.issues.map(issue => issue.code)).toEqual(['cli-not-found']);
+    expect(f.run).toHaveBeenCalledTimes(1);
+    expect(f.run.mock.calls[0][1]).toContain(WINDOWS_CODEX_METADATA_SCRIPT);
+  });
+
   it('uses a separate process-only ownership scan while ordinary discovery retains packages', async () => {
     const f = windowsFixture();
     f.run.mockImplementation(async (_command, args) => ({ stdout: JSON.stringify({ processes: [], packages: [], issues: [] }), code: 0 }));
