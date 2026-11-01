@@ -17,6 +17,26 @@ describe('Slack reply formatting', () => {
     expect(formatSlackReply('Данные citeturn1search0')).toBe('Данные [источник]');
   });
 
+  it.each([':codex-annotation{index="1"}', '::codex-annotation{index="1"}', ':codex-annotation{index="1"', '::codex-annotation{index="1', ':codex-annotation[index="1'])('removes UI-only annotations without leaking their attributes: %s', annotation => {
+    expect(formatSlackReply(`У Марты ожидающих подтверждений нет. ${annotation}`)).toBe('У Марты ожидающих подтверждений нет.');
+    expect(formatSlackReply(`До.\n  ${annotation}\nПосле.`)).toBe('До.\nПосле.');
+  });
+
+  it('keeps literal annotation examples and ordinary attributes while removing UI annotations', () => {
+    const code = '`::codex-annotation{index="1"}`\n```md\n:codex-annotation{index="2"}\n```\n~~~md\n:codex-annotation{index="3"}\n~~~';
+    expect(formatSlackReply(code)).toBe(code);
+    expect(formatSlackReply('Обычный index="1" и index="2".')).toBe('Обычный index="1" и index="2".');
+    expect(formatSlackReply('До. :codex-annotation{index="1"}\nПосле.')).toBe('До.\nПосле.');
+    expect(formatSlackReply('😀 @here [сайт](https://example.com/@here) :codex-annotation{index="1"}')).toBe('😀 @\u200bhere [сайт](https://example.com/@here)');
+  });
+
+  it('preserves long whitespace runs and line endings around annotation cleanup', () => {
+    const whitespace = ' '.repeat(35_000);
+    expect(formatSlackReply(whitespace + 'x')).toBe(whitespace + 'x');
+    expect(formatSlackReply(`${whitespace}x :codex-annotation{index="1"}`)).toBe(whitespace + 'x');
+    expect(formatSlackReply('До.\r\n  :codex-annotation{index="1"}\r\nПосле.')).toBe('До.\r\nПосле.');
+  });
+
   it('neutralizes broadcasts, users and user groups without breaking links', () => {
     const text = '<!here> <!channel> <!everyone> <@U123> <@U456|Анна> <!subteam^S123|@команда> @here [сайт](https://example.com) <https://example.com|сайт>';
     const formatted = formatSlackReply(text);

@@ -11,6 +11,9 @@ export interface RequestProgress {
   commentary?: string;
   steps?: { id: string; text: string }[];
   plan?: { step: string; status: 'pending' | 'in_progress' | 'completed' }[];
+  /** Ordered durable public blocks; a sealed block never accepts later events. */
+  segments?: { id: string; steps?: { id: string; text: string }[]; plan?: RequestProgress['plan']; sealed?: boolean; after?: string; sealedAt?: string }[];
+  boundaries?: string[];
   terminal?: 'completed' | 'failed' | 'interrupted' | 'cancelled';
 }
 
@@ -34,6 +37,8 @@ export interface ApprovalResolution {
   senderId?: string;
   senderName?: string;
   answers?: Record<string, string[]>;
+  humanMessageId?: string;
+  answerMarkerTs?: string;
 }
 
 export interface ChannelCallbacks {

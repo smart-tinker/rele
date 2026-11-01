@@ -5,7 +5,19 @@ export function formatSlackReply(text: string): string {
   // Keep quoted examples opaque while translating Codex's UI-only references.
   return text.split(/(`{3,}[\s\S]*?(?:`{3,}|$)|~{3,}[\s\S]*?(?:~{3,}|$)|``[^\n]*?``|`[^`\n]*`)/gu).map((part, index) => {
     if (index % 2) return part;
-    return part.replace(/:{1,2}(codex-[\w-]+|code-comment)(?:\[([^\]\n]*)\])?(?:\{([^}\n]*)(?:\}|$))?/gmu, (_match, name: string, label: string | undefined, attributes: string | undefined) => {
+    const lines = part.split(/(\r?\n)/u);
+    for (let line = 0; line < lines.length; line += 2) {
+      let removed = false, atEnd = false;
+      const original = lines[line];
+      lines[line] = original.replace(/:{1,2}codex-annotation(?![\w-])(?:\[[^\]\n]*(?:\]|$))?(?:\{[^}\n]*(?:\}|$))?(?:[ \t]*$)?/gu, (match, offset: number) => {
+        removed = true;
+        atEnd = offset + match.length === original.length;
+        return '';
+      });
+      if (removed && !lines[line].trim()) { lines[line] = ''; if (line + 1 < lines.length) lines[line + 1] = ''; }
+      else if (atEnd) lines[line] = lines[line].trimEnd();
+    }
+    return lines.join('').replace(/:{1,2}(codex-[\w-]+|code-comment)(?:\[([^\]\n]*)\])?(?:\{([^}\n]*)(?:\}|$))?/gmu, (_match, name: string, label: string | undefined, attributes: string | undefined) => {
       const path = attributes?.match(/\bpath\s*=\s*(?:"([^"]*)(?:"|$)|'([^']*)(?:'|$)|([^\s}]+))/u);
       if (path) return `\`${(path[1] ?? path[2] ?? path[3]).replace(/`/gu, 'ˋ')}\``;
       return label || attributes?.match(/\b(?:title|text|label)="([^"]*)"/u)?.[1] || (name === 'codex-file-citation' ? 'Источник' : attributes || '');

@@ -1425,13 +1425,14 @@ export class Store {
   }
 
   resolvedApprovalDeliveries(): Array<{ delivery: Delivery; approval: Approval; version: string }> {
-    return this.db.prepare(`SELECT d.*, a.status||':'||COALESCE(a.decision,'')||':'||a.updated_at AS ui_version
+    return this.db.prepare(`SELECT d.*, a.status||':'||COALESCE(a.decision,'')||':'||a.updated_at||CASE WHEN marker.value IS NOT NULL THEN ':'||marker.value ELSE '' END AS ui_version
       FROM deliveries d JOIN approvals a ON a.id=d.approval_id
       LEFT JOIN meta m ON m.key='approval-ui-updated:'||d.id
       LEFT JOIN meta retry ON retry.key='approval-ui-attempted:'||d.id
+      LEFT JOIN meta marker ON marker.key='approval-answer-marker-ui:'||a.id
       WHERE d.kind='approval' AND d.status='sent' AND d.remote_message_id IS NOT NULL
         AND json_extract(d.origin,'$.platform')='slack' AND json_array_length(a.questions)>0
-        AND a.status!='pending' AND (m.value IS NULL OR m.value!=a.status||':'||COALESCE(a.decision,'')||':'||a.updated_at)
+        AND a.status!='pending' AND (m.value IS NULL OR m.value!=a.status||':'||COALESCE(a.decision,'')||':'||a.updated_at||CASE WHEN marker.value IS NOT NULL THEN ':'||marker.value ELSE '' END)
       ORDER BY COALESCE(CAST(retry.value AS INTEGER),0),d.rowid LIMIT 100`).all().map(row => ({ delivery: toDelivery(row),
         approval: this.getApproval(String(row.approval_id))!, version: String(row.ui_version) }));
   }

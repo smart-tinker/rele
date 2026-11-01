@@ -5,7 +5,7 @@ import type { Store } from '../store.js';
 import { ChannelError, downloadBounded, endpointId, readableTitle, splitReply, type ApprovalContext, type ApprovalResolution, type Channel, type ChannelCallbacks, type RequestProgress, type SlackSessionStatus } from './common.js';
 import { escapeSlackText, formatSlackReply } from './slack-format.js';
 import { slackPageControls, slackProgressBlocks, slackProgressPages } from './slack-progress.js';
-import { QUESTION_VIEW, parseQuestionMetadata, questionAnswers, questionCard, questionHash, questionView, resolvedQuestion, supportsQuestionForm } from './slack-questions.js';
+import { QUESTION_VIEW, parseQuestionMetadata, questionAnswers, questionCard, questionHash, questionView, resolvedQuestion, resolvedQuestionStatus, supportsQuestionForm } from './slack-questions.js';
 
 type Json = Record<string, any>;
 const SLACK_TS = /^\d+\.\d+$/u;
@@ -72,9 +72,14 @@ interface ProgressReceipt {
   answers?: { key: string; ordinal: number; text: string }[];
   historyPage?: number;
   answerPage?: number;
+  sealed?: boolean;
+  final?: boolean;
 }
 
 type ProgressUpdate = {
+  segment?: string;
+  sealed?: boolean;
+  final?: boolean;
   answer?: { key: string; ordinal: number; text: string };
   page?: { kind: 'history' | 'answer'; index: number; ts: string };
 };
@@ -282,7 +287,15 @@ export class SlackChannel implements Channel {
   }
 
   async updateProgress(requestId: string, origin: Origin, progress: RequestProgress): Promise<void> {
-    await this.queueProgress(requestId, origin, progress);
+    if (!progress.segments) await this.queueProgress(requestId, origin, progress);
+    if (progress.existingOnly && progress.terminal) await this.queueProgress(requestId, origin, progress, { segment: 'final' });
+    if (!progress.segments) return;
+    for (const segment of progress.segments) {
+      await this.queueProgress(requestId, origin, progress.existingOnly ? { existingOnly: true, terminal: progress.terminal, statusText: progress.statusText }
+        : { steps: segment.steps, commentary: segment.steps?.at(-1)?.text, plan: segment.plan,
+          ...(segment.sealed ? { terminal: 'completed' as const } : { terminal: progress.terminal, statusText: progress.statusText }) },
+      { segment: segment.id, sealed: segment.sealed });
+    }
   }
 
   private async queueProgress(requestId: string, origin: Origin, progress: RequestProgress | undefined, update: ProgressUpdate = {}): Promise<string | undefined> {
@@ -305,7 +318,7 @@ export class SlackChannel implements Channel {
     if (!endpoint || endpoint.accountId !== origin.accountId || endpoint.chatId !== origin.chatId || endpoint.threadId !== origin.threadId) return;
     const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
     const route = digest([origin.accountId, origin.endpointId, origin.chatId, origin.threadId]);
-    const key = `slack-progress:${digest(requestId)}`;
+    const key = `slack-progress:${digest(requestId)}${update.segment && update.segment !== '0' ? `:${update.segment}` : ''}`;
     const saved = store.getMeta(key);
     let receipt: ProgressReceipt | undefined;
     if (saved !== undefined) {
@@ -315,13 +328,14 @@ export class SlackChannel implements Channel {
         return;
       }
       if (receipt.state !== 'posted' || typeof receipt.ts !== 'string' || !SLACK_TS.test(receipt.ts)) {
-        if (update.answer && receipt.answers?.length) throw new ChannelError('Slack не подтвердил сообщение с результатом. Проверьте доставку.', false, true);
+        if (update.answer) throw new ChannelError('Slack не подтвердил сообщение с результатом. Проверьте доставку.', false, true);
         return;
       }
+      if (receipt.sealed && !progress?.existingOnly && !update.page && !update.answer) return receipt.ts;
       if (receipt.progress?.existingOnly) progress = receipt.progress;
       else if (progress?.existingOnly && !progress.terminal) progress = { ...receipt.progress, statusText: progress.statusText };
       else if (update.answer && progress && !progress.existingOnly) progress = { ...receipt.progress, ...progress };
-      if (receipt.terminal && progress && receipt.terminal !== progress.terminal) {
+      if (receipt.terminal && progress && !progress.existingOnly && receipt.terminal !== progress.terminal) {
         if (update.answer) throw new ChannelError('Состояние итогового сообщения Slack уже изменилось.');
         return receipt.ts;
       }
@@ -330,7 +344,8 @@ export class SlackChannel implements Channel {
     progress ??= receipt?.progress;
     if (!progress || progress.existingOnly && !receipt) return;
     const next: ProgressReceipt = { ...receipt, route, state: receipt ? 'posted' : 'posting', progress,
-      ...(progress.terminal ? { terminal: progress.terminal } : {}) };
+      ...(progress.terminal ? { terminal: progress.terminal } : {}),
+      ...(update.sealed ? { sealed: true } : {}), ...(update.final ? { final: true } : {}) };
     // Mixed-client closure must remove earlier details, including stored result pages.
     if (progress.existingOnly) { delete next.answers; delete next.historyPage; delete next.answerPage; }
     if (update.answer) {
@@ -344,18 +359,18 @@ export class SlackChannel implements Channel {
       if (update.page.kind === 'history') next.historyPage = update.page.index;
       else next.answerPage = update.page.index;
     }
-    const blocks = slackProgressBlocks(requestId, progress, next.historyPage);
+    const blocks: Record<string, unknown>[] = next.final ? (progress.existingOnly ? [{ type: 'section', text: { type: 'plain_text', text: 'Содержимое скрыто: ход изменён другим клиентом Codex.' } }] : []) : slackProgressBlocks(requestId, progress, next.historyPage, update.segment);
     const answerPage = Math.min(next.answerPage ?? 0, Math.max(0, (next.answers?.length ?? 0) - 1));
     const answer = next.answers?.[answerPage]?.text;
     if (answer !== undefined) blocks.push({ type: 'markdown', text: formatSlackReply(answer) },
-      ...slackPageControls(requestId, 'answer', answerPage, next.answers!.length));
+      ...slackPageControls(requestId, 'answer', answerPage, next.answers!.length, update.segment));
     const hash = digest(blocks);
     if (receipt?.hash === hash) { store.setMeta(key, JSON.stringify(next)); return receipt.ts; }
     // Persist before mutation; known-ts updates are replaceable, first posts are not.
     store.setMeta(key, JSON.stringify(next));
     const body: Json = {
       channel: origin.chatId, ...(receipt ? { ts: receipt.ts } : { thread_ts: origin.threadId }),
-      text: escapeSlackText(splitReply(answer !== undefined ? formatSlackReply(answer) : progress.commentary?.trim() || String(blocks[0].title), 3000)[0]),
+      text: escapeSlackText(splitReply(answer !== undefined ? formatSlackReply(answer) : progress.commentary?.trim() || String(blocks[0]?.title ?? 'Результат'), 3000)[0]),
       blocks, mrkdwn: false, parse: 'none', link_names: false, unfurl_links: false, unfurl_media: false,
     };
     try {
@@ -375,14 +390,14 @@ export class SlackChannel implements Channel {
   }
 
   private async progressClick(payload: Json): Promise<void> {
-    const match = /^relep:([A-Za-z0-9_-]{1,128}):(history|answer):(\d{1,8})$/u.exec(String(payload.actions?.[0]?.value ?? ''));
+    const match = /^relep:([A-Za-z0-9_-]{1,128}):(?:(0|[1-9]\d{0,7}|final):)?(history|answer):(\d{1,8})$/u.exec(String(payload.actions?.[0]?.value ?? ''));
     const chatId = payload.channel?.id, threadId = payload.message?.thread_ts;
     if (!match || payload.team?.id !== this.teamId || !SLACK_USER.test(payload.user?.id ?? '')
         || typeof chatId !== 'string' || typeof threadId !== 'string' || !SLACK_TS.test(payload.message?.ts ?? '')) return;
     const origin: Origin = { platform: 'slack', accountId: this.accountId, chatId, threadId,
       endpointId: endpointId('slack', this.accountId, chatId, threadId),
       senderId: payload.user.id, senderName: '', messageId: payload.message.ts };
-    await this.queueProgress(match[1], origin, undefined, { page: { kind: match[2] as 'history' | 'answer', index: Number(match[3]), ts: payload.message.ts } });
+    await this.queueProgress(match[1], origin, undefined, { segment: match[2], page: { kind: match[3] as 'history' | 'answer', index: Number(match[4]), ts: payload.message.ts } });
   }
 
   async readThreadPage(target: Pick<Origin, 'endpointId' | 'accountId' | 'chatId' | 'threadId'>, options: { cursor?: string; oldest?: string; latest?: string } = {}): Promise<{ messages: SlackTranscriptMessage[]; nextCursor?: string }> {
@@ -541,12 +556,27 @@ export class SlackChannel implements Channel {
         && (delivery.key.startsWith('answer:') || delivery.key === 'terminal:error' || delivery.key.startsWith('retry:'))) {
       const raw = this.options.progressStore.getMeta(`request-progress:${delivery.requestId}`);
       const progress: RequestProgress = raw ? JSON.parse(raw) : {};
-      const retry = delivery.key.startsWith('retry:');
-      const ts = await this.queueProgress(delivery.requestId, delivery.origin,
-        retry ? { ...progress, statusText: delivery.body } : { ...progress, terminal: progress.terminal ?? (delivery.key === 'terminal:error' ? 'failed' : 'completed') },
-        retry ? {} : { answer: { key: delivery.key, ordinal: delivery.ordinal, text: delivery.body } });
-      if (ts) return ts;
-      // shortcut: after a lost progress-post ACK, send the final separately until Slack receipt reconciliation is available.
+      if (delivery.key.startsWith('retry:')) {
+        await this.updateProgress(delivery.requestId, delivery.origin, { ...progress, statusText: delivery.body });
+        const receipt = this.options.progressStore.getMeta(`slack-progress:${createHash('sha256').update(JSON.stringify(delivery.requestId)).digest('hex')}`);
+        if (receipt && JSON.parse(receipt).ts) return JSON.parse(receipt).ts;
+      } else {
+        const legacyRaw = this.options.progressStore.getMeta(`slack-progress:${createHash('sha256').update(JSON.stringify(delivery.requestId)).digest('hex')}`);
+        const legacy = legacyRaw ? JSON.parse(legacyRaw) as ProgressReceipt : undefined;
+        if (legacy?.answers?.length) {
+          const route = createHash('sha256').update(JSON.stringify([delivery.origin.accountId, delivery.origin.endpointId, delivery.origin.chatId, delivery.origin.threadId])).digest('hex');
+          if (legacy.route !== route) throw new ChannelError('Источник сохранённого сообщения Slack не совпадает.');
+          if (legacy.state !== 'posted' || !legacy.ts || !SLACK_TS.test(legacy.ts)) throw new ChannelError('Slack не подтвердил сообщение с результатом. Проверьте доставку.', false, true);
+          if (legacy.answers.some(answer => answer.key === delivery.key && answer.text === delivery.body)) return legacy.ts;
+          throw new ChannelError('Сохранённый итог Slack требует сверки.', false, true);
+        }
+        if (raw) await this.updateProgress(delivery.requestId, delivery.origin, { ...progress,
+          terminal: progress.terminal ?? (delivery.key === 'terminal:error' ? 'failed' : 'completed') });
+        const ts = await this.queueProgress(delivery.requestId, delivery.origin, { terminal: 'completed' },
+          { segment: 'final', final: true, answer: { key: delivery.key, ordinal: delivery.ordinal, text: delivery.body } });
+        if (!ts) throw new ChannelError('Slack не подтвердил новое итоговое сообщение. Проверьте доставку.', false, true);
+        return ts;
+      }
     }
     const rich = (delivery.kind === 'answer' || delivery.kind === 'message') && !approval;
     const formatted = rich ? formatSlackReply(delivery.body) : delivery.body;
@@ -583,6 +613,15 @@ export class SlackChannel implements Channel {
         || !approval.questions?.length
         || !/^[CDG][A-Z0-9]+$/u.test(delivery.origin.chatId) || !SLACK_TS.test(delivery.origin.threadId)
         || !delivery.remoteMessageId || !SLACK_TS.test(delivery.remoteMessageId)) throw new ChannelError('Некорректная карточка вопроса Slack.');
+    if (resolution?.answerMarkerTs) {
+      if (!SLACK_TS.test(resolution.answerMarkerTs) || resolution.answerMarkerTs === delivery.remoteMessageId) throw new ChannelError('Некорректный маркер ответа Slack.');
+      const actor = resolution.source !== 'codex' && approval.decision !== 'uncertain' && !approval.questions.some(question => question.isSecret) ? resolution.senderName : undefined;
+      const text = `${resolvedQuestionStatus(approval, resolution)}${actor ? `\nОтветил(а): ${actor}` : ''}`;
+      const marker = await this.api('chat.update', { channel: delivery.origin.chatId, ts: resolution.answerMarkerTs,
+        text: escapeSlackText(text), blocks: [{ type: 'context', elements: [{ type: 'plain_text', text }] }],
+        mrkdwn: false, parse: 'none', link_names: false }, this.botToken, true);
+      if (marker.channel !== delivery.origin.chatId || marker.ts !== resolution.answerMarkerTs) throw new ChannelError('Slack не подтвердил обновление маркера ответа.', true, false);
+    }
     const content = resolvedQuestion(delivery, approval, resolution);
     const result = await this.api('chat.update', { channel: delivery.origin.chatId, ts: delivery.remoteMessageId,
       text: escapeSlackText(content.text), blocks: content.blocks, mrkdwn: false, parse: 'none', link_names: false,

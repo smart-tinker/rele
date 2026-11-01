@@ -96,22 +96,54 @@ export function questionAnswers(approval: Approval, metadata: QuestionMetadata, 
   return { answers, errors };
 }
 
-export function resolvedQuestion(delivery: Delivery, approval: Approval, resolution?: ApprovalResolution): { text: string; blocks: Block[] } {
-  const sections = questionSections(delivery.body);
-  if (delivery.ordinal !== 0) return { text: delivery.body, blocks: sections };
-  const uncertain = approval.decision === 'uncertain', secret = approval.questions?.some(question => question.isSecret);
-  const title = uncertain ? 'Результат отправки ответа неизвестен. Проверьте в Codex.'
+// Only the typed async resolver stores native answers; serverRequest/resolved stores source alone.
+function codexQuestionAnswers(approval: Approval, resolution?: ApprovalResolution): ApprovalResolution['answers'] {
+  return resolution?.source === 'codex' && approval.method === ASYNC_QUESTION_METHOD
+    && approval.status === 'answered' && approval.decision === 'accept' && approval.questions?.length === 1
+    && !approval.questions[0].isSecret && resolution.answers?.[approval.questions[0].id]?.length === 1
+    ? resolution.answers : undefined;
+}
+
+export function resolvedQuestionStatus(approval: Approval, resolution?: ApprovalResolution): string {
+  return approval.decision === 'uncertain' ? 'Результат отправки ответа неизвестен. Проверьте в Codex.'
     : approval.decision === 'sending' ? 'Ответ отправляется в Codex'
     : approval.decision === 'queued' ? 'Ответ ожидает отправки в Codex'
-    : resolution?.source === 'codex' ? 'Вопрос закрыт в Codex' : approval.decision === 'decline' ? 'Вопрос отклонён'
-      : secret ? 'Вопрос закрыт' : approval.status === 'expired' ? 'Вопрос больше не актуален' : 'Ответ отправлен в Codex';
-  const actor = !uncertain && !secret && resolution?.source !== 'codex' ? resolution?.senderName || resolution?.senderId : undefined;
-  const details = !uncertain && !secret && approval.decision !== 'decline' && resolution?.source !== 'codex' && resolution?.answers ? (approval.questions ?? []).flatMap(question =>
-    resolution.answers![question.id]?.map(answer => `${question.header || question.question}: ${answer}`) ?? []).join('\n') : '';
-  const actorLine = actor ? `${approval.decision === 'decline' ? 'Отклонил(а)' : 'Ответил(а)'}: ${actor}` : '';
-  let footer = [title, actorLine, details].filter(Boolean).join('\n');
-  if (sections.length + questionSections(footer).length > 50 || delivery.body.length + footer.length > 35_000) {
-    footer = [title, actorLine, details ? 'Полный ответ доступен в Codex.' : ''].filter(Boolean).join('\n');
+    : resolution?.source === 'codex' ? codexQuestionAnswers(approval, resolution) ? 'Ответ подтверждён в Codex' : 'Вопрос закрыт в Codex'
+      : approval.decision === 'decline' ? 'Вопрос отклонён'
+      : approval.questions?.some(question => question.isSecret) ? 'Вопрос закрыт'
+        : approval.status === 'expired' ? 'Вопрос больше не актуален' : 'Ответ отправлен в Codex';
+}
+
+export function resolvedQuestion(delivery: Delivery, approval: Approval, resolution?: ApprovalResolution): { text: string; blocks: Block[] } {
+  const title = resolvedQuestionStatus(approval, resolution);
+  if (delivery.ordinal !== 0) {
+    const text = `${title}\n\nИстория вопроса — в первой части сообщения.`;
+    return { text, blocks: questionSections(text) };
   }
-  return { text: `${delivery.body}\n\n${footer}`, blocks: [...sections, ...questionSections(footer)] };
+  const uncertain = approval.decision === 'uncertain', secret = approval.questions?.some(question => question.isSecret);
+  const actor = !uncertain && !secret && resolution?.source !== 'codex' ? resolution?.senderName || resolution?.senderId : undefined;
+  const answers = !uncertain && !secret && approval.status !== 'expired' && approval.decision !== 'decline'
+    ? resolution?.source === 'codex' ? codexQuestionAnswers(approval, resolution) : resolution?.answers : undefined;
+  const questions = approval.questions ?? [];
+  const summary = questions.map(question => {
+    const values = answers?.[question.id];
+    return [short(question.header || question.question, 120), ...(values ?? []).map(answer =>
+      `${answer.length > 500 ? 'Ответ (фрагмент)' : 'Ответ'}: ${short(answer, 500)}`)].join('\n');
+  }).join('\n\n');
+  const actorLine = actor ? `${approval.decision === 'decline' ? 'Отклонил(а)' : 'Ответил(а)'}: ${actor}` : '';
+  const source = !actor && answers && resolution ? `Источник ответа: ${resolution.source === 'slack' ? 'Slack' : resolution.source === 'telegram' ? 'Telegram' : resolution.source === 'codex' ? 'Codex' : 'Rele'}` : '';
+  const history = questions.flatMap((question, index) => (answers?.[question.id] ?? []).map(answer =>
+    `${question.header || `Вопрос ${index + 1}`}\nОтвет: ${answer}`)).join('\n\n');
+  const details = [questions.map(questionText).join('\n\n'), title, history, actorLine || source].filter(Boolean).join('\n\n');
+  const pages = splitReply(details, 6000);
+  const text = [title, short(summary, 4000), actorLine || source,
+    pages.length > 45 ? 'Продолжение истории доступно в Codex.' : 'Полная история — в подробностях вопроса.'].filter(Boolean).join('\n\n');
+  // Keep Slack's 50-block budget even for answers larger than the question form accepts.
+  const blocks = [...questionSections(text), ...pages.slice(0, 45).map((page, index) => ({
+    type: 'task_card', task_id: `${approval.id}:question:${index}`,
+    title: index ? `Подробнее о вопросе · часть ${index + 1}` : 'Подробнее о вопросе',
+    status: ['queued', 'sending'].includes(approval.decision ?? '') ? 'in_progress' : uncertain || approval.status === 'expired' ? 'error' : 'complete',
+    details: { type: 'rich_text', elements: [{ type: 'rich_text_section', elements: splitReply(page, 1450).map(text => ({ type: 'text', text })) }] },
+  }))];
+  return { text, blocks };
 }

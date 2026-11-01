@@ -541,7 +541,8 @@ export function Deliveries({
                           )}
                         </strong>
                         <small>
-                          {delivery.kind === 'message' ? 'Сообщение агента' : delivery.kind === 'approval'
+                          {delivery.kind === 'answer' && delivery.key.startsWith('question-answer:') ? 'Ответ на уточнение'
+                            : delivery.kind === 'message' ? 'Сообщение агента' : delivery.kind === 'approval'
                             ? 'Подтверждение'
                             : delivery.kind === 'error'
                               ? 'Сообщение об ошибке'
