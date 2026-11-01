@@ -1607,7 +1607,10 @@ export class Engine extends EventEmitter {
     const origin = request.origin;
     if (origin.senderIsBot !== true) return origin.senderId === message.sender.id;
     const group = origin.platform === 'slack' ? /^[CG]/u.test(origin.chatId) : /^-/u.test(origin.chatId);
-    return group && message.sender.isBot === false;
+    if (group) return message.sender.isBot === false;
+    const direct = origin.platform === 'slack' ? /^D[A-Z0-9]+$/u.test(origin.chatId) : /^\d+$/u.test(origin.chatId);
+    return direct && message.sender.isBot === false && origin.senderId === message.sender.id
+      && origin.participants?.some(person => person.id === origin.senderId && person.isBot === false) === true;
   }
   private expireApprovals(): void {
     this.pendingQuestions.clear();

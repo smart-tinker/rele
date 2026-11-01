@@ -5,11 +5,13 @@ import { createHash, randomUUID } from 'node:crypto';
 import { copyFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import assert from 'node:assert/strict';
 import { CodexClient, CodexTransportError } from '../src/server/codex.js';
 import { CodexContextReceipts } from '../src/server/codex-context-receipts.js';
 import { Engine } from '../src/server/engine.js';
 import { Store } from '../src/server/store.js';
 import { defaultConfig } from '../src/server/config.js';
+import { initialMessageKey } from '../src/server/initial-message.js';
 import type { Channel } from '../src/server/channels/common.js';
 import type { Endpoint, Platform, SlackTranscriptMessage } from '../src/shared/types.js';
 
@@ -28,9 +30,12 @@ const endpoints = Object.fromEntries((['slack', 'telegram'] as const).map(platfo
   people: [{ id: 'fixture-user', name: 'Fixture user' }], updatedAt: new Date().toISOString(),
 } satisfies Endpoint])) as Record<Platform, Endpoint>;
 for (const endpoint of Object.values(endpoints)) store.upsertEndpoint(endpoint);
-store.createConversation({ name: 'Managed fixture', threadId: values.thread, cwd: values.directory,
+const conversation = store.createConversation({ name: 'Managed fixture', threadId: values.thread, cwd: values.directory,
   bindings: Object.values(endpoints).map(endpoint => ({ platform: endpoint.platform, endpointId: endpoint.id, allowedSenderIds: ['fixture-user'] })),
 });
+// This ownership/history fixture starts with an initialized existing conversation.
+const initializedKey = initialMessageKey(values.home, values.thread);
+store.setMeta(initializedKey, JSON.stringify({ applied: true }));
 const slackHistory: SlackTranscriptMessage[] = [{
   endpointId: endpoints.slack.id, accountId: endpoints.slack.accountId, chatId: endpoints.slack.chatId,
   threadId: endpoints.slack.threadId, messageId: '1700000000.000001',
@@ -53,6 +58,7 @@ async function start(): Promise<void> {
   } satisfies Channel;
   engine.on('diagnostic', message => { diagnostics.push(String(message)); });
   await codex.connect();
+  assert.equal(initialMessageKey(codex.status().codexHome!, store.getConversation(conversation.id)!.threadId), initializedKey);
   engine.start();
 }
 async function snapshot() {
@@ -83,7 +89,7 @@ async function freshContextProof() {
     await fresh.injectContext(thread, entryId, text);
     const metadata = await fresh.readThread(thread) as { thread: { path: string } };
     const receipt = await new CodexContextReceipts().has({ codexHome: home, rolloutPath: metadata.thread.path,
-      threadId: thread, itemId: `msg_${createHash('sha256').update(JSON.stringify([thread, entryId])).digest('hex').slice(0, 48)}`, text });
+      threadId: thread, itemId: `rele-context-${createHash('sha256').update(JSON.stringify([thread, entryId])).digest('hex').slice(0, 48)}`, text });
     const passiveTurnsStarted = startedTurns.size;
     if (!receipt || passiveTurnsStarted !== 0) throw new Error('Fresh passive context created a turn or has no persisted receipt');
     const clientId = randomUUID();

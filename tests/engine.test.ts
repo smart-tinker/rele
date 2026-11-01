@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Engine, type CodexGateway, type EngineOptions } from '../src/server/engine.js';
 import { Store } from '../src/server/store.js';
@@ -2752,12 +2753,23 @@ describe('multiple origins and terminal reconciliation', () => {
 });
 
 describe('Engine interactive Slack questions', () => {
-  async function questionFixture() {
+  async function questionFixture(assistedDm = false, kind: 'native' | 'async' = 'native') {
     const f = fixture({ start: false });
     const update = vi.fn<NonNullable<Channel['updateApproval']>>().mockResolvedValue(undefined);
     f.engine.channels.slack = { ...f.slack, updateApproval: update };
-    const request = await acceptRequest(f);
-    const approval = await requestApproval(f, request, true);
+    if (assistedDm) {
+      f.eps.slack.id = 'slack-assisted-dm';
+      f.eps.slack.chatId = 'DPRIVATE';
+      f.eps.slack.people = [{ id: 'U1', name: 'Alex', isBot: false }];
+      f.store.upsertEndpoint(f.eps.slack);
+      f.store.setBinding(f.conversation.id, 'slack', f.eps.slack.id, ['U1']);
+      await f.engine.receive(slackInbound(f, 'assisted-file', '170001.000001', 'Please inspect the shared file', {
+        sender: { id: 'U1', name: 'Alex', isBot: true },
+      }));
+      await f.engine.settled();
+    }
+    const request = assistedDm ? f.store.listRequests()[0] : await acceptRequest(f);
+    const approval = kind === 'native' ? await requestApproval(f, request, true) : (await asyncQuestion(f, request)).approval;
     const prompt = f.store.listDeliveries().find(row => row.approvalId === approval.id)!;
     expect(prompt.status).toBe('sent');
     const context = { approvalId: approval.id, platform: 'slack' as const, accountId: request.origin.accountId,
@@ -2765,6 +2777,62 @@ describe('Engine interactive Slack questions', () => {
       senderIsBot: false, senderName: 'Alex', messageId: prompt.remoteMessageId };
     return { ...f, request, approval, prompt, context, update };
   }
+
+  it.each(['native', 'async'] as const)('lets the verified human open and answer their own assisted DM %s question exactly once', async kind => {
+    const f = await questionFixture(true, kind), answers = { [f.approval.questions![0].id]: ['release'] };
+    expect(f.request.origin).toMatchObject({ senderId: 'U1', senderIsBot: true, participants: [{ id: 'U1', isBot: false }] });
+    expect(f.engine.question(f.context).id).toBe(f.approval.id);
+    await f.engine.action({ ...f.context, decision: 'accept', answers });
+    await f.engine.pump(); await f.engine.settled();
+    if (kind === 'native') {
+      expect(f.codex.respond).toHaveBeenCalledExactlyOnceWith('approval-rpc', { answers: { target: { answers: ['release'] } } });
+      expect(f.codex.steer).not.toHaveBeenCalled();
+    } else {
+      expect(f.codex.steer).toHaveBeenCalledExactlyOnceWith(THREAD, encodeAsyncAnswers(f.approval.questions!, answers), f.approval.id, 'turn-1');
+      expect(f.store.getSteeringInput(f.approval.id)).toMatchObject({ state: 'applied', approvalId: f.approval.id });
+      expect(f.codex.respond).not.toHaveBeenCalled();
+    }
+    expect(f.update).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: f.prompt.id, remoteMessageId: f.prompt.remoteMessageId }),
+      expect.objectContaining({ id: f.approval.id, status: 'answered', decision: 'accept' }),
+      { source: 'slack', senderId: 'U1', senderName: 'Alex', answers });
+    await expect(f.engine.action({ ...f.context, decision: 'accept', answers })).rejects.toThrow();
+    await f.engine.pump();
+    expect(f.update).toHaveBeenCalledTimes(1); expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+    expect(f.store.listRequests()).toHaveLength(1); expect(f.slack.deliver).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([{ senderIsBot: undefined }, { senderIsBot: true }, { senderId: 'UOTHER' }, { accountId: 'other:bot' },
+    { chatId: 'DOTHER' }, { threadId: 'other-thread' }, { platform: 'telegram' as const }])('denies unverified, other-human or foreign assisted DM callbacks: %j', async patch => {
+    const f = await questionFixture(true), context = { ...f.context, ...patch };
+    expect(() => f.engine.question(context)).toThrow();
+    await expect(f.engine.action({ ...context, decision: 'accept', answers: { target: ['main'] } })).rejects.toThrow();
+    expect(f.store.getApproval(f.approval.id)?.status).toBe('pending');
+    expect(f.codex.respond).not.toHaveBeenCalled(); expect(f.codex.steer).not.toHaveBeenCalled(); expect(f.update).not.toHaveBeenCalled();
+  });
+
+  it.each(['absent', 'unknown', 'bot', 'other-human', 'non-dm', 'malformed-dm'] as const)('does not let the current human profile authorize an unverified legacy assisted origin (%s)', async legacy => {
+    const f = await questionFixture(true), origin = { ...f.request.origin };
+    if (legacy === 'absent') delete origin.participants;
+    if (legacy === 'unknown') origin.participants = [{ id: 'U1', name: 'Alex' }];
+    if (legacy === 'bot') origin.participants = [{ id: 'U1', name: 'Agent', isBot: true }];
+    if (legacy === 'other-human') origin.participants = [{ id: 'UOTHER', name: 'Other human', isBot: false }];
+    if (legacy === 'non-dm') origin.chatId = f.context.chatId = 'XPRIVATE';
+    if (legacy === 'malformed-dm') origin.chatId = f.context.chatId = 'D';
+    const legacyDb = new DatabaseSync(f.path);
+    legacyDb.prepare('UPDATE requests SET origin=? WHERE id=?').run(JSON.stringify(origin), f.request.id);
+    legacyDb.close();
+    expect(() => f.engine.question(f.context)).toThrow();
+    await expect(f.engine.action({ ...f.context, decision: 'accept', answers: { target: ['main'] } })).rejects.toThrow();
+    expect(f.store.getApproval(f.approval.id)?.status).toBe('pending');
+    expect(f.codex.respond).not.toHaveBeenCalled(); expect(f.codex.steer).not.toHaveBeenCalled(); expect(f.update).not.toHaveBeenCalled();
+  });
+
+  it('keeps the source-off guard on an assisted DM asynchronous answer', async () => {
+    const f = await questionFixture(true, 'async');
+    f.store.setSourceAccess(f.eps.slack.id, { mode: 'off' });
+    await expect(f.engine.action({ ...f.context, decision: 'accept', answers: { [f.approval.questions![0].id]: ['main'] } })).rejects.toThrow();
+    expect(f.codex.steer).not.toHaveBeenCalled(); expect(f.codex.respond).not.toHaveBeenCalled();
+  });
 
   it('answers the exact native RPC once and updates only its existing card with the Slack actor', async () => {
     const f = await questionFixture();
