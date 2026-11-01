@@ -130,6 +130,84 @@ function asyncAction(f: ReturnType<typeof fixture>, approval: Approval, answer =
 }
 
 describe('Engine asynchronous Desktop questions', () => {
+  it('publishes a confirmed native question when its notification arrives before the history snapshot', async () => {
+    const f = fixture(), request = await acceptRequest(f); await running(f, request);
+    const item = { id: 'late-history-question', type: 'agentMessage', delivery: 'async', text: 'Question',
+      questions: [{ title: 'Which branch?', options: ['main', 'release'] }] };
+    const question = asyncQuestions(item)[0].question;
+    f.codex.asyncStates.set(question.id, { turnId: 'turn-1', question });
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1', item } });
+    await f.engine.settled(); await f.engine.pump();
+    const approval = f.store.listApprovals().find(value => value.itemId === question.id);
+    expect(approval).toMatchObject({ requestId: request.id, turnId: 'turn-1', method: ASYNC_QUESTION_METHOD, status: 'pending' });
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1', item } });
+    await f.engine.settled(); await f.engine.pump();
+    expect(f.slack.deliver.mock.calls.filter(([, value]) => value?.id === approval?.id)).toHaveLength(1);
+    f.codex.complete(request.id, 'NOREPLY'); await f.engine.settled(); await f.engine.pump();
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'completed', suppressedFinal: true });
+    expect(f.store.getApproval(approval!.id)?.status).toBe('pending');
+    expect(f.slack.deliver.mock.calls.filter(([value]) => value.kind === 'answer')).toHaveLength(0);
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+    expect(f.codex.steer).not.toHaveBeenCalled();
+  });
+
+  it.each(['turn', 'question', 'answered'] as const)('does not publish a lagging native question with incompatible canonical %s proof', async mismatch => {
+    const f = fixture(), request = await acceptRequest(f); await running(f, request);
+    const item = { id: 'unconfirmed-history-question', type: 'agentMessage', delivery: 'async', text: 'Question',
+      questions: [{ title: 'Which branch?' }] };
+    const question = asyncQuestions(item)[0].question;
+    f.codex.asyncStates.set(question.id, { turnId: mismatch === 'turn' ? 'different-turn' : 'turn-1',
+      question: mismatch === 'question' ? { ...question, question: 'Different question' } : question,
+      ...(mismatch === 'answered' ? { answer: { answer: 'main', clientId: 'desktop-answer' } } : {}) });
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1', item } });
+    await f.engine.settled(); await f.engine.pump();
+    expect(f.store.listApprovals()).toEqual([]);
+    expect(f.slack.deliver).not.toHaveBeenCalled();
+    expect(f.codex.steer).not.toHaveBeenCalled();
+  });
+
+  it.each(['reconcile', 'cancel'] as const)('does not publish a notification question while %s still awaits ownership proof', async operation => {
+    const f = fixture(), request = await acceptRequest(f); await running(f, request);
+    const item = { id: 'unverified-owner-question', type: 'agentMessage', delivery: 'async', text: 'Question',
+      questions: [{ title: 'Which branch?' }] };
+    const question = asyncQuestions(item)[0].question;
+    f.codex.asyncStates.set(question.id, { turnId: 'turn-1', question });
+    const proof = deferred<RequestLocation>();
+    f.codex.findRequest.mockImplementationOnce(() => proof.promise);
+    const pending = f.engine[operation](request.id).catch(() => {});
+    try {
+      f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1', item } });
+      await f.engine.settled();
+      expect(f.store.listApprovals()).toEqual([]);
+      expect(f.slack.deliver).not.toHaveBeenCalled();
+    } finally {
+      proof.resolve({ state: 'running', turnId: 'turn-1', mixed: true });
+      await pending; await f.engine.settled();
+    }
+  });
+
+  it('does not publish if cancellation starts during direct question verification', async () => {
+    const f = fixture(), request = await acceptRequest(f); await running(f, request);
+    const item = { id: 'cancelled-owner-question', type: 'agentMessage', delivery: 'async', text: 'Question',
+      questions: [{ title: 'Which branch?' }] };
+    const question = asyncQuestions(item)[0].question;
+    const state = deferred<{ turnId: string; question: typeof question }>();
+    f.codex.asyncQuestionState.mockImplementationOnce(() => state.promise);
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1', item } });
+    await vi.waitFor(() => expect(f.codex.asyncQuestionState).toHaveBeenCalledWith(THREAD, question.id));
+    const proof = deferred<RequestLocation>();
+    f.codex.findRequest.mockImplementationOnce(() => proof.promise);
+    const cancel = f.engine.cancel(request.id).catch(() => {});
+    try {
+      state.resolve({ turnId: 'turn-1', question }); await f.engine.settled();
+      expect(f.store.listApprovals()).toEqual([]);
+      expect(f.slack.deliver).not.toHaveBeenCalled();
+    } finally {
+      proof.resolve({ state: 'running', turnId: 'turn-1', mixed: true });
+      await cancel; await f.engine.settled();
+    }
+  });
+
   it('publishes typed questions and returns one Slack answer to the exact active question without a fake RPC', async () => {
     const f = fixture(), request = await acceptRequest(f);
     const { approval, questions, item } = await asyncQuestion(f, request);

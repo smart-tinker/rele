@@ -277,7 +277,7 @@ describe('Slack question choices and forms', () => {
 
   it('opens the existing form for long labels, keeps full wording readable and submits the exact stored choice', async () => {
     const approval = questionApproval('rele/asyncUserInput');
-    const label = 'Установить исправление и перезапустить только Rele на Home';
+    const label = 'Установить исправление и перезапустить только Rele на Home, сохранив исходный профиль и историю';
     approval.questions![0].options![0] = { label, description: 'Сохранить исходный разговор и настройки' };
     const action = vi.fn<ChannelCallbacks['action']>().mockResolvedValue(undefined);
     const { channel, calls, socket } = await makeChannel({ question: () => approval, action, api: questionApi });
@@ -346,6 +346,20 @@ describe('Slack question choices and forms', () => {
     socket.receive({ envelope_id: 'dismiss-form', type: 'interactive', payload: { type: 'view_closed', view: { callback_id: QUESTION_VIEW } } });
     await vi.waitFor(() => expect(socket.sent.map(value => JSON.parse(value).envelope_id)).toContain('dismiss-form'));
     expect(approval.status).toBe('pending');
+    const customText = '  Свой точный ответ 🙂\nВторая строка  ';
+    submit('conflicting-form', { 'q0-choice': { answer: { selected_option: { value: '1' } } },
+      'q0-text': { answer: { value: customText } }, 'q1-text': { answer: { value: 'read-only' } } });
+    await vi.waitFor(() => expect(socket.sent.map(value => JSON.parse(value))).toContainEqual({ envelope_id: 'conflicting-form', payload: {
+      response_action: 'errors', errors: { 'q0-text': 'Выбран обычный вариант. Очистите поле или выберите «Свой ответ».' },
+    } }));
+    expect(action).not.toHaveBeenCalled();
+    expect(calls.filter(call => call.url.endsWith('/views.open'))).toHaveLength(1);
+    expect(calls.some(call => call.url.endsWith('/views.update'))).toBe(false);
+    submit('corrected-form', { 'q0-choice': { answer: { selected_option: { value: 'custom' } } },
+      'q0-text': { answer: { value: customText } }, 'q1-text': { answer: { value: 'read-only' } } });
+    await vi.waitFor(() => expect(action).toHaveBeenCalledOnce());
+    expect(action).toHaveBeenLastCalledWith(expect.objectContaining({ answers: { branch: [customText], mode: ['read-only'] } }));
+    action.mockClear();
     submit('valid-form', { 'q0-choice': { answer: { selected_option: { value: '1', text: { text: 'FORGED' } } } }, 'q1-text': { answer: { value: 'read-only' } } });
     await vi.waitFor(() => expect(action).toHaveBeenCalledOnce());
     expect(action).toHaveBeenCalledWith(expect.objectContaining({ answers: { branch: ['develop'], mode: ['read-only'] } }));
@@ -430,6 +444,7 @@ describe('Slack question choices and forms', () => {
     expect(updates[0]).toMatchObject({ channel: 'CEXAMPLE', ts: '1000.2000', mrkdwn: false, parse: 'none', link_names: false });
     expect(updates[0].blocks.every((block: { type: string; text: { type: string } }) => block.type === 'task_card' || block.type === 'task_card' || block.type === 'section' && block.text.type === 'plain_text')).toBe(true);
     expect(updates[0].text).toContain('Ответ отправлен в Codex');
+    expect(updates[0].text).toContain('С какой веткой работать?');
     expect(updates[0].text).toContain('Анна &lt;@UPEER&gt;');
     expect(updates[0].text).toContain('main &lt;@UOTHER&gt;');
     expect(updates[1].text).toContain('Вопрос закрыт в Codex');
@@ -463,7 +478,7 @@ describe('Slack question choices and forms', () => {
     expect(updates[2].text).toContain('Результат отправки ответа неизвестен');
     for (const update of updates.slice(0, 3)) expect(update.text).not.toContain('Ответ отправлен в Codex');
     expect(updates[3].text).toContain('Ответ отправлен в Codex');
-    expect(updates[3].text).toContain('Ветка\nОтвет: main');
+    expect(updates[3].text).toContain('С какой веткой работать?\nОтвет: main');
     for (const update of updates) {
       expect(update).toMatchObject({ channel: 'CEXAMPLE', ts: '1000.2000' });
       expect(update.blocks.every((block: { type: string; text: { type: string } }) => block.type === 'task_card' || block.type === 'section' && block.text.type === 'plain_text')).toBe(true);

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Approval, Delivery } from '../src/shared/types.js';
 import type { ApprovalResolution } from '../src/server/channels/common.js';
-import { questionCard, resolvedQuestion } from '../src/server/channels/slack-questions.js';
+import { questionAnswers, questionCard, questionView, resolvedQuestion } from '../src/server/channels/slack-questions.js';
 
 function approval(): Approval {
   return { id: 'question-id', requestId: 'request-id', turnId: 'turn-id', itemId: 'item-id', rpcId: 'rpc-id',
@@ -24,17 +24,100 @@ function details(blocks: Record<string, any>[]): string {
     .flatMap(element => element.elements).map(element => element.text).join('');
 }
 
+function form(question: Approval, mode: 'all' | 'custom' = 'all') {
+  return questionView(question, { ...delivery().origin, approvalId: question.id, messageId: '1000.2000', senderIsBot: false }, mode);
+}
+
+describe('Slack question forms', () => {
+  it.each([undefined, null, '', ' \n '])('accepts an ordinary choice with blank custom text %j', text => {
+    const question = approval(), metadata = JSON.parse(form(question).private_metadata);
+    const result = questionAnswers(question, metadata, { 'q0-choice': { answer: { selected_option: { value: '0' } } },
+      'q0-text': { answer: { value: text } } });
+    expect(result.errors).toEqual({});
+    expect(result.answers).toEqual({ scope: ['57, 58 и 59'] });
+  });
+
+  it('rejects an ordinary choice with custom text without replacing either input', () => {
+    const question = approval(), metadata = JSON.parse(form(question).private_metadata);
+    const values = { 'q0-choice': { answer: { selected_option: { value: '0' } } },
+      'q0-text': { answer: { value: '  уточнение 🙂\nвторая строка  ' } } };
+    const before = JSON.stringify(values), result = questionAnswers(question, metadata, values);
+    expect(result.errors).toEqual({ 'q0-text': 'Выбран обычный вариант. Очистите поле или выберите «Свой ответ».' });
+    expect(result.answers).toEqual({});
+    expect(JSON.stringify(values)).toBe(before);
+    values['q0-choice'].answer.selected_option.value = 'custom';
+    expect(questionAnswers(question, metadata, values)).toEqual({ answers: { scope: [values['q0-text'].answer.value] }, errors: {} });
+  });
+
+  it.each([undefined, '8'])('does not infer custom from text when choice is %j', choice => {
+    const question = approval(), metadata = JSON.parse(form(question).private_metadata);
+    const result = questionAnswers(question, metadata, { 'q0-choice': { answer: { selected_option: { value: choice } } },
+      'q0-text': { answer: { value: 'Свой текст' } } });
+    expect(result.answers).toEqual({});
+    expect(result.errors).toEqual({ 'q0-choice': 'Выберите один из вариантов или свой ответ.' });
+  });
+
+  it.each(['label', 'description'] as const)('shows native %s at 75 units and retains a complete fallback at 76', field => {
+    const question = approval(), option = question.questions![0].options![0];
+    option[field] = 'я'.repeat(73) + '🙂';
+    const native = form(question), choice = native.blocks.find((block: any) => block.block_id === 'q0-choice');
+    expect(native.blocks.filter((block: any) => block.type === 'section').map((block: any) => block.text.text).join(''))
+      .toBe(`${question.questions![0].header}\n${question.questions![0].question}`);
+    expect(choice.element.options[0]).toEqual({ text: { type: 'plain_text', text: option.label },
+      description: { type: 'plain_text', text: option.description }, value: '0' });
+    option[field] += 'я';
+    const fallback = form(question), fallbackChoice = fallback.blocks.find((block: any) => block.block_id === 'q0-choice');
+    expect(fallback.blocks.filter((block: any) => block.type === 'section').map((block: any) => block.text.text).join(''))
+      .toContain(`${option.label} — ${option.description}`);
+    expect(fallbackChoice.element.options[0].description).toBeUndefined();
+    expect(fallbackChoice.element.options[0].text.text).not.toMatch(/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/u);
+    expect(questionAnswers(question, JSON.parse(fallback.private_metadata), {
+      'q0-choice': { answer: { selected_option: { value: '0', text: { text: 'FORGED' } } } },
+    }).answers).toEqual({ scope: [option.label] });
+  });
+
+  it('keeps mixed questions complete and uses Russian placeholders without blank descriptions', () => {
+    const question = approval();
+    question.questions![0].question = 'Полный исходный вопрос 🙂 '.repeat(150);
+    question.questions![0].options![1].description = '';
+    question.questions!.push({ id: 'second', header: 'Другой', question: 'Что проверить?', options: [
+      { label: 'Длинный вариант '.repeat(10), description: 'Полное описание' },
+    ] });
+    const view = form(question), sections = view.blocks.filter((block: any) => block.type === 'section').map((block: any) => block.text.text).join('');
+    expect(sections).toContain(question.questions![0].question);
+    expect(sections).toContain(question.questions![1].options![0].label);
+    expect(sections).not.toContain('Все согласованные исправления');
+    expect(view.blocks.find((block: any) => block.block_id === 'q0-choice').element.options[1].description).toBeUndefined();
+    expect(view.blocks.find((block: any) => block.block_id === 'q0-text').element.placeholder.text).toBe('Введите текст и выберите «Свой ответ»');
+    const custom = form(approval(), 'custom');
+    expect(custom.blocks.some((block: any) => block.block_id === 'q0-choice')).toBe(false);
+    expect(custom.blocks.filter((block: any) => block.type === 'section').map((block: any) => block.text.text).join('')).toContain('Все согласованные исправления');
+    expect(custom.blocks.find((block: any) => block.block_id === 'q0-text')).toMatchObject({ optional: false,
+      element: { placeholder: { type: 'plain_text', text: 'Введите ваш ответ' } } });
+  });
+});
+
 describe('resolved Slack questions', () => {
+  it('shows the question meaning before a short header and keeps header as a historical fallback', () => {
+    const question = approval();
+    question.questions![0].header = 'RC6';
+    question.questions![0].question = 'Продолжить проверку?';
+    const resolution: ApprovalResolution = { source: 'slack', answers: { scope: ['Да, RC6'] } };
+    expect(resolvedQuestion(delivery(), question, resolution).text).toContain('Продолжить проверку?\nОтвет: Да, RC6');
+    question.questions![0].question = '';
+    expect(resolvedQuestion(delivery(), question, resolution).text).toContain('RC6\nОтвет: Да, RC6');
+  });
+
   it('shows the exact answer once in a compact record and puts original questions/options in native read-only details', () => {
     const question = approval(), input = delivery();
     const answer = '  57 и 58 и 59\n🙂 <@UPEER> @everyone  ';
     const resolution: ApprovalResolution = { source: 'slack', senderName: 'владелец', answers: { scope: [answer] } };
     const before = JSON.stringify({ question, input, resolution });
     const result = resolvedQuestion(input, question, resolution);
-    expect(result.text).toContain(`Состав RC6\nОтвет: ${answer}`);
+    expect(result.text).toContain(`Какие исправления включить в выпуск?\nОтвет: ${answer}`);
     expect(result.text).toContain('Ответил(а): владелец');
     expect(result.text).toContain('Ответ отправлен в Codex');
-    expect(result.text).not.toMatch(/Codex ждёт уточнения|Выберите вариант|Устаревшая часть|Какие исправления|Все согласованные/);
+    expect(result.text).not.toMatch(/Codex ждёт уточнения|Выберите вариант|Устаревшая часть|Все согласованные/);
     expect(result.text.split(answer)).toHaveLength(2);
     const history = details(result.blocks);
     expect(history).toContain(question.questions![0].question);
@@ -53,7 +136,7 @@ describe('resolved Slack questions', () => {
     const result = resolvedQuestion(delivery(), question, { source: 'telegram', senderId: '88995359', answers: {
       scope: ['57, 58 и 59', 'С отдельной приёмкой'], timing: ['После проверки 🙂'], unknown: ['НЕСВЯЗАННЫЙ ОТВЕТ'],
     } });
-    expect(result.text).toContain('Состав RC6\nОтвет: 57, 58 и 59\nОтвет: С отдельной приёмкой');
+    expect(result.text).toContain('Какие исправления включить в выпуск?\nОтвет: 57, 58 и 59\nОтвет: С отдельной приёмкой');
     expect(result.text).toContain('Когда начинать?');
     expect(result.text).toContain('…\nОтвет: После проверки 🙂');
     expect(result.text).toContain('Ответил(а): 88995359');

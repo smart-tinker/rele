@@ -18,11 +18,11 @@ function request(status: RequestStatus = 'running', extra: Partial<Origin> = {})
   };
 }
 
-function make(initial: ReleRequest[] = []) {
+function make(initial: ReleRequest[] = [], saved?: { getMeta(key: string): string | undefined; setMeta(key: string, value: string): void }) {
   let rows = initial;
   const send = vi.fn<(origin: Origin, status: SlackSessionStatus) => Promise<void>>().mockResolvedValue(undefined);
   const diagnostic = vi.fn();
-  const activity = new SlackActivity(() => rows, send, diagnostic);
+  const activity = new SlackActivity(() => rows, send, diagnostic, saved);
   activities.push(activity);
   return { activity, send, diagnostic, set: (next: ReleRequest[]) => { rows = next; } };
 }
@@ -38,6 +38,55 @@ const settle = () => vi.advanceTimersByTimeAsync(0);
 const sentStatuses = (send: ReturnType<typeof make>['send']) => send.mock.calls.map(([, status]) => status);
 
 describe('Slack request activity', () => {
+  it.each(['completed', 'failed', 'cancelled', 'interrupted'] as const)('recovers a busy origin after a crash with only a %s request left', async status => {
+    const meta = new Map<string, string>();
+    const saved = { getMeta: (key: string) => meta.get(key), setMeta: (key: string, value: string) => { meta.set(key, value); } };
+    const first = make([request()], saved);
+    first.activity.refresh(); await settle();
+    expect(sentStatuses(first.send)).toEqual(['processing']);
+    const restarted = make([request(status)], saved);
+    restarted.activity.refresh(); await settle();
+    expect(restarted.send).toHaveBeenCalledExactlyOnceWith(request().origin, 'active');
+    const settled = make([], saved);
+    settled.activity.refresh(); await settle();
+    expect(settled.send).not.toHaveBeenCalled();
+  });
+
+  it('restores a busy origin without clearing another running request in the same thread', async () => {
+    const meta = new Map<string, string>();
+    const saved = { getMeta: (key: string) => meta.get(key), setMeta: (key: string, value: string) => { meta.set(key, value); } };
+    const first = make([request('waiting_approval')], saved);
+    first.activity.refresh(); await settle();
+    const restarted = make([request('completed'), { ...request(), id: 'next' }], saved);
+    restarted.activity.refresh(); await settle();
+    expect(sentStatuses(restarted.send)).toEqual(['processing']);
+    restarted.set([]); restarted.activity.refresh(); await settle();
+    expect(sentStatuses(restarted.send)).toEqual(['processing', 'active']);
+  });
+
+  it.each(['busy', 'clear'] as const)('retains a recovery target after a lost %s acknowledgement', async phase => {
+    const meta = new Map<string, string>();
+    const saved = { getMeta: (key: string) => meta.get(key), setMeta: (key: string, value: string) => { meta.set(key, value); } };
+    const first = make([request()], saved);
+    if (phase === 'busy') first.send.mockRejectedValueOnce(new Error('Lost busy ACK'));
+    first.activity.refresh(); await settle();
+    if (phase === 'clear') {
+      first.send.mockRejectedValueOnce(new Error('Lost clear ACK'));
+      first.set([]); first.activity.refresh(); await settle();
+    }
+    const restarted = make([], saved);
+    restarted.activity.refresh(); await settle();
+    expect(restarted.send).toHaveBeenCalledExactlyOnceWith(request().origin, 'active');
+    expect(first.diagnostic).toHaveBeenCalledOnce();
+  });
+
+  it('rejects invalid saved origins while continuing to represent current requests', async () => {
+    const { activity, send, diagnostic } = make([request()], { getMeta: () => '[{"platform":"slack"}]', setMeta: () => {} });
+    activity.refresh(); await settle();
+    expect(diagnostic).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledExactlyOnceWith(request().origin, 'processing');
+  });
+
   it('prioritizes suspended approvals over processing and coalesces work in a shared thread', async () => {
     const running = request();
     const transcribing = { ...request('transcribing'), id: 'transcribing' };

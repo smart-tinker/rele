@@ -1276,10 +1276,28 @@ export class Engine extends EventEmitter {
 
   private async onNotification({ method, params }: CodexNotification): Promise<void> {
     const p = params as Record<string, any>;
-    if (['item/started', 'item/completed'].includes(method) && asyncQuestions(p.item).length) {
+    const nativeQuestions = ['item/started', 'item/completed'].includes(method) ? asyncQuestions(p.item) : [];
+    if (nativeQuestions.length) {
+      const client = this.codex, epoch = this.epoch;
       const owner = this.store.activeRequests().find(request => !request.steeredInto && request.turnId === p.turnId
         && this.store.getConversation(request.conversationId)?.threadId === p.threadId);
       if (owner) await this.reconcile(owner.id);
+      if (!owner || this.reconciling.has(owner.id) || this.cancelling.has(owner.id)) return;
+      for (const candidate of nativeQuestions) {
+        if (client !== this.codex || epoch !== this.epoch || !client.asyncQuestionState) break;
+        if (this.store.listApprovals(1000).some(approval => approval.requestId === owner.id && approval.itemId === candidate.question.id)) continue;
+        try {
+          // A typed notification can precede the general history snapshot; verify its canonical question directly.
+          const state = await client.asyncQuestionState(p.threadId, candidate.question.id);
+          if (client !== this.codex || epoch !== this.epoch) break;
+          const current = this.store.getRequest(owner.id);
+          if (state && state.turnId === p.turnId && !state.answer && JSON.stringify(state.question) === JSON.stringify(candidate.question)
+            && current && current.turnId === p.turnId && ['running', 'waiting_approval', 'completed'].includes(current.status)
+            && !this.reconciling.has(owner.id) && !this.cancelling.has(owner.id) && !this.store.getMeta(`cancel-requested:${owner.id}`)) {
+            this.syncAsyncQuestions(current, { state: current.status === 'completed' ? 'completed' : 'running', turnId: p.turnId, asyncQuestions: [candidate] });
+          }
+        } catch (error) { this.emit('diagnostic', this.options.redact(error)); }
+      }
       return;
     }
     if (method === 'turn/started') for (const active of this.store.activeRequests()) {
