@@ -30,18 +30,25 @@ export function supportsQuestionForm(approval: Approval): boolean {
 }
 
 function modalBlocks(approval: Approval, custom: boolean): Block[] {
-  return (approval.questions ?? []).flatMap((question, index) => [
-    ...questionSections(questionText(question)),
-    ...(!custom && question.options?.length ? [{ type: 'input', block_id: `q${index}-choice`, label: plain('Выберите ответ'), element: {
-      type: 'radio_buttons', action_id: 'answer', options: [
-        ...question.options.map((option, optionIndex) => ({ text: plain(short(option.label)), value: String(optionIndex) })),
-        { text: plain('Свой ответ'), value: 'custom' },
-      ],
-    } }] : []),
-    { type: 'input', block_id: `q${index}-text`, label: plain(!custom && question.options?.length ? 'Свой ответ (если выбран)' : 'Ваш ответ'),
-      optional: !custom && !!question.options?.length,
-      element: { type: 'plain_text_input', action_id: 'answer', multiline: true, max_length: 3000 } },
-  ]);
+  return (approval.questions ?? []).flatMap((question, index) => {
+    // Slack limits option text and descriptions to 75 characters; keep longer values fully readable above the controls.
+    const compact = !custom && !!question.options?.length && question.options.every(option =>
+      option.label.length <= 75 && (option.description?.length ?? 0) <= 75);
+    return [
+      ...questionSections(compact ? [question.header, question.question].filter(Boolean).join('\n') : questionText(question)),
+      ...(!custom && question.options?.length ? [{ type: 'input', block_id: `q${index}-choice`, label: plain('Выберите ответ'), element: {
+        type: 'radio_buttons', action_id: 'answer', options: [
+          ...question.options.map((option, optionIndex) => ({ text: plain(short(option.label)), value: String(optionIndex),
+            ...(compact && option.description ? { description: plain(option.description) } : {}) })),
+          { text: plain('Свой ответ'), value: 'custom' },
+        ],
+      } }] : []),
+      { type: 'input', block_id: `q${index}-text`, label: plain(!custom && question.options?.length ? 'Свой ответ (если выбран)' : 'Ваш ответ'),
+        optional: !custom && !!question.options?.length,
+        element: { type: 'plain_text_input', action_id: 'answer', multiline: true, max_length: 3000,
+          placeholder: plain(!custom && question.options?.length ? 'Введите текст и выберите «Свой ответ»' : 'Введите ваш ответ') } },
+    ];
+  });
 }
 
 export function questionCard(delivery: Delivery, approval: Approval): Block[] | undefined {
@@ -83,11 +90,15 @@ export function questionAnswers(approval: Approval, metadata: QuestionMetadata, 
   for (const [index, question] of (approval.questions ?? []).entries()) {
     let answer: string | undefined;
     const choice = values?.[`q${index}-choice`]?.answer?.selected_option?.value;
+    const text = values?.[`q${index}-text`]?.answer?.value;
     if (metadata.mode === 'all' && question.options?.length && choice !== 'custom') {
       if (typeof choice === 'string' && /^[0-8]$/u.test(choice)) answer = question.options[Number(choice)]?.label;
       if (!answer) errors[`q${index}-choice`] = 'Выберите один из вариантов или свой ответ.';
+      else if (typeof text === 'string' && text.trim()) {
+        errors[`q${index}-text`] = 'Выбран обычный вариант. Очистите поле или выберите «Свой ответ».';
+        answer = undefined;
+      }
     } else {
-      const text = values?.[`q${index}-text`]?.answer?.value;
       if (typeof text === 'string' && text.trim() && text.length <= 3000) answer = text;
       else errors[`q${index}-text`] = 'Введите ответ длиной до 3000 символов.';
     }
@@ -127,7 +138,7 @@ export function resolvedQuestion(delivery: Delivery, approval: Approval, resolut
   const questions = approval.questions ?? [];
   const summary = questions.map(question => {
     const values = answers?.[question.id];
-    return [short(question.header || question.question, 120), ...(values ?? []).map(answer =>
+    return [short(question.question || question.header, 120), ...(values ?? []).map(answer =>
       `${answer.length > 500 ? 'Ответ (фрагмент)' : 'Ответ'}: ${short(answer, 500)}`)].join('\n');
   }).join('\n\n');
   const actorLine = actor ? `${approval.decision === 'decline' ? 'Отклонил(а)' : 'Ответил(а)'}: ${actor}` : '';

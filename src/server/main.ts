@@ -81,7 +81,7 @@ async function main(): Promise<void> {
     const channel = engine.channels.slack;
     if (!channel?.state.connected || !channel.setThreadStatus) throw new Error('Slack отключён; индикатор будет обновлён после подключения.');
     await channel.setThreadStatus(origin, status);
-  }, error => { process.stderr.write(`Rele Slack: ${config.redact(error)}\n`); });
+  }, error => { process.stderr.write(`Rele Slack: ${config.redact(error)}\n`); }, store);
   engine.on('change', () => activity.refresh());
   engine.on('delivered', delivery => { if (delivery.origin.platform === 'slack') activity.refresh(true); });
   let shuttingDown = false;

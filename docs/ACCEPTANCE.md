@@ -149,3 +149,17 @@ pending, sending, confirmed, uncertain, native закрытие и длинны�
 - Готовый daemon не заменяется; приватный/неизвестный owner, неподдерживаемая версия, неполная поставка, изменение источника и повреждение кэша блокируются.
 - Файлы разных Desktop-поставок не смешиваются, ссылки за пределы bundle не допускаются. Кэш публикуется атомарно; native selection/auth/history Rele вручную не записывает.
 - Итоговый RC проходит обязательную автоматическую Windows/Linux матрицу и native pins в изолированных build-каталогах windows-test-host/linux-build-host; после PR/main и публикации готовые пакеты проходят отдельную installer/recovery-приёмку только на windows-test-host и linux-test-host, включая Windows SID/ACL/DPAPI. Source/dev-suite не подменяет приёмку установленного приложения. Backend из настоящего MSIX и stdio shim не заменяют отдельную приёмку настоящего GUI.
+
+
+## RC8: Slack вопросы и восстановление статуса (#57, #62–#65)
+
+- [ ] Обычный вариант плюс непустое поле своего ответа возвращает явную ошибку у поля. Отправка не происходит, написанный текст и выбор остаются; после выбора «Свой ответ» возвращается ровно исходная строка один раз.
+- [ ] Короткие варианты и описания показаны в форме один раз; длинные сохраняют полный fallback, а submitted value берётся из исходного сохранённого варианта. Русский placeholder не меняет native подписи Slack.
+- [ ] Компактная закрытая карточка показывает текст вопроса перед fallback header; точный ответ, actor/source, uncertain/secret guards и read-only история сохранены.
+- [ ] После crash/restart прежний busy target известного origin получает актуальный status; completed/failed/interrupted/cancelled и точный NOREPLY снимают прежний busy без повторного input/final. Другой активный запрос сохраняет свой status; поздний ACK не возвращает старый статус.
+- [ ] Native-событие async-вопроса при отставшей общей истории сверяется по точному question/turn и не теряется. Parent final/NOREPLY не отменяет открытый вопрос; duplicate/reconnect не создают второй вопрос или ответ.
+- [ ] Source/unit и compiled fake transport проверки отдельно от реальной доставки. Для готового пакета проверить pending-вопрос в Slack до ответа, конфликт текста с сохранением поля, Desktop resolution того же message ID и фактический status в desktop/mobile. Исходные причины пользовательских снимков не объявлять доказанными только по синтетическому PASS.
+
+Пакеты принимаются на windows-test-host/linux-test-host, затем условный штатный rollout linux-build-host
+с baseline/backup/postflight. Опубликованные RC не заменяются. Ни merge, ни
+автоматический GSD verify не объявляют issue принятым или выпуск stable.

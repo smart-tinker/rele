@@ -1,5 +1,6 @@
 import type { Origin, ReleRequest } from '../shared/types.js';
 import type { SlackSessionStatus } from './channels/common.js';
+import type { Store } from './store.js';
 
 const refreshMs = 45_000;
 const retryMs = 15_000;
@@ -28,12 +29,28 @@ export class SlackActivity {
   private targets = new Map<string, Target>();
   private timer?: NodeJS.Timeout;
   private stopped = false;
+  private pending = new Map<string, Origin>();
 
   constructor(
     private readonly readRequests: () => ReleRequest[],
     private readonly send: (origin: Origin, status: SlackSessionStatus) => Promise<void>,
     private readonly diagnostic: (error: unknown) => void,
-  ) {}
+    private readonly store?: Pick<Store, 'getMeta' | 'setMeta'>,
+  ) {
+    try {
+      const saved = store?.getMeta('slack-activity:targets');
+      if (!saved) return;
+      const origins = JSON.parse(saved) as Origin[];
+      if (!Array.isArray(origins) || origins.some(origin => !origin || origin.platform !== 'slack'
+        || ['accountId', 'endpointId', 'chatId', 'threadId', 'senderId', 'senderName', 'messageId'].some(field => typeof origin[field as keyof Origin] !== 'string')
+        || !origin.accountId || !origin.chatId || !origin.threadId)) throw new Error('Invalid saved Slack activity target');
+      for (const origin of origins) {
+        const key = JSON.stringify([origin.accountId, origin.chatId, origin.threadId]);
+        this.pending.set(key, origin);
+        this.targets.set(key, { origin, status: 'active', active: false, revision: 1, sentRevision: 0, sentAt: 0, retryAt: 0 });
+      }
+    } catch (error) { this.report(error); }
+  }
 
   start(): void {
     if (this.timer) return;
@@ -91,18 +108,27 @@ export class SlackActivity {
 
   private flush(key: string, target: Target): void {
     if (target.task || !this.needsSend(target)) return;
-    target.task = this.write(target).finally(() => {
+    target.task = this.write(key, target).finally(() => {
       target.task = undefined;
       if (!target.active && target.status === 'active' && target.sentRevision === target.revision) this.targets.delete(key);
       else this.flush(key, target);
     });
   }
 
-  private async write(target: Target): Promise<void> {
+  private async write(key: string, target: Target): Promise<void> {
     while (this.needsSend(target)) {
       const { revision, status } = target;
       try {
+        // A crash or lost ACK must leave the original busy target available for clearing.
+        if (status !== 'active') {
+          this.pending.set(key, target.origin);
+          this.store?.setMeta('slack-activity:targets', JSON.stringify([...this.pending.values()]));
+        }
         await this.send(target.origin, status);
+        if (status === 'active') {
+          this.pending.delete(key);
+          this.store?.setMeta('slack-activity:targets', JSON.stringify([...this.pending.values()]));
+        }
         target.sentRevision = revision;
         target.sentAt = Date.now();
         target.retryAt = 0;
