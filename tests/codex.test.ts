@@ -1759,7 +1759,27 @@ describe('Codex typed async question history', () => {
     const f = await fixture({ 'thread/turns/list': () => page([turn]) }); await f.client.connect();
     expect(await f.client.findRequest(threadId, clientId)).toEqual({ state: 'completed', turnId: turn.id, text: 'Real final',
       asyncQuestions: asyncQuestions(turn.items.at(-1)),
+      publicHistory: [{ boundary: `question:${questionId}` }, { boundary: `answer:${questionId}` }, { boundary: `question:${asyncQuestions(turn.items.at(-1))[0].question.id}` }],
       asyncAnswers: [{ questionItemId: questionId, question: ref.question.question, answer: 'Slack', clientId: 'desktop-input' }] });
+  });
+
+  it.each([false, true])('preserves exact commentary/question/answer/input order and excludes mixed history (%s)', async foreign => {
+    const clientId = randomUUID(), inputId = randomUUID();
+    const comment = (id: string) => ({ type: 'agentMessage', phase: 'commentary', id, text: id });
+    const turn = { id: 'ordered-turn', status: 'inProgress', items: [
+      { type: 'userMessage', clientId }, comment('before-question'), questionItem, reply, comment('after-answer'),
+      { type: 'userMessage', clientId: foreign ? 'foreign-input' : inputId }, comment('after-input'),
+    ] };
+    const f = await fixture({ 'thread/turns/list': () => page([turn]) }); await f.client.connect();
+    const found = await f.client.findRequest(threadId, clientId, [inputId]);
+    if (foreign) { expect(found).toEqual({ state: 'running', turnId: turn.id, mixed: true }); return; }
+    expect(found.publicHistory).toEqual([
+      { step: { id: `${turn.id}:before-question`, text: 'before-question' } },
+      { boundary: `question:${questionId}` }, { boundary: `answer:${questionId}` },
+      { step: { id: `${turn.id}:after-answer`, text: 'after-answer' } }, { boundary: `input:${inputId}` },
+      { step: { id: `${turn.id}:after-input`, text: 'after-input' } },
+    ]);
+    expect(found.asyncAnswers).toEqual([{ questionItemId: questionId, question: ref.question.question, answer: 'Slack', clientId: 'desktop-input' }]);
   });
 
   it.each(['forged-title', 'prefix', 'ordinary', 'before-question'])('preserves the foreign-input guard for %s', async kind => {

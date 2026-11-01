@@ -50,7 +50,7 @@ export class Engine extends EventEmitter {
   private ownedThreads = new Set<string>();
   private releasing = new Map<string, Promise<void>>();
   private retryThreadAfter = new Map<string, number>();
-  private sending = false;
+  private deliveryTask?: Promise<void>;
   private events: Promise<void> = Promise.resolve();
   private abort = new AbortController();
   private connected = false;
@@ -210,7 +210,7 @@ export class Engine extends EventEmitter {
           this.store.addDeliveries(request.id, [{ key: `question-format:${message.eventId}`, ordinal: 0, kind: 'error', body: 'Ответьте одной строкой на каждый вопрос, по порядку: 1. ответ, затем с новой строки 2. ответ.' }]);
         } else {
           await this.resolveApproval(approval.id, 'accept', Object.fromEntries(questions.map((question, index) => [question.id, [questions.length === 1 ? lines[index] : lines[index].slice(lines[index].indexOf(' ') + 1)]])),
-            { source: message.endpoint.platform, senderId: message.sender.id, senderName: message.sender.name });
+            { source: message.endpoint.platform, senderId: message.sender.id, senderName: message.sender.name, humanMessageId: message.messageId });
         }
       }
     } else {
@@ -307,11 +307,15 @@ export class Engine extends EventEmitter {
     this.resolutions.add(id);
     if (approval.questions?.length) this.store.setMeta(`approval-resolution:${id}`, JSON.stringify({ source: resolution.source,
       ...(resolution.senderId ? { senderId: resolution.senderId } : {}), ...(resolution.senderName ? { senderName: resolution.senderName } : {}),
+      ...(resolution.humanMessageId ? { humanMessageId: resolution.humanMessageId } : {}),
       ...(decision === 'accept' && !approval.questions.some(question => question.isSecret) ? { answers } : {}) }));
-    // Persist intent before the wire write. On a crash or disconnect this is not replayed.
-    this.store.updateApproval(id, { status: 'answered', decision });
+    const client = this.codex, epoch = this.epoch;
     try {
-      await this.codex.respond(approval.rpcId!, result);
+      if (approval.questions?.length) await this.answerBoundary(request, approval, resolution);
+      if (this.stopped || this.suspended || client !== this.codex || epoch !== this.epoch || this.isMixed(request.id)) throw new Error('Подключение изменилось до отправки ответа.');
+      // Persist intent before the wire write. On a crash or disconnect this is not replayed.
+      this.store.updateApproval(id, { status: 'answered', decision });
+      await client.respond(approval.rpcId!, result);
       const current = this.store.getRequest(request.id)!;
       if (current.status === 'waiting_approval') this.store.updateRequest(request.id, { status: 'running' });
       this.store.cancelApprovalDeliveries(id);
@@ -338,6 +342,8 @@ export class Engine extends EventEmitter {
       const approval = this.store.addApproval({ requestId: request.id, turnId: found.turnId, itemId: question.id,
         rpcId: null, method: ASYNC_QUESTION_METHOD, title: 'Codex ждёт уточнения', details, questions: [question] });
       this.store.setMeta(`async-question-target:${approval.id}`, this.targetFingerprint());
+      this.sealProgress(request.id, `question:${question.id}`);
+      this.saveQuestionProgress(approval);
       const bodies = splitReply(`Codex ждёт уточнения\n\n${details}\n\nВыберите вариант или ответьте на это сообщение.`, 3000);
       this.store.addDeliveries(request.id, bodies.map((body, ordinal) => ({ key: ordinal ? `approval:${approval.id}:${ordinal}` : `approval:${approval.id}`,
         ordinal, kind: 'approval' as const, body, approvalId: approval.id })));
@@ -357,6 +363,7 @@ export class Engine extends EventEmitter {
       && !this.store.getMeta(`async-answer-submitting:${child.id}`)) this.store.finishRequest(child.id, { status: 'cancelled', error: undefined }, []);
     if (source === 'codex') this.store.setMeta(`approval-resolution:${approval.id}`, JSON.stringify({ source, answers: { [approval.questions![0].id]: [answer] } }));
     this.store.updateApproval(approval.id, { status: 'answered', decision: source === 'rele' && this.store.getMeta(`async-question-decision:${approval.id}`) === 'decline' ? 'decline' : 'accept' });
+    this.sealProgress(approval.requestId, `answer:${approval.questions![0].id}`);
     this.store.cancelApprovalDeliveries(approval.id);
   }
 
@@ -460,6 +467,8 @@ export class Engine extends EventEmitter {
       this.store.setMeta(`approval-resolution:${approval.id}`, JSON.stringify({ ...resolution, answers: values }));
       this.store.setMeta(`async-question-decision:${approval.id}`, decision);
       this.store.updateApproval(approval.id, { status: 'answered', decision: operation.request ? 'queued' : 'sending' });
+      await this.answerBoundary(request, approval, resolution);
+      if (client !== this.codex || epoch !== this.epoch || this.stopped || this.suspended || this.isMixed(request.id)) throw new Error('Подключение изменилось до отправки ответа.');
       if (operation.request) { this.track(this.pump()); return; }
       const input = operation.input!;
       if (input.state !== 'sending') throw new Error('Ответ уже принят к отправке. Повтор не выполнен.');
@@ -725,8 +734,8 @@ export class Engine extends EventEmitter {
       if (client !== this.codex || epoch !== this.epoch || terminal(this.store.getRequest(id)!.status)) return;
       if (found.mixed) this.store.setMeta(`mixed:${id}`, '1');
       else {
+        this.recoverProgress(request.id, found);
         this.syncAsyncQuestions(request, found);
-        if (found.commentary?.length && !this.isMixed(id)) this.recordProgress(id, { steps: found.commentary }, true);
       }
       if (found.state === 'not_found') this.store.updateRequest(id, { status: 'uncertain', error: 'Запрос не найден в очереди и истории Codex. Автоматическая повторная отправка запрещена; требуется сверка.' });
       else if (found.state === 'queued') {
@@ -886,6 +895,7 @@ export class Engine extends EventEmitter {
       if (client !== this.codex || epoch !== this.epoch) return;
       if (found.turnId === input.turnId && found.state !== 'not_found') {
         this.store.finishSteeringInput(input.id, 'applied');
+        if (input.requestId && !input.approvalId) this.sealProgress(parent!.id, `input:${input.id}`);
         if (input.approvalId) {
           const approval = this.store.getApproval(input.approvalId);
           const answer = parseAsyncAnswers([{ type: 'text', text: input.text }])?.[0];
@@ -1197,13 +1207,22 @@ export class Engine extends EventEmitter {
   }
 
   private async deliver(): Promise<void> {
-    if (this.sending || this.stopped) return;
-    this.sending = true;
+    if (this.deliveryTask) return this.deliveryTask;
+    const task = this.sendDeliveries();
+    this.deliveryTask = task;
+    try { await task; } finally { if (this.deliveryTask === task) this.deliveryTask = undefined; }
+  }
+
+  private async sendDeliveries(): Promise<void> {
+    if (this.stopped) return;
     try {
       for (let count = 0; count < 20 && !this.stopped; count++) {
         const delivery = this.store.claimDelivery();
         if (!delivery) break;
         const approval = delivery.approvalId ? this.store.getApproval(delivery.approvalId) : undefined;
+        if (delivery.requestId && this.isMixed(delivery.requestId) && delivery.key.startsWith('answer:')) {
+          this.store.updateDelivery(delivery.id, { status: 'cancelled', error: mixedMessage }); continue;
+        }
         if (delivery.kind === 'approval' && approval?.status !== 'pending') {
           this.store.updateDelivery(delivery.id, { status: 'cancelled', error: 'Подтверждение уже завершено.' }); continue;
         }
@@ -1219,12 +1238,24 @@ export class Engine extends EventEmitter {
           this.store.updateDelivery(delivery.id, { status: 'pending', nextAttemptAt: new Date(Date.now() + 5000).toISOString() }); continue;
         }
         try {
+          if (delivery.requestId && !delivery.key.startsWith('question-answer:') && this.store.getAsyncQuestionAnswerApproval(delivery.requestId) && this.answerMarkerBlocked(delivery.requestId)) {
+            this.store.updateDelivery(delivery.id, { status: 'pending', nextAttemptAt: new Date(Date.now() + 5000).toISOString() }); continue;
+          }
+          if (delivery.origin.platform === 'slack' && delivery.key.startsWith('question-answer:') && channel.updateProgress) {
+            const saved = this.store.getMeta(`approval-answer-progress:${delivery.key.slice('question-answer:'.length)}`);
+            if (saved) await channel.updateProgress(delivery.requestId!, delivery.origin, JSON.parse(saved) as RequestProgress);
+          }
+          if (delivery.origin.platform === 'slack' && approval?.questions?.length && channel.updateProgress) {
+            const saved = this.store.getMeta(`approval-progress:${approval.id}`);
+            if (saved) await channel.updateProgress(delivery.requestId!, delivery.origin, JSON.parse(saved) as RequestProgress);
+          }
           const remoteMessageId = await channel.deliver(delivery, approval);
           const sender = this.ownIdentity(channel, delivery.origin.platform);
           const ownReceipt: InboundMessage | undefined = delivery.kind === 'message' && delivery.origin.platform === 'telegram'
             ? { eventId: `tool-outgoing:${delivery.id}`, endpoint: this.store.getEndpoint(delivery.origin.endpointId)!, sender,
               messageId: remoteMessageId, text: channel.deliveryText?.(delivery) ?? delivery.body, contextOnly: true } : undefined;
           this.store.updateDelivery(delivery.id, { status: 'sent', remoteMessageId, error: undefined }, ownReceipt);
+          if (delivery.key.startsWith('question-answer:')) this.store.setMeta(`approval-answer-marker-ui:${delivery.key.slice('question-answer:'.length)}`, remoteMessageId);
           if (channel.state.accountId) {
             try {
               if (!ownReceipt) this.store.rememberThreadParticipant(delivery.origin.endpointId, sender, remoteMessageId);
@@ -1240,7 +1271,7 @@ export class Engine extends EventEmitter {
           });
         }
       }
-    } finally { this.sending = false; this.changed(); }
+    } finally { this.changed(); }
   }
 
   private async onNotification({ method, params }: CodexNotification): Promise<void> {
@@ -1284,6 +1315,7 @@ export class Engine extends EventEmitter {
       const own = typeof p.item.clientId === 'string' ? this.store.getRequest(input && input.state !== 'refused' && input.turnId === p.turnId ? input.parentRequestId : p.item.clientId) : undefined;
       const conversation = own && this.store.getConversation(own.conversationId);
       if (own && conversation?.threadId === p.threadId && !terminal(own.status)) {
+        if (input?.requestId && !input.approvalId) this.sealProgress(own.id, `input:${input.id}`);
         this.store.updateRequest(own.id, { turnId: p.turnId, status: this.isMixed(own.id) ? 'uncertain' : own.status === 'waiting_approval' ? 'waiting_approval' : 'running' });
       }
       for (const active of this.store.activeRequests()) {
@@ -1303,6 +1335,7 @@ export class Engine extends EventEmitter {
       for (const approval of this.store.listApprovals(1000)) if (approval.rpcId === p.requestId && approval.status === 'pending') {
         const request = this.store.getRequest(approval.requestId)!;
         if (this.store.getConversation(request.conversationId)?.threadId !== p.threadId) continue;
+        if (approval.questions?.length) this.sealProgress(request.id, `answer:${approval.id}`);
         this.store.setMeta(`approval-resolution:${approval.id}`, JSON.stringify({ source: 'codex' }));
         this.store.updateApproval(approval.id, { status: 'answered', decision: 'resolved_in_codex' });
         this.store.cancelApprovalDeliveries(approval.id);
@@ -1327,7 +1360,11 @@ export class Engine extends EventEmitter {
           || Date.now() < (this.approvalUpdateRetry.get(delivery.id) ?? 0)) continue;
         try {
           const raw = this.store.getMeta(`approval-resolution:${approval.id}`);
-          await channel.updateApproval(delivery, approval, raw ? JSON.parse(raw) as ApprovalResolution : undefined);
+          const markerId = this.store.getMeta(`approval-answer-marker:${approval.id}`);
+          const marker = markerId ? this.store.getDelivery(markerId) : undefined;
+          const resolution = raw ? JSON.parse(raw) as ApprovalResolution : undefined;
+          await channel.updateApproval(delivery, approval, { ...resolution, source: resolution?.source ?? 'codex',
+            ...(marker?.status === 'sent' && marker.remoteMessageId ? { answerMarkerTs: marker.remoteMessageId } : {}) });
           this.store.setMeta(`approval-ui-updated:${delivery.id}`, version);
           this.approvalUpdateRetry.delete(delivery.id);
         } catch (error) {
@@ -1338,12 +1375,97 @@ export class Engine extends EventEmitter {
       }
     } finally { this.approvalUpdatesSending = false; }
   }
+  private sealProgress(id: string, boundary: string): void {
+    const request = this.store.getRequest(id);
+    if (!request || request.origin.platform !== 'slack' || request.steeredInto || this.isMixed(id)) return;
+    const progress = JSON.parse(this.store.getMeta(`request-progress:${id}`) ?? '{}') as RequestProgress;
+    if (progress.terminal || progress.boundaries?.includes(boundary)) return;
+    const segments = progress.segments ?? (progress.steps?.length || progress.commentary || progress.plan?.length
+      ? [{ id: '0', steps: progress.steps ?? (progress.commentary ? [{ id: 'legacy', text: progress.commentary }] : undefined), plan: progress.plan }] : []);
+    const current = segments.at(-1);
+    if (current && !current.sealed) { current.sealed = true; current.sealedAt = boundary; }
+    this.recordProgress(id, { segments, boundaries: [...(progress.boundaries ?? []), boundary] });
+  }
+
+  private recoverProgress(id: string, found: RequestLocation): void {
+    if (!found.publicHistory) {
+      const progress = JSON.parse(this.store.getMeta(`request-progress:${id}`) ?? '{}') as RequestProgress;
+      if (!progress.segments && found.commentary?.length) this.recordProgress(id, { steps: found.commentary }, true);
+      return;
+    }
+    let after: string | undefined;
+    for (const event of found.publicHistory) {
+      if ('boundary' in event) {
+        if (event.boundary.startsWith('input:') && !this.store.getSteeringInput(event.boundary.slice('input:'.length))?.requestId) continue;
+        after = event.boundary; this.sealProgress(id, after);
+      }
+      else {
+        const progress = JSON.parse(this.store.getMeta(`request-progress:${id}`) ?? '{}') as RequestProgress;
+        // Recovery can fill only the current proven stage; sealed cards keep their original bytes.
+        if (progress.segments && (progress.boundaries?.at(-1) !== after
+          || progress.segments.some(segment => segment.steps?.some(step => step.id === event.step.id)))) continue;
+        this.recordProgress(id, { steps: [event.step] });
+      }
+    }
+  }
+
+  private saveQuestionProgress(approval: Approval): void {
+    const raw = this.store.getMeta(`request-progress:${approval.requestId}`);
+    if (!raw) return;
+    const progress = JSON.parse(raw) as RequestProgress;
+    const boundary = approval.method === ASYNC_QUESTION_METHOD ? `question:${approval.questions![0].id}` : `question:${approval.id}`;
+    const segments = progress.segments?.filter(segment => !segment.after || progress.boundaries!.indexOf(segment.after) < progress.boundaries!.indexOf(boundary));
+    this.store.setMeta(`approval-progress:${approval.id}`, JSON.stringify({ ...progress, segments }));
+  }
+
+  private answerMarkerBlocked(id: string): boolean {
+    const parent = this.store.getAsyncQuestionAnswerApproval(id);
+    return [...this.store.listApprovals(1000).filter(approval => approval.requestId === id), ...(parent ? [parent] : [])].some(approval => {
+      const markerId = this.store.getMeta(`approval-answer-marker:${approval.id}`);
+      return !!markerId && this.store.getDelivery(markerId)?.status !== 'sent';
+    });
+  }
+
+  private progressBlocked(id: string): boolean {
+    if (this.answerMarkerBlocked(id)) return true;
+    return this.store.listApprovals(1000).some(approval => {
+      if (approval.requestId !== id) return false;
+      if (approval.status === 'pending' && !this.store.approvalDeliveryProgress(approval.id).complete) return true;
+      return false;
+    });
+  }
+
+  private async answerBoundary(request: ReleRequest, approval: Approval, resolution: ApprovalResolution): Promise<void> {
+    this.sealProgress(request.id, `answer:${approval.method === ASYNC_QUESTION_METHOD ? approval.questions![0].id : approval.id}`);
+    if (request.origin.platform !== 'slack' || resolution.humanMessageId || resolution.source === 'codex'
+      || approval.questions?.some(question => question.isSecret)) return;
+    const saved = this.store.getMeta(`request-progress:${request.id}`);
+    if (saved) this.store.setMeta(`approval-answer-progress:${approval.id}`, saved);
+    const [marker] = this.store.addDeliveries(request.id, [{ key: `question-answer:${approval.id}`, ordinal: 0,
+      kind: 'answer', body: 'Ответ получен. Проверяется отправка в Codex.' }]);
+    this.store.setMeta(`approval-answer-marker:${approval.id}`, marker.id);
+    await this.deliver();
+  }
+
   private recordProgress(id: string, patch: RequestProgress, historyOrder = false): void {
     const request = this.store.getRequest(id);
     if (!request || request.origin.platform !== 'slack' || request.steeredInto) return;
     const key = `request-progress:${id}`, previous = this.store.getMeta(key);
     if (!previous && patch.terminal) return;
     const old = JSON.parse(previous ?? '{}') as RequestProgress;
+    if (old.terminal && !patch.existingOnly) return;
+    if (old.segments && !patch.existingOnly && (patch.steps || patch.plan)) {
+      const segments = structuredClone(old.segments);
+      const incoming = patch.steps?.filter(step => !segments.some(segment => segment.steps?.some(known => known.id === step.id)));
+      const changedPlan = patch.plan?.length && JSON.stringify(patch.plan) !== JSON.stringify(old.plan);
+      if (incoming?.length || changedPlan) {
+        let current = segments.at(-1);
+        if (!current || current.sealed) { current = { id: String(segments.length), after: old.boundaries?.at(-1) }; segments.push(current); }
+        if (incoming?.length) current.steps = [...(current.steps ?? []), ...incoming.map(step => ({ ...step, text: this.options.redact(step.text) }))];
+        if (patch.plan) current.plan = patch.plan;
+      }
+      patch.segments = segments;
+    }
     if (patch.steps) {
       const incoming = patch.steps.map(step => ({ ...step, text: this.options.redact(step.text) }));
       const before = old.steps ?? (old.commentary ? [{ id: 'legacy', text: old.commentary }] : []);
@@ -1370,11 +1492,11 @@ export class Engine extends EventEmitter {
         const conversation = this.store.getConversation(request.conversationId);
         if (!conversation || !request.turnId) continue;
         const key = `request-progress:${id}`, saved = this.store.getMeta(key);
-        if (!saved) continue;
+        if (!saved || this.progressBlocked(id)) continue;
         try {
           if (request.status === 'uncertain' && !this.isMixed(id)) {
             // Only relabel an already published card; unverified details stay local.
-            await channel.updateProgress(id, request.origin, { statusText: uncertainProgress, existingOnly: true });
+            await channel.updateProgress(id, request.origin, { statusText: uncertainProgress, existingOnly: true, ...(JSON.parse(saved).segments ? { segments: JSON.parse(saved).segments } : {}) });
             if (this.store.getMeta(key) === saved) this.store.setMeta('request-progress:pending', JSON.stringify(this.pendingProgress().filter(value => value !== id)));
             this.progressRetryAfter.delete(id);
             continue;
@@ -1382,7 +1504,7 @@ export class Engine extends EventEmitter {
           const found = await this.findOwnRequest(client, conversation.threadId, id);
           if (client !== this.codex || this.stopped) continue;
           if (found.mixed || this.isMixed(id)) {
-            await channel.updateProgress(id, request.origin, { terminal: 'failed', existingOnly: true });
+            await channel.updateProgress(id, request.origin, { terminal: 'failed', existingOnly: true, ...(JSON.parse(saved).segments ? { segments: JSON.parse(saved).segments } : {}) });
             this.store.setMeta('request-progress:pending', JSON.stringify(this.pendingProgress().filter(value => value !== id)));
             continue;
           }
@@ -1390,6 +1512,7 @@ export class Engine extends EventEmitter {
             this.store.setMeta('request-progress:pending', JSON.stringify(this.pendingProgress().filter(value => value !== id)));
             continue;
           }
+          if (this.progressBlocked(id)) continue;
           await channel.updateProgress(id, request.origin, JSON.parse(saved) as RequestProgress);
           if (this.store.getMeta(key) === saved) this.store.setMeta('request-progress:pending', JSON.stringify(this.pendingProgress().filter(value => value !== id)));
           this.progressRetryAfter.delete(id);
@@ -1479,6 +1602,11 @@ export class Engine extends EventEmitter {
     const questionDetails = questions?.map((value, index) => `${questions.length > 1 ? `${index + 1}. ` : ''}${value.header}: ${value.question}${value.options?.length ? '\n' + value.options.map(option => `${option.label} — ${option.description}`).join('\n') : ''}`).join('\n\n');
     const details = [metadata, questionDetails].filter(Boolean).join('\n\n');
     const approval = this.store.addApproval({ requestId: request.id, turnId: p.turnId, itemId: `${mcp ? 'mcp' : p.itemId}:${p.approvalId ?? event.id}:${this.epoch}`, rpcId: event.id, method: event.method, title, details, questions });
+    if (questions?.length) {
+      this.recoverProgress(request.id, location);
+      this.sealProgress(request.id, `question:${approval.id}`);
+      this.saveQuestionProgress(approval);
+    }
     this.store.setMeta(`approval-epoch:${approval.id}`, this.epoch);
     const choices: unknown[] | undefined = Array.isArray(p.availableDecisions) ? p.availableDecisions : undefined;
     this.approvals.set(approval.id, { accept: !choices || choices.includes('accept'), decline: choices?.includes('cancel') && !choices.includes('decline') ? 'cancel' : 'decline' });

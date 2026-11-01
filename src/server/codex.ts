@@ -34,6 +34,7 @@ export interface CodexContextReceiptCandidates {
   itemId: string;
   entries: { entryId: string; text: string }[];
 }
+export type PublicHistoryEvent = { step: { id: string; text: string } } | { boundary: string };
 export interface RequestLocation {
   state: 'queued' | 'running' | 'completed' | 'failed' | 'interrupted' | 'not_found';
   queuedSubmissionId?: string;
@@ -42,6 +43,7 @@ export interface RequestLocation {
   text?: string;
   failureReason?: 'serverOverloaded' | 'contextWindowExceeded' | 'contextCompactionFailed';
   commentary?: { id: string; text: string }[];
+  publicHistory?: PublicHistoryEvent[];
   retryCount?: number;
   retryBlocked?: boolean;
   rootTurnId?: string;
@@ -552,6 +554,7 @@ export class CodexClient extends EventEmitter {
           const location = this.historyLocation(turn, known);
           const commentary = [...(found.commentary ?? []), ...(location.commentary ?? [])];
           found = { ...location, ...(commentary.length ? { commentary } : {}),
+            ...((found.publicHistory || location.publicHistory) ? { publicHistory: [...(found.publicHistory ?? (found.commentary ?? []).map(step => ({ step }))), ...(location.publicHistory ?? (location.commentary ?? []).map(step => ({ step })))] } : {}),
             commandItems: [...(found.commandItems ?? []), ...(location.commandItems ?? [])] };
           retryCount++;
         }
@@ -692,7 +695,11 @@ export class CodexClient extends EventEmitter {
   private historyLocation(turn: HistoryTurn, known: Set<string>): RequestLocation {
     const questions = new Map<string, AsyncQuestion>(), asyncAnswers: AsyncAnswer[] = [];
     let mixed = false;
+    const publicHistory: PublicHistoryEvent[] = [];
     for (const item of turn.items) {
+      if (item.type === 'agentMessage' && item.delivery !== 'async' && item.phase === 'commentary' && item.text?.trim())
+        publicHistory.push({ step: { id: `${turn.id}:${item.id ?? createHash('sha256').update(item.text).digest('hex')}`, text: item.text } });
+      for (const entry of asyncQuestions(item)) publicHistory.push({ boundary: `question:${entry.question.id}` });
       for (const question of asyncQuestions(item)) questions.set(question.question.id, question);
       if (item.type !== 'userMessage') continue;
       const answers = parseAsyncAnswers(item.content);
@@ -700,6 +707,8 @@ export class CodexClient extends EventEmitter {
         const question = questions.get(answer.questionItemId);
         return question && matchAsyncAnswer(answer, question.question);
       });
+      if (matching) for (const answer of answers!) publicHistory.push({ boundary: `answer:${answer.questionItemId}` });
+      else if (item.clientId && known.has(item.clientId) && publicHistory.length) publicHistory.push({ boundary: `input:${item.clientId}` });
       if (matching) asyncAnswers.push(...answers!.map(answer => ({ ...answer,
         ...(typeof item.clientId === 'string' && item.clientId ? { clientId: item.clientId } : {}) })));
       if ((typeof item.clientId !== 'string' || !known.has(item.clientId)) && !matching) mixed = true;
@@ -720,6 +729,7 @@ export class CodexClient extends EventEmitter {
       state: state as RequestLocation['state'], turnId: turn.id,
       ...(mixed ? { mixed: true } : {
         ...(commentary.length ? { commentary } : {}),
+        ...(publicHistory.some(event => 'boundary' in event) ? { publicHistory } : {}),
         text: answers.length ? answers.map(item => item.text || '').join('\n\n') : legacy.at(-1)?.text,
         ...(failureReason ? { failureReason } : {}),
         ...(turn.items.some(item => codexCommandItem(item)) ? { commandItems: turn.items.flatMap(item => { const command = codexCommandItem(item); return command ? [command] : []; }) } : {}),

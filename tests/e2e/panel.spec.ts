@@ -124,6 +124,23 @@ test('queue cancels only a selected task, approvals preserve answers, uncertain 
 });
 
 
+test('a clarification answer receipt is distinguished from the final answer in deliveries', async ({ page }) => {
+  const state = fixtureState();
+  state.deliveries = [{
+    id: 'answer-marker', requestId: state.requests[0].id, origin: state.requests[0].origin,
+    key: 'question-answer:approval-1', ordinal: 0, kind: 'answer', body: 'Ответ получен от владелеца',
+    status: 'sent', attempts: 1, createdAt: '2026-10-18T20:00:00Z', updatedAt: '2026-10-18T20:00:00Z',
+  }];
+  const api = await installApi(page, state);
+  await openPanel(page);
+  await page.getByRole('navigation').getByRole('button', { name: 'Доставка' }).click();
+  const row = page.getByRole('row').filter({ hasText: 'Ответ получен от владелеца' });
+  await expect(row).toContainText('Ответ на уточнение');
+  await expect(row).not.toContainText('Сообщение об ошибке');
+  await expect(row).not.toContainText('Ответ · часть');
+  expect(api.mutations).toEqual([]);
+});
+
 test('uncertain launches can be reconciled and only an existing queued submission can be resumed', async ({
   page,
 }) => {

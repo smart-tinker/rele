@@ -2844,11 +2844,11 @@ describe('Engine interactive Slack questions', () => {
     }
     expect(f.update).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: f.prompt.id, remoteMessageId: f.prompt.remoteMessageId }),
       expect.objectContaining({ id: f.approval.id, status: 'answered', decision: 'accept' }),
-      { source: 'slack', senderId: 'U1', senderName: 'Alex', answers });
+      expect.objectContaining({ source: 'slack', senderId: 'U1', senderName: 'Alex', answers, answerMarkerTs: expect.any(String) }));
     await expect(f.engine.action({ ...f.context, decision: 'accept', answers })).rejects.toThrow();
     await f.engine.pump();
     expect(f.update).toHaveBeenCalledTimes(1); expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
-    expect(f.store.listRequests()).toHaveLength(1); expect(f.slack.deliver).toHaveBeenCalledTimes(1);
+    expect(f.store.listRequests()).toHaveLength(1); expect(f.slack.deliver).toHaveBeenCalledTimes(2);
   });
 
   it.each([{ senderIsBot: undefined }, { senderIsBot: true }, { senderId: 'UOTHER' }, { accountId: 'other:bot' },
@@ -2892,11 +2892,11 @@ describe('Engine interactive Slack questions', () => {
     expect(f.codex.respond).toHaveBeenCalledExactlyOnceWith('approval-rpc', { answers: { target: { answers: ['main'] } } });
     expect(f.update).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: f.prompt.id, remoteMessageId: f.prompt.remoteMessageId }),
       expect.objectContaining({ id: f.approval.id, status: 'answered' }),
-      { source: 'slack', senderId: f.context.senderId, senderName: 'Alex', answers: { target: ['main'] } });
+      expect.objectContaining({ source: 'slack', senderId: f.context.senderId, senderName: 'Alex', answers: { target: ['main'] }, answerMarkerTs: expect.any(String) }));
     await expect(f.engine.action({ ...f.context, decision: 'accept', answers: { target: ['different'] } })).rejects.toThrow();
     await f.engine.pump();
     expect(f.update).toHaveBeenCalledTimes(1); expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
-    expect(f.store.listRequests()).toHaveLength(1); expect(f.slack.deliver).toHaveBeenCalledTimes(1);
+    expect(f.store.listRequests()).toHaveLength(1); expect(f.slack.deliver).toHaveBeenCalledTimes(2);
   });
 
   it.each(['actor', 'bot', 'account', 'thread', 'message', 'secret', 'turn', 'delivery', 'mixed'] as const)('rejects a stale or mismatched %s before exposing a form or answering', async mismatch => {
@@ -2997,5 +2997,171 @@ describe('Engine interactive Slack questions', () => {
     expect(f.store.listApprovals()).toHaveLength(outcome === 'retry' ? 1 : 0);
     if (outcome === 'retry') expect(f.store.listDeliveries().some(row => row.body.includes('Which branch?') && row.status === 'sent')).toBe(true);
     expect(f.codex.respond).not.toHaveBeenCalled();
+  });
+});
+
+describe('Engine chronological Slack dialogue', () => {
+  const comment = (f: ReturnType<typeof fixture>, id: string, text = id) => f.codex.notification({ method: 'item/completed', params: {
+    threadId: THREAD, turnId: 'turn-1', item: { id, type: 'agentMessage', phase: 'commentary', text },
+  } });
+  const saved = (f: ReturnType<typeof fixture>, request: ReleRequest) => JSON.parse(f.store.getMeta(`request-progress:${request.id}`)!) as import('../src/server/channels/common.js').RequestProgress;
+  async function nativeQuestion(f: ReturnType<typeof fixture>, id: string) {
+    f.codex.request({ id, method: 'item/tool/requestUserInput', params: { threadId: THREAD, turnId: 'turn-1', itemId: id,
+      questions: [{ id: 'branch', header: 'Branch', question: 'Which branch?', options: [{ label: 'main', description: 'Main branch' }] }],
+    } });
+    await f.engine.settled();
+    return f.store.listApprovals().find(approval => approval.rpcId === id)!;
+  }
+
+  it('seals two native question cycles, skips the text-reply marker and retains old step ownership', async () => {
+    const f = fixture(), request = await acceptRequest(f); await running(f, request);
+    comment(f, 'before-first'); await f.engine.settled();
+    const firstQuestion = await nativeQuestion(f, 'question-1');
+    await f.engine.receive(f.message('slack', 'text-answer', { text: 'main' })); await f.engine.settled();
+    expect(f.store.listDeliveries().filter(row => row.key.startsWith('question-answer:'))).toHaveLength(0);
+    comment(f, 'between-questions'); await f.engine.settled();
+    const second = await nativeQuestion(f, 'question-2');
+    expect(saved(f, request).segments?.map(segment => segment.steps?.map(step => step.text))).toEqual([['before-first'], ['between-questions']]);
+    await f.engine.action(asyncAction(f, second)); await f.engine.settled();
+    expect(saved(f, request).segments).toHaveLength(2);
+    comment(f, 'before-first', 'Late duplicate must not rewrite a sealed step');
+    comment(f, 'after-second'); await f.engine.settled();
+    f.codex.complete(request.id, 'Final below the answers'); await f.engine.settled(); await f.engine.pump();
+    const progress = saved(f, request);
+    expect(progress.segments?.map(segment => segment.steps?.map(step => step.text))).toEqual([['before-first'], ['between-questions'], ['after-second']]);
+    expect(progress.boundaries).toEqual([`question:${firstQuestion.id}`, `answer:${firstQuestion.id}`, `question:${second.id}`, `answer:${second.id}`]);
+    expect(f.store.listDeliveries().filter(row => row.key.startsWith('question-answer:'))).toHaveLength(1);
+    expect(f.codex.respond.mock.calls.map(call => call[0])).toEqual(['question-1', 'question-2']);
+    expect(f.store.listDeliveries().find(row => row.key === 'answer:0')).toMatchObject({ status: 'sent', body: 'Final below the answers' });
+  });
+
+  it('flushes buffered pre-answer commentary before the async button marker', async () => {
+    const f = fixture(), request = await acceptRequest(f), { approval } = await asyncQuestion(f, request);
+    comment(f, 'while-question-open'); await f.engine.settled();
+    f.slack.updateProgress.mockClear(); f.slack.deliver.mockClear();
+    await f.engine.action(asyncAction(f, approval)); await f.engine.settled();
+    const markerIndex = f.slack.deliver.mock.calls.findIndex(([delivery]) => delivery.key.startsWith('question-answer:'));
+    const progressIndex = f.slack.updateProgress.mock.calls.findIndex(([, , progress]) => progress.segments?.some(segment => segment.steps?.some(step => step.text === 'while-question-open')));
+    expect(markerIndex).toBeGreaterThanOrEqual(0); expect(progressIndex).toBeGreaterThanOrEqual(0);
+    expect(f.slack.updateProgress.mock.invocationCallOrder[progressIndex]).toBeLessThan(f.slack.deliver.mock.invocationCallOrder[markerIndex]);
+    expect(f.slack.deliver.mock.calls[markerIndex][0]).toMatchObject({ kind: 'answer', body: 'Ответ получен. Проверяется отправка в Codex.' });
+    expect(saved(f, request).segments?.at(-1)?.sealed).toBe(true);
+  });
+
+  it('holds later progress and final after a lost marker ACK without replaying the native answer', async () => {
+    const f = fixture(), request = await acceptRequest(f); await running(f, request);
+    const approval = await nativeQuestion(f, 'lost-marker-question');
+    f.slack.deliver.mockImplementation(async delivery => {
+      if (delivery.key.startsWith('question-answer:')) throw new ChannelError('Lost marker ACK', false, true);
+      return 'known-message';
+    });
+    await f.engine.action(asyncAction(f, approval)); await f.engine.settled();
+    const marker = f.store.listDeliveries().find(row => row.key.startsWith('question-answer:'))!;
+    expect(marker.status).toBe('uncertain'); expect(f.codex.respond).toHaveBeenCalledTimes(1);
+    f.slack.updateProgress.mockClear();
+    comment(f, 'after-uncertain-marker'); await f.engine.settled();
+    f.codex.complete(request.id, 'Final waits for marker receipt'); await f.engine.settled(); await f.engine.pump();
+    expect(f.slack.updateProgress).not.toHaveBeenCalled();
+    expect(f.store.listDeliveries().find(row => row.key === 'answer:0')?.status).toBe('pending');
+    await expect(f.engine.action(asyncAction(f, approval))).rejects.toThrow();
+    expect(f.codex.respond).toHaveBeenCalledTimes(1);
+    expect(f.slack.deliver.mock.calls.filter(([delivery]) => delivery.id === marker.id)).toHaveLength(1);
+  });
+
+  it('delivers an older pending final before the late async answer marker and its new continuation', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture(), request = await acceptRequest(f), { approval } = await asyncQuestion(f, request);
+    let deferFinal = true;
+    f.slack.deliver.mockImplementation(async delivery => {
+      if (delivery.key === 'answer:0' && delivery.requestId === request.id && deferFinal) {
+        deferFinal = false; throw new ChannelError('Rate limited', true, false, 5000);
+      }
+      return `remote-${delivery.id}`;
+    });
+    f.codex.complete(request.id, 'Old final'); await f.engine.settled(); await f.engine.pump();
+    expect(f.store.listDeliveries().find(row => row.key === 'answer:0')?.status).toBe('pending');
+    await f.engine.action(asyncAction(f, approval)); await f.engine.settled();
+    const child = f.store.getRequest(approval.id)!;
+    expect(child.eventId).toBe(`async-question-answer:${approval.id}`);
+    vi.setSystemTime(Date.now() + 6000); await f.engine.pump(); await f.engine.settled();
+    expect(f.store.listDeliveries().find(row => row.key.startsWith('question-answer:'))?.status).toBe('sent');
+    f.codex.running(child.id, 'child-turn'); await f.engine.settled();
+    f.codex.complete(child.id, 'New final', 'child-turn'); await f.engine.settled(); await f.engine.pump();
+    const sent = f.slack.deliver.mock.calls.map(([delivery]) => delivery).filter(delivery => delivery.key.startsWith('question-answer:') || delivery.key === 'answer:0');
+    expect(sent.map(delivery => delivery.body)).toEqual(['Old final', 'Old final', 'Ответ получен. Проверяется отправка в Codex.', 'New final']);
+    expect(f.store.getRequest(request.id)?.status).toBe('completed');
+    expect(f.codex.respond).not.toHaveBeenCalled(); expect(f.codex.steer).not.toHaveBeenCalled();
+  });
+
+  it('refreshes an unchanged queued-answer card when its delayed marker receives a Slack timestamp', async () => {
+    const f = fixture(), request = await acceptRequest(f), { approval } = await asyncQuestion(f, request);
+    const updateApproval = vi.fn<NonNullable<Channel['updateApproval']>>().mockResolvedValue(undefined);
+    f.engine.channels.slack = { ...f.slack, updateApproval };
+    f.codex.complete(request.id, 'NOREPLY'); await f.engine.settled();
+    const markerPost = deferred<string>();
+    f.slack.deliver.mockImplementation(async delivery => delivery.key.startsWith('question-answer:') ? markerPost.promise : `remote-${delivery.id}`);
+    const action = f.engine.action(asyncAction(f, approval));
+    await vi.waitFor(() => expect(f.slack.deliver.mock.calls.some(([delivery]) => delivery.key.startsWith('question-answer:'))).toBe(true));
+    const pump = f.engine.pump();
+    await vi.waitFor(() => expect(updateApproval).toHaveBeenCalled());
+    expect(updateApproval.mock.calls.at(-1)?.[1].decision).toBe('queued');
+    expect(updateApproval.mock.calls.at(-1)?.[2]?.answerMarkerTs).toBeUndefined();
+    markerPost.resolve('1000.9999'); await action; await pump; await f.engine.settled(); await f.engine.pump();
+    expect(updateApproval.mock.calls.some(([, , resolution]) => resolution?.answerMarkerTs === '1000.9999')).toBe(true);
+  });
+
+  it('keeps a non-question approval closure in the same public stage', async () => {
+    const f = fixture(), request = await acceptRequest(f); await running(f, request);
+    comment(f, 'before-command'); await f.engine.settled();
+    await requestApproval(f, request);
+    f.codex.notification({ method: 'serverRequest/resolved', params: { threadId: THREAD, requestId: 'approval-rpc' } });
+    comment(f, 'after-command'); await f.engine.settled();
+    expect(saved(f, request).segments).toBeUndefined(); expect(saved(f, request).boundaries).toBeUndefined();
+    expect(saved(f, request).steps?.map(step => step.text)).toEqual(['before-command', 'after-command']);
+  });
+
+  it('delivers a continuation child question marker without blocking it on its own receipt', async () => {
+    const f = fixture(), request = await acceptRequest(f), { approval } = await asyncQuestion(f, request);
+    f.codex.complete(request.id, 'NOREPLY'); await f.engine.settled();
+    await f.engine.action(asyncAction(f, approval)); await f.engine.settled();
+    const child = f.store.getRequest(approval.id)!; await running(f, child, 'child-turn');
+    f.codex.request({ id: 'child-question', method: 'item/tool/requestUserInput', params: {
+      threadId: THREAD, turnId: 'child-turn', itemId: 'child-question', questions: [{ id: 'child-choice', header: '', question: 'Continue?' }],
+    } });
+    await f.engine.settled();
+    const childQuestion = f.store.listApprovals().find(row => row.rpcId === 'child-question')!;
+    await f.engine.action(asyncAction(f, childQuestion)); await f.engine.settled();
+    expect(f.store.listDeliveries().filter(row => row.key.startsWith('question-answer:')).map(row => row.status)).toEqual(['sent', 'sent']);
+    expect(f.codex.respond).toHaveBeenCalledExactlyOnceWith('child-question', { answers: { 'child-choice': { answers: ['main'] } } });
+  });
+
+  it('seals an accepted own input before its commentary while receipt reconciliation is delayed', async () => {
+    const f = fixture(), request = await acceptRequest(f); await running(f, request);
+    comment(f, 'before-own-input'); await f.engine.settled();
+    const receipt = deferred<RequestLocation>(); f.codex.findSteerReceipt.mockImplementationOnce(async () => receipt.promise);
+    const input = f.engine.receive(f.message('slack', 'own-followup', { text: 'Use release branch' }));
+    await vi.waitFor(() => expect(f.codex.findSteerReceipt).toHaveBeenCalled());
+    comment(f, 'after-own-input');
+    await vi.waitFor(() => expect(saved(f, request).segments?.at(-1)?.steps?.some(step => step.text === 'after-own-input')).toBe(true));
+    expect(saved(f, request).segments?.map(segment => segment.steps?.map(step => step.text))).toEqual([['before-own-input'], ['after-own-input']]);
+    receipt.resolve({ state: 'running', turnId: 'turn-1' }); await input; await f.engine.settled();
+    expect(saved(f, request).segments).toHaveLength(2);
+  });
+
+  it('recovers ordered history boundaries after restart and ignores unplaced old commentary', async () => {
+    const f = fixture(), request = await acceptRequest(f); await running(f, request);
+    const first = { id: 'turn-1:first', text: 'Before question' }, second = { id: 'turn-1:second', text: 'After answer' };
+    f.codex.locations.set(request.id, { state: 'running', turnId: 'turn-1', commentary: [first, second], publicHistory: [
+      { step: first }, { boundary: 'question:q1' }, { boundary: 'answer:q1' }, { step: second },
+    ] });
+    await f.engine.reconcile(request.id); await f.engine.settled();
+    expect(saved(f, request).segments?.map(segment => segment.steps)).toEqual([[first], [second]]);
+    await f.engine.stop(); f.store.close();
+    const next = fixture({ path: f.path, start: false }); next.codex.locations.set(request.id, { state: 'running', turnId: 'turn-1', commentary: [
+      { id: 'turn-1:unplaced', text: 'Cannot prove which old stage owns this' }, first, second,
+    ] });
+    next.engine.start(); await next.engine.reconcile(request.id); await next.engine.settled();
+    expect(saved(next, request).segments?.map(segment => segment.steps)).toEqual([[first], [second]]);
+    expect(saved(next, request).boundaries).toEqual(['question:q1', 'answer:q1']);
   });
 });
