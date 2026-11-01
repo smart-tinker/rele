@@ -470,6 +470,44 @@ describe('Slack question choices and forms', () => {
     }
     expect(calls.some(call => call.url.endsWith('/chat.postMessage'))).toBe(false);
   });
+
+  it('refreshes canonical rich-text answer markers and their question without reposting or resubmitting', async () => {
+    const approval = questionApproval(), messages = new Map<string, Record<string, any>[]>();
+    const { channel, calls, action } = await makeChannel({ question: () => approval, api: (method, body) => {
+      if (method !== 'chat.postMessage' && method !== 'chat.update') return;
+      const blocks = body.blocks as Record<string, any>[];
+      const ts = method === 'chat.postMessage' ? `1000.${2000 + messages.size}` : String(body.ts);
+      if (method === 'chat.update' && messages.get(ts)?.some(block => block.type === 'rich_text')
+        && !blocks.some(block => block.type === 'rich_text')) return Response.json({ ok: false, error: 'block_mismatch' });
+      // Slack stores a posted Markdown marker as rich_text and restricts later block-type replacement.
+      messages.set(ts, blocks.map(block => block.type === 'markdown' ? { type: 'rich_text', elements: [
+        { type: 'rich_text_section', elements: [{ type: 'text', text: block.text }] },
+      ] } : block));
+      return Response.json({ ok: true, channel: body.channel, ts });
+    } });
+    const prompt = questionDelivery(approval), questionTs = await channel.deliver(prompt, approval);
+    const markerTs = await channel.deliver({ ...delivery(), key: `question-answer:${approval.id}`,
+      body: 'Ответ получен. Проверяется отправка в Codex.' });
+    expect(messages.get(markerTs)?.[0].type).toBe('rich_text');
+    const input = { ...prompt, status: 'sent' as const, remoteMessageId: questionTs };
+    const resolution = { source: 'slack' as const, senderName: 'Анна <@UPEER>', answers: { branch: ['main'] }, answerMarkerTs: markerTs };
+    for (const decision of ['queued', 'sending', 'uncertain', 'accept', 'accept']) {
+      await expect(channel.updateApproval(input, { ...approval, status: 'answered', decision }, resolution)).resolves.toBeUndefined();
+      const marker = messages.get(markerTs)!;
+      expect(marker).toEqual([{ type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: expect.any(String) }] }] }]);
+      const text = marker[0].elements[0].elements[0].text;
+      if (decision === 'uncertain') expect(text).not.toContain('Анна');
+      else expect(text).toContain('Анна <@UPEER>');
+      expect(messages.get(questionTs)?.some(block => block.type === 'actions')).toBe(false);
+    }
+    const updates = calls.filter(call => call.url.endsWith('/chat.update')).map(call => JSON.parse(String(call.init!.body)));
+    expect(updates.map(body => body.ts)).toEqual(Array.from({ length: 5 }, () => [markerTs, questionTs]).flat());
+    expect(updates.at(-2)).toMatchObject({ text: 'Ответ отправлен в Codex\nОтветил(а): Анна &lt;@UPEER&gt;',
+      mrkdwn: false, parse: 'none', link_names: false });
+    expect(calls.filter(call => call.url.endsWith('/chat.postMessage'))).toHaveLength(2);
+    expect(messages.size).toBe(2);
+    expect(action).not.toHaveBeenCalled();
+  });
 });
 
 describe('Slack native task progress', () => {

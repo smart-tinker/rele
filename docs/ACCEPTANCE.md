@@ -126,6 +126,12 @@ pending, sending, confirmed, uncertain, native закрытие и длинны�
 открытыми; API/unit/compiled-synthetic PASS их не заменяет.
 
 
+## RC7: обновление маркера после настоящего ответа Slack
+
+- [ ] Slack преобразует опубликованный Markdown-маркер в rich_text. Его обновление сохраняет этот тип: rich_text → rich_text_section → plain text leaf; rich_text нельзя заменить context-блоком ([chat.update](https://docs.slack.dev/reference/methods/chat.update/)).
+- [ ] После короткой кнопки и modal submit маркер получает подтверждённый статус, а старый вопрос становится компактной read-only карточкой. Обновление существующих RC6 receipts после перезапуска не повторяет input/native RPC и не создаёт новые сообщения.
+- [ ] Сохранены actor/secret/uncertain guards, точные ответы, порядок этапов и отдельный итог. Реалистичный transport fixture отклоняет несовместимую замену block types.
+
 ## Несколько источников и автосоздание rc.9
 
 - [ ] Связать два Telegram и два Slack обсуждения с одним исходным Codex-тредом; ответы приходят только в свой origin, контекст общий, очередь последовательна.
