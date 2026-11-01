@@ -607,6 +607,56 @@ describe('Engine initial instruction and same-source steering', () => {
     expect(f.codex.injectContext).toHaveBeenCalledTimes(contextCount);
   });
 
+  it.each([false, true])('reconciles backfill steering with late real ingress and releases the queue once (legacy restart=%s)', async legacyRestart => {
+    const f = fixture(), root = await acceptRequest(f); await running(f, root);
+    const late = f.message('slack', 'late-real-ingress');
+    const source = { endpointId: late.endpoint.id, accountId: late.endpoint.accountId, chatId: late.endpoint.chatId,
+      threadId: late.endpoint.threadId, messageId: late.messageId, sender: late.sender, text: late.text,
+      payload: { text: late.text }, kind: 'message' as const };
+    const entry = f.store.recordSlackMessage(source)!;
+    f.codex.steer.mockImplementationOnce(async (_thread, _text, id, turnId) => {
+      await f.engine.receive({ ...late, slack: source });
+      f.codex.locations.set(id, { state: 'running', turnId });
+      if (legacyRestart) throw new CodexTransportError('Lost ACK after late ingress');
+      return { turnId };
+    });
+    await f.engine.pump(); await f.engine.settled();
+    const child = f.store.listRequests().find(value => value.eventId === late.eventId)!;
+    expect(f.codex.steer.mock.calls.map(call => call[2])).toEqual([entry.id]);
+    let active = f;
+    if (legacyRestart) {
+      await f.engine.stop();
+      const oldInput = { ...f.store.getSteeringInput(entry.id)!, state: 'sending' as const };
+      delete oldInput.requestId;
+      f.store.setMeta(`steering-input:${entry.id}`, JSON.stringify(oldInput));
+      f.store.close();
+      const old = new DatabaseSync(f.path);
+      old.prepare("UPDATE requests SET status='queued',turn_id=NULL WHERE id=?").run(child.id);
+      old.close();
+      active = fixture({ path: f.path, start: false });
+      active.codex.locations.set(entry.id, { state: 'completed', turnId: 'turn-1' });
+      active.codex.locations.set(root.id, { state: 'completed', turnId: 'turn-1', text: 'One combined final' });
+      active.engine.start();
+      await active.engine.pump(); await active.engine.settled();
+      expect(active.codex.steer).not.toHaveBeenCalled();
+      expect(active.codex.injectContext).not.toHaveBeenCalled();
+    } else {
+      f.codex.complete(root.id, 'One combined final');
+      await f.engine.settled(); await f.engine.pump();
+    }
+    await active.engine.pump(); await active.engine.settled();
+    expect(active.store.getSteeringInput(entry.id)).toMatchObject({ id: entry.id, requestId: child.id, state: 'applied' });
+    expect(active.store.getRequest(child.id)).toMatchObject({ status: 'completed', steeredInto: root.id, turnId: 'turn-1' });
+    expect(active.store.getRequest(root.id)?.status).toBe('completed');
+    expect(active.store.listDeliveries().filter(value => value.requestId === child.id)).toEqual([]);
+    expect(active.slack.deliver.mock.calls.filter(([value]) => value.kind === 'answer')).toHaveLength(1);
+    await active.engine.pump(); await active.engine.settled();
+    expect(active.slack.deliver.mock.calls.filter(([value]) => value.kind === 'answer')).toHaveLength(1);
+    const next = await acceptRequest(active, 'slack', 'after-late-ingress');
+    expect(active.codex.enqueue.mock.calls.filter(call => call[2] === next.id)).toHaveLength(1);
+    expect(active.codex.enqueue.mock.calls.some(call => call[2] === child.id)).toBe(false);
+  });
+
   it('waits for the persisted steering receipt even after an ACK before delivering the combined final', async () => {
     const f = fixture(); const root = await acceptRequest(f); await running(f, root);
     f.codex.steer.mockImplementationOnce(async (_thread, _text, _id, turnId) => ({ turnId }));

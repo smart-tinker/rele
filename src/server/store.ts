@@ -947,10 +947,17 @@ export class Store {
     const id = randomUUID();
     this.db.prepare(`INSERT INTO requests (id,conversation_id,event_id,origin,text,audio,status,created_at,updated_at) VALUES (?,?,?,?,?,?,'queued',?,?)`)
       .run(id, binding.conversationId, message.eventId, JSON.stringify(origin), message.text, message.audio ? JSON.stringify(message.audio) : null, now, now);
-    if (message.slack) this.recordSlackMessageInside(message.slack, id);
-    else this.db.prepare(`UPDATE slack_sync_entries SET request_id=? WHERE message_id=? AND stream_id IN
-      (SELECT id FROM slack_sync_streams WHERE endpoint_id=? AND conversation_id=?)`).run(id, message.messageId, endpoint.id, binding.conversationId);
     this.db.prepare('UPDATE inbound_events SET request_id=? WHERE platform=? AND account_id=? AND event_id=?').run(id, endpoint.platform, endpoint.accountId, message.eventId);
+    const entry = this.recordSlackMessageInside(saved.slack ?? { platform: endpoint.platform, endpointId: endpoint.id,
+      accountId: endpoint.accountId, chatId: endpoint.chatId, threadId: endpoint.threadId, messageId: message.messageId,
+      sender: saved.sender, text: saved.text, payload: { text: saved.text, ...(saved.audio ? { audio: saved.audio } : {}) }, kind: 'message' }, id);
+    if (entry) {
+      const members = this.listSlackSyncReceiptEntries(entry.id).map(value => value.id);
+      for (const row of this.db.prepare(`SELECT value FROM meta WHERE key LIKE 'steering-input:%'
+        AND json_extract(value,'$.entryId') IN (SELECT value FROM json_each(?))`).all(JSON.stringify(members))) {
+        this.attachLateSteeringRequest(JSON.parse(row.value as string) as SteeringInput);
+      }
+    }
     return this.getRequest(id)!;
   }
   ingest(message: InboundMessage, auto?: { rule: AutoLinkRule; targetFingerprint: string }): { request: ReleRequest | null; duplicate: boolean; autoLinkIntent?: AutoLinkIntent } {
@@ -1099,7 +1106,8 @@ export class Store {
     return this.transaction(() => {
       const row = this.db.prepare(`SELECT r.id FROM requests r JOIN conversations c ON c.id=r.conversation_id
         WHERE r.conversation_id=? AND r.status='queued' AND c.paused=0 AND (? IS NULL OR r.id=?)
-        AND NOT EXISTS(SELECT 1 FROM meta m WHERE m.key='steering-input:'||r.id AND json_extract(m.value,'$.state')<>'refused')
+        AND NOT EXISTS(SELECT 1 FROM meta m WHERE m.key LIKE 'steering-input:%'
+          AND (m.key='steering-input:'||r.id OR json_extract(m.value,'$.requestId')=r.id) AND json_extract(m.value,'$.state')<>'refused')
         AND NOT EXISTS(SELECT 1 FROM requests active WHERE active.conversation_id=r.conversation_id AND active.status IN (${BLOCKING_REQUESTS}))
         ORDER BY r.rowid LIMIT 1`).get(conversationId, requestId ?? null, requestId ?? null);
       if (!row) return undefined;
@@ -1132,12 +1140,52 @@ export class Store {
     });
   }
   getSteeringInput(id: string): SteeringInput | undefined {
-    const raw = this.getMeta(`steering-input:${id}`);
+    const direct = this.getMeta(`steering-input:${id}`);
+    const raw = direct ?? this.db.prepare(`SELECT value FROM meta WHERE key LIKE 'steering-input:%'
+      AND json_extract(value,'$.requestId')=?`).get(id)?.value as string | undefined;
     if (!raw) return;
     const input = JSON.parse(raw) as SteeringInput;
-    if (!input || input.id !== id || !input.parentRequestId || !input.turnId || typeof input.text !== 'string'
+    if (!input || input.id !== id && (direct !== undefined || input.requestId !== id) || !input.parentRequestId || !input.turnId || typeof input.text !== 'string'
       || !['sending', 'uncertain', 'applied', 'refused'].includes(input.state)) throw new Error('Invalid steering input receipt');
     return input;
+  }
+  private attachLateSteeringRequest(input: SteeringInput): SteeringInput {
+    if (input.requestId || !input.entryId || input.id !== input.entryId || input.approvalId) return input;
+    const entries = this.listSlackSyncReceiptEntries(input.entryId), entry = entries[0];
+    const requestIds = [...new Set(entries.flatMap(value => value.requestId ? [value.requestId] : []))];
+    if (!entry || requestIds.length !== 1) return input;
+    const row = this.db.prepare('SELECT * FROM requests WHERE id=?').get(requestIds[0]);
+    const child = row && toRequest(row), parentRow = this.db.prepare('SELECT * FROM requests WHERE id=?').get(input.parentRequestId);
+    const parent = parentRow && toRequest(parentRow), stream = this.getSlackSyncStream(entry.streamId);
+    const receipt = child && this.db.prepare('SELECT payload FROM inbound_events WHERE request_id=?').get(child.id);
+    const saved = receipt && json<InboundMessage>(receipt.payload);
+    if (!child || !parent || !stream || !saved || child.id === parent.id || child.status !== 'queued' || child.audio
+      || child.turnId || child.queuedSubmissionId || parent.turnId !== input.turnId
+      || child.conversationId !== parent.conversationId || stream.conversationId !== parent.conversationId
+      || saved.eventId !== child.eventId || saved.text !== child.text || saved.sender.id !== child.origin.senderId
+      || this.db.prepare(`SELECT 1 FROM meta WHERE key LIKE 'steering-input:%' AND key<>?
+        AND (key=? OR json_extract(value,'$.requestId')=? OR json_extract(value,'$.entryId') IN (SELECT value FROM json_each(?)))`)
+        .get(`steering-input:${input.id}`, `steering-input:${child.id}`, child.id, JSON.stringify(entries.map(value => value.id)))) return input;
+    const original = saved.slack ?? { platform: saved.endpoint.platform, endpointId: saved.endpoint.id, accountId: saved.endpoint.accountId,
+      chatId: saved.endpoint.chatId, threadId: saved.endpoint.threadId, messageId: saved.messageId, sender: saved.sender,
+      text: saved.text, payload: { text: saved.text }, kind: 'message' as const };
+    const sameSource = (source: Pick<Origin, 'platform' | 'accountId' | 'chatId' | 'threadId'> & { endpointId?: string; id?: string }) =>
+      source.platform === stream.platform && source.accountId === stream.accountId && source.chatId === stream.chatId
+      && source.threadId === stream.threadId && (source.endpointId ?? source.id) === stream.endpointId;
+    if (!sameSource(parent.origin) || !sameSource(child.origin) || !sameSource(saved.endpoint)
+      || saved.messageId !== child.origin.messageId || entries.some(value => value.streamId !== entry.streamId
+        || value.messageId !== child.origin.messageId || value.message.messageId !== value.messageId
+        || !sameSource({ ...value.message, platform: value.message.platform ?? stream.platform })
+        || value.message.sender.id !== child.origin.senderId || value.message.text !== child.text
+        || slackSourceRevision(value.message) !== slackSourceRevision(original))) return input;
+    // Preserve the native client UUID: late ingress adds ownership, never another send.
+    const next = { ...input, requestId: child.id }, now = new Date().toISOString();
+    this.setMeta(`steering-input:${input.id}`, JSON.stringify(next));
+    this.db.prepare(`UPDATE slack_sync_entries SET request_id=? WHERE id IN (SELECT value FROM json_each(?))`)
+      .run(child.id, JSON.stringify(entries.map(value => value.id)));
+    this.db.prepare('UPDATE requests SET status=?,turn_id=?,error=?,updated_at=? WHERE id=?')
+      .run(input.state === 'applied' ? 'completed' : 'queued', input.state === 'refused' ? null : input.turnId, input.error ?? null, now, child.id);
+    return next;
   }
   beginAsyncQuestionAnswer(approvalId: string, text: string): { input?: SteeringInput; request?: ReleRequest } {
     return this.transaction(() => {
@@ -1253,22 +1301,27 @@ export class Store {
   }
   finishSteeringInput(id: string, outcome: 'applied' | 'refused' | 'uncertain', error?: string): SteeringInput {
     return this.transaction(() => {
-      const input = this.getSteeringInput(id);
+      const found = this.getSteeringInput(id);
+      const input = found && this.attachLateSteeringRequest(found);
       if (!input || !['applied', 'refused', 'uncertain'].includes(outcome)) throw new Error('Steering input receipt not found');
       if (input.state === 'applied' || input.state === 'refused') {
         if (input.state !== outcome) throw new Error('A final steering receipt cannot change its outcome');
         return input;
       }
       const entry = input.entryId && this.getSlackSyncEntry(input.entryId);
-      if (input.entryId && (!entry || entry.requestId !== input.requestId)) throw new Error('Steering journal association changed; reconcile without replay');
+      const entries = entry ? this.listSlackSyncReceiptEntries(entry.id) : [];
+      if (input.entryId && (!entry || entry.requestId !== input.requestId || entries.some(value => value.requestId && value.requestId !== input.requestId))) {
+        throw new Error('Steering journal association changed; reconcile without replay');
+      }
       const next: SteeringInput = { ...input, state: outcome, ...(error ? { error } : {}) };
       if (!error) delete next.error;
-      this.setMeta(`steering-input:${id}`, JSON.stringify(next));
+      this.setMeta(`steering-input:${input.id}`, JSON.stringify(next));
       const now = new Date().toISOString();
       if (input.requestId) this.db.prepare('UPDATE requests SET status=?,turn_id=?,error=?,updated_at=? WHERE id=?')
         .run(outcome === 'applied' ? 'completed' : 'queued', outcome === 'refused' ? null : input.turnId, error ?? null, now, input.requestId);
-      if (entry) this.db.prepare('UPDATE slack_sync_entries SET state=?,error=?,retry_at=NULL,updated_at=? WHERE id=?')
-        .run(outcome === 'applied' ? 'applied' : outcome === 'refused' ? 'pending' : 'uncertain', error ?? null, now, entry.id);
+      if (entry) this.db.prepare(`UPDATE slack_sync_entries SET state=?,error=?,retry_at=NULL,updated_at=? WHERE id IN (SELECT value FROM json_each(?))`)
+        .run(outcome === 'applied' ? 'applied' : outcome === 'refused' ? 'pending' : 'uncertain', error ?? null, now,
+          JSON.stringify(entries.map(value => value.id)));
       return next;
     });
   }
@@ -1473,7 +1526,7 @@ export class Store {
     return this.transaction(() => {
       const now = new Date().toISOString();
       for (const row of this.db.prepare("SELECT key FROM meta WHERE key LIKE 'steering-input:%'").all()) {
-        const input = this.getSteeringInput((row.key as string).slice('steering-input:'.length))!;
+        const input = this.attachLateSteeringRequest(this.getSteeringInput((row.key as string).slice('steering-input:'.length))!);
         if (input.state !== 'sending') continue;
         const error = 'Steering acknowledgement interrupted; reconcile without replay';
         this.setMeta(`steering-input:${input.id}`, JSON.stringify({ ...input, state: 'uncertain', error }));
