@@ -467,7 +467,7 @@ test('automatic version policy separates the supported selection from the newest
   await openPanel(page);
   await page.getByRole('navigation').getByRole('button', { name: 'Codex', exact: true }).click();
   await expect(page.getByText('Работающий сервер: 0.164.0-alpha.11.1. Выбрана версия: 0.165.0-alpha.1.2.', { exact: true })).toBeVisible();
-  await expect(page.getByText('Новейший установленный Desktop: 9.0.0.', { exact: true })).toBeVisible();
+  await expect(page.getByText('Новейшая найденная установка Codex: 9.0.0.', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Подготовить обновление', exact: true })).toBeEnabled();
   await page.getByText('Настройки подключения', { exact: true }).click();
   await page.getByRole('radio', { name: /^Выбрать конкретную версию/u }).check();
