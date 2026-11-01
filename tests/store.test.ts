@@ -883,6 +883,104 @@ describe('durable addressed steering inputs', () => {
     expect(store.listRequests()).toHaveLength(1);
     expect(store.listDeliveries()).toEqual([]);
   });
+
+  it.each(['sending', 'uncertain', 'applied', 'refused'] as const)('attaches late ingress to the original %s context steering receipt', state => {
+    const { store, ep, conv, parent } = running();
+    const source = transcript(ep, '1770000002.000001', { text: 'Late addressed message', payload: { text: 'Late addressed message' } });
+    const entry = store.recordSlackMessage(source)!;
+    const input = store.beginSteeringInput(parent.id, { id: entry.id, entryId: entry.id, text: 'Quoted late message' });
+    if (state !== 'sending') store.finishSteeringInput(input.id, state);
+    const child = store.ingest(transcriptInbound(source, { endpoint: ep })).request!;
+    expect(store.getSteeringInput(child.id)).toMatchObject({ id: input.id, requestId: child.id, state });
+    expect(store.steeringInputs(parent.id).map(value => value.id)).toEqual([input.id]);
+    expect(store.getRequest(child.id)).toMatchObject(state === 'refused' ? { status: 'queued' }
+      : { status: state === 'applied' ? 'completed' : 'uncertain', steeredInto: parent.id, turnId: input.turnId });
+    if (state === 'sending' || state === 'uncertain') store.finishSteeringInput(input.id, 'applied');
+    store.updateRequest(parent.id, { status: 'completed' });
+    expect(store.claimNextRequest(conv.id, child.id)?.id).toBe(state === 'refused' ? child.id : undefined);
+    expect(store.listDeliveries()).toEqual([]);
+    expect(store.ingest(transcriptInbound(source, { endpoint: ep })).duplicate).toBe(true);
+  });
+
+  it('associates plain ingress only with its original semantic revision', () => {
+    const { store, ep, parent } = running();
+    const source = transcript(ep, '1770000002.000001', { text: 'Original', payload: { text: 'Original' } });
+    const original = store.recordSlackMessage(source)!;
+    const input = store.beginSteeringInput(parent.id, { id: original.id, entryId: original.id, text: 'Quoted original' });
+    const edited = store.recordSlackMessage({ ...source, kind: 'edit', text: 'Edited', payload: { text: 'Edited', edited: { ts: '1770000003.000001' } } })!;
+    const child = store.ingest(transcriptInbound(source, { endpoint: ep, slack: undefined })).request!;
+    expect(store.getSteeringInput(child.id)?.id).toBe(input.id);
+    expect(store.getSlackSyncEntry(edited.id)).toMatchObject({ state: 'pending', requestId: undefined });
+    store.finishSteeringInput(input.id, 'applied');
+    expect(store.getSlackSyncEntry(original.id)?.state).toBe('applied');
+    expect(store.getSlackSyncEntry(edited.id)?.state).toBe('pending');
+  });
+
+  it('recovers the persisted old association mismatch through a canonical alias without replacing the native UUID', () => {
+    const path = join(directory(), 'late-ingress.sqlite'), { store, ep, conv, parent } = running(path);
+    const source = transcript(ep, '1770000002.000001');
+    const entry = store.recordSlackMessage(source)!;
+    const input = store.beginSteeringInput(parent.id, { id: entry.id, entryId: entry.id, text: 'Quoted original' });
+    const child = store.ingest(transcriptInbound(source, { endpoint: ep })).request!;
+    store.close();
+    const old = new DatabaseSync(path), canonical = '22222222-2222-4222-8222-222222222222';
+    old.prepare('UPDATE meta SET value=? WHERE key=?').run(JSON.stringify(input), `steering-input:${input.id}`);
+    old.prepare("UPDATE requests SET status='queued',turn_id=NULL WHERE id=?").run(child.id);
+    old.prepare(`INSERT INTO slack_sync_entries(id,stream_id,message_id,message_order,revision,semantic_revision,message,request_id,state,created_at,updated_at,canonical_entry_id)
+      SELECT ?,stream_id,message_id,message_order,'legacy-envelope',semantic_revision,message,request_id,state,created_at,updated_at,id FROM slack_sync_entries WHERE id=?`).run(canonical, entry.id);
+    old.prepare('UPDATE slack_sync_entries SET canonical_entry_id=?,request_id=NULL WHERE id=?').run(canonical, entry.id);
+    old.prepare('UPDATE slack_sync_entries SET canonical_entry_id=NULL WHERE id=?').run(canonical);
+    old.close();
+    const restarted = open(path); restarted.recoverInterrupted();
+    expect(restarted.getSteeringInput(child.id)).toMatchObject({ id: input.id, requestId: child.id, state: 'uncertain' });
+    expect(restarted.listPendingRequests()).toEqual([]);
+    expect(restarted.claimNextRequest(conv.id, child.id)).toBeUndefined();
+    expect(restarted.claimSlackSyncEntry(canonical)).toBeUndefined();
+    const unrelated = restarted.ingest(message(ep, 'unrelated', { sender: ep.people[0] })).request!;
+    restarted.updateSlackSyncEntry(canonical, { requestId: unrelated.id });
+    expect(() => restarted.finishSteeringInput(input.id, 'applied')).toThrow(/association changed/);
+    expect(restarted.getRequest(unrelated.id)?.status).toBe('queued');
+    restarted.updateSlackSyncEntry(canonical, { requestId: child.id });
+    restarted.finishSteeringInput(input.id, 'applied');
+    expect(restarted.getRequest(child.id)).toMatchObject({ status: 'completed', steeredInto: parent.id });
+    expect(restarted.listSlackSyncReceiptEntries(entry.id).map(value => value.state)).toEqual(['applied', 'applied']);
+    expect(restarted.listDeliveries()).toEqual([]);
+  });
+
+  it.each(['source', 'conversation', 'revision', 'sender', 'turn', 'started', 'ownership'] as const)('refuses to repair a late association with different %s provenance', mismatch => {
+    const { store, ep, conv, parent } = running();
+    const source = transcript(ep, '1770000002.000001');
+    const entry = store.recordSlackMessage(source)!;
+    const input = store.beginSteeringInput(parent.id, { id: entry.id, entryId: entry.id, text: 'Quoted original' });
+    const other = mismatch === 'source' || mismatch === 'conversation' ? { ...ep, id: 'other-endpoint', chatId: 'OTHER' } : ep;
+    if (other !== ep) {
+      store.upsertEndpoint(other);
+      if (mismatch === 'conversation') conversation(store, other, 'another-native-thread');
+      else store.addBinding(conv.id, 'slack', other.id, []);
+      store.setSourceAccess(other.id, { mode: 'all' });
+    }
+    const childSource = { ...source, endpointId: other.id, chatId: other.chatId,
+      ...(mismatch === 'revision' ? { payload: { ...source.payload, files: [{ id: 'different-content' }] } } : {}),
+      ...(mismatch === 'sender' ? { sender: { id: 'UOTHER', name: 'Other author' } } : {}) };
+    const child = store.ingest(transcriptInbound(childSource, { endpoint: other })).request!;
+    // Recreate the pre-fix journal mismatch, never mutating a real application database.
+    store.setMeta(`steering-input:${input.id}`, JSON.stringify(input));
+    if (mismatch === 'conversation') {
+      // The public API already rejects a cross-conversation journal association.
+      expect(() => store.updateSlackSyncEntry(entry.id, { requestId: child.id })).toThrow(/another conversation/);
+      return;
+    }
+    store.updateRequest(child.id, { turnId: mismatch === 'started' ? 'another-turn' : undefined });
+    store.updateSlackSyncEntry(entry.id, { requestId: child.id });
+    if (mismatch === 'turn') store.updateRequest(parent.id, { turnId: 'another-parent-turn' });
+    if (mismatch === 'ownership') {
+      const competing = '33333333-3333-4333-8333-333333333333';
+      store.setMeta(`steering-input:${competing}`, JSON.stringify({ ...input, id: competing }));
+    }
+    expect(() => store.finishSteeringInput(input.id, 'applied')).toThrow(/association changed/);
+    expect(store.getSteeringInput(input.id)?.requestId).toBeUndefined();
+    expect(store.listDeliveries()).toEqual([]);
+  });
 });
 
 describe('durable async question answers', () => {
