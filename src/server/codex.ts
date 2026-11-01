@@ -529,10 +529,7 @@ export class CodexClient extends EventEmitter {
     let cursor: string | undefined;
     const seen = new Set<string>();
     do {
-      // shortcut: page full turns separately; use item pagination if one turn exceeds the frame limit.
-      const page = await this.call<Page<HistoryTurn>>('thread/turns/list', {
-        threadId, limit: 1, itemsView: 'full', sortDirection: 'desc', ...(cursor ? { cursor } : {}),
-      });
+      const page = await this.receiptPage(threadId, cursor);
       const matches = page.data.filter(turn => turn.items.some(item => item.type === 'userMessage' && item.clientId === clientId));
       if (matches.length > 1) throw new Error('В истории Codex несколько ходов с одним clientId; требуется ручная сверка.');
       if (matches.length) {
@@ -602,9 +599,7 @@ export class CodexClient extends EventEmitter {
     let cursor: string | undefined;
     const seen = new Set<string>();
     do {
-      const page = await this.call<Page<HistoryTurn>>('thread/turns/list', {
-        threadId, limit: 1, itemsView: 'full', sortDirection: 'desc', ...(cursor ? { cursor } : {}),
-      });
+      const page = await this.receiptPage(threadId, cursor);
       const matches = page.data.filter(turn => turn.items.some(item => item.type === 'userMessage' && item.clientId === clientId));
       if (matches.length) {
         if (matches.length !== 1 || matches[0].items.filter(item => item.type === 'userMessage' && item.clientId === clientId).length !== 1) {
@@ -618,6 +613,36 @@ export class CodexClient extends EventEmitter {
       cursor = nextPage(page.nextCursor, seen);
     } while (cursor);
     return { state: 'not_found' };
+  }
+
+  private async receiptPage(threadId: string, cursor?: string): Promise<Page<HistoryTurn>> {
+    const runtime = this.runtime;
+    const unconfirmed = () => new CodexTransportError('Codex не подтвердил историю запроса. Ожидается сверка без повторной отправки.', 'request-history-unconfirmed');
+    const page = await this.call<Page<HistoryTurn>>('thread/turns/list', {
+      threadId, limit: 1, itemsView: 'notLoaded', sortDirection: 'desc', ...(cursor ? { cursor } : {}),
+    });
+    if (runtime !== this.runtime || !this.state.connected || !page || !Array.isArray(page.data)
+      || page.nextCursor != null && (typeof page.nextCursor !== 'string' || !page.nextCursor)) throw unconfirmed();
+    for (const turn of page.data) {
+      if (!turn || typeof turn.id !== 'string' || !turn.id) throw unconfirmed();
+      const items: HistoryItem[] = [], seen = new Set<string>();
+      let itemCursor: string | undefined;
+      do {
+        // shortcut: one native item can still exceed the frame limit; reconcile without replay if it does.
+        const itemPage = await this.call<Page<{ turnId: string; item: HistoryItem }>>('thread/items/list', {
+          threadId, turnId: turn.id, limit: 1, sortDirection: 'asc', ...(itemCursor ? { cursor: itemCursor } : {}),
+        });
+        if (runtime !== this.runtime || !this.state.connected || !itemPage || !Array.isArray(itemPage.data) || itemPage.data.length > 1
+          || itemPage.nextCursor != null && (typeof itemPage.nextCursor !== 'string' || !itemPage.nextCursor)) throw unconfirmed();
+        for (const entry of itemPage.data) {
+          if (!entry || entry.turnId !== turn.id || !entry.item || typeof entry.item.type !== 'string') throw unconfirmed();
+          items.push(entry.item);
+        }
+        itemCursor = nextPage(itemPage.nextCursor, seen);
+      } while (itemCursor);
+      turn.items = items;
+    }
+    return page;
   }
 
   private knownInputIds(clientId: string, ownInputIds: readonly string[]): Set<string> {

@@ -89,6 +89,30 @@ test('expired launch links offer manual sign-in and are never retried on reload'
   ).toBeVisible();
 });
 
+test('a connected Codex with a successful empty catalog shows the genuine empty state', async ({
+  page,
+}) => {
+  const api = await installApi(page, fixtureState(true));
+  let catalogReads = 0;
+  await page.route('**/api/threads?*', async (route) => {
+    catalogReads++;
+    await route.fulfill({ json: { threads: [] } });
+  });
+  await openPanel(page);
+  await page
+    .getByRole('navigation')
+    .getByRole('button', { name: 'Codex', exact: true })
+    .click();
+  await expect(
+    page.getByRole('heading', { name: 'Список разговоров пока пуст', exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText('Создайте разговор в Codex и обновите список.', { exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Codex не подключён', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'Не удалось загрузить разговоры', exact: true })).toHaveCount(0);
+  expect(catalogReads).toBeGreaterThan(0);
+  expect(api.mutations).toEqual([]);
+});
+
 test('disconnected and failing Codex catalogs never appear as empty and can recover', async ({
   page,
 }) => {

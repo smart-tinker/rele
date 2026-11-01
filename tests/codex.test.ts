@@ -112,6 +112,7 @@ async function managedFixture(options: {
 
 async function fixture(handlers: Record<string, Handler> = {}, codexHome?: string, options: NonNullable<ConstructorParameters<typeof CodexClient>[1]> = {}, autoPong = true) {
   const calls: Rpc[] = [], responses: Rpc[] = [], sockets: WebSocket[] = [];
+  const turnItems = new Map<string, unknown[]>();
   const server = new WebSocketServer({ host: '127.0.0.1', port: 0, autoPong });
   await once(server, 'listening');
   cleanup.push(async () => {
@@ -125,6 +126,11 @@ async function fixture(handlers: Record<string, Handler> = {}, codexHome?: strin
     'thread/resume': () => ({ thread: { ...rawThread, turns: [] } }),
     'thread/read': () => ({ thread: rawThread }),
     'thread/turns/list': () => ({ data: [], nextCursor: null }),
+    'thread/items/list': request => {
+      const items = turnItems.get(String(request.params.turnId)) ?? [], index = Number(request.params.cursor ?? 0);
+      return { data: items.slice(index, index + 1).map(item => ({ turnId: request.params.turnId, item })),
+        nextCursor: index + 1 < items.length ? String(index + 1) : null };
+    },
     'turn/interrupt': () => ({}),
   };
   server.on('connection', socket => {
@@ -136,7 +142,14 @@ async function fixture(handlers: Record<string, Handler> = {}, codexHome?: strin
       if (message.id === undefined) return;
       const handler = handlers[message.method] ?? defaults[message.method];
       if (!handler) { socket.send(JSON.stringify({ id: message.id, error: { code: -32601, message: `Unknown method ${message.method}` } })); return; }
-      const result = await handler(message, socket);
+      let result = await handler(message, socket);
+      if (message.method === 'thread/turns/list' && message.params.itemsView === 'notLoaded' && result && typeof result === 'object' && 'data' in result) {
+        const page = result as { data: { id: string; items?: unknown[] }[] };
+        result = { ...page, data: page.data.map(turn => {
+          turnItems.set(turn.id, turn.items ?? []);
+          return { ...turn, items: [] };
+        }) };
+      }
       if (result !== noResponse && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ id: message.id, result }));
     });
   });
@@ -1455,6 +1468,33 @@ describe('Codex managed runtime', () => {
 });
 
 describe('Codex addressed steering and own input receipts', () => {
+  it.each(['request', 'steer'])('reconciles a composite turn over 32 MiB using single-item %s receipt pages', async kind => {
+    const rootId = randomUUID(), clientId = randomUUID(), turnId = randomUUID();
+    const turn = { id: turnId, status: 'completed', items: [
+      { type: 'userMessage', clientId: rootId },
+      { type: 'agentMessage', id: 'progress', phase: 'commentary', text: 'Working' },
+      ...[0, 1, 2].map(index => ({ type: 'commandExecution', id: `command-${index}`, processId: String(123 + index),
+        status: 'completed', aggregatedOutput: 'x'.repeat(11 * 1024 * 1024) })),
+      { type: 'userMessage', clientId },
+      { type: 'agentMessage', phase: 'final_answer', text: 'Recovered answer' },
+    ] };
+    expect(Buffer.byteLength(JSON.stringify(turn))).toBeGreaterThan(32 * 1024 * 1024);
+    const f = await fixture({ 'thread/turns/list': () => ({ data: [turn], nextCursor: null }) });
+    await f.client.connect(); const before = f.calls.length;
+    const found = kind === 'request' ? await f.client.findRequest(threadId, rootId, [clientId])
+      : await f.client.findSteerReceipt(threadId, clientId, turnId, [rootId]);
+    expect(found).toMatchObject({ state: 'completed', turnId, text: 'Recovered answer',
+      commentary: [{ id: `${turnId}:progress`, text: 'Working' }],
+      commandItems: [0, 1, 2].map(index => ({ id: `command-${index}`, processId: String(123 + index), completed: true })),
+    });
+    expect(f.client.status().connected).toBe(true);
+    expect(f.calls.slice(before).filter(call => call.method === 'thread/turns/list').map(call => call.params))
+      .toEqual([{ threadId, limit: 1, itemsView: 'notLoaded', sortDirection: 'desc' }]);
+    expect(f.calls.slice(before).filter(call => call.method === 'thread/items/list').map(call => call.params))
+      .toEqual(turn.items.map((_item, index) => ({ threadId, turnId, limit: 1, sortDirection: 'asc', ...(index ? { cursor: String(index) } : {}) })));
+    expect(f.calls.some(call => ['thread/queue/add', 'thread/resume', 'turn/steer', 'turn/start'].includes(call.method ?? ''))).toBe(false);
+  });
+
   it.each(['request', 'steer'])('keeps the %s receipt connected when older full history would overflow a bulk frame', async kind => {
     const clientId = randomUUID(), turnId = randomUUID();
     const turn = { id: turnId, status: 'completed', items: [
@@ -1475,6 +1515,39 @@ describe('Codex addressed steering and own input receipts', () => {
       commandItems: [{ id: 'command-1', processId: '123', completed: true }] });
     expect(f.client.status().connected).toBe(true);
     expect(f.calls.some(call => ['thread/queue/add', 'thread/resume', 'turn/steer', 'turn/start'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it('keeps an oversized single item uncertain without repeating any mutation', async () => {
+    const clientId = randomUUID(), turnId = randomUUID();
+    const f = await fixture({ 'thread/turns/list': () => ({ data: [{ id: turnId, status: 'completed', items: [
+      { type: 'userMessage', clientId },
+      { type: 'commandExecution', id: 'oversized-command', aggregatedOutput: 'x'.repeat(33 * 1024 * 1024) },
+    ] }], nextCursor: null }) });
+    await f.client.connect();
+    await expect(f.client.findRequest(threadId, clientId)).rejects.toMatchObject({ uncertain: true });
+    expect(f.client.status().connected).toBe(false);
+    expect(f.calls.some(call => ['thread/queue/add', 'thread/resume', 'turn/steer', 'turn/start'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it.each(['request', 'steer'])('fails closed on malformed %s receipt item pages', async kind => {
+    const clientId = randomUUID(), turnId = randomUUID();
+    const f = await fixture({
+      'thread/turns/list': () => ({ data: [{ id: turnId, status: 'completed', items: [] }], nextCursor: null }),
+      'thread/items/list': () => ({ data: [{ turnId: 'another-turn', item: { type: 'userMessage', clientId } }], nextCursor: null }),
+    });
+    await f.client.connect();
+    const found = kind === 'request' ? f.client.findRequest(threadId, clientId) : f.client.findSteerReceipt(threadId, clientId, turnId);
+    await expect(found).rejects.toMatchObject({ uncertain: true, code: 'request-history-unconfirmed' });
+  });
+
+  it('stops a repeated item cursor without claiming an absent receipt', async () => {
+    const clientId = randomUUID(), turnId = randomUUID();
+    const f = await fixture({
+      'thread/turns/list': () => ({ data: [{ id: turnId, status: 'completed', items: [] }], nextCursor: null }),
+      'thread/items/list': () => ({ data: [], nextCursor: 'repeated' }),
+    });
+    await f.client.connect();
+    await expect(f.client.findRequest(threadId, clientId)).rejects.toThrow('курсор');
   });
 
   it('steers the exact expected turn once and preserves an early native input receipt', async () => {
@@ -1589,7 +1662,7 @@ describe('Codex addressed steering and own input receipts', () => {
     expect(await f.client.findSteerReceipt(threadId, clientId, 'expected-turn')).toEqual({ state: 'not_found' });
     present = true;
     expect(await f.client.findSteerReceipt(threadId, clientId, 'expected-turn')).toMatchObject({ state: 'running', turnId: 'expected-turn' });
-    expect(f.calls.slice(before).every(call => call.method === 'thread/turns/list')).toBe(true);
+    expect(f.calls.slice(before).every(call => ['thread/turns/list', 'thread/items/list'].includes(call.method ?? ''))).toBe(true);
   });
 });
 
