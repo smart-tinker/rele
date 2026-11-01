@@ -618,7 +618,9 @@ export class SlackChannel implements Channel {
       const actor = resolution.source !== 'codex' && approval.decision !== 'uncertain' && !approval.questions.some(question => question.isSecret) ? resolution.senderName : undefined;
       const text = `${resolvedQuestionStatus(approval, resolution)}${actor ? `\nОтветил(а): ${actor}` : ''}`;
       const marker = await this.api('chat.update', { channel: delivery.origin.chatId, ts: resolution.answerMarkerTs,
-        text: escapeSlackText(text), blocks: [{ type: 'context', elements: [{ type: 'plain_text', text }] }],
+        text: escapeSlackText(text), blocks: [{ type: 'rich_text', elements: [
+          { type: 'rich_text_section', elements: [{ type: 'text', text }] },
+        ] }],
         mrkdwn: false, parse: 'none', link_names: false }, this.botToken, true);
       if (marker.channel !== delivery.origin.chatId || marker.ts !== resolution.answerMarkerTs) throw new ChannelError('Slack не подтвердил обновление маркера ответа.', true, false);
     }
