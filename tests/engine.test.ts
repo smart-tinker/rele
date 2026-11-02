@@ -11,7 +11,7 @@ import { INITIAL_RELE_MESSAGE, requestInput } from '../src/server/inbound-contex
 import { initialMessageKey } from '../src/server/initial-message.js';
 import { ASYNC_QUESTION_METHOD, asyncQuestions, encodeAsyncAnswers } from '../src/server/async-questions.js';
 import { defaultConfig } from '../src/server/config.js';
-import { CodexRpcError, CodexSteerRefusedError, CodexThreadBusyError, CodexTransportError, type CodexNotification, type CodexServerRequest, type RequestLocation } from '../src/server/codex.js';
+import { CodexClient, CodexRpcError, CodexSteerRefusedError, CodexThreadBusyError, CodexTransportError, type CodexNotification, type CodexServerRequest, type RequestLocation } from '../src/server/codex.js';
 import { ChannelError, type ApprovalAction, type Channel } from '../src/server/channels/common.js';
 import type { Approval, CodexConnectionState, Delivery, Endpoint, InboundMessage, MessageToolReceipt, Platform, ReleRequest } from '../src/shared/types.js';
 
@@ -50,7 +50,7 @@ class FakeCodex extends EventEmitter implements CodexGateway {
     this.locations.set(clientId, text === INITIAL_RELE_MESSAGE ? { state: 'completed', turnId: `initial-${clientId}`, text: 'NOREPLY' } : { state: 'queued', queuedSubmissionId });
     return { queuedSubmissionId };
   });
-  findRequest = vi.fn(async (_threadId: string, clientId: string): Promise<RequestLocation> => this.locations.get(clientId) ?? { state: 'not_found' });
+  findRequest = vi.fn(async (_threadId: string, clientId: string, _ownInputIds: readonly string[] = [], _followRetries = false): Promise<RequestLocation> => this.locations.get(clientId) ?? { state: 'not_found' });
   retryOverloaded = vi.fn<import('../src/server/codex.js').CodexClient['retryOverloaded']>(async (_thread, id, previous, _inputs, beforeSend) => {
     if (!beforeSend()) return;
     const turnId = `${previous}-retry`;
@@ -62,7 +62,7 @@ class FakeCodex extends EventEmitter implements CodexGateway {
     this.notification({ method: 'item/started', params: { threadId, turnId, item: { type: 'userMessage', clientId } } });
     return { turnId };
   });
-  findSteerReceipt = vi.fn(async (_threadId: string, clientId: string, turnId: string): Promise<RequestLocation> => {
+  findSteerReceipt = vi.fn(async (_threadId: string, clientId: string, turnId: string, _ownInputIds: readonly string[] = []): Promise<RequestLocation> => {
     const found = this.locations.get(clientId);
     return found?.turnId === turnId ? found : { state: 'not_found' };
   });
@@ -648,6 +648,121 @@ describe('Engine Codex maintenance', () => {
     await idle.engine.settled();
     const next = await acceptRequest(idle, 'slack', 'after-failure');
     expect(idle.codex.enqueue.mock.calls.some(([, , id]) => id === next.id)).toBe(true);
+  });
+});
+
+describe('Engine ownership history snapshots', () => {
+  // Only the external history read is deferred; ownership parsing uses the real CodexClient methods.
+  function history(f: ReturnType<typeof fixture>, root: ReleRequest, items: Record<string, unknown>[] = []) {
+    const entered = deferred<void>(), release = deferred<void>();
+    const turn = { id: 'turn-1', status: 'inProgress', items: [{ type: 'userMessage', clientId: root.id }, ...items] };
+    const client: CodexClient = Object.assign(Object.create(CodexClient.prototype), {
+      pages: async () => [],
+      receiptPage: async () => { entered.resolve(); await release.promise; return { data: [turn], nextCursor: null }; },
+    });
+    f.codex.findRequest.mockImplementation(client.findRequest.bind(client));
+    f.codex.findSteerReceipt.mockImplementation(client.findSteerReceipt.bind(client));
+    return { entered, release, turn };
+  }
+
+  function ownInput(f: ReturnType<typeof fixture>, root: ReleRequest, eventId: string) {
+    const child = f.store.ingest(f.message('slack', eventId)).request!;
+    const input = f.store.beginSteeringInput(root.id, { id: child.id, requestId: child.id, text: requestInput(child) });
+    f.store.setMeta(`steer-target:${input.id}`, f.engine.targetFingerprint());
+    return input;
+  }
+
+  it.each(['request', 'steer'] as const)('discards a stale %s scan after registering an ordinary own input, then accepts fresh proof', async kind => {
+    const f = fixture({ start: false }), root = await acceptRequest(f); await running(f, root);
+    const target = kind === 'steer' ? ownInput(f, root, 'receipt-target') : undefined;
+    const h = history(f, root, target ? [{ type: 'userMessage', clientId: target.id }] : []);
+    const scan = f.engine.reconcile(target?.id ?? root.id);
+    await h.entered.promise;
+    const addition = ownInput(f, root, 'during-history');
+    h.turn.items.push({ type: 'userMessage', clientId: addition.id });
+    h.release.resolve(); await scan; await f.engine.settled();
+    expect(f.store.getMeta(`mixed:${root.id}`)).toBeUndefined();
+    expect(target ? f.store.getSteeringInput(target.id)?.state : f.store.getRequest(root.id)?.status).toBe('uncertain');
+    expect(f.store.listDeliveries().filter(row => row.kind === 'answer')).toEqual([]);
+    f.store.finishSteeringInput(addition.id, 'applied');
+    await f.engine.reconcile(target?.id ?? root.id); await f.engine.settled();
+    expect(f.store.getRequest(root.id)?.status).toBe('running');
+    if (target) expect(f.store.getSteeringInput(target.id)?.state).toBe('applied');
+    expect(f.store.getMeta(`mixed:${root.id}`)).toBeUndefined();
+    expect(f.codex.steer).not.toHaveBeenCalled();
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['request', 'steer'] as const)('rejects stale own %s proof when a registered input becomes refused', async kind => {
+    const f = fixture({ start: false }), root = await acceptRequest(f); await running(f, root);
+    const target = kind === 'steer' ? ownInput(f, root, 'receipt-target') : undefined;
+    const removed = ownInput(f, root, 'refused-during-history');
+    const h = history(f, root, [...(target ? [{ type: 'userMessage', clientId: target.id }] : []), { type: 'userMessage', clientId: removed.id }]);
+    h.turn.status = 'completed'; h.turn.items.push({ type: 'agentMessage', phase: 'final_answer', text: 'Must stay local' });
+    const scan = f.engine.reconcile(target?.id ?? root.id);
+    await h.entered.promise; f.store.finishSteeringInput(removed.id, 'refused');
+    h.release.resolve(); await scan; await f.engine.settled();
+    expect(f.store.getMeta(`mixed:${root.id}`)).toBeUndefined();
+    expect(target ? f.store.getSteeringInput(target.id)?.state : f.store.getRequest(root.id)?.status).toBe('uncertain');
+    expect(f.store.listDeliveries().some(row => row.kind === 'answer')).toBe(false);
+    expect(f.codex.steer).not.toHaveBeenCalled();
+  });
+
+  it('preserves a final refusal of the receipt being read', async () => {
+    const f = fixture({ start: false }), root = await acceptRequest(f); await running(f, root);
+    const target = ownInput(f, root, 'refused-receipt-target');
+    const h = history(f, root, [{ type: 'userMessage', clientId: target.id }]);
+    const scan = f.engine.reconcile(target.id);
+    await h.entered.promise; f.store.finishSteeringInput(target.id, 'refused'); h.release.resolve();
+    await expect(scan).resolves.toBeUndefined();
+    expect(f.store.getSteeringInput(target.id)?.state).toBe('refused');
+    expect(f.store.getMeta(`mixed:${root.id}`)).toBeUndefined();
+  });
+
+  it.each(['request', 'steer'] as const)('still quarantines a real foreign input in an unchanged %s scan', async kind => {
+    const f = fixture({ start: false }), root = await acceptRequest(f); await running(f, root);
+    const target = kind === 'steer' ? ownInput(f, root, 'receipt-target') : undefined;
+    const h = history(f, root, [...(target ? [{ type: 'userMessage', clientId: target.id }] : []), { type: 'userMessage', clientId: 'foreign-client' }]);
+    h.release.resolve(); await f.engine.reconcile(target?.id ?? root.id); await f.engine.settled();
+    expect(f.store.getMeta(`mixed:${root.id}`)).toBe('1');
+    expect(f.store.getRequest(root.id)?.status).toBe('uncertain');
+    expect(f.store.listDeliveries().some(row => row.kind === 'answer')).toBe(false);
+  });
+
+  it('defers a typed Desktop answer during receipt churn without marking it mixed', async () => {
+    const f = fixture({ start: false }), root = await acceptRequest(f);
+    const { item, questions } = await asyncQuestion(f, root, 2);
+    const ownApproval = f.store.listApprovals().find(a => a.itemId === questions[0].question.id)!;
+    const desktopApproval = f.store.listApprovals().find(a => a.itemId === questions[1].question.id)!;
+    const reply = { type: 'userMessage', clientId: 'desktop-answer',
+      content: [{ type: 'text', text: encodeAsyncAnswers([questions[1].question], { [questions[1].question.id]: ['release'] }) }] };
+    const h = history(f, root, [item, reply]);
+    f.codex.asyncStates.set(questions[1].question.id, { turnId: 'turn-1', question: questions[1].question, answer: { answer: 'release', clientId: 'desktop-answer' } });
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1', item: reply } });
+    await h.entered.promise;
+    f.store.beginAsyncQuestionAnswer(ownApproval.id, encodeAsyncAnswers([questions[0].question], { [questions[0].question.id]: ['main'] }));
+    h.release.resolve(); await f.engine.settled();
+    expect(f.store.getMeta(`mixed:${root.id}`)).toBeUndefined();
+    expect(f.store.getApproval(desktopApproval.id)?.status).toBe('pending');
+    await f.engine.reconcile(root.id); await f.engine.settled();
+    vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(Date.now() + 5_001);
+    await f.engine.pump(); await f.engine.settled();
+    expect(f.store.getMeta(`mixed:${root.id}`)).toBeUndefined();
+    expect(f.store.getApproval(desktopApproval.id)?.status).toBe('answered');
+    expect(f.codex.steer).not.toHaveBeenCalled();
+  });
+
+  it.each(['missing-fields', 'history-failure'] as const)('preserves fail-closed notification handling for %s', async kind => {
+    const f = fixture({ start: false }), root = await acceptRequest(f);
+    const { questions } = await asyncQuestion(f, root);
+    const item = kind === 'missing-fields' ? { type: 'userMessage', id: 'incomplete-item', content: [] }
+      : { type: 'userMessage', clientId: 'unverified-desktop-answer', content: [{ type: 'text', text: encodeAsyncAnswers([questions[0].question], { [questions[0].question.id]: ['main'] }) }] };
+    if (kind === 'history-failure') f.codex.findRequest.mockRejectedValueOnce(new CodexTransportError('History unavailable', 'request-history-unconfirmed'));
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1', item } });
+    await f.engine.settled();
+    expect(f.store.getMeta(`mixed:${root.id}`)).toBe('1');
+    expect(f.store.getRequest(root.id)?.status).toBe('uncertain');
+    expect(f.store.listDeliveries().some(row => row.kind === 'answer')).toBe(false);
   });
 });
 
@@ -1520,6 +1635,7 @@ describe('Engine continuation after native Stop', () => {
 
   it('retries only after a confirmed busy refusal and never interrupts the active Desktop turn', async () => {
     const f = fixture(), request = await acceptRequest(f, 'telegram');
+    await f.engine.settled();
     ownQueue(f, request);
     f.codex.startQueued.mockRejectedValueOnce(new CodexThreadBusyError(THREAD, 'non_idle'));
     await f.engine.reconcile(request.id);
@@ -1547,6 +1663,7 @@ describe('Engine continuation after native Stop', () => {
 
   it('persists a lost queue/start ACK fence across restart and recovers later completion without repeating either mutation', async () => {
     const f = fixture(), request = await acceptRequest(f, 'telegram');
+    await f.engine.settled();
     ownQueue(f, request);
     f.codex.startQueued.mockRejectedValueOnce(new CodexTransportError('Lost queue/start ACK'));
     await f.engine.reconcile(request.id);
