@@ -67,6 +67,7 @@ export class Engine extends EventEmitter {
   private readonly initialMessages: InitialMessages;
   private steering = new Set<string>();
   private progressSending = false;
+  private progressReads = new Map<string, Promise<RequestLocation>>();
   private progressRetryAfter = new Map<string, number>();
   private approvalUpdatesSending = false;
   private approvalUpdateRetry = new Map<string, number>();
@@ -133,7 +134,7 @@ export class Engine extends EventEmitter {
   replaceCodex(next: CodexGateway): void {
     this.codex.off('notification', this.notification); this.codex.off('request', this.serverRequest); this.codex.off('status', this.connection);
     this.expireApprovals(); this.epoch = randomUUID(); this.connected = false;
-    this.ownedThreads.clear(); this.releasing.clear(); this.retryThreadAfter.clear();
+    this.ownedThreads.clear(); this.releasing.clear(); this.retryThreadAfter.clear(); this.progressReads.clear();
     this.codex = next;
     next.on('notification', this.notification); next.on('request', this.serverRequest); next.on('status', this.connection);
     this.connectionChanged();
@@ -327,7 +328,8 @@ export class Engine extends EventEmitter {
   }
 
   private syncAsyncQuestions(request: ReleRequest, found: RequestLocation): void {
-    if (this.stopped || this.suspended || this.isMixed(request.id) || found.mixed || this.waitsForSource(request)
+    if (this.stopped || this.suspended || this.cancelling.has(request.id) || this.store.getMeta(`cancel-requested:${request.id}`)
+      || this.isMixed(request.id) || found.mixed || this.waitsForSource(request)
       || !found.turnId || !['running', 'completed'].includes(found.state) || !this.codex.asyncQuestionState) return;
     let published = false;
     for (const { question } of found.asyncQuestions ?? []) {
@@ -721,6 +723,10 @@ export class Engine extends EventEmitter {
         this.store.updateRequest(id, { status: 'uncertain', error: 'Исходное соединение отмены потеряно. Завершение прежних процессов требует сверки.' });
         return;
       }
+      // Do not duplicate a progress scan, but reconcile with fresh proof after it settles.
+      const progressRead = this.progressReads.get(id);
+      if (progressRead) await progressRead.catch(() => {});
+      if (this.stopped || client !== this.codex || epoch !== this.epoch) return;
       await this.releasing.get(conversation.id);
       await client.subscribe(conversation.threadId);
       if (client !== this.codex || epoch !== this.epoch) return;
@@ -1346,7 +1352,8 @@ export class Engine extends EventEmitter {
         }
       }
     } else if (method === 'turn/completed' && p.turn?.id) {
-      for (const request of this.store.activeRequests()) if (request.turnId === p.turn.id || (request.status === 'starting' && this.store.getConversation(request.conversationId)?.threadId === p.threadId)) await this.reconcile(request.id);
+      // A history read must not hold notifications from unrelated threads.
+      for (const request of this.store.activeRequests()) if (request.turnId === p.turn.id || (request.status === 'starting' && this.store.getConversation(request.conversationId)?.threadId === p.threadId)) this.track(this.reconcile(request.id));
     } else if (method === 'serverRequest/resolved') {
       for (const [key, pending] of this.pendingQuestions) if (pending.epoch === this.epoch
         && pending.event.id === p.requestId && (pending.event.params as Record<string, unknown>).threadId === p.threadId) this.pendingQuestions.delete(key);
@@ -1503,8 +1510,8 @@ export class Engine extends EventEmitter {
     this.progressSending = true;
     try {
       for (const id of this.pendingProgress()) {
-        if (this.stopped || Date.now() < (this.progressRetryAfter.get(id) ?? 0)) continue;
-        const request = this.store.getRequest(id), channel = this.channels.slack, client = this.codex;
+        if (this.stopped || this.reconciling.has(id) || Date.now() < (this.progressRetryAfter.get(id) ?? 0)) continue;
+        const request = this.store.getRequest(id), channel = this.channels.slack, client = this.codex, epoch = this.epoch;
         if (!request || request.origin.platform !== 'slack' || request.steeredInto) continue;
         if (!channel?.updateProgress || !channel.state.connected || channel.state.accountId !== request.origin.accountId) continue;
         const conversation = this.store.getConversation(request.conversationId);
@@ -1519,8 +1526,12 @@ export class Engine extends EventEmitter {
             this.progressRetryAfter.delete(id);
             continue;
           }
-          const found = await this.findOwnRequest(client, conversation.threadId, id);
-          if (client !== this.codex || this.stopped) continue;
+          const reading = this.findOwnRequest(client, conversation.threadId, id);
+          this.progressReads.set(id, reading);
+          let found: RequestLocation;
+          try { found = await reading; }
+          finally { if (this.progressReads.get(id) === reading) this.progressReads.delete(id); }
+          if (client !== this.codex || epoch !== this.epoch || this.stopped) continue;
           if (found.mixed || this.isMixed(id)) {
             await channel.updateProgress(id, request.origin, { terminal: 'failed', existingOnly: true, ...(JSON.parse(saved).segments ? { segments: JSON.parse(saved).segments } : {}) });
             this.store.setMeta('request-progress:pending', JSON.stringify(this.pendingProgress().filter(value => value !== id)));
@@ -1768,7 +1779,7 @@ export class Engine extends EventEmitter {
     const connected = this.codex.status().connected;
     if (!connected && this.connected) {
       this.epoch = randomUUID(); this.expireApprovals();
-      this.ownedThreads.clear(); this.retryThreadAfter.clear();
+      this.ownedThreads.clear(); this.retryThreadAfter.clear(); this.progressReads.clear();
       for (const request of this.store.activeRequests()) if (['starting', 'running', 'waiting_approval'].includes(request.status)) this.store.updateRequest(request.id, { status: 'uncertain', error: 'Соединение с Codex прервано. Требуется сверка очереди и истории.' });
     }
     if (connected && !this.connected) for (const request of this.store.activeRequests()) if (!['queued', 'transcribing'].includes(request.status)) this.track(this.reconcile(request.id));
