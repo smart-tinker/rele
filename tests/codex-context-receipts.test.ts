@@ -186,6 +186,42 @@ describe('persisted Codex passive context receipts', () => {
     }
   });
 
+  it.each([935, 1009, 64 * 1024 + 1])('reads exact receipts around a verified NUL-only row of %i bytes without changing the file', async length => {
+    const earlierId = 'rele_slack_earlier';
+    const earlierText = 'Earlier exact synthetic context';
+    const f = await fixture([meta(), item({ id: earlierId, text: earlierText }), '\0'.repeat(length), item()]);
+    const before = await readFile(f.rolloutPath);
+    expect(await f.receipts.has({ ...f.query, itemId: earlierId, text: earlierText })).toBe(true);
+    expect(await f.receipts.has(f.query)).toBe(true);
+    expect(await readFile(f.rolloutPath)).toEqual(before);
+  });
+
+  it.each([1, 935, 1009])('rejects a NUL-only row of %i bytes before the verified session header', async length => {
+    const f = await fixture(['\0'.repeat(length), meta(), item()]);
+    await expect(f.receipts.has(f.query)).rejects.toThrow('Не удалось подтвердить сохранение контекста Codex.');
+  });
+
+  it('does not create a receipt from NUL-only rows or a different ID or text', async () => {
+    const f = await fixture([meta(), '\0'.repeat(935)]);
+    expect(await f.receipts.has(f.query)).toBe(false);
+    await appendFile(f.rolloutPath, `${item({ id: 'rele_slack_other' })}\n${item({ text: `${text} changed` })}\n`);
+    expect(await f.receipts.has(f.query)).toBe(false);
+    await appendFile(f.rolloutPath, `${item()}\n`);
+    expect(await f.receipts.has(f.query)).toBe(true);
+  });
+
+  it.each(['', '{broken synthetic json', '\0 ', `\0${item()}`])('still rejects a malformed complete row after a verified session header (%j)', async line => {
+    const f = await fixture([meta(), item(), line]);
+    await expect(f.receipts.has(f.query)).rejects.toThrow('Не удалось подтвердить сохранение контекста Codex.');
+  });
+
+  it('keeps the line-size limit for a verified NUL-only row', async () => {
+    const f = await fixture([meta()]);
+    await appendFile(f.rolloutPath, Buffer.alloc(32 * 1024 * 1024 + 1));
+    await appendFile(f.rolloutPath, '\n');
+    await expect(f.receipts.has(f.query)).rejects.toThrow('Не удалось подтвердить сохранение контекста Codex.');
+  });
+
   it('rejects malformed complete records and bounds an incomplete line', async () => {
     const f = await fixture([meta(), '{broken synthetic json']);
     await expect(f.receipts.has(f.query)).rejects.toThrow('Не удалось подтвердить сохранение контекста Codex.');

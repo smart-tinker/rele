@@ -111,6 +111,8 @@ export class CodexContextReceipts {
   }
 
   private record(line: string, state: ScanState, threadId: string): void {
+    // Native rollouts can contain NUL-only rows after their session header.
+    if (state.verified && /^\0+$/u.test(line)) return;
     const row = JSON.parse(line) as { type?: string; payload?: { type?: string; id?: string; role?: string; content?: { type?: string; text?: string }[] } } | null;
     if (!state.verified) {
       if (row?.type !== 'session_meta' || row.payload?.id !== threadId) throw new Error();
