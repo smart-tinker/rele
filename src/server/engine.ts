@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Approval, ApprovalQuestion, AutoLinkIntent, Delivery, Endpoint, InboundMessage, MessageDestination, MessageToolCall, MessageToolReceipt, Person, Platform, ReleRequest } from '../shared/types.js';
-import { CodexClient, CodexRpcError, CodexSteerRefusedError, CodexThreadBusyError, codexCommandItem, type CodexCommandItem, type CodexNotification, type CodexServerRequest, type CodexTerminal, type CodexTerminalSnapshot, type RequestLocation } from './codex.js';
+import { CodexClient, CodexRpcError, CodexSteerRefusedError, CodexThreadBusyError, CodexTransportError, codexCommandItem, type CodexCommandItem, type CodexNotification, type CodexServerRequest, type CodexTerminal, type CodexTerminalSnapshot, type RequestLocation } from './codex.js';
 import { Store, type SteeringInput } from './store.js';
 import type { AppConfig } from './config.js';
 import { ChannelError, splitReply, type ApprovalAction, type ApprovalContext, type ApprovalResolution, type Channel, type RequestProgress } from './channels/common.js';
@@ -389,7 +389,10 @@ export class Engine extends EventEmitter {
         if (client !== this.codex || epoch !== this.epoch) return new Set();
         if (!found.mixed && found.turnId === turnId && replies.every(reply => found.asyncAnswers?.some(answer =>
           answer.questionItemId === reply.questionItemId && answer.question === reply.question && answer.answer === reply.answer && answer.clientId === item.clientId))) owners.add(request.id);
-      } catch (error) { this.emit('diagnostic', this.options.redact(error)); }
+      } catch (error) {
+        if (error instanceof CodexTransportError && error.code === 'request-inputs-changed') throw error;
+        this.emit('diagnostic', this.options.redact(error));
+      }
     }
     for (const approval of this.store.listApprovals(1000).filter(a => a.method === ASYNC_QUESTION_METHOD
       && (a.status === 'pending' || ['queued', 'uncertain', 'sending'].includes(a.decision ?? '')))) {
@@ -881,8 +884,18 @@ export class Engine extends EventEmitter {
   }
 
   private findOwnRequest(client: CodexGateway, threadId: string, requestId: string): Promise<RequestLocation> {
+    return this.readOwnHistory(requestId, inputs => client.findRequest(threadId, requestId, inputs, true));
+  }
+
+  private async readOwnHistory(requestId: string, read: (inputs: string[]) => Promise<RequestLocation>): Promise<RequestLocation> {
     const inputs = this.ownInputIds(requestId);
-    return client.findRequest(threadId, requestId, inputs, true);
+    const found = await read(inputs);
+    const current = this.ownInputIds(requestId);
+    // A paginated read can observe inputs registered after its ownership snapshot.
+    if (inputs.length !== current.length || inputs.some(id => !current.includes(id))) {
+      throw new CodexTransportError('Состав собственных сообщений изменился во время сверки Codex. Ожидается новая сверка без повторной отправки.', 'request-inputs-changed');
+    }
+    return found;
   }
 
   private ownInputIds(requestId: string): string[] {
@@ -897,7 +910,7 @@ export class Engine extends EventEmitter {
     const client = this.codex, epoch = this.epoch;
     if (!conversation || this.store.getMeta(`steer-target:${input.id}`) !== this.targetFingerprint() || !client.status().connected) return;
     try {
-      const found = await client.findSteerReceipt(conversation.threadId, input.id, input.turnId, this.ownInputIds(parent!.id));
+      const found = await this.readOwnHistory(parent!.id, inputs => client.findSteerReceipt(conversation.threadId, input.id, input.turnId, inputs));
       if (client !== this.codex || epoch !== this.epoch) return;
       if (found.turnId === input.turnId && found.state !== 'not_found') {
         this.store.finishSteeringInput(input.id, 'applied');
@@ -915,7 +928,7 @@ export class Engine extends EventEmitter {
         if (found.mixed) this.store.setMeta(`mixed:${parent!.id}`, '1');
       }
     } catch (error) {
-      if (client === this.codex && epoch === this.epoch && this.store.getSteeringInput(input.id)?.state !== 'applied') {
+      if (client === this.codex && epoch === this.epoch && !['applied', 'refused'].includes(this.store.getSteeringInput(input.id)?.state ?? '')) {
         this.store.finishSteeringInput(input.id, 'uncertain', this.options.redact(error));
       }
     }
