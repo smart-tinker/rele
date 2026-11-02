@@ -208,6 +208,54 @@ describe('Engine asynchronous Desktop questions', () => {
     }
   });
 
+  it.each(['running', 'completed'] as const)('does not publish a %s history question when Stop starts while reconciliation awaits progress', async state => {
+    const f = fixture({ start: false }), request = await acceptRequest(f); await running(f, request);
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1',
+      item: { id: 'before-stop-question', type: 'agentMessage', phase: 'commentary', text: 'Before Stop' } } });
+    await f.engine.settled();
+    const progressProof = deferred<RequestLocation>(), cancelProof = deferred<RequestLocation>();
+    const item = { id: 'question-after-stop', type: 'agentMessage', delivery: 'async', text: 'Question', questions: [{ title: 'Continue?' }] };
+    const question = asyncQuestions(item)[0];
+    f.codex.asyncStates.set(question.question.id, { turnId: 'turn-1', question: question.question });
+    f.codex.findRequest.mockClear();
+    f.codex.findRequest.mockReturnValueOnce(progressProof.promise).mockReturnValueOnce(cancelProof.promise)
+      .mockResolvedValueOnce({ state, turnId: 'turn-1', text: 'NOREPLY', asyncQuestions: [question] });
+    const pump = f.engine.pump();
+    await vi.waitFor(() => expect(f.codex.findRequest).toHaveBeenCalledTimes(1));
+    const reconciliation = f.engine.reconcile(request.id), cancellation = f.engine.cancel(request.id);
+    try {
+      await vi.waitFor(() => expect(f.codex.findRequest).toHaveBeenCalledTimes(2));
+      progressProof.resolve({ state: 'running', turnId: 'turn-1' });
+      await pump; await reconciliation;
+      expect(f.codex.findRequest).toHaveBeenCalledTimes(3);
+      expect(f.store.getMeta(`cancel-requested:${request.id}`)).toBe('1');
+      expect(f.store.listApprovals()).toEqual([]);
+      expect(f.store.listDeliveries().filter(row => row.kind === 'approval')).toEqual([]);
+      expect(f.slack.deliver.mock.calls.filter(([row]) => row.kind === 'approval')).toEqual([]);
+    } finally {
+      progressProof.resolve({ state: 'running', turnId: 'turn-1' });
+      cancelProof.resolve({ state: 'running', turnId: 'turn-1' });
+      await pump; await reconciliation; await cancellation; await f.engine.settled();
+    }
+    expect(f.store.listApprovals()).toEqual([]);
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not publish a recovered async question after a persisted Stop intent', async () => {
+    const f = fixture({ start: false }), request = await acceptRequest(f); await running(f, request);
+    const item = { id: 'question-after-persisted-stop', type: 'agentMessage', delivery: 'async', text: 'Question', questions: [{ title: 'Continue?' }] };
+    const question = asyncQuestions(item)[0];
+    f.codex.asyncStates.set(question.question.id, { turnId: 'turn-1', question: question.question });
+    f.codex.locations.set(request.id, { state: 'running', turnId: 'turn-1', asyncQuestions: [question] });
+    f.store.setMeta(`cancel-requested:${request.id}`, '1');
+    await f.engine.reconcile(request.id); await f.engine.settled();
+    expect(f.store.listApprovals()).toEqual([]);
+    expect(f.store.listDeliveries().some(row => row.kind === 'approval')).toBe(false);
+    expect(f.slack.deliver.mock.calls.some(([row]) => row.kind === 'approval')).toBe(false);
+    expect(f.store.getRequest(request.id)?.status).toBe('interrupted');
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+  });
+
   it('publishes typed questions and returns one Slack answer to the exact active question without a fake RPC', async () => {
     const f = fixture(), request = await acceptRequest(f);
     const { approval, questions, item } = await asyncQuestion(f, request);
@@ -774,6 +822,130 @@ describe('Engine initial instruction and same-source steering', () => {
 });
 
 describe('Engine public Slack progress', () => {
+  it('does not delay verified progress behind a Slack backfill read', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture({ start: false }), request = await acceptRequest(f); await running(f, request);
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1',
+      item: { id: 'unblocked-comment', type: 'agentMessage', phase: 'commentary', text: 'Verified public step' } } });
+    await f.engine.settled();
+    const page = deferred<{ messages: [] }>();
+    f.slack.readThreadPage.mockClear(); f.slack.readThreadPage.mockReturnValueOnce(page.promise);
+    vi.setSystemTime(Date.now() + 2000);
+    const pump = f.engine.pump();
+    try {
+      await vi.waitFor(() => expect(f.slack.readThreadPage).toHaveBeenCalled());
+      await vi.waitFor(() => expect(f.slack.updateProgress).toHaveBeenCalledExactlyOnceWith(request.id, request.origin, {
+        commentary: 'Verified public step', steps: [{ id: 'turn-1:unblocked-comment', text: 'Verified public step' }],
+      }));
+    } finally {
+      page.resolve({ messages: [] }); await pump; await f.engine.settled();
+    }
+  });
+
+  it('does not overlap pending progress and periodic ownership scans for the same request', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture({ start: false }), request = await acceptRequest(f); await running(f, request);
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1',
+      item: { id: 'pending-comment', type: 'agentMessage', phase: 'commentary', text: 'Pending public step' } } });
+    await f.engine.settled();
+    const proof = deferred<RequestLocation>();
+    const reconcile = vi.spyOn(f.engine, 'reconcile');
+    f.codex.subscribe.mockClear(); f.codex.findRequest.mockClear();
+    f.codex.findRequest.mockImplementation(() => proof.promise);
+    vi.setSystemTime(Date.now() + 16_000);
+    const pump = f.engine.pump();
+    try {
+      await vi.waitFor(() => expect(reconcile).toHaveBeenCalledWith(request.id));
+      await Promise.resolve(); await Promise.resolve();
+      expect(f.codex.findRequest).toHaveBeenCalledTimes(1);
+      await f.engine.pump();
+      expect(f.codex.findRequest).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(f.store.getMeta('request-progress:pending')!)).toContain(request.id);
+      expect(f.slack.updateProgress).not.toHaveBeenCalled();
+    } finally {
+      proof.resolve({ state: 'running', turnId: 'turn-1' });
+      await pump; await f.engine.settled();
+    }
+    await f.engine.pump();
+    expect(f.slack.updateProgress).toHaveBeenCalledExactlyOnceWith(request.id, request.origin, {
+      commentary: 'Pending public step', steps: [{ id: 'turn-1:pending-comment', text: 'Pending public step' }],
+    });
+    expect(JSON.parse(f.store.getMeta('request-progress:pending')!)).not.toContain(request.id);
+  });
+
+  it.each(['resolved', 'rejected'] as const)('reconciles completion with fresh proof after a %s progress read', async outcome => {
+    const f = fixture({ start: false }), request = await acceptRequest(f); await running(f, request);
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1',
+      item: { id: 'stale-comment', type: 'agentMessage', phase: 'commentary', text: 'Before completion' } } });
+    await f.engine.settled();
+    const proof = deferred<RequestLocation>();
+    f.codex.findRequest.mockClear(); f.codex.findRequest.mockReturnValueOnce(proof.promise);
+    const pump = f.engine.pump();
+    await vi.waitFor(() => expect(f.codex.findRequest).toHaveBeenCalledTimes(1));
+    const reconciliation = f.engine.reconcile(request.id);
+    try {
+      await Promise.resolve(); await Promise.resolve();
+      expect(f.codex.findRequest).toHaveBeenCalledTimes(1);
+      f.codex.locations.set(request.id, { state: 'completed', turnId: 'turn-1', text: 'Fresh final' });
+    } finally {
+      if (outcome === 'resolved') proof.resolve({ state: 'running', turnId: 'turn-1' });
+      else proof.reject(new Error('Progress snapshot unavailable'));
+      await pump; await reconciliation; await f.engine.settled();
+    }
+    expect(f.codex.findRequest).toHaveBeenCalledTimes(2);
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'completed', error: undefined });
+    expect(f.store.listDeliveries().filter(row => row.requestId === request.id && row.body === 'Fresh final')).toHaveLength(1);
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+  });
+
+  it.each(['stop', 'replace', 'disconnect'] as const)('discards progress proof after %s while reconciliation waits for it', async change => {
+    const f = fixture({ start: false }); f.codex.connection(true);
+    const request = await acceptRequest(f); await running(f, request);
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1',
+      item: { id: 'obsolete-comment', type: 'agentMessage', phase: 'commentary', text: 'Obsolete public step' } } });
+    await f.engine.settled();
+    const proof = deferred<RequestLocation>();
+    f.codex.findRequest.mockClear(); f.codex.findRequest.mockReturnValueOnce(proof.promise);
+    const pump = f.engine.pump();
+    await vi.waitFor(() => expect(f.codex.findRequest).toHaveBeenCalledTimes(1));
+    const reconciliation = f.engine.reconcile(request.id);
+    if (change === 'stop') await f.engine.stop();
+    else if (change === 'replace') {
+      const next = new FakeCodex(); next.locations.set(request.id, { state: 'completed', turnId: 'fresh-turn', text: 'Fresh target final' });
+      f.engine.replaceCodex(next);
+    } else f.codex.connection(false);
+    proof.resolve({ state: 'completed', turnId: 'turn-1', text: 'Obsolete final' });
+    await pump; await reconciliation; await f.engine.settled();
+    expect(f.codex.findRequest).toHaveBeenCalledTimes(1);
+    expect(f.slack.updateProgress).not.toHaveBeenCalled();
+    expect(f.store.listDeliveries().some(row => row.body === 'Obsolete final')).toBe(false);
+    if (change === 'replace') expect(f.store.listDeliveries().filter(row => row.body === 'Fresh target final')).toHaveLength(1);
+  });
+
+  it('does not block cancellation or revive an answer while a progress read holds reconciliation', async () => {
+    const f = fixture({ start: false }), request = await acceptRequest(f); await running(f, request);
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1',
+      item: { id: 'before-cancel', type: 'agentMessage', phase: 'commentary', text: 'Before cancellation' } } });
+    await f.engine.settled();
+    const proof = deferred<RequestLocation>();
+    f.codex.findRequest.mockReturnValueOnce(proof.promise);
+    const before = f.codex.findRequest.mock.calls.length, pump = f.engine.pump();
+    await vi.waitFor(() => expect(f.codex.findRequest).toHaveBeenCalledTimes(before + 1));
+    const reconciliation = f.engine.reconcile(request.id);
+    try {
+      await f.engine.cancel(request.id);
+      expect(f.store.getRequest(request.id)?.status).toBe('interrupted');
+    } finally {
+      proof.resolve({ state: 'running', turnId: 'turn-1' });
+      await pump; await reconciliation; await f.engine.settled();
+    }
+    expect(f.store.getRequest(request.id)?.status).toBe('interrupted');
+    expect(f.store.listDeliveries().some(row => row.requestId === request.id && row.kind === 'answer')).toBe(false);
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+    expect(f.codex.interrupt).toHaveBeenCalledExactlyOnceWith(THREAD, 'turn-1');
+  });
+
   it.each(['missing', 'unavailable'] as const)('periodically recovers a request with %s history while another thread runs, without resending', async failure => {
     vi.useFakeTimers({ toFake: ['Date'] });
     const f = fixture();
@@ -2877,6 +3049,49 @@ describe('multiple origins and terminal reconciliation', () => {
     expect(f.store.getRequest(request.id)?.status).toBe('completed');
     expect(f.telegram.deliver.mock.calls.map(([delivery]) => delivery.body)).toContain('OK');
     expect(f.codex.interrupt).not.toHaveBeenCalled();
+  });
+
+  it.each(['completion', 'question'] as const)('does not delay another thread %s behind a blocked completion history read', async event => {
+    const f = fixture({ start: false });
+    const otherThread = 'independent-codex-thread';
+    const otherEndpoint = { ...f.eps.telegram, id: 'independent-telegram-endpoint', threadId: '18' };
+    f.store.upsertEndpoint(otherEndpoint);
+    f.store.createConversation({ name: 'Independent', threadId: otherThread, cwd: '/projects/independent',
+      bindings: [{ platform: 'telegram', endpointId: otherEndpoint.id, allowedSenderIds: ['123'] }] });
+    f.store.setMeta(initialMessageKey('/test/codex-home', otherThread), JSON.stringify({ applied: true }));
+    const first = await acceptRequest(f, 'telegram'); await running(f, first);
+    await f.engine.receive(f.message('telegram', 'independent', { endpoint: otherEndpoint })); await f.engine.settled();
+    const second = f.store.listRequests().find(row => row.eventId === 'independent')!;
+    f.codex.locations.set(second.id, { state: 'running', turnId: 'independent-turn' });
+    await f.engine.reconcile(second.id);
+    const proof = deferred<RequestLocation>();
+    f.codex.findRequest.mockClear();
+    f.codex.findRequest.mockImplementation(async (_threadId, id) => id === first.id ? proof.promise : f.codex.locations.get(id)!);
+    f.codex.complete(first.id, 'First final');
+    try {
+      await vi.waitFor(() => expect(f.codex.findRequest.mock.calls.some(([, id]) => id === first.id)).toBe(true));
+      if (event === 'completion') {
+        f.codex.locations.set(second.id, { state: 'completed', turnId: 'independent-turn', text: 'Independent final' });
+        f.codex.notification({ method: 'turn/completed', params: { threadId: otherThread, turn: { id: 'independent-turn', status: 'completed' } } });
+        await vi.waitFor(() => expect(f.store.getRequest(second.id)?.status).toBe('completed'));
+        expect(f.store.listDeliveries().filter(row => row.requestId === second.id && row.body === 'Independent final')).toHaveLength(1);
+      } else {
+        const item = { id: 'independent-question', type: 'agentMessage', delivery: 'async', text: 'Question', questions: [{ title: 'Continue?' }] };
+        const question = asyncQuestions(item)[0].question;
+        f.codex.asyncStates.set(question.id, { turnId: 'independent-turn', question });
+        f.codex.notification({ method: 'item/completed', params: { threadId: otherThread, turnId: 'independent-turn', item } });
+        await vi.waitFor(() => expect(f.store.listApprovals().some(row => row.requestId === second.id && row.itemId === question.id)).toBe(true));
+      }
+      expect(f.store.getRequest(first.id)?.status).toBe('running');
+      expect(f.store.listDeliveries().some(row => row.requestId === first.id && row.kind === 'answer')).toBe(false);
+    } finally {
+      proof.resolve({ state: 'completed', turnId: 'turn-1', text: 'First final' });
+      await f.engine.settled();
+    }
+    expect(f.store.getRequest(first.id)?.status).toBe('completed');
+    expect(f.store.listDeliveries().filter(row => row.requestId === first.id && row.body === 'First final')).toHaveLength(1);
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(2);
   });
 });
 

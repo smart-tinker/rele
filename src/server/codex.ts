@@ -542,9 +542,10 @@ export class CodexClient extends EventEmitter {
         let retryCount = 0;
         for (const next of [...newer, ...page.data.slice(0, page.data.indexOf(turn))].reverse()) {
           if (found.failureReason !== 'serverOverloaded') break;
-          // Desktop Retry creates an empty successor; Rele also tags its root for recovery.
+          // Desktop Retry starts a self-rooted successor; only registered inputs may extend it.
           const users = next.items.filter(item => item.type === 'userMessage');
-          if (users.length && (next.rootTurnId !== rootTurnId || users.some(item => !item.clientId || !known.has(item.clientId)))) {
+          if (users.length && ((next.rootTurnId !== rootTurnId && next.rootTurnId !== next.id)
+            || users.some(item => !item.clientId || !known.has(item.clientId)))) {
             return { ...found, rootTurnId, retryCount, retryBlocked: true };
           }
           if (next.rootTurnId && next.rootTurnId !== next.id && next.rootTurnId !== rootTurnId) {

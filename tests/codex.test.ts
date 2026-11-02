@@ -1695,6 +1695,42 @@ describe('Overload continuation protocol', () => {
       commentary: [{ id: `${failed.id}:before`, text: 'before' }, { id: `${retry.id}:after`, text: 'after' }] });
   });
 
+  it.each([
+    ['desktop', 'completed'], ['desktop', 'inProgress'],
+    ['rele', 'completed'], ['rele', 'inProgress'],
+    ['page-boundary', 'completed'], ['page-boundary', 'inProgress'],
+  ])('keeps known steering in a %s continuation that is %s', async (kind, status) => {
+    const ownSteer = 'own-steer';
+    const continued = { ...retry, rootTurnId: kind === 'rele' ? failed.id : retry.id, status,
+      items: [{ type: 'userMessage', clientId: ownSteer }, ...retry.items] };
+    const f = await fixture({ 'thread/turns/list': message => kind === 'page-boundary' && !message.params?.cursor
+      ? { data: [continued], nextCursor: 'older' } : page(kind === 'page-boundary' ? [failed] : [continued, failed]) });
+    await f.client.connect();
+    expect(await f.client.findRequest(threadId, clientId, [ownSteer], true)).toMatchObject({
+      state: status === 'inProgress' ? 'running' : 'completed', turnId: retry.id, text: 'Recovered', retryCount: 1,
+    });
+    expect(await f.client.findRequest(threadId, clientId, [ownSteer])).toMatchObject({
+      state: 'failed', turnId: failed.id, failureReason: 'serverOverloaded',
+    });
+    expect(await f.client.retryOverloaded(threadId, clientId, failed.id, [ownSteer], () => { throw Error('must not send'); })).toBeUndefined();
+    expect(f.calls.filter(call => call.method === 'turn/start')).toHaveLength(0);
+  });
+
+  it.each(['foreign-input', 'mixed-input', 'missing-input-id', 'foreign-root', 'unrooted-input'])('keeps the retry guard for known steering with %s', async kind => {
+    const ownSteer = 'own-steer';
+    const users = kind === 'foreign-input' ? [{ type: 'userMessage', clientId: 'foreign' }]
+      : kind === 'missing-input-id' ? [{ type: 'userMessage' }]
+      : [{ type: 'userMessage', clientId: ownSteer }, ...(kind === 'mixed-input' ? [{ type: 'userMessage', clientId: 'foreign' }] : [])];
+    const continued = { ...retry,
+      rootTurnId: kind === 'foreign-root' ? 'different-root' : kind === 'unrooted-input' ? undefined : retry.id, items: users };
+    const f = await fixture({ 'thread/turns/list': () => page([continued, failed]) }); await f.client.connect();
+    expect(await f.client.findRequest(threadId, clientId, [ownSteer], true)).toMatchObject({
+      state: 'failed', turnId: failed.id, retryBlocked: true,
+    });
+    expect(await f.client.retryOverloaded(threadId, clientId, failed.id, [ownSteer], () => { throw Error('must not send'); })).toBeUndefined();
+    expect(f.calls.filter(call => call.method === 'turn/start')).toHaveLength(0);
+  });
+
   it.each(['foreign-input', 'foreign-root'])('does not adopt or retry past %s', async kind => {
     const foreign = kind === 'foreign-input' ? { ...retry, items: [{ type: 'userMessage', clientId: 'foreign' }] } : { ...retry, rootTurnId: 'different-root' };
     const f = await fixture({ 'thread/turns/list': () => page([foreign, failed]) }); await f.client.connect();
