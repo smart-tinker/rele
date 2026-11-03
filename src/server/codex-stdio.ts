@@ -67,6 +67,11 @@ export class CodexStdioTransport {
     this.child.stderr.setEncoding('utf8').on('data', (chunk: string) => this.callbacks.stderr(chunk));
   }
 
+  get helperExecutable(): string | undefined { return (this.options.platform ?? process.platform) === 'win32' ? WINDOWS_PROCESS_HELPER : undefined; }
+
+  /** The pipe-owning child; a reported native descendant is not this peer. */
+  get pid(): number | undefined { return this.spawned && !this.rootExited && !this.stopping ? this.child.pid : undefined; }
+
   send(raw: string): Promise<void> {
     if (!this.spawned || this.stopping || this.ended || this.child.stdin.destroyed) {
       return Promise.reject(new CodexStdioError('Codex не подключён.', 'connection-closed'));

@@ -78,8 +78,9 @@ class FakeCodex extends EventEmitter implements CodexGateway {
   startQueued = vi.fn(async (_threadId: string, _queuedSubmissionId: string) => ({ turn: { id: 'resumed-turn', status: 'inProgress', items: [] } }));
   terminals: Array<{ itemId: string; processId: string }> = [];
   serverId = 42;
-  backgroundTerminals = vi.fn(async (_threadId: string) => ({ serverId: this.serverId, terminals: this.terminals.map(row => ({ ...row })) }));
-  terminateBackgroundTerminal = vi.fn(async (_threadId: string, target: { serverId: number; itemId: string; processId: string }) => {
+  serverGeneration: string | undefined = 'a'.repeat(64);
+  backgroundTerminals = vi.fn<CodexClient['backgroundTerminals']>(async (_threadId: string) => ({ serverId: this.serverId, serverGeneration: this.serverGeneration, terminals: this.terminals.map(row => ({ ...row })) }));
+  terminateBackgroundTerminal = vi.fn(async (_threadId: string, target: { serverId: number; serverGeneration?: string; itemId: string; processId: string }) => {
     this.terminals = this.terminals.filter(row => row.itemId !== target.itemId || row.processId !== target.processId);
   });
   notification(event: CodexNotification): void {
@@ -1803,7 +1804,7 @@ describe('Engine scoped shell cancellation', () => {
     expect(f.store.listDeliveries().some(row => row.requestId === request.id && row.key === 'terminal:error')).toBe(false);
     cleanup.resolve(); await cancelling; await f.engine.settled(); await f.engine.pump(); await f.engine.settled();
     expect(f.store.getRequest(request.id)?.status).toBe('interrupted');
-    expect(f.codex.terminateBackgroundTerminal).toHaveBeenCalledExactlyOnceWith(THREAD, { serverId: 42, itemId: 'own-command', processId: '1234' });
+    expect(f.codex.terminateBackgroundTerminal).toHaveBeenCalledExactlyOnceWith(THREAD, { serverId: 42, serverGeneration: 'a'.repeat(64), itemId: 'own-command', processId: '1234' });
     expect(f.codex.terminals).toEqual([{ itemId: 'foreign-command', processId: '9876' }]);
     expect(f.diagnostics).toEqual([]);
     expect(f.store.getRequest(next.id)).toMatchObject({ status: 'starting' });
@@ -1824,6 +1825,101 @@ describe('Engine scoped shell cancellation', () => {
     expect(f.store.getRequest(request.id)?.status).toBe('interrupted');
     expect(f.codex.terminateBackgroundTerminal).toHaveBeenCalledTimes(1);
     expect(f.codex.interrupt).toHaveBeenCalledTimes(state === 'running' ? 1 : 0);
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not interrupt a turn that becomes mixed during the native generation preflight', async () => {
+    const f = fixture(), request = await shell(f);
+    const gate = deferred<Awaited<ReturnType<CodexClient['backgroundTerminals']>>>();
+    f.codex.backgroundTerminals.mockClear();
+    f.codex.backgroundTerminals.mockImplementationOnce(() => gate.promise);
+    const stopping = f.engine.cancel(request.id); void stopping.catch(() => {});
+    await vi.waitFor(() => expect(f.codex.backgroundTerminals).toHaveBeenCalledOnce());
+    f.codex.locations.set(request.id, { state: 'running', turnId: 'shell-turn', mixed: true });
+    f.codex.notification({ method: 'item/started', params: { threadId: THREAD, turnId: 'shell-turn',
+      item: { type: 'userMessage', clientId: 'foreign-input' } } });
+    await vi.waitFor(() => expect(f.store.getMeta(`mixed:${request.id}`)).toBe('1'));
+    gate.resolve({ serverId: 42, serverGeneration: 'a'.repeat(64), terminals: [{ itemId: 'own-command', processId: '1234' }] });
+    await expect(stopping).rejects.toThrow();
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+    expect(f.codex.terminateBackgroundTerminal).not.toHaveBeenCalled();
+    expect(f.store.getRequest(request.id)?.status).toBe('uncertain');
+  });
+
+  it('finishes the first Stop after Engine restart on the same native generation while preserving foreign terminals', async () => {
+    const f = fixture();
+    f.codex.terminals = [{ itemId: 'foreign-command', processId: '9876' }];
+    const request = await shell(f);
+    expect(f.store.getMeta(`cancel-cleanup:${request.id}`)).toBeUndefined();
+    await f.engine.stop();
+
+    const restarted = fixture({ path: f.path, start: false });
+    restarted.codex.terminals = [
+      { itemId: 'foreign-command', processId: '9876' },
+      { itemId: 'own-command', processId: '1234' },
+    ];
+    restarted.codex.locations.set(request.id, { state: 'running', turnId: 'shell-turn',
+      commandItems: [{ id: 'own-command', processId: '1234' }] });
+    restarted.engine.start(); await restarted.engine.settled();
+
+    await expect(restarted.engine.cancel(request.id)).resolves.toBeUndefined();
+    await restarted.engine.settled(); await restarted.engine.pump();
+    expect(restarted.store.getRequest(request.id)).toMatchObject({ status: 'interrupted', turnId: 'shell-turn',
+      queuedSubmissionId: request.queuedSubmissionId, origin: request.origin });
+    expect(restarted.codex.interrupt).toHaveBeenCalledExactlyOnceWith(THREAD, 'shell-turn');
+    expect(restarted.codex.terminateBackgroundTerminal).toHaveBeenCalledExactlyOnceWith(THREAD,
+      { serverId: 42, serverGeneration: 'a'.repeat(64), itemId: 'own-command', processId: '1234' });
+    expect(restarted.codex.terminals).toEqual([{ itemId: 'foreign-command', processId: '9876' }]);
+    expect(restarted.store.listDeliveries().filter(row => row.requestId === request.id && row.key === 'terminal:error'))
+      .toMatchObject([{ status: 'sent', origin: request.origin }]);
+    expect(restarted.codex.enqueue).not.toHaveBeenCalled();
+    expect(restarted.store.listRequests()).toHaveLength(1);
+  });
+
+  it.each(['different-generation', 'missing-generation', 'invalid-generation', 'legacy-baseline'] as const)(
+    'refuses Stop before interrupt when native identity is %s', async identity => {
+      const f = fixture(), request = await shell(f);
+      if (identity === 'legacy-baseline') {
+        const baseline = JSON.parse(f.store.getMeta(`request-terminal-baseline:${request.id}`)!);
+        delete baseline.serverGeneration;
+        f.store.setMeta(`request-terminal-baseline:${request.id}`, JSON.stringify(baseline));
+      } else f.codex.serverGeneration = identity === 'different-generation' ? 'b'.repeat(64)
+        : identity === 'invalid-generation' ? 'A'.repeat(64) : undefined;
+
+      await expect(f.engine.cancel(request.id)).rejects.toThrow();
+      expect(f.store.getRequest(request.id)?.status).toBe('uncertain');
+      expect(f.codex.interrupt).not.toHaveBeenCalled();
+      expect(f.codex.terminateBackgroundTerminal).not.toHaveBeenCalled();
+      expect(f.codex.terminals).toEqual([{ itemId: 'own-command', processId: '1234' }]);
+      expect(f.store.listDeliveries().some(row => row.requestId === request.id && row.key === 'terminal:error')).toBe(false);
+    });
+
+  it('refuses terminal cleanup when the generation changes after interrupt', async () => {
+    const f = fixture(), request = await shell(f);
+    f.codex.interrupt.mockImplementationOnce(async () => {
+      f.codex.locations.set(request.id, { state: 'interrupted', turnId: 'shell-turn' });
+      f.codex.serverGeneration = 'b'.repeat(64);
+    });
+
+    await expect(f.engine.cancel(request.id)).rejects.toThrow();
+    expect(f.codex.interrupt).toHaveBeenCalledExactlyOnceWith(THREAD, 'shell-turn');
+    expect(f.codex.terminateBackgroundTerminal).not.toHaveBeenCalled();
+    expect(f.codex.terminals).toEqual([{ itemId: 'own-command', processId: '1234' }]);
+    expect(f.store.getRequest(request.id)?.status).toBe('uncertain');
+    expect(f.store.listDeliveries().some(row => row.requestId === request.id && row.key === 'terminal:error')).toBe(false);
+  });
+
+  it('keeps Stop uncertain when the native generation changes after terminal cleanup', async () => {
+    const f = fixture(), request = await shell(f);
+    f.codex.terminateBackgroundTerminal.mockImplementationOnce(async () => {
+      f.codex.terminals = [];
+      f.codex.serverGeneration = 'b'.repeat(64);
+    });
+
+    await expect(f.engine.cancel(request.id)).rejects.toThrow();
+    expect(f.codex.terminateBackgroundTerminal).toHaveBeenCalledOnce();
+    expect(f.store.getRequest(request.id)?.status).toBe('uncertain');
+    expect(f.store.listDeliveries().some(row => row.requestId === request.id && row.key === 'terminal:error')).toBe(false);
     expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
   });
 
