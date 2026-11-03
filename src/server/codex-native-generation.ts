@@ -89,6 +89,18 @@ def unix_peers():
                 result[inode]=(state,struct.unpack('=I',peer)[0] if peer and len(peer)==4 else None,attributes.get(0,b'').rstrip(b'\0').decode())
                 offset+=(length+3)&~3
 
+def pid_records(home):
+    records=[]
+    for name in ('daemon.pid','app-server.pid'):
+        file=os.path.join(home,'app-server-daemon',name)
+        try: info=os.lstat(file)
+        except FileNotFoundError: continue
+        require(stat.S_ISREG(info.st_mode) and info.st_uid==os.getuid() and info.st_size<=16384)
+        raw=read(file,16384)
+        fields=('st_dev','st_ino','st_uid','st_gid','st_mode','st_size','st_mtime_ns','st_ctime_ns')
+        records.append((file,raw,json.loads(raw),tuple(getattr(info,key) for key in fields)))
+    return records
+
 def endpoint_identity(endpoint):
     published=os.lstat(endpoint)
     require(published.st_uid==os.getuid() and (stat.S_ISSOCK(published.st_mode) or stat.S_ISLNK(published.st_mode)))
@@ -106,6 +118,7 @@ try:
     require(kind in ('stdio','proxy') and peer_pid>1 and server_pid>1 and os.path.isabs(home))
     home=os.path.realpath(home)
     require(stat.S_ISDIR(os.stat(home).st_mode) and os.stat(home).st_uid==os.getuid())
+    records=pid_records(home) if kind=='proxy' else []
     boot=read('/proc/sys/kernel/random/boot_id').decode().strip()
     require(re.fullmatch('[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',boot))
     before=identity(server_pid)
@@ -122,19 +135,14 @@ try:
         require(len(listeners)==1)
         matches=[inode for inode in proxy_sockets if inode in rows and rows[inode][1] in native_sockets and rows[rows[inode][1]][1]==inode and rows[rows[inode][1]][2]==bound]
         require(len(matches)==1)
-        records=[]
-        for name in ('daemon.pid','app-server.pid'):
-            file=os.path.join(home,'app-server-daemon',name)
-            try:
-                info=os.lstat(file)
-                require(stat.S_ISREG(info.st_mode) and info.st_uid==os.getuid() and info.st_size<=16384)
-                raw=read(file,16384)
-                records.append((file,raw,json.loads(raw)))
-            except FileNotFoundError: pass
-        require(len(records)==1 and records[0][2].get('pid')==server_pid)
-        birth=subprocess.check_output(['/usr/bin/ps','-p',str(server_pid),'-o','lstart='],timeout=2).decode().strip()
-        require(records[0][2].get('processStartTime')==birth)
-        require(read(records[0][0],16384)==records[0][1] and endpoint_identity(endpoint)==(bound,endpoint_before))
+        # Legacy retained daemons may have no pid-record. Existing records are
+        # strict corroboration; kernel transport and physical proof remain required.
+        require(len(records)<=1)
+        if records:
+            require(records[0][2].get('pid')==server_pid)
+            birth=subprocess.check_output(['/usr/bin/ps','-p',str(server_pid),'-o','lstart='],timeout=2).decode().strip()
+            require(records[0][2].get('processStartTime')==birth)
+        require(endpoint_identity(endpoint)==(bound,endpoint_before))
         selected={listeners[0],matches[0],rows[matches[0]][1]}
         require(matches[0] in sockets(peer_pid) and {listeners[0],rows[matches[0]][1]} <= sockets(server_pid))
         # Only this listener and reciprocal transport pair matter; other native
@@ -144,6 +152,7 @@ try:
     require(identity(server_pid)==before and profile(server_pid)==home)
     require(read('/proc/'+str(peer_pid)+'/stat').rsplit(b')',1)[1].split()[19]==peer_before[19])
     require(read('/proc/sys/kernel/random/boot_id').decode().strip()==boot)
+    if kind=='proxy': require(pid_records(home)==records)
     print(json.dumps(dict(before,boot=boot,codexHome=home)))
 except Exception:
     sys.exit(1)
