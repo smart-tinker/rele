@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,13 +29,28 @@ using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using System.Security.Principal;
+using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Text;
 using System.Web.Script.Serialization;
 class Smoke {
  static Type launcher; static object config; static int passed; static string data;
  static JavaScriptSerializer json = new JavaScriptSerializer();
- static object Call(string name, params object[] args) { try { return launcher.GetMethod(name, BindingFlags.NonPublic|BindingFlags.Static).Invoke(null,args); } catch(TargetInvocationException e) { throw e.InnerException; } }
+ static object CallOn(Type target, string name, params object[] args) { try { return target.GetMethod(name, BindingFlags.NonPublic|BindingFlags.Static).Invoke(null,args); } catch(TargetInvocationException e) { throw e.InnerException; } }
+ static object Call(string name, params object[] args) { return CallOn(launcher,name,args); }
+ static void OwnerDirectory(Type host, string directory, bool accepted) {
+  foreach(Type target in new[]{launcher,host}) {
+   try {
+    CallOn(target,target==launcher?"PrivateDirectory":"RequirePrivateDirectory",target==launcher?new object[]{directory,false}:new object[]{directory});
+    if(!accepted) throw new Exception("unsafe-owner-directory-accepted"); passed++;
+   } catch(InvalidOperationException) { if(accepted) throw; passed++; }
+  }
+ }
+ static void DirectoryAcl(string directory, SecurityIdentifier owner, FileSystemAccessRule extra=null, bool protect=true) {
+  var acl=new DirectorySecurity(); acl.SetOwner(owner); acl.SetAccessRuleProtection(protect,false);
+  acl.AddAccessRule(new FileSystemAccessRule(owner,FileSystemRights.FullControl,InheritanceFlags.ContainerInherit|InheritanceFlags.ObjectInherit,PropagationFlags.None,AccessControlType.Allow));
+  if(extra!=null) acl.AddAccessRule(extra); Directory.SetAccessControl(directory,acl);
+ }
  static void Set(string key, object value) { config.GetType().GetProperty(key).SetValue(config,value,null); }
  static object Get(string key) { return config.GetType().GetProperty(key).GetValue(config,null); }
  static void Check(bool value) { if(!value) throw new Exception("assertion"); passed++; }
@@ -58,6 +73,41 @@ class Smoke {
   Set("DataDirectory",data); Set("OwnerSid",WindowsIdentity.GetCurrent().User.Value);
   launcher.GetField("Config",BindingFlags.NonPublic|BindingFlags.Static).SetValue(null,config);
   launcher.GetField("AppDirectory",BindingFlags.NonPublic|BindingFlags.Static).SetValue(null,Path.Combine(args[1],"app"));
+  Type host=Assembly.LoadFrom(args[2]).GetType("ProcessHost",true);
+  string ownerDirectory=Path.Combine(args[1],"owner-acl"); Directory.CreateDirectory(ownerDirectory);
+  SecurityIdentifier owner=WindowsIdentity.GetCurrent().User, sandbox=null;
+  var inherit=InheritanceFlags.ContainerInherit|InheritanceFlags.ObjectInherit;
+  var read=FileSystemRights.ReadAndExecute|FileSystemRights.Synchronize;
+  int beforeAcl=passed;
+  DirectoryAcl(ownerDirectory,owner); OwnerDirectory(host,ownerDirectory,true);
+  DirectoryAcl(ownerDirectory,owner,new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.WorldSid,null),read,inherit,PropagationFlags.None,AccessControlType.Allow));
+  OwnerDirectory(host,ownerDirectory,false);
+  DirectoryAcl(ownerDirectory,owner,null,false); OwnerDirectory(host,ownerDirectory,false);
+  string foreignOwned=Environment.GetFolderPath(Environment.SpecialFolder.System);
+  Check(!Directory.GetAccessControl(foreignOwned).GetOwner(typeof(SecurityIdentifier)).Equals(owner));
+  OwnerDirectory(host,foreignOwned,false); OwnerDirectory(host,args[3],false);
+  try { sandbox=(SecurityIdentifier)new NTAccount(Environment.MachineName,"CodexSandboxUsers").Translate(typeof(SecurityIdentifier)); }
+  catch(IdentityNotMappedException) { }
+  if(sandbox!=null) {
+   DirectoryAcl(ownerDirectory,owner,new FileSystemAccessRule(sandbox,read,inherit,PropagationFlags.None,AccessControlType.Allow));
+   OwnerDirectory(host,ownerDirectory,true);
+   foreach(FileSystemRights rights in new[]{FileSystemRights.Read,FileSystemRights.Write,FileSystemRights.Modify,FileSystemRights.FullControl,FileSystemRights.Delete,FileSystemRights.ChangePermissions,FileSystemRights.TakeOwnership}) {
+    DirectoryAcl(ownerDirectory,owner,new FileSystemAccessRule(sandbox,rights,inherit,PropagationFlags.None,AccessControlType.Allow));
+    OwnerDirectory(host,ownerDirectory,false);
+   }
+   foreach(InheritanceFlags flags in new[]{InheritanceFlags.None,InheritanceFlags.ObjectInherit,InheritanceFlags.ContainerInherit}) {
+    DirectoryAcl(ownerDirectory,owner,new FileSystemAccessRule(sandbox,read,flags,PropagationFlags.None,AccessControlType.Allow));
+    OwnerDirectory(host,ownerDirectory,false);
+   }
+   foreach(PropagationFlags propagation in new[]{PropagationFlags.NoPropagateInherit,PropagationFlags.InheritOnly}) {
+    DirectoryAcl(ownerDirectory,owner,new FileSystemAccessRule(sandbox,read,inherit,propagation,AccessControlType.Allow));
+    OwnerDirectory(host,ownerDirectory,false);
+   }
+   var inherited=(FileSystemAccessRule)new DirectorySecurity().AccessRuleFactory(sandbox,(int)read,true,inherit,PropagationFlags.None,AccessControlType.Allow);
+   foreach(Type target in new[]{launcher,host}) Check(!(bool)CallOn(target,"IsCodexSandboxReadRule",inherited));
+  }
+  DirectoryAcl(ownerDirectory,owner);
+  int ownerAclChecks=passed-beforeAcl;
   Idle(Diagnostic(Gauge("app.requests.in_flight",1)));
   Idle(Diagnostic(Gauge("app.requests.in_flight",1),Gauge("app.requests.queued",0),Gauge("core.threads.live",14),Gauge("mcp.connections.live",28)));
   Idle(Diagnostic(Gauge("app.requests.in_flight",1),Gauge("app.requests.queued",0),Gauge("app.server_requests.pending",0),Gauge("core.mailbox.pending",0),Gauge("core.threads.live",14),Gauge("core.turns.active",0),Gauge("mcp.connections.live",28)));
@@ -91,13 +141,16 @@ class Smoke {
   snapshot=Call("AdapterSnapshot",renamed); Check((string)snapshot.GetType().GetField("Fingerprint").GetValue(snapshot)==expected);
   File.WriteAllText(Path.Combine(renamed,"personal-document.txt"),"must keep");
   try { Call("AdapterSnapshot",renamed); throw new Exception("unknown-file-allowed"); } catch(InvalidOperationException) { passed++; }
-  Console.WriteLine(json.Serialize(new {passed=passed,taskActions=0,environmentChanges=0,nativeProcesses=0}));
+  Console.WriteLine(json.Serialize(new {passed=passed,ownerDirectoryAclChecks=ownerAclChecks,codexSandboxGroupPresent=sandbox!=null,taskActions=0,environmentChanges=0,nativeProcesses=0}));
  }
 }
 `);
   const executable = path.join(temporary, 'Smoke.exe');
   run(compiler, ['/nologo', '/target:exe', '/platform:x64', '/codepage:65001', '/r:System.Web.Extensions.dll', `/out:${executable}`, source]);
-  const receipt = JSON.parse(run(executable, [library, temporary]));
-  assert.equal(receipt.passed, 27);
+  const junctionTarget = path.join(temporary, 'junction-target'); await mkdir(junctionTarget);
+  const junction = path.join(temporary, 'junction'); await symlink(junctionTarget, junction, 'junction');
+  const receipt = JSON.parse(run(executable, [library, temporary, path.join(root, 'dist/native/Rele.Process.exe'), junction]));
+  assert.equal(receipt.ownerDirectoryAclChecks, receipt.codexSandboxGroupPresent ? 39 : 11);
+  assert.equal(receipt.passed, 27 + receipt.ownerDirectoryAclChecks);
   console.log(JSON.stringify(receipt));
 } finally { await rm(temporary, { recursive: true, force: true }); }
