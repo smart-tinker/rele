@@ -573,9 +573,16 @@ export class CodexClient extends EventEmitter {
     const runtime = this.runtime;
     const snapshot = await this.call<{ thread: RawThread }>('thread/read', { threadId });
     const queue = await this.pages<QueueEntry>('thread/queue/list', { threadId, limit: 100 });
-    if (snapshot.thread.id !== threadId || snapshot.thread.status?.type !== 'idle' || queue.length) return;
+    if (snapshot.thread.id !== threadId || !['idle', 'systemError'].includes(snapshot.thread.status?.type ?? '') || queue.length) return;
     const found = await this.findRequest(threadId, clientId, ownInputIds, true);
     if (found.turnId !== expectedTurnId || found.failureReason !== 'serverOverloaded' || found.mixed || found.retryBlocked) return;
+    if (snapshot.thread.status?.type === 'systemError') {
+      // Native keeps systemError until the next turn; it alone does not prove the failed turn has ended.
+      if ('activeFlags' in snapshot.thread.status) return;
+      const page = await this.call<Page<HistoryTurn>>('thread/turns/list', { threadId, limit: 1, itemsView: 'notLoaded', sortDirection: 'desc' });
+      const latest = Array.isArray(page?.data) && page.data.length === 1 ? page.data[0] : undefined;
+      if (latest?.id !== expectedTurnId || latest.status !== 'failed' || typeof latest.completedAt !== 'number' || !Number.isFinite(latest.completedAt) || latest.completedAt <= 0) return;
+    }
     // shortcut: native has no expected-previous-turn fence; history is checked immediately before sending.
     if (runtime !== this.runtime || !this.state.connected || !beforeSend()) return;
     try {
