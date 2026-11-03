@@ -1180,6 +1180,18 @@ describe('Codex shared passive context receipts', () => {
     expect(await readFile(f.rolloutPath)).toEqual(beforeFile);
   });
 
+  it.each(['local', 'msg'])('reconciles an entry-derived %s receipt after semantic-ID and quote migration', async format => {
+    const f = await sharedContextFixture(), itemId = `rele-context-${'e'.repeat(48)}`;
+    const digest = createHash('sha256').update(JSON.stringify([threadId, 'old-entry'])).digest('hex').slice(0, 48);
+    const persistedId = format === 'local' ? `rele-context-${digest}` : `msg_${digest}`;
+    await appendFile(f.rolloutPath, JSON.stringify({ type: 'response_item', payload: { type: 'message', id: persistedId,
+      role: 'user', content: [{ type: 'input_text', text: 'Exact full legacy quote' }] } }) + '\n');
+    const beforeFile = await readFile(f.rolloutPath); await f.client.connect(); const before = f.calls.length;
+    await f.client.injectContext(threadId, 'canonical-entry', 'Compact quote', { itemId, entries: [{ entryId: 'old-entry', text: 'Exact full legacy quote' }] });
+    expect(f.calls.slice(before).map(call => call.method)).toEqual(['thread/read']);
+    expect(await readFile(f.rolloutPath)).toEqual(beforeFile);
+  });
+
   it('reconciles a new-ID lost ACK even when the canonical journal entry changes', async () => {
     const f = await sharedContextFixture({ dropAck: true }), itemId = `rele-context-${'c'.repeat(48)}`;
     await f.client.connect();
@@ -1190,9 +1202,11 @@ describe('Codex shared passive context receipts', () => {
     expect(f.calls.filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
   });
 
-  it.each(['legacy', 'msg'])('does not accept %s alias provenance with another exact text', async format => {
+  it.each(['legacy', 'msg', 'entry-local', 'entry-msg'])('does not accept %s alias provenance with another exact text', async format => {
     const f = await sharedContextFixture(), itemId = `rele-context-${'d'.repeat(48)}`;
-    const persistedId = format === 'legacy' ? 'rele_slack_old-entry' : `msg_${'d'.repeat(48)}`;
+    const digest = createHash('sha256').update(JSON.stringify([threadId, 'old-entry'])).digest('hex').slice(0, 48);
+    const persistedId = format === 'legacy' ? 'rele_slack_old-entry' : format === 'msg' ? `msg_${'d'.repeat(48)}`
+      : format === 'entry-local' ? `rele-context-${digest}` : `msg_${digest}`;
     await appendFile(f.rolloutPath, JSON.stringify({ type: 'response_item', payload: { type: 'message', id: persistedId, role: 'user', content: [{ type: 'input_text', text: 'Another source version' }] } }) + '\n');
     await f.client.connect();
     await f.client.injectContext(threadId, 'canonical-entry', 'Current quote', { itemId, entries: [{ entryId: 'old-entry', text: 'Expected exact old quote' }] });
@@ -1672,16 +1686,40 @@ describe('Overload continuation protocol', () => {
   const retry = { id: 'retry-turn', rootTurnId: 'failed-turn', status: 'completed', items: [{ type: 'agentMessage', phase: 'final_answer', text: 'Recovered' }] };
   const page = (data: unknown[]) => ({ data, nextCursor: null });
 
-  it('continues via empty turn/start with lineage and without changing model or policies', async () => {
+  it.each(['idle', 'systemError'])('continues from %s via empty turn/start with lineage and without changing model or policies', async status => {
     const f = await fixture({
-      'thread/turns/list': () => page([failed]),
+      'thread/read': () => ({ thread: { ...rawThread, status: { type: status } } }),
+      'thread/turns/list': () => page([{ ...failed, completedAt: 1793665117 }]),
       'turn/start': () => ({ turn: { ...retry, status: 'inProgress', items: [] } }),
     });
     await f.client.connect();
     let intent = 0;
     expect(await f.client.retryOverloaded(threadId, clientId, failed.id, [], () => { intent++; return true; })).toEqual({ turnId: retry.id });
     expect(intent).toBe(1);
+    expect(f.calls.filter(call => call.method === 'thread/turns/list').every(call => call.params.itemsView === 'notLoaded')).toBe(true);
+    expect(f.calls.filter(call => call.method === 'turn/start')).toHaveLength(1);
     expect(f.calls.find(call => call.method === 'turn/start')?.params).toEqual({ threadId, input: [], turnTrigger: 'capacity_retry_automatic', parentTurnId: failed.id, rootTurnId: failed.id });
+  });
+
+  it.each(['missing-latest', 'different-latest', 'running-latest', 'missing-completion', 'null-completion', 'invalid-completion', 'zero-completion', 'foreign-input', 'other-error', 'active-flags', 'queued'])('keeps systemError blocked with %s', async condition => {
+    const terminal = { ...failed, completedAt: 1793665117 };
+    const history = condition === 'foreign-input' ? { ...terminal, items: [...terminal.items, { type: 'userMessage', clientId: 'foreign' }] }
+      : condition === 'other-error' ? { ...terminal, error: { codexErrorInfo: 'other' } } : terminal;
+    const latest = condition === 'different-latest' ? { ...terminal, id: 'different-turn' }
+      : condition === 'running-latest' ? { ...terminal, status: 'inProgress' }
+      : condition === 'missing-completion' ? { ...terminal, completedAt: undefined }
+      : condition === 'null-completion' ? { ...terminal, completedAt: null }
+      : condition === 'invalid-completion' ? { ...terminal, completedAt: '1793665117' }
+      : condition === 'zero-completion' ? { ...terminal, completedAt: 0 } : terminal;
+    let reads = 0;
+    const f = await fixture({
+      'thread/read': () => ({ thread: { ...rawThread, status: { type: 'systemError', ...(condition === 'active-flags' ? { activeFlags: ['waitingOnApproval'] } : {}) } } }),
+      'thread/queue/list': () => page(condition === 'queued' ? [{ id: 'foreign', clientUserMessageId: 'other' }] : []),
+      'thread/turns/list': () => page(reads++ === 0 ? [history] : condition === 'missing-latest' ? [] : [latest]),
+    });
+    await f.client.connect();
+    expect(await f.client.retryOverloaded(threadId, clientId, failed.id, [], () => { throw Error('must not send'); })).toBeUndefined();
+    expect(f.calls.filter(call => call.method === 'turn/start')).toHaveLength(0);
   });
 
   it.each(['desktop', 'rele', 'page-boundary'])('finds an empty %s continuation from the original client ID', async kind => {
@@ -1753,8 +1791,10 @@ describe('Overload continuation protocol', () => {
     expect(f.calls.filter(call => call.method === 'turn/start')).toHaveLength(0);
   });
 
-  it('treats the exact native EmptyInput rejection as a busy thread', async () => {
-    const f = await fixture({ 'thread/turns/list': () => page([failed]), 'turn/start': (message, socket) => {
+  it.each(['idle', 'systemError'])('treats the exact native EmptyInput rejection from %s as a busy thread', async status => {
+    const f = await fixture({
+      'thread/read': () => ({ thread: { ...rawThread, status: { type: status } } }),
+      'thread/turns/list': () => page([{ ...failed, completedAt: 1793665117 }]), 'turn/start': (message, socket) => {
       socket.send(JSON.stringify({ id: message.id, error: { code: -32603, message: 'failed to submit turn input: EmptyInput' } })); return noResponse;
     } }); await f.client.connect();
     await expect(f.client.retryOverloaded(threadId, clientId, failed.id, [], () => true)).rejects.toMatchObject({ reason: 'non_idle' });
