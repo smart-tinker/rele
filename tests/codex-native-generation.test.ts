@@ -3,7 +3,7 @@ import { spawn, execFile } from 'node:child_process';
 import net from 'node:net';
 import { promisify } from 'node:util';
 import { once } from 'node:events';
-import { copyFile, lstat, lutimes, mkdir, mkdtemp, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { copyFile, lstat, lutimes, mkdir, mkdtemp, readFile, rename, rm, stat, unlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -12,7 +12,7 @@ import { CodexClient } from '../src/server/codex.js';
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
 
-async function proxyFixture(churn = false, coldExecutable = false, symlinkEndpoint = false) {
+async function proxyFixture(churn = false, coldExecutable = false, symlinkEndpoint = false, pidRecord = true) {
   const home = await mkdtemp(path.join(tmpdir(), 'rele-generation-'));
   cleanup.push(() => rm(home, { recursive: true, force: true }));
   const directory = path.join(home, 'app-server-control'), endpoint = path.join(directory, 'app-server-control.sock');
@@ -43,7 +43,7 @@ async function proxyFixture(churn = false, coldExecutable = false, symlinkEndpoi
     }));
     server.listen(boundEndpoint, () => {
       if (${JSON.stringify(symlinkEndpoint)}) require('node:fs').symlinkSync(boundEndpoint, endpoint);
-      writeFileSync(home + '/app-server-daemon/daemon.pid', JSON.stringify({ pid:process.pid, processStartTime:execFileSync('/usr/bin/ps', ['-p', String(process.pid), '-o', 'lstart='], { encoding:'utf8' }).trim() }));
+      if (${JSON.stringify(pidRecord)}) writeFileSync(home + '/app-server-daemon/daemon.pid', JSON.stringify({ pid:process.pid, processStartTime:execFileSync('/usr/bin/ps', ['-p', String(process.pid), '-o', 'lstart='], { encoding:'utf8' }).trim() }));
       if (${JSON.stringify(churn)}) { let noisy; setInterval(() => { noisy?.destroy(); noisy=require('node:net').createConnection(endpoint); noisy.on('error',()=>{}); }, 3); }
       process.stdout.write('ready\\n');
     });
@@ -124,6 +124,58 @@ it.skipIf(process.platform !== 'linux')('proves a symlink native endpoint when r
   expect(snapshot.serverId).toBe(f.server.pid);
   expect(snapshot.serverGeneration).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
   expect(await f.client.backgroundTerminals('fixture')).toEqual(snapshot);
+}, 15000);
+
+it.skipIf(process.platform !== 'linux')('proves a legacy Unix daemon without pid-records across proxy reconnects', async () => {
+  const f = await proxyFixture(false, false, true, false);
+  await f.client.connect();
+  const first = await f.client.backgroundTerminals('fixture');
+  expect(first.serverId).toBe(f.server.pid);
+  expect(first.serverGeneration).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
+  await f.client.close();
+  await f.client.connect();
+  expect(await f.client.backgroundTerminals('fixture')).toEqual(first);
+}, 15000);
+
+it.skipIf(process.platform !== 'linux').each(['malformed', 'wrong-pid', 'wrong-birth', 'multiple', 'directory'] as const)('refuses an existing %s Unix pid-record', async invalid => {
+  const f = await proxyFixture();
+  const record = path.join(f.home, 'app-server-daemon', 'daemon.pid');
+  const valid = await readFile(record, 'utf8');
+  if (invalid === 'malformed') await writeFile(record, '{');
+  if (invalid === 'wrong-pid') await writeFile(record, JSON.stringify({ ...JSON.parse(valid), pid:f.server.pid! + 1 }));
+  if (invalid === 'wrong-birth') await writeFile(record, JSON.stringify({ ...JSON.parse(valid), processStartTime:'foreign birth' }));
+  if (invalid === 'multiple') await writeFile(path.join(f.home, 'app-server-daemon', 'app-server.pid'), valid);
+  if (invalid === 'directory') { await unlink(record); await mkdir(record); }
+  await f.client.connect();
+  const snapshot = await f.client.backgroundTerminals('fixture');
+  expect(snapshot.serverId).toBe(f.server.pid);
+  expect(snapshot).not.toHaveProperty('serverGeneration');
+});
+
+it.skipIf(process.platform !== 'linux').each(['appeared', 'disappeared', 'rewritten', 'replaced'] as const)('refuses a Unix pid-record that %s during physical proof', async change => {
+  const f = await proxyFixture(false, true);
+  const record = path.join(f.home, 'app-server-daemon', 'daemon.pid');
+  const valid = await readFile(record, 'utf8');
+  if (change === 'appeared') await unlink(record);
+  await f.client.connect();
+  const executable = await stat(f.nativeExecutable);
+  const oldAccess = new Date('2000-01-01T00:00:00Z');
+  await utimes(f.nativeExecutable, oldAccess, executable.mtime);
+  const pending = f.client.backgroundTerminals('fixture');
+  // A copied executable belongs only to this fixture. Its first hash read signals
+  // that physical proof has begun, without hooks in the production proof code.
+  const deadline = Date.now() + 5000;
+  while ((await stat(f.nativeExecutable)).atimeMs <= oldAccess.getTime()) {
+    if (Date.now() >= deadline) throw new Error('fixture executable was not read');
+    await new Promise(resolve => setTimeout(resolve, 1));
+  }
+  if (change === 'appeared') await writeFile(record, valid);
+  if (change === 'disappeared') await unlink(record);
+  if (change === 'rewritten') await writeFile(record, JSON.stringify({ ...JSON.parse(valid), changedDuringProof:true }));
+  if (change === 'replaced') { await rename(record, record + '.old'); await writeFile(record, valid); }
+  const snapshot = await pending;
+  expect(snapshot.serverId).toBe(f.server.pid);
+  expect(snapshot).not.toHaveProperty('serverGeneration');
 }, 15000);
 
 // Windows commands are the external OS boundary on this Linux builder. The same
