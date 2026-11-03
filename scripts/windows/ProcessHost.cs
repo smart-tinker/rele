@@ -211,6 +211,21 @@ internal sealed class ProcessHost : IDisposable
         }
     }
 
+    // Codex grants its local sandbox users read/execute on the native server's startup directory.
+    private static bool IsCodexSandboxReadRule(System.Security.AccessControl.FileSystemAccessRule rule)
+    {
+        if (rule.AccessControlType != System.Security.AccessControl.AccessControlType.Allow || rule.IsInherited ||
+            rule.FileSystemRights != (System.Security.AccessControl.FileSystemRights.ReadAndExecute | System.Security.AccessControl.FileSystemRights.Synchronize) ||
+            rule.InheritanceFlags != (System.Security.AccessControl.InheritanceFlags.ContainerInherit | System.Security.AccessControl.InheritanceFlags.ObjectInherit) ||
+            rule.PropagationFlags != System.Security.AccessControl.PropagationFlags.None) return false;
+        try
+        {
+            var sandbox = new NTAccount(Environment.MachineName, "CodexSandboxUsers").Translate(typeof(SecurityIdentifier));
+            return rule.IdentityReference.Equals(sandbox);
+        }
+        catch (IdentityNotMappedException) { return false; }
+    }
+
     private static void RequirePrivateDirectory(string directory)
     {
         if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0) throw new InvalidOperationException("owner directory is redirected");
@@ -219,7 +234,7 @@ internal sealed class ProcessHost : IDisposable
         if (!security.GetOwner(typeof(SecurityIdentifier)).Equals(sid) || !security.AreAccessRulesProtected)
             throw new InvalidOperationException("owner directory is not private");
         foreach (System.Security.AccessControl.FileSystemAccessRule rule in security.GetAccessRules(true, true, typeof(SecurityIdentifier)))
-            if (rule.AccessControlType == System.Security.AccessControl.AccessControlType.Allow && !rule.IdentityReference.Equals(sid))
+            if (rule.AccessControlType == System.Security.AccessControl.AccessControlType.Allow && !rule.IdentityReference.Equals(sid) && !IsCodexSandboxReadRule(rule))
                 throw new InvalidOperationException("owner directory has a foreign access grant");
     }
 

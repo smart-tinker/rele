@@ -912,6 +912,21 @@ internal static class Rele
         }));
     }
 
+    // Codex grants its local sandbox users read/execute on the native server's startup directory.
+    private static bool IsCodexSandboxReadRule(System.Security.AccessControl.FileSystemAccessRule rule)
+    {
+        if (rule.AccessControlType != System.Security.AccessControl.AccessControlType.Allow || rule.IsInherited ||
+            rule.FileSystemRights != (System.Security.AccessControl.FileSystemRights.ReadAndExecute | System.Security.AccessControl.FileSystemRights.Synchronize) ||
+            rule.InheritanceFlags != (System.Security.AccessControl.InheritanceFlags.ContainerInherit | System.Security.AccessControl.InheritanceFlags.ObjectInherit) ||
+            rule.PropagationFlags != System.Security.AccessControl.PropagationFlags.None) return false;
+        try
+        {
+            var sandbox = new NTAccount(Environment.MachineName, "CodexSandboxUsers").Translate(typeof(SecurityIdentifier));
+            return rule.IdentityReference.Equals(sandbox);
+        }
+        catch (IdentityNotMappedException) { return false; }
+    }
+
     private static void PrivateDirectory(string directory, bool create = true)
     {
         SecurityIdentifier sid = WindowsIdentity.GetCurrent().User;
@@ -933,7 +948,7 @@ internal static class Rele
         if (!actual.GetOwner(typeof(SecurityIdentifier)).Equals(sid) || !actual.AreAccessRulesProtected)
             throw new InvalidOperationException("Каталог владельца Codex принадлежит другой учётной записи или не защищён.");
         foreach (System.Security.AccessControl.FileSystemAccessRule rule in actual.GetAccessRules(true, true, typeof(SecurityIdentifier)))
-            if (rule.AccessControlType == System.Security.AccessControl.AccessControlType.Allow && !rule.IdentityReference.Equals(sid))
+            if (rule.AccessControlType == System.Security.AccessControl.AccessControlType.Allow && !rule.IdentityReference.Equals(sid) && !IsCodexSandboxReadRule(rule))
                 throw new InvalidOperationException("Каталог владельца Codex доступен другой учётной записи.");
     }
 
