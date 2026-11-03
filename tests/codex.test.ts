@@ -1180,6 +1180,18 @@ describe('Codex shared passive context receipts', () => {
     expect(await readFile(f.rolloutPath)).toEqual(beforeFile);
   });
 
+  it.each(['local', 'msg'])('reconciles an entry-derived %s receipt after semantic-ID and quote migration', async format => {
+    const f = await sharedContextFixture(), itemId = `rele-context-${'e'.repeat(48)}`;
+    const digest = createHash('sha256').update(JSON.stringify([threadId, 'old-entry'])).digest('hex').slice(0, 48);
+    const persistedId = format === 'local' ? `rele-context-${digest}` : `msg_${digest}`;
+    await appendFile(f.rolloutPath, JSON.stringify({ type: 'response_item', payload: { type: 'message', id: persistedId,
+      role: 'user', content: [{ type: 'input_text', text: 'Exact full legacy quote' }] } }) + '\n');
+    const beforeFile = await readFile(f.rolloutPath); await f.client.connect(); const before = f.calls.length;
+    await f.client.injectContext(threadId, 'canonical-entry', 'Compact quote', { itemId, entries: [{ entryId: 'old-entry', text: 'Exact full legacy quote' }] });
+    expect(f.calls.slice(before).map(call => call.method)).toEqual(['thread/read']);
+    expect(await readFile(f.rolloutPath)).toEqual(beforeFile);
+  });
+
   it('reconciles a new-ID lost ACK even when the canonical journal entry changes', async () => {
     const f = await sharedContextFixture({ dropAck: true }), itemId = `rele-context-${'c'.repeat(48)}`;
     await f.client.connect();
@@ -1190,9 +1202,11 @@ describe('Codex shared passive context receipts', () => {
     expect(f.calls.filter(call => call.method === 'thread/inject_items')).toHaveLength(1);
   });
 
-  it.each(['legacy', 'msg'])('does not accept %s alias provenance with another exact text', async format => {
+  it.each(['legacy', 'msg', 'entry-local', 'entry-msg'])('does not accept %s alias provenance with another exact text', async format => {
     const f = await sharedContextFixture(), itemId = `rele-context-${'d'.repeat(48)}`;
-    const persistedId = format === 'legacy' ? 'rele_slack_old-entry' : `msg_${'d'.repeat(48)}`;
+    const digest = createHash('sha256').update(JSON.stringify([threadId, 'old-entry'])).digest('hex').slice(0, 48);
+    const persistedId = format === 'legacy' ? 'rele_slack_old-entry' : format === 'msg' ? `msg_${'d'.repeat(48)}`
+      : format === 'entry-local' ? `rele-context-${digest}` : `msg_${digest}`;
     await appendFile(f.rolloutPath, JSON.stringify({ type: 'response_item', payload: { type: 'message', id: persistedId, role: 'user', content: [{ type: 'input_text', text: 'Another source version' }] } }) + '\n');
     await f.client.connect();
     await f.client.injectContext(threadId, 'canonical-entry', 'Current quote', { itemId, entries: [{ entryId: 'old-entry', text: 'Expected exact old quote' }] });

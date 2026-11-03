@@ -353,9 +353,12 @@ export class CodexClient extends EventEmitter {
       throw new Error('Не удалось проверить идентификаторы сохранённого контекста Codex.');
     }
     const previousItemId = `msg_${itemId.slice('rele-context-'.length)}`;
-    const receipts = [{ entryId, text }, ...(candidates?.entries ?? [])].flatMap(entry => [
-      { itemId, text: entry.text }, { itemId: previousItemId, text: entry.text }, { itemId: `rele_slack_${entry.entryId}`, text: entry.text },
-    ]);
+    const receipts = [{ entryId, text }, ...(candidates?.entries ?? [])].flatMap(entry => {
+      // Older three-argument callers derived IDs from the journal entry rather than its source version.
+      const digest = createHash('sha256').update(JSON.stringify([threadId, entry.entryId])).digest('hex').slice(0, 48);
+      return [{ itemId, text: entry.text }, { itemId: previousItemId, text: entry.text }, { itemId: `rele_slack_${entry.entryId}`, text: entry.text },
+        { itemId: `rele-context-${digest}`, text: entry.text }, { itemId: `msg_${digest}`, text: entry.text }];
+    });
     this.requireQueue();
     if (!this.isVerifiedVersion()) throw new Error(`Для фонового контекста нужен проверенный Codex ${SUPPORTED_CODEX_VERSION}.`);
     const runtime = this.runtime;

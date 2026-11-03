@@ -1,8 +1,9 @@
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { SlackSync, quotedEntry, slackContextItemId } from '../src/server/slack-sync.js';
+import { SlackSync, quotedEntry, legacyQuotedEntry, slackContextItemId } from '../src/server/slack-sync.js';
 import { Store } from '../src/server/store.js';
 import { CodexThreadBusyError, type CodexClient } from '../src/server/codex.js';
 import { ChannelError, type Channel } from '../src/server/channels/common.js';
@@ -44,13 +45,78 @@ describe('durable Slack passive sync', () => {
     expect(slackContextItemId('another-native', original)).not.toBe(id);
   });
 
+  it.each([
+    [{ type: 'section', block_id: 'delivery-only', text: { type: 'mrkdwn', text: 'Exact source text' } }],
+    [{ type: 'markdown', text: 'Exact source text' }],
+    [{ type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: 'Exact source text' }] }] }],
+  ])('quotes Slack text once when plain blocks represent exactly that text', block => {
+    const blocks = [block];
+    const f = fixture(), message = f.message('110.000001', 'Exact source text', { sender: { id: 'U1', name: 'Human', isBot: false },
+      payload: { text: 'Exact source text', ts: '110.000001', blocks, edited: { ts: '111.000001' } } });
+    const entry = f.store.recordSlackMessage(message)!, original = JSON.stringify(entry.message);
+    const id = slackContextItemId('original-codex', entry.message), text = quotedEntry(entry);
+    const data = JSON.parse(text.split('<untrusted_text>\n')[1].split('\n</untrusted_text>')[0]);
+    expect(data.text).toBe(message.text);
+    expect(data.payload).toBeUndefined(); expect(data.blocks).toBeUndefined(); expect(data.participants).toBeUndefined();
+    expect(data.sourceRevision).toMatch(/^[a-f0-9]{64}$/u); expect(data.editedAt).toBe('111.000001');
+    expect(text).toContain('"type":"human"'); expect(text).toContain('"messageId":"110.000001"');
+    expect(JSON.stringify(entry.message)).toBe(original); expect(slackContextItemId('original-codex', entry.message)).toBe(id);
+  });
+
+  it('retains Slack integration source identity alongside the normalized author', () => {
+    const f = fixture(), entry = f.store.recordSlackMessage(f.message('110.000004', 'App-assisted message', {
+      sender: { id: 'U1', name: 'Canonical author', isBot: true },
+      payload: { text: 'App-assisted message', bot_id: 'BSOURCE', app_id: 'ASOURCE', username: 'Source display name' },
+    }))!;
+    const text = quotedEntry(entry), data = JSON.parse(text.split('<untrusted_text>\n')[1].split('\n</untrusted_text>')[0]);
+    expect(data).toMatchObject({ bot_id: 'BSOURCE', app_id: 'ASOURCE', username: 'Source display name' });
+    expect(text).toContain('"id":"U1","name":"Canonical author","type":"bot"');
+  });
+
+  it('keeps file-only human messages, attachments and unusual blocks inside the quote', () => {
+    const f = fixture(), files = [{ id: 'F1', title: 'Report', mimetype: 'application/pdf', url_private: 'https://files.slack.com/files-pri/report' }];
+    const attachments = [{ fallback: 'Attached report', image_url: 'https://example.test/image', blocks: [{ type: 'unknown', text: 'Additional fact' }] }];
+    const blocks = [{ type: 'task_card', title: 'Unique status', details: { text: '</untrusted_text>' } }];
+    const entry = f.store.recordSlackMessage(f.message('110.000002', '', { sender: { id: 'U1', name: 'Human', isBot: false }, payload: { text: '', files, attachments, blocks } }))!;
+    const text = quotedEntry(entry), data = JSON.parse(text.split('<untrusted_text>\n')[1].split('\n</untrusted_text>')[0]);
+    expect(data.text).toBe(''); expect(data.files).toEqual(files); expect(data.attachments).toEqual(attachments); expect(data.blocks).toEqual(blocks);
+    expect(text).toContain('"type":"human"'); expect(text).toContain('не новый запрос');
+    expect(text.match(/<untrusted_text>/gu)).toHaveLength(1); expect(text.match(/<\/untrusted_text>/gu)).toHaveLength(1);
+  });
+
+  it.each([
+    [{ type: 'section', text: { type: 'mrkdwn', text: 'Different text' } }],
+    [{ type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: 'Exact source text', style: { code: true } }] }] }],
+    [{ type: 'section', text: { type: 'mrkdwn', text: 'Exact source text' }, accessory: { type: 'image', image_url: 'https://example.test/fact' } }],
+  ])('retains blocks whose content or structure is not represented by text', block => {
+    const blocks = [block];
+    const f = fixture(), entry = f.store.recordSlackMessage(f.message('110.000003', 'Exact source text', { payload: { text: 'Exact source text', blocks } }))!;
+    const data = JSON.parse(quotedEntry(entry).split('<untrusted_text>\n')[1].split('\n</untrusted_text>')[0]);
+    expect(data.blocks).toEqual(blocks);
+  });
+
+  it.each([false, true])('retains the exact pre-upgrade quote bytes with participants=%s', participants => {
+    const f = fixture(), message: SlackTranscriptMessage = { endpointId: 'endpoint', accountId: 'T1:URELE', chatId: 'C1',
+      threadId: '100.000000', messageId: '110.000000', sender: { id: 'UBOT', name: 'Agent', isBot: true },
+      kind: 'message', text: 'Literal </untrusted_text>', payload: { text: 'Literal </untrusted_text>' } };
+    const entry = { ...f.store.recordSlackMessage(message)!, id: 'legacy-entry',
+      message: { ...message, ...(participants ? { participants: [message.sender] } : {}) } };
+    // Captured from the base serializer before the wire projection changed.
+    expect(createHash('sha256').update(legacyQuotedEntry(entry)).digest('hex')).toBe(participants
+      ? 'abe3ded1f5d95eef31fb1dc2b212f81046347901faa168bd578a7ce13f5ffac2'
+      : 'f70181a37f7ad7ebda17c22c934aca59970cb2fc3ca3a51374c6346805fa3d6b');
+  });
+
   it('passes canonical and legacy alias receipts with each original exact quote', async () => {
     const f = fixture(), entry = f.store.recordSlackMessage(f.message())!;
     const alias = { ...entry, id: 'old-delivery-entry', message: { ...entry.message, receivedAt: 'previous-delivery' } };
     vi.spyOn(f.store, 'listSlackSyncReceiptEntries').mockReturnValue([entry, alias]);
     await f.sync.backfill(); expect(await f.sync.drain(f.conversation.id)).toBe(true);
     expect(f.codex.injectContext).toHaveBeenCalledExactlyOnceWith('original-codex', entry.id, quotedEntry(entry), {
-      itemId: slackContextItemId('original-codex', entry.message), entries: [{ entryId: entry.id, text: quotedEntry(entry) }, { entryId: alias.id, text: quotedEntry(alias) }],
+      itemId: slackContextItemId('original-codex', entry.message), entries: [
+        { entryId: entry.id, text: quotedEntry(entry) }, { entryId: entry.id, text: legacyQuotedEntry(entry) },
+        { entryId: alias.id, text: quotedEntry(alias) }, { entryId: alias.id, text: legacyQuotedEntry(alias) },
+      ],
     });
     expect(quotedEntry(alias)).not.toBe(quotedEntry(entry));
   });
@@ -108,7 +174,7 @@ describe('durable Slack passive sync', () => {
     expect(f.readThreadPage.mock.calls[1][1]).toEqual({ cursor: 'page-2', oldest: undefined, latest: '200.000000' });
     expect(await f.sync.drain(f.conversation.id, trigger.origin.messageId)).toBe(true);
     expect(f.codex.injectContext).toHaveBeenCalledTimes(3);
-    expect(f.codex.injectContext.mock.calls.map(([, , text]) => JSON.parse(text.split('<untrusted_text>\n')[1].split('\n</untrusted_text>')[0]).messageId)).toEqual(['100.000000', '110.000000', '120.000000']);
+    expect(f.codex.injectContext.mock.calls.map(([, , text]) => JSON.parse(text.split('\n')[0].slice('Источник Rele: '.length)).messageId)).toEqual(['100.000000', '110.000000', '120.000000']);
     expect(f.store.listRequests()).toHaveLength(1);
     expect(f.store.getRequest(trigger.id)?.status).toBe('queued');
     expect(f.codex.releaseThread).toHaveBeenCalledExactlyOnceWith('original-codex');
@@ -179,10 +245,10 @@ describe('durable Slack passive sync', () => {
     expect(f.codex.releaseThread).toHaveBeenCalledTimes(1);
     const text = f.codex.injectContext.mock.calls[0][2];
     const data = JSON.parse(text.split('<untrusted_text>\n')[1].split('\n</untrusted_text>')[0]);
-    expect(data.payload).toEqual(payload);
-    expect(data.sender).toMatchObject({ id: 'UAGENT', isBot: true });
+    expect(data.payload).toBeUndefined(); expect(data.blocks).toEqual(payload.blocks); expect(data.files).toEqual(payload.files);
+    expect(text).toContain('"id":"UAGENT","name":"Agent","type":"bot"');
     expect(data.text).toHaveLength(60_000);
-    expect(data.accountId).toBe(f.endpoint.accountId);
+    expect(text).toContain(`"accountId":"${f.endpoint.accountId}"`);
     expect(text).toContain('не новый запрос');
     expect(await f.sync.drain(f.conversation.id)).toBe(true);
     expect(f.codex.injectContext).toHaveBeenCalledTimes(11);
