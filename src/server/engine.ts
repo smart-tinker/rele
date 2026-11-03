@@ -575,14 +575,27 @@ export class Engine extends EventEmitter {
     state.turnId = found.turnId;
     this.store.updateRequest(id, { status: 'uncertain', turnId: found.turnId, error: 'Проверяется остановка запроса и его фоновых команд.' });
     this.rememberCommandItems(id, found.commandItems ?? []);
+    const rawBaseline = this.store.getMeta(`request-terminal-baseline:${id}`);
+    const baseline = rawBaseline ? JSON.parse(rawBaseline) as TerminalBaseline : undefined;
+    if (!baseline || baseline.target !== state.target || typeof baseline.serverGeneration !== 'string'
+      || !/^[a-f0-9]{64}$/u.test(baseline.serverGeneration) || !Array.isArray(baseline.terminals)
+      || baseline.terminals.some(entry => !terminalPair(entry))) {
+      throw new Error('Исходный сервер или снимок команд не подтверждён. Отсутствие терминалов не доказывает завершение прежних процессов.');
+    }
+    const verifyServer = (snapshot: CodexTerminalSnapshot) => {
+      current();
+      if (this.isMixed(id)) throw new Error('В ход добавлено сообщение другого клиента Codex. Автоматическая отмена смешанного хода недоступна.');
+      if (snapshot.serverId !== baseline.serverId || snapshot.serverGeneration !== baseline.serverGeneration) {
+        throw new Error('Сервер Codex изменился или его поколение не подтверждено. Завершение прежних процессов не подтверждено.');
+      }
+    };
+    verifyServer(await client.backgroundTerminals(conversation.threadId));
     if (found.state === 'running' && !state.interruptAttempted) {
       state.interruptAttempted = true; this.store.setMeta(`cancel-cleanup:${id}`, JSON.stringify(state));
       try { await client.interrupt(conversation.threadId, found.turnId); }
       catch (error) { current(); this.emit('diagnostic', this.options.redact(error)); }
     }
     this.store.setMeta(`cancel-cleanup:${id}`, JSON.stringify(state));
-    const rawBaseline = this.store.getMeta(`request-terminal-baseline:${id}`);
-    const baseline = rawBaseline ? JSON.parse(rawBaseline) as TerminalBaseline : undefined;
     const attempted = new Set<string>(), deadline = performance.now() + 2000;
     do {
       current();
@@ -592,11 +605,7 @@ export class Engine extends EventEmitter {
       const items = this.rememberCommandItems(id, found.commandItems ?? []);
       if (['completed', 'failed', 'interrupted'].includes(found.state)) {
         const snapshot = await client.backgroundTerminals(conversation.threadId);
-        current();
-        if (!baseline || baseline.epoch !== epoch || baseline.target !== state.target || baseline.serverId !== snapshot.serverId
-          || !Array.isArray(baseline.terminals) || baseline.terminals.some(entry => !terminalPair(entry))) {
-          throw new Error('Исходный сервер или снимок команд не подтверждён. Отсутствие терминалов не доказывает завершение прежних процессов.');
-        }
+        verifyServer(snapshot);
         const fresh = snapshot.terminals.filter(entry => !baseline.terminals.some(old => old.itemId === entry.itemId && old.processId === entry.processId));
         for (const entry of fresh) {
           const commands = items.filter(item => item.id === entry.itemId);
@@ -611,12 +620,11 @@ export class Engine extends EventEmitter {
           }
           state.terminalAttempts = [...(state.terminalAttempts ?? []), entry]; this.store.setMeta(`cancel-cleanup:${id}`, JSON.stringify(state));
           attempted.add(JSON.stringify(entry));
-          await client.terminateBackgroundTerminal(conversation.threadId, { ...entry, serverId: snapshot.serverId });
+          await client.terminateBackgroundTerminal(conversation.threadId, { ...entry, serverId: snapshot.serverId, serverGeneration: snapshot.serverGeneration });
           current();
         }
         const after = await client.backgroundTerminals(conversation.threadId);
-        current();
-        if (after.serverId !== baseline.serverId) throw new Error('Сервер Codex изменился во время отмены. Завершение прежних процессов не подтверждено.');
+        verifyServer(after);
         const latestItems = this.rememberCommandItems(id, []);
         const pendingStarts = latestItems.some(item => !latestItems.some(other => other.id === item.id && other.completed)
           && !state.terminalAttempts?.some(attempt => attempt.itemId === item.id));

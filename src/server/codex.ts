@@ -14,7 +14,8 @@ import { discoverCodex } from './codex-discovery.js';
 import { codexEnvironment, environmentValue, resolveCodexLaunch } from './codex-launch.js';
 import { CodexContextReceipts } from './codex-context-receipts.js';
 import { CodexStdioError, CodexStdioTransport } from './codex-stdio.js';
-import { ensureSharedCodex, SharedCodexError } from './codex-shared.js';
+import { codexNativeGeneration, type CodexNativePeer } from './codex-native-generation.js';
+import { effectiveSharedCodexHome, ensureSharedCodex, SharedCodexError } from './codex-shared.js';
 import { asyncQuestions, matchAsyncAnswer, parseAsyncAnswers, type AsyncAnswer, type AsyncQuestion } from './async-questions.js';
 
 export { SUPPORTED_CODEX_VERSION } from '../shared/codex-runtime.js';
@@ -54,7 +55,7 @@ export interface RequestLocation {
 }
 export interface CodexCommandItem { id: string; processId: string | null; completed?: true }
 export interface CodexTerminal { itemId: string; processId: string }
-export interface CodexTerminalSnapshot { serverId: number; terminals: CodexTerminal[] }
+export interface CodexTerminalSnapshot { serverId: number; serverGeneration?: string; terminals: CodexTerminal[] }
 const nativeProcessId = (value: unknown): value is string => typeof value === 'string' && /^\d+$/u.test(value) && Number(value) > 0 && Number(value) <= 0x7fffffff;
 /** Canonical startup items bind a command to its turn even before native publishes its PID. */
 export function codexCommandItem(value: unknown): CodexCommandItem | undefined {
@@ -156,6 +157,7 @@ export class CodexClient extends EventEmitter {
   private stopped = true;
   private retry = 0;
   private runtime?: CodexRuntime;
+  private nativePeer?: CodexNativePeer;
   private contextReceipts = new CodexContextReceipts();
   private version?: string;
   private state: CodexConnectionState;
@@ -505,18 +507,22 @@ export class CodexClient extends EventEmitter {
     this.requireQueue();
     const runtime = this.runtime;
     const diagnostic = await this.diagnostics();
+    const peer = this.nativePeer;
+    const generation = runtime ? await codexNativeGeneration(peer, diagnostic?.process?.id, runtime.codexHome) : undefined;
     const entries = await this.pages<CodexTerminal>('thread/backgroundTerminals/list', { threadId, limit: 100 });
-    if (runtime !== this.runtime || !this.state.connected || !Number.isSafeInteger(diagnostic?.process?.id) || diagnostic.process.id <= 0
+    const after = generation && runtime ? await codexNativeGeneration(peer, diagnostic.process.id, runtime.codexHome) : undefined;
+    if (runtime !== this.runtime || peer !== this.nativePeer || !this.state.connected || !Number.isSafeInteger(diagnostic?.process?.id) || diagnostic.process.id <= 0
       || entries.some(entry => !entry || typeof entry.itemId !== 'string' || !entry.itemId || !nativeProcessId(entry.processId))) {
       throw new CodexTransportError('Codex не подтвердил идентичность фоновых команд. Отмена команды требует сверки.', 'terminal-identity-unconfirmed');
     }
-    return { serverId: diagnostic.process.id, terminals: entries.map(({ itemId, processId }) => ({ itemId, processId })) };
+    return { serverId: diagnostic.process.id, ...(generation && generation === after ? { serverGeneration: generation } : {}), terminals: entries.map(({ itemId, processId }) => ({ itemId, processId })) };
   }
 
-  async terminateBackgroundTerminal(threadId: string, target: CodexTerminal & { serverId: number }): Promise<void> {
+  async terminateBackgroundTerminal(threadId: string, target: CodexTerminal & { serverId: number; serverGeneration?: string }): Promise<void> {
     const current = await this.backgroundTerminals(threadId);
     const matching = current.terminals.filter(entry => entry.itemId === target.itemId);
-    if (current.serverId !== target.serverId || matching.length !== 1 || matching[0].processId !== target.processId) {
+    if (target.serverGeneration !== undefined && (!/^[a-f0-9]{64}$/u.test(target.serverGeneration) || current.serverGeneration !== target.serverGeneration)
+      || current.serverId !== target.serverId || matching.length !== 1 || matching[0].processId !== target.processId) {
       throw new CodexTransportError('Фоновая команда или сервер изменились. Адресное завершение не отправлено.', 'terminal-identity-changed');
     }
     // Native has no expected-item CAS: revalidate immediately, never terminate a stored PID blindly.
@@ -774,6 +780,7 @@ export class CodexClient extends EventEmitter {
     // Reconnect must not overlap two owned runtimes, even after an uncertain shutdown.
     await this.cleanup;
     this.runtime = undefined;
+    this.nativePeer = undefined;
     this.version = undefined;
     this.setState({ connected: false, queueSupported: false, codexHome: undefined });
     let target: CodexConnectionTarget = { executable: this.config.executable, transport: this.config.transport, endpoint: this.config.endpoint ?? '', ...(this.config.codexHome ? { codexHome: this.config.codexHome } : {}) };
@@ -831,7 +838,14 @@ export class CodexClient extends EventEmitter {
         },
       });
       this.stdio = stdio;
-      try { await stdio.ready; }
+      try {
+        await stdio.ready;
+        if (stdio.pid) {
+          let codexHome: string | undefined;
+          try { codexHome = effectiveSharedCodexHome(env); } catch { /* An unknown launch profile cannot attest stdio. */ }
+          this.nativePeer = { kind: 'stdio', pid: stdio.pid, executable: launch.command, codexHome, helperExecutable: stdio.helperExecutable };
+        }
+      }
       catch (error) {
         const details = failure ?? { message: error instanceof CodexStdioError ? error.message : 'Не удалось запустить управляемый Codex.', code: error instanceof CodexStdioError ? error.code : 'cli-unavailable' };
         throw new CodexTransportError(details.message, details.code);
@@ -848,6 +862,7 @@ export class CodexClient extends EventEmitter {
         const args = [...launch.args, 'app-server', 'proxy'];
         if (target.endpoint) args.push('--sock', target.endpoint);
         this.proxy = spawn(launch.command, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env });
+        if (this.proxy.pid && target.endpoint) this.nativePeer = { kind: 'proxy', pid: this.proxy.pid, endpoint: target.endpoint };
         this.proxy.stderr.setEncoding('utf8').on('data', diagnostic);
         const stream = Duplex.from({ readable: this.proxy.stdout, writable: this.proxy.stdin });
         options = { ...options, createConnection: () => stream as Socket };
@@ -875,6 +890,12 @@ export class CodexClient extends EventEmitter {
         });
         socket.once('close', () => reject(new CodexTransportError(failure?.message || 'Codex app-server закрыл соединение во время подключения.', failure?.code || 'connection-closed')));
       });
+    }
+    if (process.platform === 'win32' && this.config.transport === 'shared' && target.transport === 'websocket') {
+      const connection = (this.socket as WebSocket & { _socket?: Socket } | undefined)?._socket;
+      if (connection?.localAddress === '127.0.0.1' && connection.remoteAddress === '127.0.0.1' && connection.localPort && connection.remotePort) {
+        this.nativePeer = { kind: 'windows-shared', endpoint: target.endpoint, localPort: connection.localPort, remotePort: connection.remotePort };
+      }
     }
     this.runtime = await this.call<CodexRuntime>('initialize', {
       clientInfo: { name: 'rele', title: 'Rele', version: '0.1.0' }, capabilities: { experimentalApi: true },

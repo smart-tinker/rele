@@ -37,6 +37,8 @@ async function managedFixture(options: {
   contextQueue?: 'pending' | 'afterResume';
   dropInjectAck?: boolean;
   malformed?: boolean;
+  diagnosticPid?: 'parent';
+  terminals?: boolean;
   codexHome?: string;
   auto?: boolean;
   releaseTimeoutMs?: number;
@@ -64,6 +66,9 @@ async function managedFixture(options: {
           if (options.malformed) { writeSync(2, 'synthetic-secret-never-published\\n'); writeSync(1, 'malformed-json\\n'); break; }
           reply({ userAgent: 'rele/' + (options.version || '0.163.0') + ' (Fixture)', codexHome: process.env.CODEX_HOME || ${JSON.stringify(directory)}, platformFamily: 'fixture', platformOs: process.platform });
           break;
+        case 'server/diagnostics': reply({ process: { id: options.diagnosticPid === 'parent' ? process.ppid : process.pid }, gauges: [] }); break;
+        case 'thread/backgroundTerminals/list': reply({ data: options.terminals ? [{ itemId:'fixture-command', processId:'1234' }] : [], nextCursor: null }); break;
+        case 'thread/backgroundTerminals/terminate': reply({ terminated:true }); break;
         case 'thread/list': reply({ data: [thread], nextCursor: null }); break;
         case 'thread/queue/list':
           reply({ data: options.contextQueue === 'pending' || options.contextQueue === 'afterResume' && resumed ? [{ id: 'other-queue', clientUserMessageId: 'other-request' }] : [], nextCursor: null });
@@ -1336,6 +1341,49 @@ describe('Codex shared passive context receipts', () => {
 });
 
 describe('Codex managed runtime', () => {
+  it('never sends terminal termination with an unproven or malformed target generation', async () => {
+    const f = await fixture({
+      'server/diagnostics': () => ({ process: { id: 42 }, gauges: [] }),
+      'thread/backgroundTerminals/list': () => ({ data: [{ itemId: 'own-command', processId: '1234' }], nextCursor: null }),
+      'thread/backgroundTerminals/terminate': () => ({ terminated: true }),
+    });
+    await f.client.connect();
+    for (const serverGeneration of ['a'.repeat(64), 'A'.repeat(64), 'a'.repeat(63), '']) {
+      await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, serverGeneration, itemId: 'own-command', processId: '1234' })).rejects.toMatchObject({ code: 'terminal-identity-changed' });
+    }
+    expect(f.calls.some(call => call.method === 'thread/backgroundTerminals/terminate')).toBe(false);
+    expect(await f.client.backgroundTerminals(threadId)).not.toHaveProperty('serverGeneration');
+  });
+
+  it.skipIf(!['linux', 'win32'].includes(process.platform))('proves a stable generation for the actual owned stdio peer and changes it for a replacement process', async () => {
+    const home = await mkdtemp(path.join(tmpdir(), 'Rele native generation '));
+    cleanup.push(() => rm(home, { recursive: true, force: true }));
+    const f = await managedFixture({ codexHome: home, terminals:true });
+    await f.client.connect();
+    const first = await f.client.backgroundTerminals(threadId);
+    expect(first.serverId).toBe((await f.records())[0].pid);
+    expect(first).toHaveProperty('serverGeneration', expect.stringMatching(/^[a-f0-9]{64}$/u));
+    expect(await f.client.backgroundTerminals(threadId)).toEqual(first);
+    await expect(f.client.terminateBackgroundTerminal(threadId, { serverId:first.serverId, serverGeneration:'0'.repeat(64), itemId:'fixture-command', processId:'1234' })).rejects.toMatchObject({ code:'terminal-identity-changed' });
+    expect((await f.calls()).filter(call => call.method === 'thread/backgroundTerminals/terminate')).toHaveLength(0);
+    await f.client.terminateBackgroundTerminal(threadId, { serverId:first.serverId, serverGeneration:first.serverGeneration, itemId:'fixture-command', processId:'1234' });
+    expect((await f.calls()).filter(call => call.method === 'thread/backgroundTerminals/terminate').map(call => call.params)).toEqual([{ threadId, processId:'1234' }]);
+    await f.client.close();
+    await f.client.connect();
+    const replacement = await f.client.backgroundTerminals(threadId);
+    expect(replacement).toHaveProperty('serverGeneration', expect.stringMatching(/^[a-f0-9]{64}$/u));
+    expect(replacement.serverId).not.toBe(first.serverId);
+    expect(replacement).not.toHaveProperty('serverGeneration', Reflect.get(first, 'serverGeneration'));
+  }, 60000);
+
+  it('does not turn a claimed diagnostics PID into proof of another stdio process', async () => {
+    const home = await mkdtemp(path.join(tmpdir(), 'Rele claimed generation '));
+    cleanup.push(() => rm(home, { recursive: true, force: true }));
+    const f = await managedFixture({ codexHome: home, diagnosticPid: 'parent' });
+    await f.client.connect();
+    expect(await f.client.backgroundTerminals(threadId)).not.toHaveProperty('serverGeneration');
+  });
+
   it('owns an NDJSON child, preserves the inherited profile and safely closes that process', async () => {
     vi.stubEnv('CODEX_HOME', path.join(tmpdir(), 'inherited Codex profile'));
     vi.stubEnv('RELE_CODEX_TEST_MARKER', 'inherited-sentinel');
