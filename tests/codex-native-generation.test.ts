@@ -3,7 +3,7 @@ import { spawn, execFile } from 'node:child_process';
 import net from 'node:net';
 import { promisify } from 'node:util';
 import { once } from 'node:events';
-import { copyFile, mkdir, mkdtemp, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { copyFile, lstat, lutimes, mkdir, mkdtemp, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -12,7 +12,7 @@ import { CodexClient } from '../src/server/codex.js';
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
 
-async function proxyFixture(churn = false, coldExecutable = false) {
+async function proxyFixture(churn = false, coldExecutable = false, symlinkEndpoint = false) {
   const home = await mkdtemp(path.join(tmpdir(), 'rele-generation-'));
   cleanup.push(() => rm(home, { recursive: true, force: true }));
   const directory = path.join(home, 'app-server-control'), endpoint = path.join(directory, 'app-server-control.sock');
@@ -27,7 +27,7 @@ async function proxyFixture(churn = false, coldExecutable = false) {
     const { writeFileSync, readFileSync } = require('node:fs');
     const { execFileSync } = require('node:child_process');
     const { WebSocketServer } = require(${JSON.stringify(ws)});
-    const home = ${JSON.stringify(home)}, endpoint = ${JSON.stringify(endpoint)};
+    const home = ${JSON.stringify(home)}, endpoint = ${JSON.stringify(endpoint)}, boundEndpoint = ${JSON.stringify(symlinkEndpoint ? endpoint + '.bound' : endpoint)};
     const server = createServer(), websocket = new WebSocketServer({ server });
     websocket.on('connection', socket => socket.on('message', raw => {
       const m = JSON.parse(raw); if (m.id === undefined) return;
@@ -41,7 +41,8 @@ async function proxyFixture(churn = false, coldExecutable = false) {
       else { socket.send(JSON.stringify({ id:m.id, error:{ code:-32601, message:'fixture method' } })); return; }
       socket.send(JSON.stringify({ id:m.id, result }));
     }));
-    server.listen(endpoint, () => {
+    server.listen(boundEndpoint, () => {
+      if (${JSON.stringify(symlinkEndpoint)}) require('node:fs').symlinkSync(boundEndpoint, endpoint);
       writeFileSync(home + '/app-server-daemon/daemon.pid', JSON.stringify({ pid:process.pid, processStartTime:execFileSync('/usr/bin/ps', ['-p', String(process.pid), '-o', 'lstart='], { encoding:'utf8' }).trim() }));
       if (${JSON.stringify(churn)}) { let noisy; setInterval(() => { noisy?.destroy(); noisy=require('node:net').createConnection(endpoint); noisy.on('error',()=>{}); }, 3); }
       process.stdout.write('ready\\n');
@@ -111,6 +112,18 @@ it.skipIf(process.platform !== 'linux')('proves a cold native executable when re
   const snapshot = await f.client.backgroundTerminals('fixture');
   expect(snapshot.serverId).toBe(f.server.pid);
   expect(snapshot.serverGeneration).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
+}, 15000);
+
+it.skipIf(process.platform !== 'linux')('proves a symlink native endpoint when readlink changes only its access time', async () => {
+  const f = await proxyFixture(false, false, true);
+  await f.client.connect();
+  const endpoint = await lstat(f.endpoint);
+  expect(endpoint.isSymbolicLink()).toBe(true);
+  await lutimes(f.endpoint, new Date('2000-01-01T00:00:00Z'), endpoint.mtime);
+  const snapshot = await f.client.backgroundTerminals('fixture');
+  expect(snapshot.serverId).toBe(f.server.pid);
+  expect(snapshot.serverGeneration).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
+  expect(await f.client.backgroundTerminals('fixture')).toEqual(snapshot);
 }, 15000);
 
 // Windows commands are the external OS boundary on this Linux builder. The same

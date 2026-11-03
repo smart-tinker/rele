@@ -95,7 +95,10 @@ def endpoint_identity(endpoint):
     canonical=os.path.realpath(endpoint)
     target=os.lstat(canonical)
     require(stat.S_ISSOCK(target.st_mode) and target.st_uid==os.getuid())
-    return canonical,(published,os.readlink(endpoint) if stat.S_ISLNK(published.st_mode) else None,target)
+    fields=('st_dev','st_ino','st_uid','st_gid','st_mode','st_size','st_mtime_ns','st_ctime_ns')
+    return canonical,(tuple(getattr(published,key) for key in fields),
+        os.readlink(endpoint) if stat.S_ISLNK(published.st_mode) else None,
+        tuple(getattr(target,key) for key in fields))
 
 try:
     kind,peer_pid,server_pid,home,endpoint=sys.argv[1:]
@@ -169,14 +172,14 @@ try {
         $expectedParent=$inputProof.gatewayId
         if ($p.helperExecutable) { $expectedParent=$p.pid } else { Require ($native.Id -eq $p.pid) }
         Require ($record.ParentProcessId -eq $expectedParent)
-        $home=[IO.Path]::GetFullPath($p.codexHome)
-        Require ([IO.Directory]::Exists($home))
+        $nativeHome=[IO.Path]::GetFullPath($p.codexHome)
+        Require ([IO.Directory]::Exists($nativeHome))
       } else {
         Require ($owner.Sid -eq $r.ownerSid -and $birth -ceq $r.processStartTime -and $hash -ceq $r.executableSha256 -and [IO.Path]::GetFullPath($exe) -ieq [IO.Path]::GetFullPath($r.executable))
-        $home=[IO.Path]::GetFullPath($r.codexHome)
+        $nativeHome=[IO.Path]::GetFullPath($r.codexHome)
       }
       $boot=(Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime().ToString('o')
-      $result=[ordered]@{pid=$native.Id;birth=$birth;boot=$boot;executable=[IO.Path]::GetFullPath($exe).ToLowerInvariant();sha256=$hash;owner=$owner.Sid;codexHome=$home.ToLowerInvariant()}
+      $result=[ordered]@{pid=$native.Id;birth=$birth;boot=$boot;executable=[IO.Path]::GetFullPath($exe).ToLowerInvariant();sha256=$hash;owner=$owner.Sid;codexHome=$nativeHome.ToLowerInvariant()}
       if ($stdio) {
         $result.parentPid=[int]$record.ParentProcessId; $result.gatewayOwner=$gatewayOwner
         if ($p.helperExecutable) {
