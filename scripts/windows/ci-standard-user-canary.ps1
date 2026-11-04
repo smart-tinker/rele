@@ -288,7 +288,8 @@ try {
     }
     $credential = New-Object System.Management.Automation.PSCredential ($env:COMPUTERNAME + '\' + $account), $password
     $resultPath = Join-Path $FixtureRoot 'windows-standard-user-results.json'
-    if ($RunGates) { $gatesDeadline = [DateTime]::UtcNow.AddMinutes($(if ($Phase -eq 'Shared') { 5 } else { 20 })) }
+    # Eight versions plus Desktop need 13.5 minutes of 90-second marker observation; desktop-first skips cancellation.
+    if ($RunGates) { $gatesDeadline = [DateTime]::UtcNow.AddMinutes($(if ($Phase -eq 'Shared') { 60 } else { 80 })) }
     if ($RunGates) {
         $parentStage = 'shared'
         $marker.phase = 'Shared'; $marker | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8

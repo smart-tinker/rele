@@ -862,8 +862,9 @@ trust_level="trusted"
             # The command is bounded and writes only inside this disposable workspace.
             ready_file, late_file = workspace / 'cancel-ready.json', workspace / 'cancel-late.txt'
             command_file = workspace / 'cancel-child.cjs'
+            shell_delay = 90 if os.name == 'nt' else 12
             # PowerShell 5 strips embedded JS quotes from native -e arguments.
-            command_file.write_text('const f=require("node:fs");f.writeFileSync(process.argv[2],JSON.stringify({pid:process.pid}));setTimeout(()=>f.writeFileSync(process.argv[3],"not-stopped"),12000);', encoding='utf-8')
+            command_file.write_text(f'const f=require("node:fs");f.writeFileSync(process.argv[2],JSON.stringify({{pid:process.pid}}));setTimeout(()=>f.writeFileSync(process.argv[3],"not-stopped"),{shell_delay * 1000});', encoding='utf-8')
             command_args = [str(Path(NODE).resolve(strict=True)), str(command_file), str(ready_file), str(late_file)]
             shell_command = ('& ' + ' '.join("'" + value.replace("'", "''") + "'" for value in command_args)
                              if os.name == 'nt' else shlex.join(command_args))
@@ -882,14 +883,14 @@ trust_level="trusted"
                 assert asyncio.get_running_loop().time() < deadline, 'Shell neither started nor requested approval'
                 await asyncio.sleep(.05)
             assert len(shell_approvals) <= 1 and all(item['method'] == 'item/commandExecution/requestApproval' and item['requestId'] == next(row['id'] for row in pending['requests'] if row['eventId'] == 'cancel') for item in shell_approvals), 'Unexpected shell approval'
-            shell_deadline = asyncio.get_running_loop().time() + 15
+            shell_deadline = asyncio.get_running_loop().time() + shell_delay + 3
             if shell_approvals:
                 await engine.command('answer', approvalId=shell_approvals[0]['id'], decision='accept')
             await asyncio.wait_for(wait_records(before + 2), 25)
             assert ready_file.is_file(), 'Bounded shell child did not start'
+            shell_deadline = asyncio.get_running_loop().time() + shell_delay + 1
             if args.expected_version == '0.166.0-alpha.6':
                 assert any(item.get('type') == 'custom_tool_call_output' and item.get('call_id') == f'call-{before + 1}' for item in records[before + 1].get('input', [])), 'Missing actual custom exec result'
-            shell_deadline = asyncio.get_running_loop().time() + 13
             child_pid = json.loads(ready_file.read_text())['pid']
             running = await engine.command('wait', status='running')
             cancel = next(row for row in running['requests'] if row['eventId'] == 'cancel')
@@ -906,6 +907,10 @@ trust_level="trusted"
             following = next(row for row in queued['requests'] if row['eventId'] == 'after-shell-cancel')
             assert following['status'] == 'queued'
             cancelled = await engine.command('cancel', requestId=cancel['id'], processId=child_pid)
+            witnesses = cancelled['cancellationInterruptWitnesses']
+            report.setdefault('cancellationInterruptWitnesses', []).extend({'scenario': order, **item} for item in witnesses)
+            assert len(witnesses) == 1 and witnesses[0] == {'threadId': thread, 'turnId': cancel['turnId'],
+                'processId': child_pid, 'processAlive': True, 'markerExists': False}, 'Native interrupt was not dispatched against the live fixture child before its delayed marker'
             assert not cancelled['probeProcessAlive'], 'Engine cancelled the model but left its shell child alive'
             aborted = await peer.completed(cancel['turnId'])
             assert aborted['params']['turn']['status'] == 'interrupted'
@@ -923,7 +928,7 @@ trust_level="trusted"
             assert not terminal_page.get('nextCursor'), 'Unexpected terminal pagination in the disposable fixture'
             terminals = terminal_page['data']
             assert not any(item['itemId'] == item_id for item in terminals)
-            await asyncio.sleep(13)
+            await asyncio.sleep(max(0, shell_deadline - asyncio.get_running_loop().time()))
             assert not late_file.exists(), 'Cancelled shell wrote its delayed marker'
             report['checks']['origin_engine_cancels_exact_native_turn_seen_by_desktop'] = True
             report['checks']['engine_shell_stop_cleans_owned_process_before_next_origin_turn_without_backend_restart'] = True

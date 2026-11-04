@@ -2,6 +2,7 @@
 import { parseArgs } from 'node:util';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
+import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ConfigStore, defaultConfig, defaultDataDirectory } from '../src/server/config.js';
@@ -69,7 +70,8 @@ if (values['expect-error']) {
   const diagnostics: string[] = [];
   const observedTurns: Array<{ method: string; threadId: string; turnId: string }> = [];
   const cancellationProcessChecks: Array<{ turnId: string; processAlive: boolean }> = [];
-  let cancellationProcess: { id: number; turnId: string } | undefined;
+  const cancellationInterruptWitnesses: Array<{ threadId: string; turnId: string; processId: number; processAlive: boolean; markerExists: boolean }> = [];
+  let cancellationProcess: { id: number; threadId: string; turnId: string } | undefined;
   let codex: SourceCodexClient | undefined, engine: SourceEngine | undefined;
   let threadId = values.thread;
   let loseNextQueueAck = false, droppedQueueAcks = 0, catalogValidated = false;
@@ -91,6 +93,15 @@ if (values['expect-error']) {
       }
     });
     await codex.connect();
+    const interrupt = codex.interrupt.bind(codex);
+    codex.interrupt = async (...args) => {
+      const owned = cancellationProcess;
+      if (owned && args[0] === owned.threadId && args[1] === owned.turnId) {
+        cancellationInterruptWitnesses.push({ threadId: args[0], turnId: args[1], processId: owned.id,
+          processAlive: alive(owned.id), markerExists: existsSync(join(values.directory!, 'cancel-late.txt')) });
+      }
+      return interrupt(...args);
+    };
     const enqueue = codex.enqueue.bind(codex);
     codex.enqueue = async (...args) => {
       const result = await enqueue(...args);
@@ -134,7 +145,7 @@ if (values['expect-error']) {
       return raw ? [[request.id, JSON.parse(raw)]] : [];
     }));
     return { threadId, configuredExecutable: config.codex.executable, status: codex.status(), runtime: codex.runtimeInfo(), runtimeProcessId,
-      droppedQueueAcks, catalogValidated, observedTurns, cancellationProcessChecks,
+      droppedQueueAcks, catalogValidated, observedTurns, cancellationProcessChecks, cancellationInterruptWitnesses,
       ...(processId ? { probeProcessAlive: alive(processId) } : {}),
       requests, cancelCleanups, deliveries: store.listDeliveries(), approvals: store.listApprovals(), diagnostics };
   }
@@ -182,7 +193,7 @@ if (values['expect-error']) {
         if (command.processId) {
           const request = store.listRequests().find(request => request.id === command.requestId);
           if (!request?.turnId) throw new Error('Missing cancellation fixture turn');
-          cancellationProcess = { id: command.processId, turnId: request.turnId };
+          cancellationProcess = { id: command.processId, threadId: threadId!, turnId: request.turnId };
         }
         await engine!.cancel(command.requestId!);
       } else if (command.action === 'close') {
