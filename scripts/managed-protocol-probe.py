@@ -18,15 +18,20 @@ from aiohttp import web
 import websockets
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--codex-prefix', required=True)
-parser.add_argument('--expected-version', required=True, choices=['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1'])
+source = parser.add_mutually_exclusive_group(required=True)
+source.add_argument('--codex-prefix')
+source.add_argument('--codex', help='Native executable inside a complete extracted Codex package.')
+parser.add_argument('--expected-version', required=True, choices=['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6'])
 parser.add_argument('--report', type=Path, required=True)
 args = parser.parse_args()
 binary = 'codex.exe' if os.name == 'nt' else 'codex'
-candidates = list(Path(args.codex_prefix).glob(f'node_modules/@openai/codex-*/vendor/*/bin/{binary}'))
-if len(candidates) != 1:
-    parser.error('Expected one native binary in the isolated npm prefix.')
-CLI = str(candidates[0].resolve())
+if args.codex:
+    CLI = str(Path(args.codex).resolve(strict=True))
+else:
+    candidates = list(Path(args.codex_prefix).glob(f'node_modules/@openai/codex-*/vendor/*/bin/{binary}'))
+    if len(candidates) != 1:
+        parser.error('Expected one native binary in the isolated npm prefix.')
+    CLI = str(candidates[0].resolve())
 REPO = Path(__file__).resolve().parent.parent
 PROCESS_HOST = REPO / 'dist' / 'native' / 'Rele.Process.exe'
 if os.name == 'nt' and not PROCESS_HOST.is_file():

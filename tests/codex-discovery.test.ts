@@ -190,7 +190,7 @@ describe('Codex installation and existing Desktop discovery', () => {
     expect(result.recommended).toEqual({ executable: desktop, transport: 'websocket', endpoint: 'ws://127.0.0.1:4500' });
   });
 
-  it.each(['0.165.0-alpha.1.2', '0.166.0-alpha.5.1'])('recommends supported %s even when a newer unsupported package is found first', async version => {
+  it.each(['0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6'])('recommends supported %s even when a newer unsupported package is found first', async version => {
     const latest = desktop.replace('26.1_', '26.2_'), unsupported = desktop.replace('26.1_', '26.3_');
     const packages = [unsupported, desktop, latest].map(executable => ({ name: 'OpenAI.Codex', location: win.dirname(win.dirname(win.dirname(executable))) }));
     const metadata = { processes: [], packages, issues: [] };

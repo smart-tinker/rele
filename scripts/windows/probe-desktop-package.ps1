@@ -12,6 +12,11 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+function Test-FullyQualifiedWindowsPath([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path -match '^[\\/]{2}[?.][\\/]') { return $false }
+    return $Path -match '^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+(?:[\\/]|$))'
+}
+
 function Assert-NoReparsePath([string]$Path) {
     $current = [IO.Path]::GetFullPath($Path)
     while ($current) {
@@ -26,7 +31,7 @@ function Assert-NoReparsePath([string]$Path) {
 if ($env:OS -ne 'Windows_NT' -or -not $env:RUNNER_TEMP -or (-not $Standalone -and $env:GITHUB_ACTIONS -ne 'true')) {
     throw 'Run this probe on a disposable GitHub Windows runner or explicitly use -Standalone with disposable RUNNER_TEMP.'
 }
-if ($Standalone -and (-not [IO.Path]::IsPathFullyQualified($env:RUNNER_TEMP) -or -not (Test-Path -LiteralPath $env:RUNNER_TEMP -PathType Container))) {
+if ($Standalone -and (-not (Test-FullyQualifiedWindowsPath $env:RUNNER_TEMP) -or -not (Test-Path -LiteralPath $env:RUNNER_TEMP -PathType Container))) {
     throw 'Standalone mode requires an explicit existing absolute RUNNER_TEMP directory.'
 }
 $root = [IO.Path]::GetFullPath($OutputDirectory)
@@ -39,7 +44,7 @@ $reusePackage = $PSBoundParameters.ContainsKey('PackageFile')
 if ($Standalone -or $reusePackage) { Assert-NoReparsePath $root }
 $sourcePackage = $null
 if ($reusePackage) {
-    if ([string]::IsNullOrWhiteSpace($PackageFile) -or -not [IO.Path]::IsPathFullyQualified($PackageFile)) { throw 'PackageFile must be an absolute local MSIX under RUNNER_TEMP.' }
+    if ([string]::IsNullOrWhiteSpace($PackageFile) -or -not (Test-FullyQualifiedWindowsPath $PackageFile)) { throw 'PackageFile must be an absolute local MSIX under RUNNER_TEMP.' }
     $sourcePackage = [IO.Path]::GetFullPath($PackageFile)
     if (-not $sourcePackage.StartsWith($temporaryRoot, [StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetExtension($sourcePackage) -ine '.msix' -or -not (Test-Path -LiteralPath $sourcePackage -PathType Leaf)) {
         throw 'PackageFile must be an existing local MSIX strictly under RUNNER_TEMP.'

@@ -8,7 +8,7 @@ import { ConfigStore, defaultConfig, defaultDataDirectory } from '../src/server/
 import { CodexClient as SourceCodexClient } from '../src/server/codex.js';
 import { Engine as SourceEngine } from '../src/server/engine.js';
 import { Store as SourceStore } from '../src/server/store.js';
-import { ensureWindowsSharedCodex } from '../src/server/codex-shared.js';
+import { ensureWindowsSharedCodex, readPreparedDesktopCodexPackage } from '../src/server/codex-shared.js';
 import type { Channel } from '../src/server/channels/common.js';
 import type { Endpoint, Platform, SlackTranscriptMessage } from '../src/shared/types.js';
 
@@ -127,15 +127,27 @@ if (values['expect-error']) {
   }
   async function snapshot(processId?: number) {
     if (!codex) throw new Error('Client is closed');
-    return { threadId, configuredExecutable: config.codex.executable, status: codex.status(), runtime: codex.runtimeInfo(), runtimeProcessId: (await codex.diagnostics()).process.id,
+    const runtimeProcessId = (await codex.diagnostics()).process.id;
+    const requests = store.listRequests();
+    const cancelCleanups = Object.fromEntries(requests.flatMap(request => {
+      const raw = store.getMeta(`cancel-cleanup:${request.id}`);
+      return raw ? [[request.id, JSON.parse(raw)]] : [];
+    }));
+    return { threadId, configuredExecutable: config.codex.executable, status: codex.status(), runtime: codex.runtimeInfo(), runtimeProcessId,
       droppedQueueAcks, catalogValidated, observedTurns, cancellationProcessChecks,
       ...(processId ? { probeProcessAlive: alive(processId) } : {}),
-      requests: store.listRequests(), deliveries: store.listDeliveries(), approvals: store.listApprovals(), diagnostics };
+      requests, cancelCleanups, deliveries: store.listDeliveries(), approvals: store.listApprovals(), diagnostics };
   }
   const input = createInterface({ input: process.stdin });
   try {
     await start();
-    process.stdout.write(JSON.stringify({ ready: true, ...(await snapshot()) }) + '\n');
+    const ready = await snapshot();
+    let preparedRuntime;
+    if (process.platform === 'win32') {
+      const shared = values['runtime-directory'] ? await load('codex-shared') as typeof import('../src/server/codex-shared.js') : { readPreparedDesktopCodexPackage };
+      preparedRuntime = await shared.readPreparedDesktopCodexPackage(ready.status.executable!, {}, true);
+    }
+    process.stdout.write(JSON.stringify({ ready: true, ...ready, preparedRuntime }) + '\n');
     for await (const line of input) {
       const command = JSON.parse(line) as { action: string; platform?: Platform; text?: string; eventId?: string;
         requestId?: string; approvalId?: string; status?: string; turnId?: string; loseAck?: boolean;
