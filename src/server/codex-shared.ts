@@ -119,15 +119,18 @@ export async function completeCodexPackage(executable: string): Promise<string |
     const directory = path.dirname(native);
     const packaged = ['bin', 'codex-resources'].includes(path.basename(directory));
     const root = packaged ? path.dirname(directory) : directory;
-    const metadata = JSON.parse(await readFile(path.join(root, 'codex-package.json'), 'utf8')) as { layoutVersion?: unknown; version?: unknown; target?: unknown; entrypoint?: unknown };
+    const metadata = JSON.parse(await readFile(path.join(root, 'codex-package.json'), 'utf8')) as { layoutVersion?: unknown; version?: unknown; target?: unknown; entrypoint?: unknown; execServer?: unknown };
     const entrypoint = `bin/${binary}`;
     const winget = process.platform === 'win32' && metadata.layoutVersion === 1 && metadata.entrypoint === `codex-${target}.exe` && path.basename(native) === metadata.entrypoint;
     if (!packaged && !winget || typeof metadata.version !== 'string' || !SUPPORTED_CODEX_VERSIONS.includes(metadata.version)
       || metadata.target !== target || metadata.entrypoint !== entrypoint && !winget) return undefined;
     const sourceEntrypoint = String(metadata.entrypoint);
+    const execServer = `bin/${process.platform === 'win32' ? 'codex-exec-server.exe' : 'codex-exec-server'}`;
+    if (metadata.execServer !== undefined && metadata.execServer !== execServer) return undefined;
     const files = ['codex-package.json', sourceEntrypoint, path.posix.join(path.posix.dirname(sourceEntrypoint), process.platform === 'win32' ? 'codex-code-mode-host.exe' : 'codex-code-mode-host'),
       process.platform === 'win32' ? 'codex-path/rg.exe' : 'codex-path/rg',
       ...(process.platform === 'win32' ? ['codex-resources/codex-command-runner.exe', 'codex-resources/codex-windows-sandbox-setup.exe'] : ['codex-resources/bwrap'])];
+    if (metadata.execServer) files.push(execServer);
     const present = await Promise.all(files.map(async file => {
       const info = await stat(path.join(root, file));
       return info.isFile() && (process.platform === 'win32' || file === 'codex-package.json' || !!(info.mode & 0o111));
@@ -150,38 +153,133 @@ async function fileDigest(file: string): Promise<string> {
   return hash.digest('hex');
 }
 
-/** Snapshot only Desktop's bundled native files; Codex owns installation into its original profile. */
-export async function prepareDesktopCodexPackage(executable: string, options: SharedCodexOptions = {}): Promise<string | undefined> {
-  if (process.arch !== 'x64' || path.basename(executable).toLowerCase() !== 'codex.exe'
-      || path.basename(path.dirname(executable)).toLowerCase() !== 'resources') return undefined;
-  const env = options.env ?? process.env;
-  let staging: string | undefined;
-  const invalid = () => new SharedCodexError('Не удалось проверить локальный пакет Desktop. Полностью закройте Desktop и повторите запуск; существующий Codex не заменён.', 'shared-desktop-package-invalid');
+interface PreparedDesktopPackage {
+  executable: string;
+  sourceExecutable: string;
+  version: string;
+  executableSha256: string;
+  sourceSelection: string;
+  sourceUnchanged: boolean;
+}
+
+function sourceIdentity(info: Awaited<ReturnType<typeof stat>>) {
+  return { dev: info.dev, ino: info.ino, size: info.size, mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs };
+}
+
+async function packageFiles(directory: string): Promise<string[]> {
+  const files: string[] = []; let entries = 0;
+  const walk = async (relative: string) => {
+    for (const name of await readdir(path.join(directory, relative))) {
+      const item = path.posix.join(relative, name), file = path.join(directory, item), info = await lstat(file);
+      if (++entries > 512 || info.isSymbolicLink()) throw new Error('Invalid native package inventory.');
+      if (info.isDirectory()) await walk(item);
+      else if (info.isFile()) files.push(item);
+      else throw new Error('Invalid native package file.');
+    }
+  };
+  if (JSON.stringify((await readdir(directory)).sort()) !== JSON.stringify(['bin', 'codex-package.json', 'codex-path', 'codex-resources'])) throw new Error('Invalid native package root.');
+  for (const folder of ['bin', 'codex-resources', 'codex-path']) {
+    const info = await lstat(path.join(directory, folder));
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Invalid native package directory.');
+    await walk(folder);
+  }
+  return files.sort();
+}
+
+/** Status reads bind metadata; prepare/apply separately verify every cached file. */
+export async function readPreparedDesktopCodexPackage(executable: string, options: SharedCodexOptions = {}, verifyFiles = false): Promise<PreparedDesktopPackage | undefined> {
+  const data = path.resolve(environmentValue(options.env ?? process.env, 'RELE_DATA_DIR') || defaultDataDirectory());
+  const cache = path.join(data, 'codex-desktop-packages');
+  const parts = path.relative(cache, path.resolve(executable)).split(path.sep);
+  if (parts.length !== 3 || !/^[a-f0-9]{64}$/u.test(parts[0]) || parts[1] !== 'bin' || parts[2] !== 'codex.exe') return;
+  const invalid = () => new SharedCodexError('Сохранённый полный пакет Codex изменён или не подтверждён. Файлы и работающий сервер сохранены.', 'shared-desktop-package-invalid');
   try {
+    const directory = path.join(cache, parts[0]);
+    for (const folder of [data, cache, directory]) if (!(await lstat(folder)).isDirectory() || !samePath(await realpath(folder), folder)) throw invalid();
+    const file = path.join(directory, 'codex-package.json'), info = await lstat(file);
+    if (!info.isFile() || info.isSymbolicLink() || info.size > 64 * 1024) throw invalid();
+    const bytes = await readFile(file), manifest = JSON.parse(bytes.toString('utf8'));
+    const required: string[] = DESKTOP_PACKAGE_FILES.map(([, destination]) => destination);
+    if (manifest.execServer !== undefined) {
+      if (manifest.execServer !== 'bin/codex-exec-server.exe') throw invalid();
+      required.push(manifest.execServer);
+    }
+    if (createHash('sha256').update(bytes).digest('hex') !== parts[0] || manifest.layoutVersion !== 1
+      || manifest.target !== 'x86_64-pc-windows-msvc' || manifest.entrypoint !== 'bin/codex.exe'
+      || manifest.resourcesDir !== 'codex-resources' || manifest.pathDir !== 'codex-path'
+      || typeof manifest.version !== 'string' || !SUPPORTED_CODEX_VERSIONS.includes(manifest.version)
+      || typeof manifest.sourceExecutable !== 'string' || !path.isAbsolute(manifest.sourceExecutable)
+      || manifest.sourceSelection !== undefined && (typeof manifest.sourceSelection !== 'string' || !manifest.sourceSelection || manifest.sourceSelection.includes('\0'))
+      || !Array.isArray(manifest.files) || manifest.files.length < required.length || manifest.files.length > 512
+      || manifest.files.some((item: { path?: unknown; sha256?: unknown }) => typeof item.path !== 'string'
+        || !/^(?:bin|codex-resources|codex-path)\//u.test(item.path) || item.path.includes('\\') || item.path.split('/').some(part => !part || part === '.' || part === '..')
+        || typeof item.sha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(item.sha256))
+      || new Set(manifest.files.map((item: { path: string }) => item.path)).size !== manifest.files.length
+      || required.some(name => !manifest.files.some((item: { path: string }) => item.path === name))) throw invalid();
+    if (verifyFiles) {
+      if (JSON.stringify(await packageFiles(directory)) !== JSON.stringify(manifest.files.map((item: { path: string }) => item.path).sort())) throw invalid();
+      for (const item of manifest.files) if (await fileDigest(path.join(directory, item.path)) !== item.sha256) throw invalid();
+    }
+    if (!(await readFile(file)).equals(bytes)) throw invalid();
+    const unchanged = await stat(manifest.sourceExecutable).then(info => info.isFile()
+      && JSON.stringify(sourceIdentity(info)) === JSON.stringify(manifest.sourceIdentity), () => false);
+    return { executable: path.join(directory, 'bin', 'codex.exe'), sourceExecutable: manifest.sourceExecutable,
+      sourceSelection: manifest.sourceSelection ?? manifest.sourceExecutable, sourceUnchanged: unchanged,
+      version: manifest.version, executableSha256: manifest.files.find((item: { path: string }) => item.path === 'bin/codex.exe').sha256 };
+  } catch (error) { if (error instanceof SharedCodexError) throw error; throw invalid(); }
+}
+
+/** Snapshot one complete native package, never auth, history or another release's helpers. */
+export async function prepareDesktopCodexPackage(executable: string, options: SharedCodexOptions = {}, sourceSelection = executable): Promise<string | undefined> {
+  if (process.arch !== 'x64' || path.basename(executable).toLowerCase() !== 'codex.exe'
+    || !['resources', 'bin'].includes(path.basename(path.dirname(executable)).toLowerCase())) return;
+  const existing = await readPreparedDesktopCodexPackage(executable, options, true);
+  if (existing) return existing.executable;
+  const env = options.env ?? process.env; let staging: string | undefined, recognized = false;
+  const invalid = () => new SharedCodexError('Не удалось проверить полный локальный пакет Codex. Существующие файлы и сервер сохранены.', 'shared-desktop-package-invalid');
+  try {
+    const canonical = path.basename(path.dirname(executable)) === 'bin';
     const bundle = await realpath(path.dirname(path.dirname(executable)));
     const inside = (file: string) => { const relative = path.relative(bundle, file); return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative); };
-    const localFile = async (file: string) => {
-      const resolved = await realpath(file);
-      if (!inside(resolved) || !(await stat(resolved)).isFile()) throw invalid();
-      return resolved;
-    };
-    const resources = path.join(bundle, 'resources');
-    if (!await stat(path.join(resources, 'app.asar')).then(info => info.isFile(), () => false)) return undefined;
-    const gui = await Promise.all(['ChatGPT.exe', 'Codex.exe'].map(name => stat(path.join(bundle, name)).then(info => info.isFile(), () => false)));
-    if (!gui.some(Boolean)) return undefined;
-    await localFile(path.join(resources, 'app.asar'));
-    await Promise.all(['ChatGPT.exe', 'Codex.exe'].filter((_, index) => gui[index]).map(name => localFile(path.join(bundle, name))));
-    const sources: Array<{ source: string; destination: string; digest: string }> = [];
-    for (const [name, destination] of DESKTOP_PACKAGE_FILES) {
-      const source = await localFile(path.join(resources, name));
-      sources.push({ source, destination, digest: await fileDigest(source) });
+    const localFile = async (file: string) => { const resolved = await realpath(file); if (!inside(resolved) || !(await stat(resolved)).isFile()) throw invalid(); return resolved; };
+    const sources: Array<{ source: string; original: string; destination: string; digest: string }> = [];
+    let metadata: Record<string, unknown>, originalManifest: Buffer | undefined;
+    if (canonical) {
+      try { originalManifest = await readFile(path.join(bundle, 'codex-package.json')); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        const packageLayout = await Promise.all(['codex-resources', 'codex-path'].map(name => stat(path.join(bundle, name)).then(info => info.isDirectory(), () => false)));
+        if (packageLayout.some(Boolean)) throw invalid();
+        return; // Older self-contained CLI paths can legitimately have no package manifest.
+      }
+      if (originalManifest.length > 64 * 1024) throw invalid();
+      metadata = JSON.parse(originalManifest.toString('utf8'));
+      if (metadata.layoutVersion !== 1 || metadata.target !== 'x86_64-pc-windows-msvc' || metadata.entrypoint !== 'bin/codex.exe'
+        || metadata.resourcesDir !== 'codex-resources' || metadata.pathDir !== 'codex-path'
+        || metadata.execServer !== undefined && metadata.execServer !== 'bin/codex-exec-server.exe') throw invalid();
+      recognized = true;
+      const paths = await packageFiles(bundle), required: string[] = DESKTOP_PACKAGE_FILES.map(([, destination]) => destination);
+      if (metadata.execServer) required.push(metadata.execServer as string);
+      if (required.some(file => !paths.includes(file))) throw invalid();
+      for (const destination of paths) { const original = path.join(bundle, destination), source = await localFile(original); sources.push({ source, original, destination, digest: await fileDigest(source) }); }
+    } else {
+      const resources = path.join(bundle, 'resources');
+      if (!await stat(path.join(resources, 'app.asar')).then(info => info.isFile(), () => false)) return;
+      const gui = await Promise.all(['ChatGPT.exe', 'Codex.exe'].map(name => stat(path.join(bundle, name)).then(info => info.isFile(), () => false)));
+      if (!gui.some(Boolean)) return;
+      await localFile(path.join(resources, 'app.asar'));
+      await Promise.all(['ChatGPT.exe', 'Codex.exe'].filter((_, index) => gui[index]).map(name => localFile(path.join(bundle, name))));
+      for (const [name, destination] of DESKTOP_PACKAGE_FILES) { const original = path.join(resources, name), source = await localFile(original); sources.push({ source, original, destination, digest: await fileDigest(source) }); }
+      metadata = { layoutVersion: 1, target: 'x86_64-pc-windows-msvc', variant: 'codex', entrypoint: 'bin/codex.exe', resourcesDir: 'codex-resources', pathDir: 'codex-path' };
     }
-    // Hash first so an update between --version and copying cannot mix releases.
-    const cli = await (options.run ?? runSharedCommand)(sources[0].source, ['--version'], Math.min(options.timeoutMs ?? 15_000, 4_000), env);
+    const entry = sources.find(item => item.destination === 'bin/codex.exe')!;
+    const cli = await (options.run ?? runSharedCommand)(entry.source, ['--version'], Math.min(options.timeoutMs ?? 15_000, 4_000), env);
     const version = cli.stdout.trim().match(/^codex(?:-cli)?\s+(\S+)(?:\s|$)/iu)?.[1];
     if (cli.code !== 0 || !version || !SUPPORTED_CODEX_VERSIONS.includes(version)) throw new SharedCodexError(`Для общего daemon нужен проверенный Codex ${SUPPORTED_CODEX_VERSIONS.join(' или ')}.`, 'shared-cli-unverified');
-    const manifest = JSON.stringify({ layoutVersion: 1, version, target: 'x86_64-pc-windows-msvc', variant: 'codex', entrypoint: 'bin/codex.exe', resourcesDir: 'codex-resources', pathDir: 'codex-path' });
-    const digest = createHash('sha256').update(manifest).update(JSON.stringify(sources.map(({ destination, digest }) => [destination, digest]))).digest('hex');
+    if (canonical && metadata.version !== version) throw invalid();
+    const sourceStat = await stat(entry.source);
+    const manifest = JSON.stringify({ ...metadata, version, sourceExecutable: entry.source, sourceSelection, sourceIdentity: sourceIdentity(sourceStat), files: sources.map(({ destination, digest }) => ({ path: destination, sha256: digest })) });
+    const digest = createHash('sha256').update(manifest).digest('hex');
     const dataDirectory = path.resolve(environmentValue(env, 'RELE_DATA_DIR') || defaultDataDirectory());
     if (!isLocalCodexHome(dataDirectory)) throw invalid();
     await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
@@ -190,43 +288,27 @@ export async function prepareDesktopCodexPackage(executable: string, options: Sh
     if (!samePath(await realpath(cache), cache)) throw invalid();
     const destination = path.join(cache, digest);
     const unchanged = async () => {
-      for (let index = 0; index < sources.length; index++) {
-        const source = sources[index];
-        if (!samePath(await localFile(path.join(resources, DESKTOP_PACKAGE_FILES[index][0])), source.source) || await fileDigest(source.source) !== source.digest) throw invalid();
-      }
+      if (canonical && (!(await readFile(path.join(bundle, 'codex-package.json'))).equals(originalManifest!)
+        || JSON.stringify(await packageFiles(bundle)) !== JSON.stringify(sources.map(item => item.destination).sort()))) throw invalid();
+      for (const source of sources) if (!samePath(await localFile(source.original), source.source) || await fileDigest(source.source) !== source.digest) throw invalid();
+      if (JSON.stringify(sourceIdentity(await stat(entry.source))) !== JSON.stringify(sourceIdentity(sourceStat))) throw invalid();
     };
     const verify = async (directory: string) => {
-      const entries = async (root: string, names: string[]) => {
-        const info = await lstat(root);
-        if (!info.isDirectory() || info.isSymbolicLink() || JSON.stringify((await readdir(root)).sort()) !== JSON.stringify(names.sort())) throw invalid();
-      };
-      await entries(directory, ['bin', 'codex-path', 'codex-resources', 'codex-package.json']);
-      for (const folder of ['bin', 'codex-path', 'codex-resources']) await entries(path.join(directory, folder), sources.filter(file => path.posix.dirname(file.destination) === folder).map(file => path.posix.basename(file.destination)));
-      for (const file of [...sources, { destination: 'codex-package.json', digest: createHash('sha256').update(manifest).digest('hex') }]) {
-        const target = path.join(directory, file.destination), info = await lstat(target);
-        if (!info.isFile() || info.isSymbolicLink() || await fileDigest(target) !== file.digest) throw invalid();
-      }
+      const info = await lstat(directory);
+      if (!info.isDirectory() || info.isSymbolicLink()) throw invalid();
+      if (JSON.stringify(await packageFiles(directory)) !== JSON.stringify(sources.map(item => item.destination).sort())) throw invalid();
+      for (const source of sources) if (await fileDigest(path.join(directory, source.destination)) !== source.digest) throw invalid();
+      if (!(await readFile(path.join(directory, 'codex-package.json'))).equals(Buffer.from(manifest))) throw invalid();
     };
-    const exists = await lstat(destination).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
-    if (exists) { await unchanged(); await verify(destination); return path.join(destination, 'bin', 'codex.exe'); }
+    if (await lstat(destination).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })) { await unchanged(); await verify(destination); return path.join(destination, 'bin', 'codex.exe'); }
     staging = await mkdtemp(path.join(cache, '.prepare-'));
-    for (const file of sources) {
-      const target = path.join(staging, file.destination);
-      await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
-      await copyFile(file.source, target, constants.COPYFILE_EXCL);
-    }
+    for (const source of sources) { const target = path.join(staging, source.destination); await mkdir(path.dirname(target), { recursive: true, mode: 0o700 }); await copyFile(source.source, target, constants.COPYFILE_EXCL); }
     await writeFile(path.join(staging, 'codex-package.json'), manifest, { flag: 'wx', mode: 0o600 });
-    await unchanged();
-    await verify(staging);
-    try { await rename(staging, destination); }
-    catch (error) { if (!['EEXIST', 'ENOTEMPTY', 'EPERM'].includes((error as NodeJS.ErrnoException).code || '')) throw error; }
-    await verify(destination);
-    return path.join(destination, 'bin', 'codex.exe');
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-    if (error instanceof SharedCodexError) throw error;
-    throw invalid();
-  } finally { if (staging) await rm(staging, { recursive: true, force: true }); }
+    await unchanged(); await verify(staging);
+    try { await rename(staging, destination); } catch (error) { if (!['EEXIST', 'ENOTEMPTY', 'EPERM'].includes((error as NodeJS.ErrnoException).code || '')) throw error; }
+    await verify(destination); return path.join(destination, 'bin', 'codex.exe');
+  } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT' && !recognized) return; if (error instanceof SharedCodexError) throw error; throw invalid(); }
+  finally { if (staging) await rm(staging, { recursive: true, force: true }); }
 }
 
 /** Resolve only installed files and version metadata; this never starts the daemon. */
@@ -251,6 +333,7 @@ export async function resolveSharedCodexExecutable(target: CodexConnectionTarget
       if (!executable) throw new SharedCodexError(`Не найден проверенный Codex CLI. Нужен ${SUPPORTED_CODEX_VERSIONS.join(' или ')}.`, 'shared-cli-unavailable');
     }
   }
+  await readPreparedDesktopCodexPackage(executable, { ...options, env });
   const launch = await resolveCodexLaunch(executable, { env });
   const cli = await run(launch.command, [...launch.args, '--version'], Math.min(timeoutMs, 4_000), env);
   const version = cli.stdout.trim().match(/^codex(?:-cli)?\s+(\S+)(?:\s|$)/iu)?.[1];
@@ -376,15 +459,28 @@ export async function ensureWindowsSharedCodex(target: CodexConnectionTarget, op
       return receipt;
     };
     let selected = target.executable, resolved: string | undefined;
+    const priorPackage = async () => {
+      const directory = before.CodexWebSocketOwnerDirectory;
+      if (typeof directory !== 'string' || !/^[a-f0-9]{64}$/u.test(path.basename(directory)) || !samePath(path.dirname(directory), path.join(await realpath(before.DataDirectory as string), 'codex-websocket-owners'))) return;
+      const bytes = await readFile(path.join(directory, 'owner.json')).catch(error => { if (error.code === 'ENOENT') return; throw error; });
+      if (!bytes) return;
+      if (bytes.length > 64 * 1024 || createHash('sha256').update(bytes).digest('hex') !== path.basename(directory)) throw invalid();
+      const owner = JSON.parse(bytes.toString('utf8'));
+      if (owner.OwnerSid !== before.OwnerSid || owner.TaskName !== `${before.TaskName}-Codex` || !samePath(owner.CodexHome, home)) throw invalid();
+      const prepared = await readPreparedDesktopCodexPackage(owner.Executable, { ...options, env });
+      if (prepared && (selected === 'codex' || samePath(selected, prepared.sourceSelection) || samePath(selected, prepared.sourceExecutable) || samePath(selected, prepared.executable))) return prepared.executable;
+    };
     // The saved executable is desired policy; an existing owned server remains actual until explicit maintenance.
     const current = await run(path.join(installationDirectory, 'Rele.exe'), ['codex-status', '--quiet', '--codex-home', home], timeoutMs, env);
     const status = JSON.parse(current.stdout) as { status?: unknown; pendingUpdate?: unknown; pendingExe?: unknown } | null;
     if (current.code !== 0 || !status || !['notRunning', 'alreadyRunning'].includes(String(status.status))) throw invalid();
+    const prior = status.status === 'notRunning' && status.pendingUpdate !== true ? await priorPackage() : undefined;
     if (status.status === 'alreadyRunning') selected = (await validateReceipt(current, undefined, true)).executable;
     else if (status.pendingUpdate === true) {
       if (typeof status.pendingExe !== 'string' || !path.isAbsolute(status.pendingExe)) throw invalid();
       selected = status.pendingExe;
-    } else if (selected === 'codex') {
+    } else if (prior) selected = prior;
+    else if (selected === 'codex') {
       const discovery = await (options.discover ?? discoverCodex)({ env, ...(target.codexHome ? { codexHome: target.codexHome } : {}) });
       const candidates = discovery.installations.filter(item => item.version && SUPPORTED_CODEX_VERSIONS.includes(item.version))
         .sort((a, b) => compareCodexInstallations(a, b, 'win32'));
@@ -401,7 +497,19 @@ export async function ensureWindowsSharedCodex(target: CodexConnectionTarget, op
       }
       if (!resolved) throw new SharedCodexError('Не найден проверенный установленный Codex Desktop.', 'shared-cli-unavailable');
     }
-    const executable = resolved ?? await nativeCodexExecutable(await resolveSharedCodexExecutable({ ...target, executable: selected }, { ...options, env }), 'win32');
+    let executable = resolved ?? await nativeCodexExecutable(await resolveSharedCodexExecutable({ ...target, executable: selected }, { ...options, env }), 'win32');
+    if (status.status !== 'alreadyRunning' && status.pendingUpdate !== true) {
+      const prepared = await prepareDesktopCodexPackage(executable, { ...options, env }, target.executable);
+      if (!prepared && path.basename(path.dirname(executable)).toLowerCase() === 'resources') throw new SharedCodexError('Полная исходная поставка Codex не подтверждена. Сервер не запускался.', 'shared-desktop-package-invalid');
+      executable = prepared ?? executable;
+    }
+    if (status.status !== 'alreadyRunning') {
+      const cached = await readPreparedDesktopCodexPackage(executable, { ...options, env }, true);
+      if (!cached) {
+        const version = await run(executable, ['--version'], Math.min(timeoutMs, 4_000), env);
+        if (/^codex(?:-cli)?\s+0\.166\.0-alpha\.6(?:\s|$)/u.test(version.stdout)) throw new SharedCodexError('Для нового Codex требуется подтверждённый полный пакет. Сервер не запускался.', 'shared-desktop-package-invalid');
+      }
+    }
     if (path.basename(executable).toLowerCase() !== 'codex.exe') throw new SharedCodexError('Общему Windows Codex нужен штатный codex.exe из установленного Desktop.', 'shared-cli-unverified');
     const deadline = Date.now() + timeoutMs;
     const result = await run(path.join(installationDirectory, 'Rele.exe'), ['codex-start', '--quiet', '--codex-executable', executable, '--codex-home', home,

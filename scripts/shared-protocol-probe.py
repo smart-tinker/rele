@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Real shared Codex/Engine gate: Linux native UDS, Windows installed direct WS owner.
 
-Only isolated profiles, complete npm vendor packages or signed Desktop payloads,
+Only isolated profiles, complete native packages or signed Desktop payloads,
 a fake Responses provider and synthetic messenger channels are used. The optional
 Desktop mode tests real backend bytes and production bootstrap, never the GUI.
 """
@@ -25,7 +25,7 @@ import websockets
 from websockets.exceptions import ConnectionClosedError
 from websockets.protocol import State
 
-VERSIONS = ['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1']
+VERSIONS = ['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6']
 REPO = Path(__file__).resolve().parent.parent
 NODE = shutil.which('node')
 DRIVER = REPO / 'scripts/probe-shared-codex.ts'
@@ -36,6 +36,7 @@ def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument('--codex-prefix', type=Path)
+    source.add_argument('--codex', type=Path, help='Native executable inside a complete extracted Codex package.')
     source.add_argument('--desktop-bundle', type=Path)
     parser.add_argument('--desktop-inventory', type=Path)
     parser.add_argument('--installed-desktop', action='store_true')
@@ -77,14 +78,17 @@ def arguments():
         args.cli = args.desktop_bundle / 'app/resources/codex.exe'
         args.package = None
     else:
-        candidates = list(args.codex_prefix.glob(f'node_modules/@openai/codex-*/vendor/*/bin/{binary}'))
-        if len(candidates) != 1:
-            parser.error('Expected exactly one native CLI in the isolated npm prefix.')
-        args.cli = candidates[0].resolve()
+        if args.codex:
+            args.cli = args.codex.resolve(strict=True)
+        else:
+            candidates = list(args.codex_prefix.glob(f'node_modules/@openai/codex-*/vendor/*/bin/{binary}'))
+            if len(candidates) != 1:
+                parser.error('Expected exactly one native CLI in the isolated npm prefix.')
+            args.cli = candidates[0].resolve()
         args.package = args.cli.parent.parent
         manifest = args.package / 'codex-package.json'
         if not manifest.is_file():
-            parser.error('Native shared gate requires a complete npm vendor package with codex-package.json.')
+            parser.error('Native shared gate requires a complete package with codex-package.json.')
         metadata = json.loads(manifest.read_text())
         if metadata.get('entrypoint') != f'bin/{binary}' or metadata.get('version') != args.expected_version:
             parser.error('Native vendor package manifest does not match the selected version and executable.')
@@ -215,6 +219,9 @@ async def gate(args, root):
     native_executables = {}
     windows_fixtures = {}
     if os.name == 'nt':
+        with args.cli.open('rb') as stream:
+            native_source_sha256 = hashlib.file_digest(stream, 'sha256').hexdigest()
+        report['windowsNativeSourceSha256'] = native_source_sha256
         report['windowsSharedRuntime'] = args.windows_runtime
         report['windowsPeerTransport'] = 'direct-websocket'
         report['windowsControlHashes'] = {name: hashlib.sha256((args.windows_app_template / name).read_bytes()).hexdigest()
@@ -255,6 +262,15 @@ async def gate(args, root):
             else:
                 item = {'type': 'message', 'role': 'assistant', 'id': f'msg-{index}', 'phase': 'final_answer',
                         'content': [{'type': 'output_text', 'text': 'NOREPLY' if initial else f'shared-answer-{index}'}]}
+            if args.expected_version == '0.166.0-alpha.6' and item['type'] == 'function_call':
+                tools = body.get('tools', [])
+                if item['name'] == 'request_user_input':
+                    question_specs = [tool for tool in tools if tool.get('type') == 'function' and tool.get('name') == item['name']]
+                    assert len(question_specs) == 1 and question_specs[0].get('parameters', {}).get('properties', {}).get('questions', {}).get('type') == 'array' and 'questions' in question_specs[0]['parameters'].get('required', []), 'Native did not advertise the direct question function'
+                else:
+                    assert len([tool for tool in tools if tool.get('type') == 'custom' and tool.get('name') == 'exec']) == 1, 'Native did not advertise the custom exec tool'
+                    item = {'type': 'custom_tool_call', 'name': 'exec', 'call_id': item['call_id'],
+                            'input': 'text(await tools.' + item['name'] + '(' + item['arguments'] + '));'}
             await response.write(frame({'type': 'response.output_item.done', 'output_index': 0, 'item': item}))
             await response.write(frame({'type': 'response.completed', 'response': {'id': f'resp-{index}',
                 'usage': {'input_tokens': 10, 'output_tokens': 3, 'total_tokens': 13}}}))
@@ -270,6 +286,7 @@ async def gate(args, root):
     site = web.TCPSite(runner, '127.0.0.1', 0)
     await site.start()
     port = site._server.sockets[0].getsockname()[1]
+    code_mode_feature = 'code_mode=true\ncode_mode_host=true\n' if args.expected_version == '0.166.0-alpha.6' else ''
     config = f'''model="mock-model"
 model_provider="mock_provider"
 approval_policy="on-request"
@@ -278,7 +295,7 @@ sandbox_mode="read-only"
 cli_auth_credentials_store="file"
 [features]
 plugins=false
-[model_providers.mock_provider]
+{code_mode_feature}[model_providers.mock_provider]
 name="Rele isolated native shared fixture"
 base_url="http://127.0.0.1:{port}/v1"
 wire_api="responses"
@@ -418,14 +435,16 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
                 stopped = await owner_stop(env)
                 if operation == 'stop':
                     return stopped
+            executable = native_executables.get(env['CODEX_HOME'], args.cli)
             process = await spawn([str(fixture['application'] / 'Rele.exe'), 'codex-start', '--quiet',
-                '--codex-executable', str(args.cli), '--codex-home', env['CODEX_HOME']], env, root)
+                '--codex-executable', str(executable), '--codex-home', env['CODEX_HOME']], env, root)
             output = await output_and_exit(process, 45)
             assert process.returncode == 0, (operation, errors[-10:])
             receipt = json.loads(output)
             assert receipt['status'] in ('started', 'alreadyRunning') and receipt['codexHome'] == env['CODEX_HOME']
-            assert Path(receipt['executable']).resolve() == args.cli.resolve()
-            assert receipt['executableSha256'] == hashlib.sha256(args.cli.read_bytes()).hexdigest()
+            assert Path(receipt['executable']).resolve() == executable.resolve()
+            with executable.open('rb') as stream:
+                assert receipt['executableSha256'] == native_source_sha256 == hashlib.file_digest(stream, 'sha256').hexdigest()
             fixture['endpoint'] = receipt['endpoint']
             fixture['target']['endpoint'] = receipt['endpoint']
             return receipt
@@ -434,6 +453,27 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
         output = await output_and_exit(process, 20)
         assert process.returncode == 0, (operation, errors[-10:])
         return json.loads(output)
+
+    def remember_windows_native(env, ready):
+        executable = Path(ready['status']['executable']).resolve(strict=True)
+        source = args.cli.resolve(strict=True)
+        with source.open('rb') as stream:
+            assert hashlib.file_digest(stream, 'sha256').hexdigest() == native_source_sha256, 'Original native executable changed'
+        assert f'/{args.expected_version} ' in ready['runtime']['userAgent']
+        assert Path(ready['runtime']['codexHome']).resolve() == Path(env['CODEX_HOME']).resolve()
+        if executable != source:
+            cache = Path(env['RELE_DATA_DIR']).resolve(strict=True) / 'codex-desktop-packages'
+            package = executable.parent.parent
+            assert cache.resolve(strict=True) == cache and package.parent == cache and executable == package / 'bin/codex.exe'
+            assert len(package.name) == 64 and all(character in '0123456789abcdef' for character in package.name)
+            manifest = (package / 'codex-package.json').read_bytes()
+            assert hashlib.sha256(manifest).hexdigest() == package.name, 'Prepared native manifest changed'
+            proof = ready['preparedRuntime']
+            assert Path(proof['executable']).resolve() == executable and Path(proof['sourceExecutable']).resolve() == source
+            assert proof['sourceSelection'] == ready['configuredExecutable'] and proof['sourceUnchanged'] is True
+            assert proof['version'] == args.expected_version and proof['executableSha256'] == native_source_sha256
+        native_executables[env['CODEX_HOME']] = executable
+        windows_fixtures[env['CODEX_HOME']]['target']['executable'] = str(executable)
 
     async def driver(env, workspace, prepare=False, thread=None, profile_socket=None, expected_error=None):
         command = [NODE, str(REPO / 'node_modules/tsx/dist/cli.mjs'), str(DRIVER),
@@ -453,7 +493,10 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
             command += ['--thread', thread]
         process = await spawn(command, env, REPO)
         client = EngineDriver(process)
-        return client, await client.read()
+        ready = await client.read()
+        if os.name == 'nt':
+            remember_windows_native(env, ready)
+        return client, ready
 
     async def desktop(env, name, private=False, plugin_helpers=False):
         command = [str(args.cli)] if private else [NODE, str(SHIM)]
@@ -653,8 +696,7 @@ trust_level="trusted"
                 report['desktopBootstrap'] = {'originalThreadId': thread, 'privateProcessId': private_pid,
                     'nativeProcessId': pid, 'configuredExecutable': ready['configuredExecutable'],
                     'codexHome': ready['runtime']['codexHome'], 'automaticDiscovery': not args.installed_desktop}
-                native_executables[env['CODEX_HOME']] = Path(ready['status']['executable'])
-                assert native_executables[env['CODEX_HOME']].resolve() == args.cli.resolve()
+                assert native_executables[env['CODEX_HOME']] == Path(ready['status']['executable']).resolve()
                 peer = await desktop(env, 'actual_desktop_direct_ws_peer')
                 await peer.call('thread/resume', {'threadId': thread, 'excludeTurns': True})
                 report['checks']['explicit_installed_desktop_backend_same_thread_profile' if args.installed_desktop
@@ -681,6 +723,8 @@ trust_level="trusted"
                 report['checks']['desktop_first_production_catalog_selects_original_existing_thread'] = True
             assert (await peer.call('server/diagnostics'))['process']['id'] == pid
             assert ready['status']['queueSupported'] and ready['status']['transport'] == 'shared', ready['status']
+            if os.name == 'nt' and order in ('rele-first', 'desktop-bundle'):
+                assert ready.get('preparedRuntime') and native_executables[env['CODEX_HOME']] != args.cli.resolve(), 'Cold Windows bootstrap did not use the verified private native package'
             report['checks'][f'{order}_same_original_id_profile_pid'] = True
             if order == 'rele-first':
                 wrong_home = directory / 'other-profile'
@@ -772,12 +816,33 @@ trust_level="trusted"
             report['checks']['origin_engine_declines_approval_and_desktop_observes_resolution'] = True
             # Desktop's native question is replayed to a late second shim subscriber.
             actions.append(('question', None))
+            question_record_start = len(records)
             question_turn = (await peer.call('turn/start', {'threadId': thread,
                 'collaborationMode': {'mode': 'plan', 'settings': {'model': 'mock-model',
                     'reasoning_effort': None, 'developer_instructions': None}},
                 'input': [{'type': 'text', 'text': 'shared-native-question'}]}))['turn']['id']
-            question = await peer.wait(lambda event: event.get('method') == 'item/tool/requestUserInput'
-                                      and event['params'].get('turnId') == question_turn)
+            try:
+                question = await peer.wait(lambda event: event.get('method') == 'item/tool/requestUserInput'
+                                          and event['params'].get('turnId') == question_turn)
+            except TimeoutError:
+                question_records = records[question_record_start:]
+                report['questionDiagnostics'] = {
+                    'advertisedTools': [{'type': tool.get('type'), 'name': tool.get('name'),
+                        'parameterKeys': sorted((tool.get('parameters') or {}).get('properties', {}))}
+                        for tool in (question_records[0].get('tools', []) if question_records else [])
+                        if tool.get('name') in ('exec', 'request_user_input')],
+                    'toolOutputs': [{'type': item['type'], 'callId': item.get('call_id'),
+                        'output': str(item.get('output', ''))[:2048]}
+                        for record in question_records for item in record.get('input', [])
+                        if item.get('type') in ('function_call_output', 'custom_tool_call_output')
+                        and item.get('call_id') == f'call-{question_record_start + 1}'][:4],
+                    'events': [{'method': event.get('method'), 'itemType': (event['params'].get('item') or {}).get('type'),
+                        'itemName': (event['params'].get('item') or {}).get('name'),
+                        'status': (event['params'].get('turn') or {}).get('status'),
+                        'errorMessage': str(event['params']['error'].get('message', '') if isinstance(event['params'].get('error'), dict) else '')[:512]}
+                        for event in peer.events if event.get('params', {}).get('turnId') == question_turn
+                        or (event.get('params', {}).get('turn') or {}).get('id') == question_turn][-30:]}
+                raise
             observer = await desktop(env, 'desktop_question_peer', plugin_helpers=True)
             await observer.call('thread/resume', {'threadId': thread, 'excludeTurns': True})
             assert (await observer.call('server/diagnostics'))['process']['id'] == pid
@@ -797,8 +862,9 @@ trust_level="trusted"
             # The command is bounded and writes only inside this disposable workspace.
             ready_file, late_file = workspace / 'cancel-ready.json', workspace / 'cancel-late.txt'
             command_file = workspace / 'cancel-child.cjs'
+            shell_delay = 90 if os.name == 'nt' else 12
             # PowerShell 5 strips embedded JS quotes from native -e arguments.
-            command_file.write_text('const f=require("node:fs");f.writeFileSync(process.argv[2],JSON.stringify({pid:process.pid}));setTimeout(()=>f.writeFileSync(process.argv[3],"not-stopped"),12000);', encoding='utf-8')
+            command_file.write_text(f'const f=require("node:fs");f.writeFileSync(process.argv[2],JSON.stringify({{pid:process.pid}}));setTimeout(()=>f.writeFileSync(process.argv[3],"not-stopped"),{shell_delay * 1000});', encoding='utf-8')
             command_args = [str(Path(NODE).resolve(strict=True)), str(command_file), str(ready_file), str(late_file)]
             shell_command = ('& ' + ' '.join("'" + value.replace("'", "''") + "'" for value in command_args)
                              if os.name == 'nt' else shlex.join(command_args))
@@ -808,13 +874,23 @@ trust_level="trusted"
                 ('hold', hold_cancel)])
             before = len(records)
             await engine.command('ingest', platform='telegram', eventId='cancel', text='shared-cancel-request')
-            pending = await engine.command('wait', status='waiting_approval')
-            shell_approval = next(item for item in pending['approvals'] if item['status'] == 'pending')
-            shell_deadline = asyncio.get_running_loop().time() + 15
-            await engine.command('answer', approvalId=shell_approval['id'], decision='accept')
+            deadline = asyncio.get_running_loop().time() + 25
+            while True:
+                pending = await engine.command('snapshot')
+                shell_approvals = [item for item in pending['approvals'] if item['status'] == 'pending']
+                if shell_approvals or ready_file.is_file():
+                    break
+                assert asyncio.get_running_loop().time() < deadline, 'Shell neither started nor requested approval'
+                await asyncio.sleep(.05)
+            assert len(shell_approvals) <= 1 and all(item['method'] == 'item/commandExecution/requestApproval' and item['requestId'] == next(row['id'] for row in pending['requests'] if row['eventId'] == 'cancel') for item in shell_approvals), 'Unexpected shell approval'
+            shell_deadline = asyncio.get_running_loop().time() + shell_delay + 3
+            if shell_approvals:
+                await engine.command('answer', approvalId=shell_approvals[0]['id'], decision='accept')
             await asyncio.wait_for(wait_records(before + 2), 25)
-            assert ready_file.is_file(), 'Approved shell child did not start'
-            shell_deadline = asyncio.get_running_loop().time() + 13
+            assert ready_file.is_file(), 'Bounded shell child did not start'
+            shell_deadline = asyncio.get_running_loop().time() + shell_delay + 1
+            if args.expected_version == '0.166.0-alpha.6':
+                assert any(item.get('type') == 'custom_tool_call_output' and item.get('call_id') == f'call-{before + 1}' for item in records[before + 1].get('input', [])), 'Missing actual custom exec result'
             child_pid = json.loads(ready_file.read_text())['pid']
             running = await engine.command('wait', status='running')
             cancel = next(row for row in running['requests'] if row['eventId'] == 'cancel')
@@ -831,6 +907,10 @@ trust_level="trusted"
             following = next(row for row in queued['requests'] if row['eventId'] == 'after-shell-cancel')
             assert following['status'] == 'queued'
             cancelled = await engine.command('cancel', requestId=cancel['id'], processId=child_pid)
+            witnesses = cancelled['cancellationInterruptWitnesses']
+            report.setdefault('cancellationInterruptWitnesses', []).extend({'scenario': order, **item} for item in witnesses)
+            assert len(witnesses) == 1 and witnesses[0] == {'threadId': thread, 'turnId': cancel['turnId'],
+                'processId': child_pid, 'processAlive': True, 'markerExists': False}, 'Native interrupt was not dispatched against the live fixture child before its delayed marker'
             assert not cancelled['probeProcessAlive'], 'Engine cancelled the model but left its shell child alive'
             aborted = await peer.completed(cancel['turnId'])
             assert aborted['params']['turn']['status'] == 'interrupted'
@@ -848,10 +928,26 @@ trust_level="trusted"
             assert not terminal_page.get('nextCursor'), 'Unexpected terminal pagination in the disposable fixture'
             terminals = terminal_page['data']
             assert not any(item['itemId'] == item_id for item in terminals)
-            await asyncio.sleep(13)
+            await asyncio.sleep(max(0, shell_deadline - asyncio.get_running_loop().time()))
             assert not late_file.exists(), 'Cancelled shell wrote its delayed marker'
             report['checks']['origin_engine_cancels_exact_native_turn_seen_by_desktop'] = True
             report['checks']['engine_shell_stop_cleans_owned_process_before_next_origin_turn_without_backend_restart'] = True
+            if args.expected_version == '0.166.0-alpha.6':
+                assert terminal_page['data'] == [] and terminal_page['nextCursor'] is None, 'Native background terminals are not confirmed empty through EOF'
+                native_queue = await peer.call('thread/queue/list', {'threadId': thread, 'limit': 100})
+                assert native_queue['data'] == [] and native_queue['nextCursor'] is None, 'Native cancellation queue is not confirmed empty through EOF'
+                command_completed = await peer.wait(lambda event: event.get('method') == 'item/completed'
+                    and event['params'].get('threadId') == thread and event['params'].get('turnId') == cancel['turnId']
+                    and event['params'].get('item', {}).get('type') == 'commandExecution'
+                    and event['params']['item'].get('id') == item_id)
+                started_item, finished_item = command_item['params']['item'], command_completed['params']['item']
+                assert command_item['params']['threadId'] == thread and isinstance(started_item.get('command'), str) and started_item['command'], 'Missing canonical started command'
+                assert finished_item.get('command') == started_item['command'] and finished_item.get('cwd') == started_item['cwd'] and finished_item.get('status') in ('completed', 'failed'), 'Canonical command completion changed'
+                cleanup = completed['cancelCleanups'][cancel['id']]
+                assert cleanup['done'] is True and cleanup['turnId'] == cancel['turnId'] and cleanup['interruptAttempted'] is True, 'Engine cancel cleanup is not confirmed done for the original turn'
+                cancelled_rows = [row for row in completed['requests'] if row['id'] == cancel['id']]
+                assert len(cancelled_rows) == 1 and cancelled_rows[0]['status'] == 'interrupted' and cancelled_rows[0]['turnId'] == cancel['turnId'] and cancelled_rows[0].get('queuedSubmissionId') == cancel.get('queuedSubmissionId') and cancelled_rows[0]['origin'] == cancel['origin'], 'Cancelled request identity or terminal receipt changed'
+                report['checks']['custom_exec_code_mode_host_starts_and_cancels_owned_shell'] = True
             preserved = {row['id'] for row in (await engine.command('snapshot'))['requests']}
             await engine.close(); engine = None
             await observer.close(); observer = None

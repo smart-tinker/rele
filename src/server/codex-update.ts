@@ -8,7 +8,7 @@ import type { CodexConnectionState, CodexConnectionTarget, CodexDiscoveryResult,
 import { compareCodexVersions, SUPPORTED_CODEX_VERSIONS } from '../shared/codex-runtime.js';
 import { compareCodexInstallations, discoverCodex } from './codex-discovery.js';
 import { codexEnvironment, resolveCodexLaunch } from './codex-launch.js';
-import { effectiveSharedCodexHome, isSharedCodexWebSocket, nativeCodexExecutable } from './codex-shared.js';
+import { effectiveSharedCodexHome, isSharedCodexWebSocket, nativeCodexExecutable, prepareDesktopCodexPackage, readPreparedDesktopCodexPackage } from './codex-shared.js';
 import { LinuxCodexUpdate, LinuxCodexUpdateError } from './codex-linux-update.js';
 
 const execute = promisify(execFile);
@@ -102,6 +102,10 @@ export class CodexUpdate {
     this.lastError = undefined;
     this.last = { available: false, phase: 'current', selectionMode: this.target().executable === 'codex' ? 'auto' : 'manual' };
   }
+  private packageOptions(home: string) {
+    return { env: codexEnvironment(home, { ...process.env, RELE_DATA_DIR: this.dataDirectory }),
+      run: async (command: string, args: string[]) => (this.options.run ?? runLauncher)(command, args) };
+  }
   private async normalizeExecutable(executable: string, home: string): Promise<string> {
     if (this.options.resolveNative) return this.options.resolveNative(executable, home);
     const platform = this.options.platform ?? process.platform;
@@ -175,7 +179,7 @@ export class CodexUpdate {
       || this.target().codexHome && !samePath(await realpath(this.target().codexHome!), home)) throw new CodexUpdateError('Обновление требует исходный профиль работающего общего Codex.', 409);
     const discovery: CodexDiscoveryResult = await (this.options.discover ?? discoverCodex)({ codexHome: home });
     this.assertIdentity(identity);
-    const { candidate, normalized, installedVersion } = await this.selectCandidate(home, selectionMode, discovery);
+    let { candidate, normalized, installedVersion } = await this.selectCandidate(home, selectionMode, discovery);
     if (installedVersion) state.installedVersion = installedVersion;
     this.assertIdentity(identity);
     if (candidate) state.selectedVersion = candidate.version;
@@ -195,6 +199,14 @@ export class CodexUpdate {
       const version = normalized.find(item => samePath(item.executable, native.executable as string))?.version;
       if (version && !current.connected) state.currentVersion = version;
     }
+    const knownExe = native.pendingUpdate === true ? native.status === 'notRunning' ? native.pendingExe : native.successorExe : native.executable;
+    const prepared = typeof knownExe === 'string' ? await readPreparedDesktopCodexPackage(knownExe, this.packageOptions(home)) : undefined;
+    if (selectionMode === 'manual' && prepared && samePath(this.target().executable, prepared.sourceSelection)
+      && (!candidate || samePath(candidate.executable, prepared.sourceExecutable))
+      && (native.pendingUpdate === true || !candidate || prepared.sourceUnchanged && candidate.version === prepared.version)) {
+      candidate = { executable: prepared.executable, version: prepared.version, name: 'Prepared Codex', source: 'path', running: false };
+      state.selectedVersion = prepared.version;
+    }
     if (native.pendingUpdate === true) {
       const pendingExecutable = native.status === 'notRunning' ? native.pendingExe : native.successorExe;
       const pendingHash = native.status === 'notRunning' ? native.pendingSha256 : native.successorSha256;
@@ -206,7 +218,10 @@ export class CodexUpdate {
         || typeof native.successorDirectory !== 'string' || !/^[a-f0-9]{64}$/u.test(path.basename(native.successorDirectory))
         || !samePath(path.dirname(native.successorDirectory), path.join(await realpath(this.dataDirectory), 'codex-websocket-owners'))) throw new CodexUpdateError(failure, 502);
       const pending = normalized.find(item => samePath(item.executable, pendingExecutable));
-      if (pending?.version) state.pendingVersion = pending.version;
+      if (prepared) {
+        if (prepared.executableSha256 !== pendingHash) throw new CodexUpdateError('Подготовленный пакет Codex не соответствует сохранённому SHA-256.', 409);
+        state.pendingVersion = prepared.version;
+      } else if (pending?.version) state.pendingVersion = pending.version;
       else if (candidate && samePath(candidate.executable, pendingExecutable)) state.pendingVersion = candidate.version;
       else {
         if (await executableDigest(pendingExecutable) !== pendingHash) throw new CodexUpdateError('Подготовленный файл Codex изменился. Применение остановлено.', 409);
@@ -389,14 +404,19 @@ export class CodexUpdate {
         || await executableDigest(before.candidate.executable) !== digest) {
         throw new CodexUpdateError('Установка Codex изменилась во время проверки. Обновите состояние перед подготовкой обновления.', 409);
       }
+      const prepared = await prepareDesktopCodexPackage(before.candidate.executable, this.packageOptions(before.home), this.target().executable);
+      if (!prepared && (before.candidate.version === '0.166.0-alpha.6' || path.basename(path.dirname(before.candidate.executable)).toLowerCase() === 'resources')) throw new CodexUpdateError('Полная исходная поставка Codex не подтверждена. Работающий сервер сохранён.', 409);
+      const executable = prepared ?? before.candidate.executable;
+      if (prepared && (await readPreparedDesktopCodexPackage(prepared, this.packageOptions(before.home)))?.version !== before.candidate.version
+        || await executableDigest(executable) !== digest) throw new CodexUpdateError('Установка Codex изменилась во время подготовки полного пакета.', 409);
       const marker = await this.checkedInstallation(before.marker);
       this.assertIdentity(before.identity);
-      const native = nativeResult(await (this.options.run ?? runLauncher)(path.join(this.root, 'Rele.exe'), ['codex-update', '--quiet', '--codex-executable', before.candidate.executable, '--expected-sha256', digest, '--codex-home', before.home]));
+      const native = nativeResult(await (this.options.run ?? runLauncher)(path.join(this.root, 'Rele.exe'), ['codex-update', '--quiet', '--codex-executable', executable, '--expected-sha256', digest, '--codex-home', before.home]));
       if (native.status !== 'updatePrepared' || native.pendingUpdate !== true
         || native.ownerSid !== marker.OwnerSid || native.taskName !== `${marker.TaskName}-Codex`
         || typeof native.codexHome !== 'string' || !samePath(await realpath(native.codexHome), before.home)
         || typeof native.endpoint !== 'string' || !isSharedCodexWebSocket(native.endpoint)
-        || typeof native.successorExe !== 'string' || !samePath(native.successorExe, before.candidate.executable)
+        || typeof native.successorExe !== 'string' || !samePath(native.successorExe, executable)
         || native.successorSha256 !== digest
         || typeof native.successorDirectory !== 'string' || !/^[a-f0-9]{64}$/u.test(path.basename(native.successorDirectory))
         || !samePath(path.dirname(native.successorDirectory), path.join(await realpath(this.dataDirectory), 'codex-websocket-owners'))) throw new CodexUpdateError(failure, 502);
@@ -434,6 +454,7 @@ export class CodexUpdate {
       if (typeof pendingExe !== 'string' || await executableDigest(pendingExe) !== pendingHash) {
         throw new CodexUpdateError('Подготовленный файл Codex изменился. Обновление остановлено; проверьте установку Desktop.', 409);
       }
+      await readPreparedDesktopCodexPackage(pendingExe, this.packageOptions(before.home), true);
       const marker = await this.checkedInstallation(before.marker);
       this.assertIdentity(before.identity);
       const native = nativeResult(await (this.options.run ?? runLauncher)(path.join(this.root, 'Rele.exe'),

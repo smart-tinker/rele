@@ -16,19 +16,19 @@ afterEach(async () => {
 });
 const hash = async (file: string) => createHash('sha256').update(await readFile(file)).digest('hex');
 
-async function packageFixture(root: string, text: string) {
+async function packageFixture(root: string, text: string, packageVersion = version) {
   for (const file of ['bin/codex', 'bin/codex-code-mode-host', 'codex-path/rg', 'codex-resources/bwrap']) {
     await mkdir(path.dirname(path.join(root, file)), { recursive: true }); await writeFile(path.join(root, file), text, { mode: 0o755 });
   }
-  await writeFile(path.join(root, 'codex-package.json'), JSON.stringify({ layoutVersion: 1, version, target: `${process.arch === 'x64' ? 'x86_64' : 'aarch64'}-unknown-linux-musl`, entrypoint: 'bin/codex' }));
+  await writeFile(path.join(root, 'codex-package.json'), JSON.stringify({ layoutVersion: 1, version: packageVersion, target: `${process.arch === 'x64' ? 'x86_64' : 'aarch64'}-unknown-linux-musl`, entrypoint: 'bin/codex' }));
   return path.join(root, 'bin/codex');
 }
-async function fixture(externalStarter = false) {
+async function fixture(externalStarter = false, candidateVersion = version) {
   const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'rlu-'))); directories.push(directory);
   const home = path.join(directory, 'c'), data = path.join(directory, 'd'), endpoint = path.join(home, 'app-server-control/app-server-control.sock');
   await mkdir(path.dirname(endpoint), { recursive: true }); await mkdir(data); await mkdir(path.join(home, 'app-server-daemon'));
   const releaseRoot = path.join(home, 'packages/app-server-daemon/releases'), oldRoot = path.join(releaseRoot, 'old');
-  const old = await packageFixture(oldRoot, 'old-native'), selectedRoot = path.join(directory, 'selected'), selected = await packageFixture(selectedRoot, 'selected-native');
+  const old = await packageFixture(oldRoot, 'old-native'), selectedRoot = path.join(directory, 'selected'), selected = await packageFixture(selectedRoot, 'selected-native', candidateVersion);
   const alias = path.join(home, 'packages/app-server-daemon/current'); await symlink(oldRoot, alias);
   const managed = path.join(alias, 'bin/codex'), pidFile = path.join(home, 'app-server-daemon/daemon.pid');
   const state = { pid: 20001, start: '100', executable: old, oldAlive: true, newAlive: false, cgroup: externalStarter ? '0::/system.slice/rele-codex.service' : '0::/user.slice/session.scope', ephemeral: false, status: { type: 'idle', activeFlags: [] as string[] }, queue: [] as object[], terminals: [] as object[], requests: [] as object[], peers: 0, losesStartAck: false, startEffect: true, losesSelectionAck: false,
@@ -55,7 +55,7 @@ async function fixture(externalStarter = false) {
   const calls: string[][] = [];
   const run: NonNullable<LinuxCodexUpdateOptions['run']> = vi.fn(async (command, args, env) => {
     expect(env.CODEX_HOME).toBe(home); calls.push([command, ...args]);
-    if (args[0] === '--version') return { code: 0, stdout: `codex-cli ${version}` };
+    if (args[0] === '--version') return { code: 0, stdout: `codex-cli ${candidateVersion}` };
     if (command === '/usr/bin/ps') return { code: 0, stdout: 'fixture-stamp\n' };
     if (args.includes('--check')) return { code: 0, stdout: '{"supported":true}' };
     if (args.includes('--peers')) return { code: 0, stdout: JSON.stringify({ listener: true, peers: state.peers }) };
@@ -83,7 +83,7 @@ async function fixture(externalStarter = false) {
   };
   const target: CodexConnectionTarget = { transport: 'shared', executable: 'codex', endpoint: '', codexHome: home };
   const current: CodexConnectionState = { configured: true, connected: true, name: `Codex ${version}`, queueSupported: true, desktopVerified: false, executable: old, transport: 'proxy', endpoint, codexHome: home };
-  const candidate = { executable: selected, version, sha256: await hash(selected) };
+  const candidate = { executable: selected, version: candidateVersion, sha256: await hash(selected) };
   const pending = async () => JSON.parse(await readFile(path.join(data, 'codex-linux-update.json'), 'utf8')).pending;
   const starter = new LinuxCodexUpdate(data, { run, readProcess });
   const service = new LinuxCodexUpdate(data, { run, readProcess, ...(externalStarter ? { env: { RELE_CODEX_DAEMON_EXTERNAL: '1' } } : {}), wait: async () => { if (externalStarter && (await pending()).startAttempted) await starter.startPrepared(target); } });
@@ -101,6 +101,18 @@ describe.skipIf(process.platform !== 'linux')('Linux native controlled update', 
     expect(f.calls.filter(call => call.includes('--signal'))).toHaveLength(1);
     expect(f.calls.filter(call => call[3] === 'update')).toHaveLength(1);
     expect(f.calls.some(call => call.some(value => ['stop', 'restart', 'SIGTERM', 'SIGKILL'].includes(value)))).toBe(false);
+  });
+  it.each([
+    ['0.166.0-alpha.6', 'linux-graceful-unsupported'],
+    ['0.166.0-alpha.6.1', 'linux-owner-unconfirmed'],
+  ])('refuses unverified graceful candidate %s before persisting or changing native state', async (candidateVersion, code) => {
+    const f = await fixture(false, candidateVersion);
+    await expect(f.service.prepare(f.target, f.current, f.candidate)).rejects.toMatchObject({ code });
+    await expect(readFile(path.join(f.data, 'codex-linux-update.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(f.calls.some(call => call.includes('--signal') || ['update', 'start'].includes(call[3]))).toBe(false);
+    expect(f.calls.some(call => call[1] === '--version')).toBe(false);
+    expect(f.state.oldAlive).toBe(true);
+    expect(f.state.newAlive).toBe(false);
   });
   it('explains external service ownership and does not prepare or signal it', async () => {
     const f = await fixture(); f.state.cgroup = '0::/user.slice/app.slice/codex-app-server.service';

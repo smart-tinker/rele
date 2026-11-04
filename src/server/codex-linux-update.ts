@@ -50,6 +50,8 @@ const execute = promisify(execFile), hashes = new Map<string, string>();
 const SHA = /^[a-f0-9]{64}$/u, UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u;
 const uncertain = 'Результат обновления Codex требует сверки. Повторный сигнал не отправлен; очередь сохранена.';
 const external = 'Codex запущен внешней службой или другим владельцем. Rele не меняет и не перезапускает эту службу.';
+const GRACEFUL_CODEX_VERSIONS: readonly string[] = ['0.166.0-alpha.5.1'];
+const gracefulUnsupported = 'Безопасный graceful update подтверждён только для Codex 0.166.0-alpha.5.1.';
 function requireValue(ok: unknown, message: string, code = 'linux-owner-unconfirmed'): asserts ok {
   if (!ok) throw new LinuxCodexUpdateError(message, 409, code);
 }
@@ -190,7 +192,7 @@ export class LinuxCodexUpdate {
     const value = await this.process(meta.pid);
     requireValue(value && value.uid === process.getuid?.() && path.isAbsolute(value.executable) && SHA.test(value.sha256), external, 'linux-owner-external');
     requireValue(!value.cgroup.split('\n').some(line => { const unit = path.basename(line.slice(line.lastIndexOf(':') + 1)); return unit.endsWith('.service') && unit !== 'rele-codex.service'; }), external, 'linux-owner-external');
-    requireValue(meta.version === '0.166.0-alpha.5.1', 'Безопасный graceful update подтверждён только для Codex 0.166.0-alpha.5.1.', 'linux-graceful-unsupported');
+    requireValue(GRACEFUL_CODEX_VERSIONS.includes(meta.version), gracefulUnsupported, 'linux-graceful-unsupported');
     const status = await this.run(value.executable, ['app-server', 'daemon', 'version'], meta.codexHome);
     let daemon: any; try { daemon = JSON.parse(status.stdout); } catch { throw new LinuxCodexUpdateError(external, 409, 'linux-owner-external'); }
     requireValue(status.code === 0 && daemon.status === 'running' && daemon.backend === 'pid' && daemon.socketPath === endpoint && daemon.appServerVersion === meta.version && typeof daemon.managedCodexPath === 'string' && await realpath(daemon.managedCodexPath) === value.executable, external, 'linux-owner-external');
@@ -224,6 +226,7 @@ export class LinuxCodexUpdate {
   }
   private async candidate(value: LinuxCodexCandidate, home: string): Promise<LinuxCodexCandidate> {
     requireValue(path.isAbsolute(value.executable) && SUPPORTED_CODEX_VERSIONS.includes(value.version) && SHA.test(value.sha256), 'Выберите существующий поддержанный пакет Codex.');
+    requireValue(GRACEFUL_CODEX_VERSIONS.includes(value.version), gracefulUnsupported, 'linux-graceful-unsupported');
     const executable = await realpath(value.executable);
     requireValue(await digest(executable) === value.sha256 && await completeCodexPackage(executable) === value.version, 'Выбранный пакет Codex изменился или неполон.', 'linux-candidate-changed');
     const result = await this.run(executable, ['--version'], home);

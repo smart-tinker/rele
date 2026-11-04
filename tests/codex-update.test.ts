@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { CodexConnectionState, CodexConnectionTarget, CodexDiscoveryResult } from '../src/shared/types.js';
 import { CodexUpdate } from '../src/server/codex-update.js';
+import { nativeCodexExecutable } from '../src/server/codex-shared.js';
 import { LinuxCodexUpdateError, type LinuxCodexInspection, type LinuxCodexCandidate } from '../src/server/codex-linux-update.js';
 
 const directories: string[] = [];
@@ -138,7 +139,94 @@ describe('Linux controlled update API policy', () => {
   });
 });
 
+async function desktopInstallation(f: Awaited<ReturnType<typeof fixture>>) {
+  const bundle = path.join(f.root, 'desktop', 'app'), resources = path.join(bundle, 'resources');
+  await mkdir(resources, { recursive: true }); await writeFile(path.join(bundle, 'ChatGPT.exe'), 'synthetic gui');
+  await writeFile(path.join(resources, 'app.asar'), 'synthetic archive');
+  for (const name of ['codex.exe', 'codex-code-mode-host.exe', 'codex-command-runner.exe', 'codex-windows-sandbox-setup.exe', 'rg.exe']) await writeFile(path.join(resources, name), 'synthetic bundled ' + name);
+  const source = path.join(resources, 'codex.exe'); f.target.executable = source;
+  f.discovery.installations = [{ executable: source, source: 'desktop-install', name: 'Desktop', version: '0.164.0-alpha.11.1', running: false }];
+  return { bundle, resources, source };
+}
+
 describe('controlled shared Codex update', () => {
+  it('recognizes an unchanged manual Desktop source as the running cached package, but not source drift', async () => {
+    const f = await fixture(), { source } = await desktopInstallation(f); await f.update.prepare();
+    await f.update.apply();
+    f.current.executable = f.getNative().executable as string; f.current.name = 'Codex 0.164.0-alpha.11.1';
+    expect(await f.service().status()).toMatchObject({ phase: 'current', selectedVersion: '0.164.0-alpha.11.1' });
+    await writeFile(source, 'same-version source replacement');
+    expect(await f.service().status()).toMatchObject({ phase: 'available' });
+  });
+
+  it.each(['present', 'gone'])('keeps exact manual npm wrapper identity with its %s canonical source across service recreation', async sourceState => {
+    const f = await fixture(), npm = path.join(f.root, 'npm'), root = path.join(npm, 'vendor', 'x86_64-pc-windows-msvc');
+    const files = ['bin/codex.exe', 'bin/codex-code-mode-host.exe', 'bin/codex-exec-server.exe', 'codex-path/rg.exe', 'codex-resources/codex-command-runner.exe', 'codex-resources/codex-windows-sandbox-setup.exe'];
+    for (const file of files) { await mkdir(path.dirname(path.join(root, file)), { recursive: true }); await writeFile(path.join(root, file), 'canonical-' + file); }
+    await writeFile(path.join(root, 'codex-package.json'), JSON.stringify({ layoutVersion: 1, version: '0.164.0-alpha.11.1', target: 'x86_64-pc-windows-msvc', entrypoint: 'bin/codex.exe', execServer: 'bin/codex-exec-server.exe', resourcesDir: 'codex-resources', pathDir: 'codex-path' }));
+    await mkdir(path.join(npm, 'bin')); await writeFile(path.join(npm, 'package.json'), JSON.stringify({ name: '@openai/codex' }));
+    const wrapper = path.join(npm, 'bin/codex.js'), source = path.join(root, 'bin/codex.exe'); await writeFile(wrapper, '// official wrapper fixture');
+    f.target.executable = wrapper; f.resolveNative.mockImplementation(executable => nativeCodexExecutable(executable, 'win32'));
+    f.discovery.installations = [{ executable: wrapper, source: 'path', name: 'Official wrapper', version: '0.164.0-alpha.11.1', running: false }];
+    const run = f.run.getMockImplementation()!;
+    f.run.mockImplementation((command, args) => args[0] === '--version' ? Promise.resolve({ code: 0, stdout: 'codex-cli 0.164.0-alpha.11.1' }) : run(command, args));
+    await f.update.prepare(); const cached = f.getNative().successorExe as string;
+    expect(cached).not.toBe(source);
+    if (sourceState === 'gone') { await rm(npm, { recursive: true }); f.discovery.installations = []; }
+    const ready = await f.service().status();
+    expect(ready).toMatchObject({ phase: 'ready', pendingVersion: '0.164.0-alpha.11.1' });
+    expect(ready.error).toBeUndefined();
+    await f.service().apply();
+    f.current.executable = cached; f.current.name = 'Codex 0.164.0-alpha.11.1';
+    expect(await f.service().status()).toMatchObject({ phase: 'current' });
+    f.target.executable = source;
+    expect((await f.service().status()).phase).not.toBe('current');
+  });
+
+  it('refuses a selected canonical package with a missing manifest before native preparation', async () => {
+    const f = await fixture(), root = path.join(f.root, 'canonical');
+    const source = path.join(root, 'bin/codex.exe');
+    for (const file of ['bin/codex.exe', 'bin/codex-code-mode-host.exe', 'codex-path/rg.exe', 'codex-resources/codex-command-runner.exe']) { await mkdir(path.dirname(path.join(root, file)), { recursive: true }); await writeFile(path.join(root, file), 'canonical-' + file); }
+    f.target.executable = source;
+    f.discovery.installations = [{ executable: source, source: 'path', name: 'Canonical package', version: '0.166.0-alpha.6', running: false }];
+    await expect(f.update.prepare()).rejects.toThrow();
+    expect(f.run.mock.calls.some(([, args]) => args[0] === 'codex-update')).toBe(false);
+  });
+
+  it.each(['missing', 'changed', 'extra'])('refuses %s prepared helper bytes before native apply and never repairs the cache', async tamper => {
+    const f = await fixture(); await desktopInstallation(f); await f.update.prepare();
+    const native = f.getNative(), executable = native.successorExe as string;
+    const file = path.join(path.dirname(executable), tamper === 'extra' ? 'unexpected.dll' : 'codex-code-mode-host.exe');
+    if (tamper === 'missing') await rm(file); else await writeFile(file, 'untrusted helper bytes');
+    await expect(f.update.apply()).rejects.toThrow();
+    expect(f.run.mock.calls.some(([, args]) => args[0] === 'codex-apply-update')).toBe(false);
+    expect(f.getNative()).toEqual(native);
+    if (tamper !== 'missing') expect(await readFile(file, 'utf8')).toBe('untrusted helper bytes');
+  });
+
+  it('keeps the exact prepared package when its original Desktop is updated in place', async () => {
+    const f = await fixture(), { source } = await desktopInstallation(f); await f.update.prepare();
+    const executable = f.getNative().successorExe;
+    await writeFile(source, 'new Desktop release bytes'); f.discovery.installations[0].version = '0.165.0-alpha.1.2';
+    expect(await f.service().status()).toMatchObject({ phase: 'ready', pendingVersion: '0.164.0-alpha.11.1', selectedVersion: '0.164.0-alpha.11.1' });
+    await f.service().apply(); expect(f.getNative().executable).toBe(executable);
+  });
+
+  it('prepares a full immutable Desktop candidate only on explicit preparation and applies after source deletion', async () => {
+    const f = await fixture(), { bundle, source } = await desktopInstallation(f);
+    expect(await f.update.status()).toMatchObject({ phase: 'available' });
+    expect(await readdir(f.data)).not.toContain('codex-desktop-packages');
+    await f.update.prepare(); const pending = f.getNative().successorExe as string;
+    expect(pending).not.toBe(source);
+    expect(path.relative(f.data, pending)).toMatch(/^codex-desktop-packages[/\\][a-f0-9]{64}[/\\]bin[/\\]codex\.exe$/u);
+    expect(await readFile(path.join(path.dirname(pending), 'codex-code-mode-host.exe'), 'utf8')).toBe('synthetic bundled codex-code-mode-host.exe');
+    await rm(bundle, { recursive: true }); f.discovery.installations = [];
+    const original = f.run.getMockImplementation()!;
+    f.run.mockImplementation((command, args) => args[0] === '--version' && command === pending ? Promise.resolve({ code: 0, stdout: 'codex-cli 0.164.0-alpha.11.1' }) : original(command, args));
+    expect(await f.service().status()).toMatchObject({ phase: 'ready', pendingVersion: '0.164.0-alpha.11.1' });
+    expect(await f.service().apply()).toMatchObject({ phase: 'current', currentVersion: '0.164.0-alpha.11.1' });
+    expect(f.current.executable).toBe(f.old); expect(await readFile(f.config, 'utf8')).toBe('protected synthetic settings; must not be read or changed');
+  });
   it('cleans only after a verified connection and shares one in-flight postflight', async () => {
     const f = await fixture();
     const original = f.run.getMockImplementation()!;

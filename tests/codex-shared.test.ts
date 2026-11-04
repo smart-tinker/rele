@@ -8,7 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CodexConnectionTarget, CodexDiscoveryResult } from '../src/shared/types.js';
-import { ensureSharedCodex, ensureWindowsSharedCodex, isSharedCodexWebSocket, prepareDesktopCodexPackage, resolveSharedCodexExecutable, type SharedCodexOptions } from '../src/server/codex-shared.js';
+import { ensureSharedCodex, ensureWindowsSharedCodex, isSharedCodexWebSocket, completeCodexPackage, prepareDesktopCodexPackage, resolveSharedCodexExecutable, type SharedCodexOptions } from '../src/server/codex-shared.js';
 import { runCodexProbe } from '../src/server/codex-discovery.js';
 
 const directories: string[] = [];
@@ -83,14 +83,106 @@ async function windowsFixture() {
     if (message.method === 'server/diagnostics') socket.send(JSON.stringify({ id: message.id, result: diagnostics }));
   }));
   f.discovery.installations.push({ executable, name: 'Desktop', source: 'desktop-install', version: '0.163.0-alpha.11.2', running: false });
+  const started = async (args: string[]) => {
+    const selected = args[args.indexOf('--codex-executable') + 1];
+    const manifest = await readFile(path.join(path.dirname(path.dirname(selected)), 'codex-package.json'), 'utf8').then(JSON.parse).catch(() => undefined);
+    if (receipt.status === 'started' && manifest?.sourceExecutable === receipt.executable) receipt.executable = selected;
+    return JSON.stringify(receipt);
+  };
   f.run.mockImplementation(async (_command, args) => ({ code: 0, stdout: args[0] === 'codex-status'
     ? JSON.stringify(owner.running ? receipt : { status: 'notRunning' })
-    : args.at(-1) === '--version' ? 'codex-cli 0.163.0-alpha.11.2' : JSON.stringify(receipt) }));
-  return { ...f, executable, installationDirectory, receipt, metadata, runtime, diagnostics, owner, calls,
+    : args.at(-1) === '--version' ? 'codex-cli 0.163.0-alpha.11.2' : await started(args) }));
+  return { ...f, executable, installationDirectory, receipt, metadata, runtime, diagnostics, owner, calls, started,
     target: { ...f.target, executable: 'codex' } };
 }
 
 describe('Windows direct shared Codex', () => {
+  it('cold-starts a complete Rele-owned Desktop snapshot that survives source removal', async () => {
+    const f = await windowsFixture(), source = f.executable, original = f.run.getMockImplementation()!;
+    f.run.mockImplementation(async (command, args, ...rest) => {
+      if (args[0] === 'codex-start') {
+        f.receipt.executable = args[args.indexOf('--codex-executable') + 1];
+        f.receipt.executableSha256 = createHash('sha256').update(await readFile(f.receipt.executable)).digest('hex');
+      }
+      return original(command, args, ...rest);
+    });
+    const result = await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory);
+    expect(result.executable).not.toBe(source);
+    expect(path.relative(f.env.RELE_DATA_DIR, result.executable)).toMatch(/^codex-desktop-packages[/\\][a-f0-9]{64}[/\\]bin[/\\]codex\.exe$/u);
+    expect(await readFile(path.join(path.dirname(result.executable), 'codex-code-mode-host.exe'))).toEqual(await readFile(path.join(path.dirname(source), 'codex-code-mode-host.exe')));
+    await rm(path.dirname(path.dirname(source)), { recursive: true });
+    f.owner.running = true; f.receipt.status = 'alreadyRunning';
+    expect((await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).executable).toBe(result.executable);    const owner = { Version: 1, OwnerSid: f.metadata.OwnerSid, TaskName: f.receipt.taskName, CodexHome: f.home, Executable: result.executable };
+    const bytes = JSON.stringify(owner), directory = path.join(f.env.RELE_DATA_DIR, 'codex-websocket-owners', createHash('sha256').update(bytes).digest('hex'));
+    await mkdir(directory); await writeFile(path.join(directory, 'owner.json'), bytes);
+    f.metadata.CodexWebSocketOwnerDirectory = directory; f.receipt.ownerDirectory = directory;
+    await writeFile(path.join(f.installationDirectory, 'rele-install.json'), JSON.stringify(f.metadata));
+    f.owner.running = false; f.receipt.status = 'started';
+    const packages = await readdir(path.join(f.env.RELE_DATA_DIR, 'codex-desktop-packages'));
+    expect((await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).executable).toBe(result.executable);
+    expect(await readdir(path.join(f.env.RELE_DATA_DIR, 'codex-desktop-packages'))).toEqual(packages);
+  });
+
+  it('cold-starts the exact prepared npm wrapper after source removal but never reuses it for another wrapper', async () => {
+    const f = await windowsFixture(), npm = path.join(f.home, 'npm'), root = path.join(npm, 'vendor/x86_64-pc-windows-msvc');
+    const files = ['bin/codex.exe', 'bin/codex-code-mode-host.exe', 'bin/codex-exec-server.exe', 'codex-path/rg.exe', 'codex-resources/codex-command-runner.exe', 'codex-resources/codex-windows-sandbox-setup.exe'];
+    for (const file of files) { await mkdir(path.dirname(path.join(root, file)), { recursive: true }); await writeFile(path.join(root, file), 'same-package-' + file); }
+    await writeFile(path.join(root, 'codex-package.json'), JSON.stringify({ layoutVersion: 1, version: '0.163.0-alpha.11.2', target: 'x86_64-pc-windows-msvc', entrypoint: 'bin/codex.exe', execServer: 'bin/codex-exec-server.exe', resourcesDir: 'codex-resources', pathDir: 'codex-path' }));
+    await mkdir(path.join(npm, 'bin')); await writeFile(path.join(npm, 'package.json'), JSON.stringify({ name: '@openai/codex' }));
+    const wrapper = path.join(npm, 'bin/codex.js'); await writeFile(wrapper, '// official wrapper fixture');
+    const prepared = (await prepareDesktopCodexPackage(path.join(root, 'bin/codex.exe'), f.options, wrapper))!;
+    const owner = JSON.stringify({ Version: 1, OwnerSid: f.metadata.OwnerSid, TaskName: f.receipt.taskName, CodexHome: f.home, Executable: prepared });
+    const directory = path.join(f.env.RELE_DATA_DIR, 'codex-websocket-owners', createHash('sha256').update(owner).digest('hex'));
+    await mkdir(directory); await writeFile(path.join(directory, 'owner.json'), owner);
+    f.metadata.CodexWebSocketOwnerDirectory = directory; f.receipt.ownerDirectory = directory;
+    f.receipt.executable = prepared; f.receipt.executableSha256 = createHash('sha256').update(await readFile(prepared)).digest('hex');
+    await writeFile(path.join(f.installationDirectory, 'rele-install.json'), JSON.stringify(f.metadata));
+    f.target.executable = wrapper;
+    await rm(npm, { recursive: true });
+    expect((await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).executable).toBe(prepared);
+    f.run.mockClear(); f.target.executable = path.join(f.home, 'another-npm/bin/codex.js');
+    await expect(ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).rejects.toThrow();
+    expect(f.run.mock.calls.some(([, args]) => args[0] === 'codex-start')).toBe(false);
+  });
+
+  it('refuses a partial Desktop before starting an owner instead of falling back to its bare executable', async () => {
+    const f = await windowsFixture(); await unlink(path.join(path.dirname(f.executable), 'codex-code-mode-host.exe'));
+    await expect(ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).rejects.toMatchObject({ code: 'shared-desktop-package-invalid' });
+    expect(f.run.mock.calls.some(([, args]) => args[0] === 'codex-start')).toBe(false);
+  });
+
+  it('does not stage or repair the missing helpers of an already running owned backend', async () => {
+    const f = await windowsFixture(); f.owner.running = true; f.receipt.status = 'alreadyRunning';
+    await unlink(path.join(path.dirname(f.executable), 'codex-code-mode-host.exe'));
+    expect((await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).executable).toBe(f.executable);
+    expect(await readdir(f.env.RELE_DATA_DIR)).toEqual(['codex-websocket-owners']);
+  });
+  it.each(['missing', 'changed'])('refuses a %s cached pending helper before a cold start without repairing it', async change => {
+    const f = await windowsFixture(), prepared = (await prepareDesktopCodexPackage(f.executable, f.options))!;
+    const helper = path.join(path.dirname(prepared), 'codex-code-mode-host.exe');
+    if (change === 'missing') await rm(helper); else await writeFile(helper, 'changed-pending-helper');
+    const marker = await readFile(path.join(f.installationDirectory, 'rele-install.json'));
+    const original = f.run.getMockImplementation()!;
+    f.run.mockImplementation((command, args, ...rest) => args[0] === 'codex-status'
+      ? Promise.resolve({ code: 0, stdout: JSON.stringify({ status: 'notRunning', pendingUpdate: true, pendingExe: prepared }) }) : original(command, args, ...rest));
+    await expect(ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).rejects.toMatchObject({ code: 'shared-desktop-package-invalid' });
+    expect(f.run.mock.calls.some(([, args]) => args[0] === 'codex-start')).toBe(false);
+    expect(await readFile(path.join(f.installationDirectory, 'rele-install.json'))).toEqual(marker);
+    if (change === 'changed') expect(await readFile(helper, 'utf8')).toBe('changed-pending-helper');
+  });
+
+  it('refuses a canonical package whose manifest disappeared before cold start', async () => {
+    const f = await windowsFixture(), root = path.join(f.home, 'full-package');
+    const source = await packageFixture(root);
+    f.target.executable = source;
+    const bin = path.dirname(source), winSource = path.join(bin, 'codex.exe');
+    if (source !== winSource) await writeFile(winSource, 'synthetic canonical native');
+    f.target.executable = winSource;
+    await rm(path.join(root, 'codex-package.json'));
+    await expect(ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).rejects.toMatchObject({ code: 'shared-desktop-package-invalid' });
+    expect(f.run.mock.calls.some(([, args]) => args[0] === 'codex-start')).toBe(false);
+  });
+
   it('rejects a pending successor without a pinned executable instead of rediscovering an arbitrary backend', async () => {
     const f = await windowsFixture();
     f.run.mockResolvedValue({ code: 0, stdout: JSON.stringify({ status: 'notRunning', pendingUpdate: true }) });
@@ -101,7 +193,7 @@ describe('Windows direct shared Codex', () => {
 
   it('uses the pinned successor after its predecessor exits instead of rediscovering the previous backend', async () => {
     const f = await windowsFixture();
-    f.run.mockImplementation(async (_command, args) => ({ code: 0, stdout: args[0] === 'codex-status'
+  f.run.mockImplementation(async (_command, args) => ({ code: 0, stdout: args[0] === 'codex-status'
       ? JSON.stringify({ status: 'notRunning', pendingUpdate: true, pendingExe: f.executable })
       : args.at(-1) === '--version' ? 'codex-cli 0.163.0-alpha.11.2' : JSON.stringify(f.receipt) }));
     expect(await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).toMatchObject({ executable: f.executable, endpoint: f.receipt.endpoint });
@@ -109,14 +201,14 @@ describe('Windows direct shared Codex', () => {
     expect(f.run.mock.calls.find(([, args]) => args[0] === 'codex-start')?.[1]).toContain(f.executable);
   });
 
-  it('starts only the installed owner and uses the original Desktop backend without a CLI snapshot or adapter', async () => {
+  it('starts only the installed owner with the verified Desktop snapshot and no adapter', async () => {
     const f = await windowsFixture(), before = structuredClone(f.target);
-    expect(await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).toEqual({ ...f.target, transport: 'websocket', executable: f.executable, endpoint: f.receipt.endpoint });
+    expect(await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).toEqual({ ...f.target, transport: 'websocket', executable: f.receipt.executable, endpoint: f.receipt.endpoint });
     expect(f.run.mock.calls.filter(([, args]) => args[0] === 'codex-start')).toEqual([[path.join(f.installationDirectory, 'Rele.exe'),
-      ['codex-start', '--quiet', '--codex-executable', f.executable, '--codex-home', f.home, '--preserve-active'], 15_000,
+      ['codex-start', '--quiet', '--codex-executable', f.receipt.executable, '--codex-home', f.home, '--preserve-active'], 15_000,
       expect.objectContaining({ CODEX_HOME: f.home, RELE_TEST_MARKER: 'preserved' })]]);
     expect(f.calls).toEqual(['initialize', 'initialized', 'server/diagnostics']);
-    expect(await readdir(f.env.RELE_DATA_DIR)).toEqual(['codex-websocket-owners']);
+    expect((await readdir(f.env.RELE_DATA_DIR)).sort()).toEqual(['codex-desktop-packages', 'codex-websocket-owners']);
     expect(f.prepareControlDirectory).not.toHaveBeenCalled(); expect(f.target).toEqual(before);
   });
 
@@ -153,7 +245,7 @@ describe('Windows direct shared Codex', () => {
     f.run.mockImplementation(async (_command, args) => {
       if (args[0] === 'codex-start') await mkdir(home);
       return { code: 0, stdout: args[0] === 'codex-status' ? JSON.stringify({ status: 'notRunning' })
-        : args.at(-1) === '--version' ? 'codex-cli 0.163.0-alpha.11.2' : JSON.stringify(f.receipt) };
+        : args.at(-1) === '--version' ? 'codex-cli 0.163.0-alpha.11.2' : await f.started(args) };
     });
     expect(await ensureWindowsSharedCodex({ ...f.target, codexHome: home }, f.options, f.installationDirectory)).toMatchObject({ codexHome: home, transport: 'websocket' });
     expect(await readdir(home)).toEqual([]);
@@ -196,8 +288,8 @@ describe('Windows direct shared Codex', () => {
   it('chooses a deterministic installed backend when several supported paths exist without a live owner', async () => {
     const f = await windowsFixture(), other = await desktopFixture(path.join(f.home, 'other'));
     f.discovery.installations.push({ executable: other, name: 'Other Desktop', source: 'desktop-process', version: '0.163.0-alpha.11.2', running: true });
-    expect(await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).toMatchObject({ executable: f.executable });
-    expect(f.run.mock.calls.find(([, args]) => args[0] === 'codex-start')?.[1]).toContain(f.executable);
+    expect(await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).toMatchObject({ executable: f.receipt.executable });
+    expect(f.run.mock.calls.find(([, args]) => args[0] === 'codex-start')?.[1]).toContain(f.receipt.executable);
   });
 
   it.each(['0.165.0-alpha.1.2', '0.166.0-alpha.5.1'])('automatically chooses supported %s while ignoring a newer unsupported installation', async version => {
@@ -211,9 +303,10 @@ describe('Windows direct shared Codex', () => {
     f.runtime.userAgent = `codex_cli_rs/${version} (Windows)`;
     f.run.mockImplementation(async (command, args) => ({ code: 0, stdout: args[0] === 'codex-status'
       ? JSON.stringify({ status: 'notRunning' }) : args.at(-1) === '--version'
-        ? `codex-cli ${command === newer ? version : '0.163.0-alpha.11.2'}` : JSON.stringify(f.receipt) }));
-    expect(await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).toMatchObject({ executable: newer });
-    expect(f.run.mock.calls.find(([, args]) => args[0] === 'codex-start')?.[1]).toContain(newer);
+        ? `codex-cli ${command === newer ? version : '0.163.0-alpha.11.2'}` : await f.started(args) }));
+    expect(await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).toMatchObject({ executable: f.receipt.executable });
+    expect(f.run.mock.calls.find(([, args]) => args[0] === 'codex-start')?.[1]).toContain(f.receipt.executable);
+    expect(JSON.parse(await readFile(path.join(path.dirname(path.dirname(f.receipt.executable)), 'codex-package.json'), 'utf8')).sourceExecutable).toBe(newer);
     expect(f.run.mock.calls.some(([command]) => command === unsupported)).toBe(false);
   });
 
@@ -243,7 +336,7 @@ describe('Windows direct shared Codex', () => {
     await writeFile(path.join(f.installationDirectory, 'rele-install.json'), JSON.stringify(withoutPointer));
     f.run.mockImplementation(async (_command, args) => {
       if (args[0] === 'codex-start') await writeFile(path.join(f.installationDirectory, 'rele-install.json'), JSON.stringify(f.metadata));
-      return { code: 0, stdout: args.at(-1) === '--version' ? 'codex-cli 0.163.0-alpha.11.2' : JSON.stringify(f.receipt) };
+      return { code: 0, stdout: args.at(-1) === '--version' ? 'codex-cli 0.163.0-alpha.11.2' : await f.started(args) };
     });
     expect(await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).toMatchObject({ executable: f.executable, transport: 'websocket' });
     expect(f.discover).not.toHaveBeenCalled();
@@ -262,7 +355,7 @@ describe('Windows direct shared Codex', () => {
         expect(await readFile(metadataPath, 'utf8')).toBe(before);
         await writeFile(metadataPath, JSON.stringify({ ...f.metadata, CodexWebSocketOwnerDirectory: f.receipt.ownerDirectory }));
       }
-      return { code: 0, stdout: args.at(-1) === '--version' ? 'codex-cli 0.163.0-alpha.11.2' : JSON.stringify(f.receipt) };
+      return { code: 0, stdout: args.at(-1) === '--version' ? 'codex-cli 0.163.0-alpha.11.2' : await f.started(args) };
     });
     expect(await ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).toMatchObject({ executable: f.executable, transport: 'websocket' });
     expect(f.discover).not.toHaveBeenCalled();
@@ -332,6 +425,20 @@ describe('Windows direct shared Codex', () => {
 });
 
 describe('local Desktop native package preparation', () => {
+  it('preserves the advertised executor and every canonical package asset without borrowing Desktop helpers', async () => {
+    const f = await fixture(), root = path.join(f.home, 'official-package');
+    const paths = ['bin/codex.exe', 'bin/codex-code-mode-host.exe', 'bin/codex-exec-server.exe', 'codex-path/rg.exe',
+      'codex-resources/codex-command-runner.exe', 'codex-resources/codex-windows-sandbox-setup.exe', 'codex-resources/voice/bin/codex-voice-host.exe', 'codex-resources/voice/assets/model.bin'];
+    for (const file of paths) { await mkdir(path.dirname(path.join(root, file)), { recursive: true }); await writeFile(path.join(root, file), 'same-release-' + file); }
+    await writeFile(path.join(root, 'codex-package.json'), JSON.stringify({ layoutVersion: 1, version: '0.163.0', target: 'x86_64-pc-windows-msvc', variant: 'codex', entrypoint: 'bin/codex.exe', execServer: 'bin/codex-exec-server.exe', resourcesDir: 'codex-resources', pathDir: 'codex-path' }));
+    const prepared = await prepareDesktopCodexPackage(path.join(root, 'bin/codex.exe'), f.options);
+    expect(prepared).toBeTruthy();
+    const cached = path.dirname(path.dirname(prepared!));
+    for (const file of paths) expect(await readFile(path.join(cached, file), 'utf8')).toBe('same-release-' + file);
+    expect(JSON.parse(await readFile(path.join(cached, 'codex-package.json'), 'utf8')).execServer).toBe('bin/codex-exec-server.exe');
+    await rm(path.join(root, 'bin/codex-exec-server.exe'));
+    await expect(prepareDesktopCodexPackage(path.join(root, 'bin/codex.exe'), f.options)).rejects.toMatchObject({ code: 'shared-desktop-package-invalid' });
+  });
   it('copies the five same-bundle helpers into the native layout and reuses only a verified immutable snapshot', async () => {
     const f = await fixture(), desktop = await desktopFixture(path.join(f.home, 'desktop'));
     const prepared = await prepareDesktopCodexPackage(desktop, f.options);
@@ -392,6 +499,28 @@ describe('local Desktop native package preparation', () => {
     await writeFile(changed, 'synthetic-cache-tamper');
     await expect(prepareDesktopCodexPackage(desktop, f.options)).rejects.toMatchObject({ code: 'shared-desktop-package-invalid' });
     expect(await readFile(changed, 'utf8')).toBe('synthetic-cache-tamper');
+  });
+
+  it('rejects a cached package directory replaced by a link without repairing or deleting its target', async () => {
+    const f = await fixture(), desktop = await desktopFixture(path.join(f.home, 'desktop'));
+    const prepared = (await prepareDesktopCodexPackage(desktop, f.options))!, root = path.dirname(path.dirname(prepared));
+    const foreign = path.join(f.home, 'foreign-cache');
+    await rename(root, foreign);
+    await symlink(foreign, root, process.platform === 'win32' ? 'junction' : 'dir');
+    await expect(prepareDesktopCodexPackage(desktop, f.options)).rejects.toMatchObject({ code: 'shared-desktop-package-invalid' });
+    expect(await readFile(path.join(foreign, 'bin/codex.exe'), 'utf8')).toBe('synthetic-desktop-codex.exe');
+  });
+
+  it('requires an advertised executor but still supports packages with the native re-exec fallback', async () => {
+    const f = await fixture(), executable = await packageFixture(path.join(f.home, 'package'));
+    expect(await completeCodexPackage(executable)).toBe('0.163.0');
+    const file = path.join(path.dirname(path.dirname(executable)), 'codex-package.json');
+    const metadata = JSON.parse(await readFile(file, 'utf8'));
+    const execServer = `bin/${process.platform === 'win32' ? 'codex-exec-server.exe' : 'codex-exec-server'}`;
+    await writeFile(file, JSON.stringify({ ...metadata, execServer }));
+    expect(await completeCodexPackage(executable)).toBeUndefined();
+    await writeFile(path.join(path.dirname(path.dirname(executable)), execServer), 'same-package-executor', { mode: 0o755 });
+    expect(await completeCodexPackage(executable)).toBe('0.163.0');
   });
 
   it('publishes one complete immutable package when two preparations race', async () => {
