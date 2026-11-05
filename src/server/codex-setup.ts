@@ -42,7 +42,7 @@ async function requireUnsentQueue(directory: string): Promise<void> {
   try {
     database.exec('PRAGMA busy_timeout=500; BEGIN;');
     const version = Number(database.prepare('PRAGMA user_version').get()!.user_version);
-    if (database.prepare('PRAGMA application_id').get()!.application_id !== 0x52454c45 || !Number.isSafeInteger(version) || version < 1 || version > 8) throw new Error('Неизвестная версия базы Rele; настройки сохранены.');
+    if (database.prepare('PRAGMA application_id').get()!.application_id !== 0x52454c45 || !Number.isSafeInteger(version) || version < 1 || version > 9) throw new Error('Неизвестная версия базы Rele; настройки сохранены.');
     const blocked = database.prepare(`SELECT 1 FROM requests WHERE status IS NULL
       OR status NOT IN ('queued','completed','failed','interrupted','cancelled')
       OR (status='queued' AND (queued_submission_id IS NOT NULL OR turn_id IS NOT NULL)) LIMIT 1`).get()

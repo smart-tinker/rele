@@ -21,7 +21,8 @@ function open(path = join(directory(), 'rele.sqlite')): Store {
 }
 function dropSourceVersionSchema(database: DatabaseSync): void {
   database.exec(`DROP TABLE inbound_source_versions; DROP INDEX slack_sync_semantic_source; DROP INDEX slack_sync_aliases;
-    ALTER TABLE slack_sync_entries DROP COLUMN canonical_entry_id; ALTER TABLE slack_sync_entries DROP COLUMN semantic_revision;`);
+    ALTER TABLE slack_sync_entries DROP COLUMN canonical_entry_id; ALTER TABLE slack_sync_entries DROP COLUMN semantic_revision;
+    ALTER TABLE requests DROP COLUMN images;`);
 }
 function endpoint(overrides: Partial<Endpoint> = {}): Endpoint {
   return { id: 'slack-1', platform: 'slack', accountId: 'workspace-1', chatId: 'channel-1', threadId: 'thread-1',
@@ -94,6 +95,35 @@ describe('Store inbox and bindings', () => {
     expect(request(store, telegram).id).not.toBe(original.id);
     expect(request(store, otherSlack).id).not.toBe(original.id);
     expect(store.listRequests()).toHaveLength(3);
+  });
+
+  it('retains authorized Slack image references after a restart and deduplicates the original input', () => {
+    const path = join(directory(), 'images.sqlite');
+    const store = open(path), ep = endpoint(), conv = conversation(store, ep);
+    const images = [{ fileId: 'FIMAGE', mimeType: 'image/png', size: 321 }];
+    expect(store.ingest(message(ep, 'context-image', { text: '', images, contextOnly: true })).request).toBeNull();
+    expect(store.ingest(message(ep, 'unknown-sender-image', { text: '', images, sender: { id: 'other', name: 'Other' } })).request).toBeNull();
+    const inbound = message(ep, 'image', { text: '', images });
+    const accepted = store.ingest(inbound).request!;
+    expect(accepted).toMatchObject({ status: 'queued', text: '', images });
+    store.close();
+
+    const reopened = open(path);
+    expect(reopened.ingest({ ...inbound, images: [{ fileId: 'FOTHER', mimeType: 'image/jpeg' }] })).toEqual({ request: accepted, duplicate: true });
+    expect(reopened.listRequests()).toEqual([accepted]);
+    expect(reopened.claimNextRequest(conv.id)).toMatchObject({ id: accepted.id, text: '', images });
+  });
+
+  it('auto-links an image-only Slack message only when it is directed to the bot', () => {
+    const store = open();
+    const ep = endpoint({ accountId: 'T1:UBOT', chatId: 'C1' });
+    const auto = { rule: { id: 'slack-auto', enabled: true, platform: 'slack' as const, accountId: ep.accountId,
+      chatId: ep.chatId, cwd: '/fixture', allowedSenderIds: ['U1'], requireMention: false }, targetFingerprint: 'native' };
+    const upload = { text: '', images: [{ fileId: 'FIMAGE', mimeType: 'image/png' }], sender: { id: 'U1', name: 'Owner' } };
+    expect(store.ingest(message(ep, 'unaddressed-image', upload), auto).autoLinkIntent).toBeUndefined();
+    expect(store.ingest(message(ep, 'addressed-image', { ...upload, directMention: true }), auto).autoLinkIntent).toBeDefined();
+    const direct = endpoint({ id: 'slack-direct', accountId: ep.accountId, chatId: 'D1' });
+    expect(store.ingest(message(direct, 'dm-image', upload), { ...auto, rule: { ...auto.rule, chatId: direct.chatId } }).autoLinkIntent).toBeDefined();
   });
 
   it('requires an active binding and an explicit allowed sender, and does not replay ignored events', () => {
@@ -446,7 +476,7 @@ describe('Store durability and recovery', () => {
     const check = new DatabaseSync(path);
     try {
       expect(check.prepare('PRAGMA journal_mode').get()?.journal_mode).toBe('wal');
-      expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(8);
+      expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(9);
       expect(check.prepare('PRAGMA quick_check').get()?.quick_check).toBe('ok');
       expect(check.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     } finally { check.close(); }
@@ -767,6 +797,20 @@ describe('durable addressed steering inputs', () => {
   function addon(store: Store, ep: Endpoint, sender = { id: 'U2', name: 'Another participant', isBot: false }) {
     return store.ingest(message(ep, 'addon', { sender, messageId: '1770000002.000001', text: 'New direction' })).request!;
   }
+
+  it('keeps an image request queued rather than absorbing it into a text steering receipt', () => {
+    const { store, ep, conv, parent } = running();
+    const images = [{ fileId: 'FIMAGE', mimeType: 'image/png' }];
+    const source = transcript(ep, '1770000002.000001', { text: 'Look at this image', payload: { files: [{ id: 'FIMAGE', mimetype: 'image/png' }] } });
+    const entry = store.recordSlackMessage(source)!;
+    const input = store.beginSteeringInput(parent.id, { id: entry.id, entryId: entry.id, text: 'Quoted metadata' });
+    store.finishSteeringInput(input.id, 'applied');
+    const child = store.ingest(transcriptInbound(source, { endpoint: ep, images })).request!;
+    expect(store.getSteeringInput(child.id)).toBeUndefined();
+    expect(() => store.beginSteeringInput(parent.id, { id: child.id, requestId: child.id, text: child.text })).toThrow(/authorized queued input/);
+    store.updateRequest(parent.id, { status: 'completed' });
+    expect(store.claimNextRequest(conv.id, child.id)).toMatchObject({ id: child.id, images });
+  });
 
   it.each([false, true])('attaches any authorized same-source author without transferring ownership (bot=%s)', isBot => {
     const { store, ep, conv, parent } = running(), child = addon(store, ep, { id: isBot ? 'UBOT2' : 'U2', name: 'Participant', isBot });

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type WebSocket from 'ws';
 import type { Approval, Delivery, Endpoint, InboundMessage } from '../src/shared/types.js';
-import { SlackChannel } from '../src/server/channels/slack.js';
+import { MAX_SLACK_IMAGE_BYTES, SlackChannel } from '../src/server/channels/slack.js';
 import { QUESTION_VIEW } from '../src/server/channels/slack-questions.js';
 import { Store } from '../src/server/store.js';
 import {
@@ -1077,15 +1077,21 @@ describe('Slack Socket Mode durability and identity', () => {
     expect(JSON.parse(String(posts[1].init!.body)).blocks).toEqual([{ type: 'markdown', text: '**Result** @\u200bUUNVALIDATED @\u200beveryone' }]);
   });
 
-  it('keeps non-audio uploads as context while allowing a human voice task', async () => {
+  it('keeps unsupported uploads as context while admitting human voice and image tasks', async () => {
     const { socket, message } = await makeChannel();
     socket.receive(envelope('human-file', 'message', { text: '', subtype: 'file_share', files: [{ id: 'FPDF', name: 'Отчёт.pdf', mimetype: 'application/pdf' }] }));
     socket.receive(envelope('human-voice', 'message', { text: '', subtype: 'file_share', ts: '1000.1002', files: [{ id: 'FAUDIO', name: 'Сообщение.ogg', mimetype: 'audio/ogg', url_private_download: 'https://files.slack.com/files-pri/audio.ogg' }] }));
-    await vi.waitFor(() => expect(message).toHaveBeenCalledTimes(2));
+    const png = { id: 'FIMAGE', name: 'Скриншот.png', mimetype: 'image/png', size: 100, url_private_download: 'https://files.slack.com/files-pri/image.png' };
+    socket.receive(envelope('human-image', 'message', { text: '', subtype: 'file_share', ts: '1000.1003', files: [png, png, { ...png, id: 'FEXTERNAL', is_external: true }] }));
+    socket.receive(envelope('human-image-caption', 'app_mention', { text: '<@UBOT> Что на скриншоте?', ts: '1000.1004', files: [png] }));
+    await vi.waitFor(() => expect(message).toHaveBeenCalledTimes(4));
     const received = vi.mocked(message).mock.calls.map(([value]) => value);
     expect(received[0]).toMatchObject({ contextOnly: true, text: '', slack: { payload: { files: [{ id: 'FPDF' }] } } });
     expect(received[0].audio).toBeUndefined();
     expect(received[1]).toMatchObject({ contextOnly: false, audio: { fileId: 'FAUDIO', mimeType: 'audio/ogg' } });
+    expect(received[2]).toMatchObject({ contextOnly: false, text: '', directMention: false });
+    expect(received[2].images).toEqual([{ fileId: 'FIMAGE', mimeType: 'image/png', size: 100 }]);
+    expect(received[3]).toMatchObject({ contextOnly: false, text: '<@UBOT> Что на скриншоте?', directMention: true, images: received[2].images });
   });
 
   it.each([
@@ -1282,5 +1288,45 @@ describe('Slack private audio URL restrictions', () => {
       redirect: 'error',
       headers: { Authorization: 'Bearer SLACK_TOKEN_PLACEHOLDER_4051722' },
     });
+  });
+});
+
+describe('Slack image downloads', () => {
+  const account = 'TEXAMPLE:UBOT';
+  const image = { fileId: 'FCAPTURE', mimeType: 'image/png' };
+  const url = 'https://files.slack.com/files-pri/TEXAMPLE-FCAPTURE/download/capture.png';
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=';
+  const info = (fields = {}) => Response.json({ ok: true, file: { id: image.fileId, mimetype: image.mimeType, url_private_download: url, ...fields } });
+
+  it('resolves the stored ID with bot authorization and returns native PNG data without the Slack URL', async () => {
+    const { channel, calls } = await makeChannel({ api: method => method === 'files.info' ? info()
+      : method === 'capture.png' ? new Response(Buffer.from(png, 'base64'), { headers: { 'content-type': 'image/png' } }) : undefined });
+    await expect(channel.downloadImage(image, account)).resolves.toBe(`data:image/png;base64,${png}`);
+    const [lookup, download] = calls.slice(-2);
+    expect(lookup.url).toBe('https://slack.com/api/files.info');
+    expect(new URLSearchParams(String(lookup.init?.body)).get('file')).toBe(image.fileId);
+    expect(download.url).toBe(url);
+    for (const request of [lookup, download]) expect(request.init).toMatchObject({ redirect: 'error', headers: { Authorization: 'Bearer SLACK_TOKEN_PLACEHOLDER_4051722' } });
+  });
+
+  it('does not use the bot token for a different Slack account or an untrusted file host', async () => {
+    const { channel, calls } = await makeChannel({ api: method => method === 'files.info'
+      ? info({ url_private_download: 'https://files.slack.com.invalid/files-pri/capture.png' }) : undefined });
+    const before = calls.length;
+    await expect(channel.downloadImage(image, 'TOTHER:UBOT')).rejects.toThrow(/Подключение Slack изменилось/);
+    expect(calls).toHaveLength(before);
+    await expect(channel.downloadImage(image, account)).rejects.toThrow(/Не удалось скачать изображение Slack/);
+    expect(calls.slice(before).map(call => call.url)).toEqual(['https://slack.com/api/files.info']);
+  });
+
+  it.each([
+    ['invalid magic bytes', () => new Response('not a PNG', { headers: { 'content-type': 'image/png' } }), /Не удалось скачать изображение Slack/],
+    ['oversized stream', () => new Response(new Uint8Array(MAX_SLACK_IMAGE_BYTES + 1), { headers: { 'content-type': 'image/png' } }), /превышает 2 МБ/],
+    ['redirect', () => new Response(null, { status: 302, headers: { location: 'https://external.invalid/capture.png' } }), /Не удалось скачать изображение Slack/],
+  ] as const)('rejects %s', async (_case, response, error) => {
+    const { channel, calls } = await makeChannel({ api: method => method === 'files.info' ? info()
+      : method === 'capture.png' ? response() : undefined });
+    await expect(channel.downloadImage(image, account)).rejects.toThrow(error);
+    expect(calls.slice(-2).map(call => call.url)).toEqual(['https://slack.com/api/files.info', url]);
   });
 });

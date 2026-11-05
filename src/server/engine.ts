@@ -169,7 +169,7 @@ export class Engine extends EventEmitter {
     if (this.changingSelection) throw new ChannelError('Выбор версии Codex меняется; событие будет доставлено повторно.', true);
     const controlText = message.endpoint.platform === 'slack'
       ? message.text.replaceAll(`<@${message.endpoint.accountId.split(':').at(-1)}>`, '').trim() : message.text.trim();
-    if (message.control === 'stop' || !message.contextOnly && !message.audio && /^(?:rele:cancel|\/rele_cancel(?:@[A-Za-z0-9_]+)?)$/iu.test(controlText)) {
+    if (message.control === 'stop' || !message.contextOnly && !message.audio && !message.images?.length && /^(?:rele:cancel|\/rele_cancel(?:@[A-Za-z0-9_]+)?)$/iu.test(controlText)) {
       if (this.suspended) throw new ChannelError('Rele временно приостановлен. Повторите управление запросом после обновления.', true);
       if (this.store.recordInbound(message).duplicate) return;
       const requests = this.store.activeRequests().filter(request => !request.steeredInto && this.sameOrigin(request, message)
@@ -196,7 +196,7 @@ export class Engine extends EventEmitter {
         return !!request && this.sameOrigin(request, message)
           && this.store.approvalDeliveryProgress(candidate.id).sent;
       });
-    if (approval && (message.endpoint.platform === 'telegram' || (message.text.trim() && !message.audio))) {
+    if (approval && (message.endpoint.platform === 'telegram' || (message.text.trim() && !message.audio && !message.images?.length))) {
       if (this.suspended) throw new ChannelError('Rele временно приостановлен. Ответ на вопрос пока не принят.', true);
       // Record first: after any crash this event cannot become a fresh Codex turn.
       // A crash before resolution leaves the question available in the panel.
@@ -204,7 +204,7 @@ export class Engine extends EventEmitter {
       const request = this.store.getRequest(approval.requestId);
       const allPartsSent = this.store.approvalDeliveryProgress(approval.id).complete;
       if (approval.status === 'pending' && allPartsSent && request && (!terminal(request.status) || approval.method === ASYNC_QUESTION_METHOD && request.status === 'completed') && this.sameOrigin(request, message)
-          && approval.questions?.length && !approval.questions.some(question => question.isSecret) && message.text.trim() && !message.audio) {
+          && approval.questions?.length && !approval.questions.some(question => question.isSecret) && message.text.trim() && !message.audio && !message.images?.length) {
         const questions = approval.questions;
         const lines = questions.length === 1 ? [message.text] : message.text.trim().split(/\r?\n/u).filter(line => line.trim());
         if (questions.length > 1 && (lines.length !== questions.length || lines.some((line, index) => !line.startsWith(`${index + 1}. `) || !line.slice(line.indexOf(' ') + 1).trim()))) {
@@ -960,10 +960,10 @@ export class Engine extends EventEmitter {
       const entry = stream && this.store.listSlackSyncEntries(stream.id, { pending: true, limit: 100 }).find(row => {
         if (row.state !== 'pending' || row.message.sender.id === self || this.store.getSteeringInput(row.id)) return false;
         const request = row.requestId && this.store.getRequest(row.requestId);
-        return !request || request.status === 'queued' && !request.audio && !this.store.getSteeringInput(request.id) && !this.store.getAsyncQuestionAnswerApproval(request.id);
+        return !request || request.status === 'queued' && !request.audio && !request.images?.length && !this.store.getSteeringInput(request.id) && !this.store.getAsyncQuestionAnswerApproval(request.id);
       });
       const candidate = entry?.requestId ? this.store.getRequest(entry.requestId)
-        : entry ? undefined : this.store.listPendingRequests().find(row => row.conversationId === parent.conversationId && !row.audio && !this.store.getSteeringInput(row.id) && !this.store.getAsyncQuestionAnswerApproval(row.id) && this.sameSource(parent, { endpoint: row.origin }));
+        : entry ? undefined : this.store.listPendingRequests().find(row => row.conversationId === parent.conversationId && !row.audio && !row.images?.length && !this.store.getSteeringInput(row.id) && !this.store.getAsyncQuestionAnswerApproval(row.id) && this.sameSource(parent, { endpoint: row.origin }));
       if (!entry && !candidate) return;
       const found = await this.findOwnRequest(client, conversation.threadId, parent.id);
       const current = this.store.getRequest(parent.id);
@@ -1003,8 +1003,14 @@ export class Engine extends EventEmitter {
       const conversation = this.store.getConversation(conversationId)!;
       const queued = this.store.listPendingRequests().filter(row => row.conversationId === conversationId);
       const blockedReason = 'Источник выключен. Включите его для проверки полного контекста или отмените принятый запрос.';
-      for (const row of queued) if (this.waitsForSource(row) && row.error !== blockedReason) this.store.updateRequest(row.id, { error: blockedReason });
-      waiting = queued.find(row => !this.waitsForSource(row));
+      const imageBlockedReason = 'Ожидается исходное разрешённое подключение Slack для передачи изображения.';
+      for (const row of queued) {
+        const channel = this.channels.slack;
+        const error = this.waitsForSource(row) ? blockedReason : row.images?.length
+          && (!channel?.downloadImage || channel.state.accountId !== row.origin.accountId || !this.store.canDispatchSlackImages(row)) ? imageBlockedReason : undefined;
+        if (!error) { waiting ??= row; continue; }
+        if (row.error !== error) this.store.updateRequest(row.id, { error });
+      }
       const active = this.store.activeRequests().find(row => row.conversationId === conversationId && row.status !== 'queued' && !row.steeredInto);
       if (active) { await this.steerPending(active); return; }
       if (this.store.listAutoLinkIntents().some(intent => intent.status !== 'completed' && this.store.bindingForEndpoint(intent.endpointId)?.conversationId === conversationId)) return;
@@ -1028,6 +1034,36 @@ export class Engine extends EventEmitter {
       if (client !== this.codex) { await client.releaseThread(conversation.threadId); return; }
       this.ownedThreads.add(conversationId);
       if (!this.codex.status().queueSupported || this.stopped || this.suspended || this.store.getRequest(waiting.id)?.status !== 'queued' || this.waitsForSource(waiting)) return;
+      let images: string[] | undefined;
+      let imageSourceCurrent: (() => boolean) | undefined;
+      const attachments = waiting.images;
+      if (attachments?.length) {
+        const original = waiting;
+        const source = original.origin;
+        const channel = this.channels.slack;
+        const epoch = this.epoch;
+        imageSourceCurrent = () => client === this.codex && epoch === this.epoch && !this.stopped && !this.suspended
+          && this.channels.slack === channel && channel?.state.accountId === source.accountId
+          && this.store.getConversation(conversationId)?.paused === false && this.store.canDispatchSlackImages(original);
+        if (source.platform !== 'slack' || !channel?.downloadImage || !imageSourceCurrent()) {
+          if (original.error !== imageBlockedReason) this.store.updateRequest(original.id, { error: imageBlockedReason });
+          return;
+        }
+        images = [];
+        let bytes = 0;
+        try {
+          for (const image of attachments) {
+            const url = await channel.downloadImage(image, source.accountId);
+            if (!imageSourceCurrent() || this.store.getRequest(original.id)?.status !== 'queued') return;
+            bytes += Buffer.byteLength(url.slice(url.indexOf(',') + 1), 'base64');
+            if (bytes > 2 * 1024 * 1024) throw new Error('Общий размер изображений Slack превышает 2 МиБ.');
+            images.push(url);
+          }
+        } catch (error) {
+          if (imageSourceCurrent() && this.store.getRequest(original.id)?.status === 'queued') this.fail(original.id, this.options.redact(error));
+          return;
+        }
+      }
       request = this.store.claimNextRequest(conversationId, waiting.id);
       if (!request) return;
       if (request.id !== waiting.id) { this.store.updateRequest(request.id, { status: 'queued' }); request = undefined; return; }
@@ -1057,6 +1093,14 @@ export class Engine extends EventEmitter {
         || terminal(this.store.getRequest(request.id)!.status)) {
         if (!terminal(this.store.getRequest(request.id)!.status) && !this.store.getMeta(`cancel-requested:${request.id}`)) this.store.updateRequest(request.id, { status: 'queued' });
         return;
+      }
+      if (imageSourceCurrent) {
+        const fresh = this.store.getRequest(request.id)!;
+        if (fresh.status !== 'starting' || fresh.turnId || fresh.queuedSubmissionId) return;
+        if (!imageSourceCurrent()) {
+          this.store.updateRequest(request.id, { status: 'queued' });
+          return;
+        }
       }
       this.store.setMeta(`request-terminal-baseline:${request.id}`, JSON.stringify({ ...baseline, epoch, target: this.targetFingerprint() } satisfies TerminalBaseline));
       const answerApproval = this.store.getAsyncQuestionAnswerApproval(request.id);
@@ -1094,7 +1138,8 @@ export class Engine extends EventEmitter {
         this.asyncAnswerDelivery(request.id, 'sending');
       }
       attempted = true;
-      const result = await client.enqueue(conversation.threadId, answerApproval ? request.text : requestInput(request), request.id);
+      const input = answerApproval ? request.text : requestInput(request);
+      const result = await (images ? client.enqueue(conversation.threadId, input, request.id, images) : client.enqueue(conversation.threadId, input, request.id));
       // The userMessage and completion notifications may arrive before this ACK.
       this.store.updateRequest(request.id, { queuedSubmissionId: result.queuedSubmissionId });
       this.track(this.reconcile(request.id));

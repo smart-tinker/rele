@@ -203,7 +203,7 @@ describe('installer-only shared Codex setup', () => {
     const f = await fixture(), db = inbox(f); db.store.close();
     const malformed = new DatabaseSync(db.file);
     try { malformed.exec(problem === 'foreign-owner' ? 'PRAGMA application_id=123;' : problem === 'future-schema'
-      ? 'PRAGMA user_version=9;' : 'ALTER TABLE requests RENAME COLUMN queued_submission_id TO unknown_submission;'); }
+      ? 'PRAGMA user_version=10;' : 'ALTER TABLE requests RENAME COLUMN queued_submission_id TO unknown_submission;'); }
     finally { malformed.close(); }
     const originalDatabase = await readFile(db.file);
     await expect(setupSharedCodex(f.config, f.verify, f.env)).rejects.toThrow();

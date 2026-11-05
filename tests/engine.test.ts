@@ -45,7 +45,7 @@ class FakeCodex extends EventEmitter implements CodexGateway {
   injectContext = vi.fn(async (_threadId: string, _entryId: string, _text: string) => {});
   subscribe = vi.fn(async (_threadId: string) => {});
   releaseThread = vi.fn(async (_threadId: string) => {});
-  enqueue = vi.fn(async (_threadId: string, text: string, clientId: string) => {
+  enqueue = vi.fn(async (_threadId: string, text: string, clientId: string, _images?: readonly string[]) => {
     const queuedSubmissionId = `queue-${clientId}`;
     this.locations.set(clientId, text === INITIAL_RELE_MESSAGE ? { state: 'completed', turnId: `initial-${clientId}`, text: 'NOREPLY' } : { state: 'queued', queuedSubmissionId });
     return { queuedSubmissionId };
@@ -2392,6 +2392,70 @@ function slackInbound(f: ReturnType<typeof fixture>, eventId: string, messageId:
   return { ...value, slack: { endpointId: value.endpoint.id, accountId: value.endpoint.accountId, chatId: value.endpoint.chatId,
     threadId: value.endpoint.threadId, messageId, text, sender: value.sender, kind: 'message', payload: { text, ts: messageId } } };
 }
+
+describe('Engine Slack image input', () => {
+  const image = { fileId: 'FSCREEN', mimeType: 'image/png' };
+  const dataUrl = 'data:image/png;base64,iVBORw0KGgo=';
+  it.each(['', 'Read the screenshot'])('submits one typed image for an accepted Slack request (%s)', async text => {
+    const f = fixture();
+    const downloadImage = vi.fn().mockResolvedValue(dataUrl);
+    f.engine.channels.slack = { ...f.slack, downloadImage };
+    const inbound = f.message('slack', 'screen', { text, images: [image] });
+    await f.engine.receive(inbound);
+    await f.engine.receive(inbound);
+    await f.engine.settled();
+    const [request] = f.store.listRequests();
+    expect(downloadImage).toHaveBeenCalledExactlyOnceWith(image, inbound.endpoint.accountId);
+    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, requestInput(request), request.id, [dataUrl]);
+  });
+
+  it.each(['cancel', 'access changed'])('does not enqueue if the request changes while downloading (%s)', async change => {
+    const f = fixture();
+    const download = deferred<string>();
+    const started = deferred<void>();
+    const downloadImage = vi.fn(() => { started.resolve(); return download.promise; });
+    f.engine.channels.slack = { ...f.slack, downloadImage };
+    await f.engine.receive(f.message('slack', 'pending-screen', { images: [image] }));
+    await started.promise;
+    const [request] = f.store.listRequests();
+    if (change === 'cancel') await f.engine.cancel(request.id);
+    else f.store.setSourceAccess(f.eps.slack.id, { mode: 'off' });
+    download.resolve(dataUrl);
+    await f.engine.settled();
+    expect(f.codex.enqueue).not.toHaveBeenCalled();
+    expect(f.store.getRequest(request.id)?.status).toBe(change === 'cancel' ? 'cancelled' : 'queued');
+  });
+
+  it('does not block a later permitted Slack request behind an image that now requires a mention', async () => {
+    const f = fixture({ start: false });
+    const downloadImage = vi.fn().mockResolvedValue(dataUrl);
+    f.engine.channels.slack = { ...f.slack, downloadImage };
+    f.codex.connected = false;
+    await f.engine.receive(f.message('slack', 'blocked-image', { images: [image] }));
+    await f.engine.settled();
+    f.store.setSourceAccess(f.eps.slack.id, { mode: 'mention' });
+    await f.engine.receive(f.message('slack', 'next-allowed', { directMention: true }));
+    await f.engine.settled();
+    f.codex.connected = true;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 2000);
+    try { await f.engine.pump(); await f.engine.settled(); }
+    finally { clock.mockRestore(); }
+    const [allowed, blocked] = f.store.listRequests();
+    expect(blocked).toMatchObject({ eventId: 'blocked-image', status: 'queued' });
+    expect(downloadImage).not.toHaveBeenCalled();
+    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, requestInput(allowed), allowed.id);
+  });
+
+  it('reports an inaccessible attachment without submitting a misleading text-only request', async () => {
+    const f = fixture();
+    const downloadImage = vi.fn().mockRejectedValue(new ChannelError('Изображение Slack недоступно.'));
+    f.engine.channels.slack = { ...f.slack, downloadImage };
+    await f.engine.receive(f.message('slack', 'missing-screen', { images: [image] }));
+    await f.engine.settled();
+    expect(f.codex.enqueue).not.toHaveBeenCalled();
+    expect(f.store.listRequests()).toMatchObject([{ status: 'failed', error: 'Изображение Slack недоступно.' }]);
+  });
+});
 
 describe('Engine durable outgoing tools', () => {
   function toolsFixture() {

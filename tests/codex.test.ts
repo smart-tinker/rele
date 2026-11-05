@@ -660,6 +660,16 @@ describe('Codex shared-runtime adapter', () => {
     expect(f.calls.some(call => ['turn/start', 'thread/queue/start'].includes(call.method || ''))).toBe(false);
   });
 
+  it('keeps a Slack image in the same native queue submission as its attributed text', async () => {
+    const f = await fixture({ 'thread/queue/add': () => ({ queuedSubmission: { id: 'image-queue-id' } }) });
+    const clientId = randomUUID(), url = 'data:image/png;base64,iVBORw0KGgo=';
+    await f.client.connect();
+    await f.client.enqueue(threadId, 'Slack screenshot', clientId, [url]);
+    expect(f.calls.filter(call => call.method === 'thread/queue/add').map(call => call.params)).toEqual([
+      { threadId, clientUserMessageId: clientId, input: [{ type: 'text', text: 'Slack screenshot' }, { type: 'image', url }] },
+    ]);
+  });
+
   it('refuses writes on an untested runtime and never falls back to turn/start', async () => {
     const f = await fixture({ initialize: () => ({ userAgent: 'rele/0.164.0 (Linux)', codexHome: '/isolated', platformFamily: 'unix', platformOs: 'linux' }) });
     await f.client.connect();

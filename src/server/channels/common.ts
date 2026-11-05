@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
-import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionState, Delivery, Endpoint, InboundMessage, Origin, Person, Platform, SlackTranscriptMessage } from '../../shared/types.js';
+import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionState, Delivery, Endpoint, InboundMessage, Origin, Person, Platform, SlackImageAttachment, SlackTranscriptMessage } from '../../shared/types.js';
 
 export type SlackSessionStatus = 'processing' | 'active' | 'suspended';
 
@@ -57,6 +57,7 @@ export interface Channel {
   deliver(delivery: Delivery, approval?: Approval): Promise<string>;
   deliveryText?(delivery: Delivery): string;
   download(audio: AudioAttachment, file: string): Promise<void>;
+  downloadImage?(image: SlackImageAttachment, accountId: string): Promise<string>;
   listChats?(cursor?: string): Promise<CatalogPage<CatalogChat>>;
   listThreads?(chatId: string, cursor?: string): Promise<CatalogPage<Endpoint>>;
   listPeople?(chatId: string, cursor?: string): Promise<CatalogPage<Person>>;

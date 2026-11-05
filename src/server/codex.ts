@@ -432,7 +432,7 @@ export class CodexClient extends EventEmitter {
     } catch { throw new Error(error); }
   }
 
-  async enqueue(threadId: string, text: string, clientUserMessageId: string): Promise<{ queuedSubmissionId: string }> {
+  async enqueue(threadId: string, text: string, clientUserMessageId: string, images: readonly string[] = []): Promise<{ queuedSubmissionId: string }> {
     if (!text.trim()) throw new Error('Нельзя отправить пустой запрос Codex.');
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(clientUserMessageId)) {
       throw new Error('Запрос Codex должен иметь постоянный UUID для восстановления после обрыва связи.');
@@ -442,7 +442,7 @@ export class CodexClient extends EventEmitter {
     // add is NOT idempotent. Never retry it here, even with the same clientUserMessageId.
     // Auto-drain creates a separate turn atomically; turn/start would steer a Desktop turn.
     const response = await this.call<{ queuedSubmission: QueueEntry }>('thread/queue/add', {
-      threadId, input: [{ type: 'text', text }], clientUserMessageId,
+      threadId, input: [{ type: 'text', text }, ...images.map(url => ({ type: 'image', url }))], clientUserMessageId,
     });
     if (!response.queuedSubmission?.id) throw new CodexTransportError('Codex принял запрос, но не вернул идентификатор очереди. Проверьте историю перед повтором.');
     return { queuedSubmissionId: response.queuedSubmission.id };

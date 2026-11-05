@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import WebSocket from 'ws';
-import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionState, Delivery, Endpoint, InboundMessage, Origin, Person, SlackTranscriptMessage } from '../../shared/types.js';
+import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionState, Delivery, Endpoint, InboundMessage, Origin, Person, SlackImageAttachment, SlackTranscriptMessage } from '../../shared/types.js';
 import type { Store } from '../store.js';
 import { ChannelError, downloadBounded, endpointId, readableTitle, splitReply, type ApprovalContext, type ApprovalResolution, type Channel, type ChannelCallbacks, type RequestProgress, type SlackSessionStatus } from './common.js';
 import { escapeSlackText, formatSlackReply } from './slack-format.js';
@@ -11,10 +11,38 @@ type Json = Record<string, any>;
 const SLACK_TS = /^\d+\.\d+$/u;
 const SLACK_USER = /^[UW][A-Z0-9]+$/u;
 const SLACK_BOT = /^B[A-Z0-9]+$/u;
+const SLACK_FILE = /^F[A-Z0-9]{1,63}$/u;
+const SLACK_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+const MAX_SLACK_IMAGES = 4;
+export const MAX_SLACK_IMAGE_BYTES = 2 * 1024 * 1024;
 const CONVERSATION_TYPES = [
   ['public_channel', 'channels:read'], ['private_channel', 'groups:read'], ['im', 'im:read'], ['mpim', 'mpim:read'],
 ] as const;
 const PAYLOAD_NOISE = new Set(['token', 'access_token', 'refresh_token', 'authorization', 'response_url', 'bot_profile', 'user_profile', 'event_ts', 'client_msg_id', 'team', 'channel', 'reply_count', 'reply_users', 'reply_users_count', 'latest_reply', 'last_read', 'subscribed', 'reactions']);
+
+export function slackImageAttachments(files: unknown): SlackImageAttachment[] {
+  const images: SlackImageAttachment[] = [];
+  if (!Array.isArray(files)) return images;
+  const seen = new Set<string>();
+  for (const file of files) {
+    if (!file || typeof file.id !== 'string' || !SLACK_FILE.test(file.id) || seen.has(file.id)
+      || !SLACK_IMAGE_TYPES.has(file.mimetype) || file.is_external === true || file.mode === 'external') continue;
+    seen.add(file.id);
+    images.push({ fileId: file.id, mimeType: file.mimetype, ...(Number.isSafeInteger(file.size) && file.size >= 0 ? { size: file.size } : {}) });
+    if (images.length === MAX_SLACK_IMAGES) break;
+  }
+  return images;
+}
+
+function matchesImageType(bytes: Buffer, mimeType: string): boolean {
+  switch (mimeType) {
+    case 'image/png': return bytes.subarray(0, 8).toString('hex') === '89504e470d0a1a0a';
+    case 'image/jpeg': return bytes.subarray(0, 3).toString('hex') === 'ffd8ff';
+    case 'image/gif': return ['GIF87a', 'GIF89a'].includes(bytes.toString('latin1', 0, 6));
+    case 'image/webp': return bytes.toString('latin1', 0, 4) === 'RIFF' && bytes.toString('latin1', 8, 12) === 'WEBP';
+    default: return false;
+  }
+}
 
 function visiblePayload(value: unknown): any {
   if (Array.isArray(value)) return value.map(visiblePayload);
@@ -734,6 +762,53 @@ export class SlackChannel implements Channel {
     await downloadBounded(response, file);
   }
 
+  async downloadImage(image: SlackImageAttachment, accountId: string): Promise<string> {
+    const signal = this.abort.signal;
+    const checkAccount = () => {
+      if (!accountId || accountId !== this.accountId || this.stopped || signal.aborted || signal !== this.abort.signal) {
+        throw new ChannelError('Подключение Slack изменилось. Изображение недоступно.');
+      }
+    };
+    const unavailable = () => new ChannelError('Не удалось скачать изображение Slack.');
+    const oversized = () => new ChannelError('Изображение Slack превышает 2 МБ.');
+    checkAccount();
+    if (!SLACK_FILE.test(image.fileId) || !SLACK_IMAGE_TYPES.has(image.mimeType)) throw unavailable();
+    if ((image.size ?? 0) > MAX_SLACK_IMAGE_BYTES) throw oversized();
+    const { file } = await this.api('files.info', { file: image.fileId });
+    checkAccount();
+    const [resolved] = slackImageAttachments([file]);
+    if (resolved?.fileId !== image.fileId || resolved.mimeType !== image.mimeType) throw unavailable();
+    if ((resolved.size ?? 0) > MAX_SLACK_IMAGE_BYTES) throw oversized();
+    let url: URL;
+    try { url = new URL(file.url_private_download ?? file.url_private); } catch { throw unavailable(); }
+    if (url.protocol !== 'https:' || url.hostname !== 'files.slack.com' || !url.pathname.startsWith('/files-pri/') || url.username || url.password || url.port) throw unavailable();
+    let response: Response;
+    try { response = await this.fetcher(url, { headers: { Authorization: `Bearer ${this.botToken}` }, redirect: 'error', signal: AbortSignal.any([signal, AbortSignal.timeout(60_000)]) }); }
+    catch { throw unavailable(); }
+    const contentType = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
+    const reader = response.body?.getReader();
+    if (!reader) throw unavailable();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      checkAccount();
+      if (!response.ok || response.redirected || (contentType && contentType !== image.mimeType && contentType !== 'application/octet-stream')) throw unavailable();
+      if (Number(response.headers.get('content-length')) > MAX_SLACK_IMAGE_BYTES) throw oversized();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > MAX_SLACK_IMAGE_BYTES) throw oversized();
+        chunks.push(value);
+      }
+    } catch (error) { throw error instanceof ChannelError ? error : unavailable(); }
+    finally { await reader.cancel().catch(() => {}); }
+    checkAccount();
+    const bytes = Buffer.concat(chunks, total);
+    if (!matchesImageType(bytes, image.mimeType)) throw unavailable();
+    return `data:${image.mimeType};base64,${bytes.toString('base64')}`;
+  }
+
   private async receive(raw: string, socket: WebSocket): Promise<void> {
     let envelope: Json;
     try { envelope = JSON.parse(raw); } catch { return; }
@@ -839,12 +914,14 @@ export class SlackChannel implements Channel {
     };
     this.endpoints.set(id, endpoint);
     const file = (Array.isArray(event.files) ? event.files : []).find((entry: Json) => String(entry.mimetype).startsWith('audio/') && entry.url_private_download);
+    const images = slackImageAttachments(event.files);
     return {
       // app_mention and message may describe the same message with distinct envelope/event IDs.
       eventId: `message:${event.channel}:${event.ts}${kind === 'message' ? '' : `:${kind}:${createHash('sha256').update(JSON.stringify(slack.payload)).digest('hex').slice(0, 16)}`}`, endpoint, sender: person, messageId: event.ts, text, slack, directMention,
       contextOnly: kind !== 'message' || !!event.subtype && !['file_share', 'bot_message', 'me_message', 'thread_broadcast'].includes(event.subtype)
-        || !(stableUser || stableBot && !!this.botId) || self || person.id === 'USLACKBOT' || !text && !file,
+        || !(stableUser || stableBot && !!this.botId) || self || person.id === 'USLACKBOT' || !text && !file && !images.length,
       ...(file ? { audio: { platform: 'slack' as const, fileId: String(file.id), url: file.url_private_download, name: readableTitle(file.name, 'audio'), mimeType: file.mimetype, size: file.size } } : {}),
+      ...(images.length ? { images } : {}),
     };
   }
 
@@ -874,9 +951,9 @@ export class SlackChannel implements Channel {
     const signal = this.abort.signal;
     let response: Response;
     // These Slack read methods ignore JSON arguments on the live bot API.
-    const form = ['users.conversations', 'conversations.members', 'users.info', 'conversations.replies'].includes(method);
+    const form = ['users.conversations', 'conversations.members', 'users.info', 'conversations.replies', 'files.info'].includes(method);
     const payload = form ? new URLSearchParams(body).toString() : JSON.stringify(body);
-    try { response = await this.fetcher(`https://slack.com/api/${method}`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': form ? 'application/x-www-form-urlencoded; charset=utf-8' : 'application/json; charset=utf-8' }, body: payload, signal: AbortSignal.any([signal, AbortSignal.timeout(20_000)]) }); }
+    try { response = await this.fetcher(`https://slack.com/api/${method}`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': form ? 'application/x-www-form-urlencoded; charset=utf-8' : 'application/json; charset=utf-8' }, body: payload, ...(method === 'files.info' ? { redirect: 'error' as const } : {}), signal: AbortSignal.any([signal, AbortSignal.timeout(20_000)]) }); }
     catch { throw new ChannelError('Соединение со Slack прервано.', !sending, sending); }
     const retrySeconds = Number(response.headers.get('retry-after'));
     const retryAfterMs = Number.isFinite(retrySeconds) && retrySeconds > 0 ? Math.max(1000, Math.min(3600_000, retrySeconds * 1000)) : 30_000;

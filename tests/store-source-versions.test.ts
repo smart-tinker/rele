@@ -24,7 +24,7 @@ function fixture() {
 function downgrade(file: string) {
   const db = new DatabaseSync(file);
   db.exec(`DROP TABLE inbound_source_versions; DROP INDEX slack_sync_semantic_source; DROP INDEX slack_sync_aliases;
-    ALTER TABLE slack_sync_entries DROP COLUMN canonical_entry_id; ALTER TABLE slack_sync_entries DROP COLUMN semantic_revision; PRAGMA user_version=7;`);
+    ALTER TABLE slack_sync_entries DROP COLUMN canonical_entry_id; ALTER TABLE slack_sync_entries DROP COLUMN semantic_revision; ALTER TABLE requests DROP COLUMN images; PRAGMA user_version=7;`);
   return db;
 }
 
@@ -73,7 +73,7 @@ describe('Persistent transcript source versions', () => {
     expect(store.recordSlackMessage(f.message(first.messageId))!.id).toBe(first.id);
     expect(store.recordSlackMessage(f.message(second.messageId))!.id).toBe(second.id);
     const check = new DatabaseSync(f.file, { readOnly: true });
-    try { expect(check.prepare('SELECT id,revision,message,state,request_id,created_at FROM slack_sync_entries ORDER BY id').all()).toEqual(raw); expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(8); } finally { check.close(); }
+    try { expect(check.prepare('SELECT id,revision,message,state,request_id,created_at FROM slack_sync_entries ORDER BY id').all()).toEqual(raw); expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(9); } finally { check.close(); }
     store.close(); const reopened = open(f.file);
     expect(reopened.listSlackSyncEntries(stream.id).map(e => e.id)).toEqual([first.id, second.id]);
   });

@@ -110,6 +110,12 @@ export interface AudioAttachment {
   size?: number;
 }
 
+export interface SlackImageAttachment {
+  fileId: string;
+  mimeType: string;
+  size?: number;
+}
+
 export interface SlackTranscriptMessage {
   platform?: Platform;
   receivedAt?: string;
@@ -135,6 +141,7 @@ export interface InboundMessage {
   messageId: string;
   text: string;
   audio?: AudioAttachment;
+  images?: SlackImageAttachment[];
   replyToMessageId?: string;
   slack?: SlackTranscriptMessage;
   contextOnly?: boolean;
@@ -149,6 +156,7 @@ export interface ReleRequest {
   origin: Origin;
   text: string;
   audio?: AudioAttachment;
+  images?: SlackImageAttachment[];
   status: RequestStatus;
   queuedSubmissionId?: string;
   turnId?: string;
