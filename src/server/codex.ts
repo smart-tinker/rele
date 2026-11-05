@@ -739,7 +739,10 @@ export class CodexClient extends EventEmitter {
     }
     const commentary = turn.items.filter(item => item.type === 'agentMessage' && item.delivery !== 'async' && item.phase === 'commentary' && item.text?.trim())
       .map(item => ({ id: `${turn.id}:${item.id ?? createHash('sha256').update(item.text!).digest('hex')}`, text: item.text! }));
-    const answers = turn.items.filter(item => item.type === 'agentMessage' && item.delivery !== 'async' && item.phase === 'final_answer');
+    const answers = turn.items.filter(item => item.type === 'agentMessage' && item.delivery !== 'async' && item.phase === 'final_answer')
+      .map(item => item.text || '');
+    const visibleAnswers = answers.filter(text => text.trim() !== 'NOREPLY');
+    const finalText = visibleAnswers.join('\n\n');
     const legacy = turn.items.filter(item => item.type === 'agentMessage' && item.delivery !== 'async' && item.phase == null);
     const unanswered = [...questions.values()].filter(({ question }) => !asyncAnswers.some(answer => answer.questionItemId === question.id));
     return {
@@ -747,7 +750,8 @@ export class CodexClient extends EventEmitter {
       ...(mixed ? { mixed: true } : {
         ...(commentary.length ? { commentary } : {}),
         ...(publicHistory.some(event => 'boundary' in event) ? { publicHistory } : {}),
-        text: answers.length ? answers.map(item => item.text || '').join('\n\n') : legacy.at(-1)?.text,
+        text: !answers.length ? legacy.at(-1)?.text
+          : !finalText.trim() && visibleAnswers.length < answers.length ? 'NOREPLY' : finalText,
         ...(failureReason ? { failureReason } : {}),
         ...(turn.items.some(item => codexCommandItem(item)) ? { commandItems: turn.items.flatMap(item => { const command = codexCommandItem(item); return command ? [command] : []; }) } : {}),
         ...(['running', 'completed'].includes(state) && unanswered.length ? { asyncQuestions: unanswered } : {}),
