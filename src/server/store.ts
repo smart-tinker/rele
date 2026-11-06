@@ -178,6 +178,8 @@ const MIGRATIONS = [String.raw`
   ) STRICT;
   CREATE UNIQUE INDEX inbound_semantic_source ON inbound_source_versions(platform,account_id,endpoint_id,message_id,revision)
     WHERE event_id=canonical_event_id;
+`, String.raw`
+  ALTER TABLE requests ADD COLUMN images TEXT CHECK(images IS NULL OR (json_valid(images) AND json_type(images) = 'array'));
 `];
 
 function required(value: string, label: string): void {
@@ -218,6 +220,7 @@ function toAutoLinkIntent(r: Row): AutoLinkIntent {
 function toRequest(r: Row): ReleRequest {
   return { id: r.id as string, conversationId: r.conversation_id as string, eventId: r.event_id as string,
     origin: json(r.origin), text: r.text as string, audio: r.audio === null ? undefined : json(r.audio),
+    ...(r.images === null ? {} : { images: json<ReleRequest['images']>(r.images) }),
     status: r.status as ReleRequest['status'], queuedSubmissionId: optional(r.queued_submission_id),
     turnId: optional(r.turn_id), error: optional(r.error), createdAt: r.created_at as string, updatedAt: r.updated_at as string };
 }
@@ -935,6 +938,12 @@ export class Store {
     return (access.mode !== 'mention' || message.directMention === true) && this.acceptsRequest(message, access.allowedSenderIds,
       { allowAllSenders: !this.isDirectMessage(message.endpoint), requireMention: false });
   }
+  allowsSlackRequest(request: ReleRequest): boolean {
+    const binding = this.bindingForEndpoint(request.origin.endpointId);
+    if (request.origin.platform !== 'slack' || binding?.conversationId !== request.conversationId) return false;
+    const receipt = this.db.prepare('SELECT payload FROM inbound_events WHERE request_id=?').get(request.id);
+    return !!receipt && this.acceptsSourceRequest(json<InboundMessage>(receipt.payload), binding);
+  }
   private writeRequest(message: InboundMessage, binding: Binding): ReleRequest {
     const endpoint = message.endpoint;
     const now = new Date().toISOString();
@@ -945,8 +954,9 @@ export class Store {
       chatId: endpoint.chatId, threadId: endpoint.threadId, senderId: saved.sender.id, senderName: saved.sender.name,
       senderIsBot: saved.sender.isBot, participants: saved.participants, messageId: message.messageId };
     const id = randomUUID();
-    this.db.prepare(`INSERT INTO requests (id,conversation_id,event_id,origin,text,audio,status,created_at,updated_at) VALUES (?,?,?,?,?,?,'queued',?,?)`)
-      .run(id, binding.conversationId, message.eventId, JSON.stringify(origin), message.text, message.audio ? JSON.stringify(message.audio) : null, now, now);
+    this.db.prepare(`INSERT INTO requests (id,conversation_id,event_id,origin,text,audio,images,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,'queued',?,?)`)
+      .run(id, binding.conversationId, message.eventId, JSON.stringify(origin), message.text, message.audio ? JSON.stringify(message.audio) : null,
+        endpoint.platform === 'slack' && saved.images?.length ? JSON.stringify(saved.images) : null, now, now);
     this.db.prepare('UPDATE inbound_events SET request_id=? WHERE platform=? AND account_id=? AND event_id=?').run(id, endpoint.platform, endpoint.accountId, message.eventId);
     const entry = this.recordSlackMessageInside(saved.slack ?? { platform: endpoint.platform, endpointId: endpoint.id,
       accountId: endpoint.accountId, chatId: endpoint.chatId, threadId: endpoint.threadId, messageId: message.messageId,
@@ -980,7 +990,8 @@ export class Store {
       rule.platform === endpoint.platform && rule.accountId === endpoint.accountId && rule.chatId === endpoint.chatId &&
       Array.isArray(rule.allowedSenderIds) && this.acceptsSourceRequest(message, rule, rule) &&
       (!rule.requireMention || directMessage || message.directMention === true) &&
-      (!!message.audio || typeof message.text === 'string' && !!message.text.trim()) &&
+      (!!message.audio || typeof message.text === 'string' && !!message.text.trim()
+        || endpoint.platform === 'slack' && !!message.images?.length && (directMessage || message.directMention === true)) &&
       !/^(?:rele:cancel|\/rele_cancel(?:@[\w]+)?)(?:\s|$)/iu.test(message.text) &&
       !(endpoint.platform === 'telegram' && /^\/(?:start|rele_register|rele_chats)(?:@[\w]+)?(?:\s|$)/iu.test(message.text));
   }
@@ -1159,7 +1170,7 @@ export class Store {
     const parent = parentRow && toRequest(parentRow), stream = this.getSlackSyncStream(entry.streamId);
     const receipt = child && this.db.prepare('SELECT payload FROM inbound_events WHERE request_id=?').get(child.id);
     const saved = receipt && json<InboundMessage>(receipt.payload);
-    if (!child || !parent || !stream || !saved || child.id === parent.id || child.status !== 'queued' || child.audio
+    if (!child || !parent || !stream || !saved || child.id === parent.id || child.status !== 'queued' || child.audio || child.images?.length
       || child.turnId || child.queuedSubmissionId || parent.turnId !== input.turnId
       || child.conversationId !== parent.conversationId || stream.conversationId !== parent.conversationId
       || saved.eventId !== child.eventId || saved.text !== child.text || saved.sender.id !== child.origin.senderId
@@ -1270,7 +1281,7 @@ export class Store {
         const binding = child && this.bindingForEndpoint(child.origin.endpointId);
         const savedRow = child && this.db.prepare('SELECT payload FROM inbound_events WHERE request_id=?').get(child.id);
         const saved = savedRow && json<InboundMessage>(savedRow.payload);
-        if (!child || child.id === parent.id || child.status !== 'queued' || child.audio || child.turnId || child.queuedSubmissionId
+        if (!child || child.id === parent.id || child.status !== 'queued' || child.audio || child.images?.length || child.turnId || child.queuedSubmissionId
           || child.conversationId !== parent.conversationId || !sameSource(child.origin) || !binding || binding.conversationId !== parent.conversationId
           || !saved || !this.acceptsSourceRequest(saved, binding)) throw new Error('Steering request is not an authorized queued input from the same source');
         const original = saved.slack ?? { platform: saved.endpoint.platform, endpointId: saved.endpoint.id, accountId: saved.endpoint.accountId,

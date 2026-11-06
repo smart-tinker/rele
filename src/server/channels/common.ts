@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
-import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionState, Delivery, Endpoint, InboundMessage, Origin, Person, Platform, SlackTranscriptMessage } from '../../shared/types.js';
+import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionState, Delivery, Endpoint, InboundMessage, Origin, Person, Platform, SlackImageAttachment, SlackTranscriptMessage } from '../../shared/types.js';
 
 export type SlackSessionStatus = 'processing' | 'active' | 'suspended';
 
@@ -46,6 +46,8 @@ export interface ChannelCallbacks {
   endpoint(endpoint: Endpoint): void;
   action(action: ApprovalAction): Promise<void>;
   question?(context: ApprovalContext): Approval | Promise<Approval>;
+  inspectAutoReview?(context: ApprovalContext): string | Promise<string>;
+  autoReview?(context: ApprovalContext): Promise<void>;
   status(): void;
 }
 
@@ -57,6 +59,7 @@ export interface Channel {
   deliver(delivery: Delivery, approval?: Approval): Promise<string>;
   deliveryText?(delivery: Delivery): string;
   download(audio: AudioAttachment, file: string): Promise<void>;
+  downloadImage?(image: SlackImageAttachment, accountId: string): Promise<string>;
   listChats?(cursor?: string): Promise<CatalogPage<CatalogChat>>;
   listThreads?(chatId: string, cursor?: string): Promise<CatalogPage<Endpoint>>;
   listPeople?(chatId: string, cursor?: string): Promise<CatalogPage<Person>>;
@@ -64,6 +67,8 @@ export interface Channel {
   setThreadStatus?(origin: Origin, status: SlackSessionStatus): Promise<void>;
   updateProgress?(requestId: string, origin: Origin, progress: RequestProgress): Promise<void>;
   updateApproval?(delivery: Delivery, approval: Approval, resolution?: ApprovalResolution): Promise<void>;
+  showAutoReview?(origin: Origin, id: string): Promise<string>;
+  updateAutoReview?(origin: Origin, messageId: string, state: 'recorded' | 'uncertain'): Promise<void>;
   readThreadPage?(target: Pick<Origin, 'endpointId' | 'accountId' | 'chatId' | 'threadId'>, options?: { cursor?: string; oldest?: string; latest?: string }): Promise<{ messages: SlackTranscriptMessage[]; nextCursor?: string }>;
 }
 

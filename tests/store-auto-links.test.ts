@@ -81,7 +81,7 @@ describe('multiple origin bindings and v5 migration', () => {
       SELECT rowid,id,conversation_id,platform,endpoint_id,allowed_sender_ids FROM bindings;
     DROP TABLE bindings; ALTER TABLE bindings_v4 RENAME TO bindings;
     DROP INDEX inbound_auto_link; ALTER TABLE inbound_events DROP COLUMN auto_link_intent_id;
-    DROP TABLE auto_link_intents; PRAGMA user_version=4;`);
+    DROP TABLE auto_link_intents; ALTER TABLE requests DROP COLUMN images; PRAGMA user_version=4;`);
     expect(() => old.prepare('INSERT INTO bindings VALUES (?,?,?,?,?)').run('conflict', original.id, 'slack', 'unused', '[]')).toThrow(/UNIQUE/);
     old.close();
     const upgraded = open(file);
@@ -96,7 +96,7 @@ describe('multiple origin bindings and v5 migration', () => {
     expect(upgraded.getConversation(original.id)?.bindings).toHaveLength(4);
     expect(upgraded.getConversation(original.id)?.threadId).toBe('native-original');
     const check = new DatabaseSync(file);
-    expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(8);
+    expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(9);
     expect(check.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(check.prepare('PRAGMA quick_check').get()?.quick_check).toBe('ok');
     check.close();
@@ -387,14 +387,14 @@ describe('source access and routing', () => {
     store.close();
     const old = new DatabaseSync(file);
     dropSourceVersionSchema(old);
-    old.exec("DROP TABLE tool_outbox; DELETE FROM meta WHERE key='source-policy-version'; PRAGMA user_version=5;"); old.close();
+    old.exec("DROP TABLE tool_outbox; DELETE FROM meta WHERE key='source-policy-version'; ALTER TABLE requests DROP COLUMN images; PRAGMA user_version=5;"); old.close();
     const upgraded = open(file);
     expect(upgraded.getConversation(conversation.id)).toEqual(conversation);
     expect(upgraded.getRequest(accepted.id)).toEqual(accepted);
     expect(upgraded.getSourceAccess(ep.id)).toEqual(access);
     expect(upgraded.getMeta('source-policy-version')).toBe('1');
     const check = new DatabaseSync(file);
-    expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(8);
+    expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(9);
     expect(check.prepare('PRAGMA foreign_key_check').all()).toEqual([]); check.close();
     expect(upgraded.ingest(message(ep, 'still-off')).request).toBeNull();
   });

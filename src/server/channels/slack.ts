@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import WebSocket from 'ws';
-import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionState, Delivery, Endpoint, InboundMessage, Origin, Person, SlackTranscriptMessage } from '../../shared/types.js';
+import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionState, Delivery, Endpoint, InboundMessage, Origin, Person, SlackImageAttachment, SlackTranscriptMessage } from '../../shared/types.js';
 import type { Store } from '../store.js';
 import { ChannelError, downloadBounded, endpointId, readableTitle, splitReply, type ApprovalContext, type ApprovalResolution, type Channel, type ChannelCallbacks, type RequestProgress, type SlackSessionStatus } from './common.js';
 import { escapeSlackText, formatSlackReply } from './slack-format.js';
@@ -11,10 +11,41 @@ type Json = Record<string, any>;
 const SLACK_TS = /^\d+\.\d+$/u;
 const SLACK_USER = /^[UW][A-Z0-9]+$/u;
 const SLACK_BOT = /^B[A-Z0-9]+$/u;
+const SLACK_FILE = /^F[A-Z0-9]{1,63}$/u;
+const SLACK_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+const MAX_SLACK_IMAGES = 4;
+export const MAX_SLACK_IMAGE_BYTES = 2 * 1024 * 1024;
+const AUTO_REVIEW_ACTION = 'rele_auto_review_inspect';
+const AUTO_REVIEW_VIEW = 'rele_auto_review_view';
+const AUTO_REVIEW_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
 const CONVERSATION_TYPES = [
   ['public_channel', 'channels:read'], ['private_channel', 'groups:read'], ['im', 'im:read'], ['mpim', 'mpim:read'],
 ] as const;
 const PAYLOAD_NOISE = new Set(['token', 'access_token', 'refresh_token', 'authorization', 'response_url', 'bot_profile', 'user_profile', 'event_ts', 'client_msg_id', 'team', 'channel', 'reply_count', 'reply_users', 'reply_users_count', 'latest_reply', 'last_read', 'subscribed', 'reactions']);
+
+export function slackImageAttachments(files: unknown): SlackImageAttachment[] {
+  const images: SlackImageAttachment[] = [];
+  if (!Array.isArray(files)) return images;
+  const seen = new Set<string>();
+  for (const file of files) {
+    if (!file || typeof file.id !== 'string' || !SLACK_FILE.test(file.id) || seen.has(file.id)
+      || !SLACK_IMAGE_TYPES.has(file.mimetype) || file.is_external === true || file.mode === 'external') continue;
+    seen.add(file.id);
+    images.push({ fileId: file.id, mimeType: file.mimetype, ...(Number.isSafeInteger(file.size) && file.size >= 0 ? { size: file.size } : {}) });
+    if (images.length === MAX_SLACK_IMAGES) break;
+  }
+  return images;
+}
+
+function matchesImageType(bytes: Buffer, mimeType: string): boolean {
+  switch (mimeType) {
+    case 'image/png': return bytes.subarray(0, 8).toString('hex') === '89504e470d0a1a0a';
+    case 'image/jpeg': return bytes.subarray(0, 3).toString('hex') === 'ffd8ff';
+    case 'image/gif': return ['GIF87a', 'GIF89a'].includes(bytes.toString('latin1', 0, 6));
+    case 'image/webp': return bytes.toString('latin1', 0, 4) === 'RIFF' && bytes.toString('latin1', 8, 12) === 'WEBP';
+    default: return false;
+  }
+}
 
 function visiblePayload(value: unknown): any {
   if (Array.isArray(value)) return value.map(visiblePayload);
@@ -152,10 +183,11 @@ export class SlackChannel implements Channel {
       socket.on('error', () => {});
       socket.on('message', raw => {
         // Interactive ACKs/trigger IDs expire in three seconds. A slow durable
-        // inbox callback must not hold the independent question interaction queue.
+        // inbox callback must not hold the independent interaction queue.
         try {
           const envelope = JSON.parse(raw.toString());
-          if (envelope.type === 'interactive' && (envelope.payload?.view?.callback_id === QUESTION_VIEW
+          if (envelope.type === 'interactive' && ([QUESTION_VIEW, AUTO_REVIEW_VIEW].includes(envelope.payload?.view?.callback_id)
+              || envelope.payload?.actions?.[0]?.action_id === AUTO_REVIEW_ACTION
               || /^rele[qp]:/u.test(String(envelope.payload?.actions?.[0]?.value ?? '')))) {
             void this.receive(raw.toString(), socket).catch(() => {}); return;
           }
@@ -484,18 +516,19 @@ export class SlackChannel implements Channel {
     throw new ChannelError('Разговор недоступен боту Slack. Добавьте Rele в разговор и обновите каталог.');
   }
 
-  private async person(userId: string): Promise<Person | undefined> {
+  private async person(userId: string, verifyHuman = false): Promise<Person | undefined> {
     const accountId = this.requireAccount();
     const signal = this.abort.signal;
     if (!SLACK_USER.test(userId) || userId === this.botUserId || userId === 'USLACKBOT') return;
-    let user = this.profiles.get(userId);
+    let user = verifyHuman ? undefined : this.profiles.get(userId);
     if (!user) {
       user = (await this.api('users.info', { user: userId })).user;
       this.requireAccount(accountId, signal);
       if (!user || user.id !== userId) throw new ChannelError('Slack не подтвердил сведения об участнике.');
       this.profiles.set(userId, user);
     }
-    if (user.deleted) return;
+    if (user.deleted || verifyHuman && (user.is_bot !== false || user.is_app_user !== undefined && user.is_app_user !== false
+        || user.team_id !== undefined && user.team_id !== this.teamId)) return;
     const isBot = user.is_bot === true || user.is_app_user === true ? true
       : user.is_bot === false && (user.is_app_user === undefined || user.is_app_user === false) ? false : this.people.get(userId)?.isBot;
     const person: Person = { id: userId, name: readableTitle(user.profile?.display_name || user.profile?.real_name || user.real_name || user.name, 'Участник Slack'),
@@ -631,6 +664,115 @@ export class SlackChannel implements Channel {
     if (result.channel !== delivery.origin.chatId || result.ts !== delivery.remoteMessageId) throw new ChannelError('Slack не подтвердил обновление вопроса.', true, true);
   }
 
+  private autoReviewCard(origin: Origin, text: string): Json {
+    this.requireAccount(origin.accountId);
+    if (origin.platform !== 'slack' || !/^[CDG][A-Z0-9]+$/u.test(origin.chatId) || !SLACK_TS.test(origin.threadId)
+        || origin.endpointId !== endpointId('slack', origin.accountId, origin.chatId, origin.threadId))
+      throw new ChannelError('Некорректная карточка Auto-review в Slack.');
+    return { channel: origin.chatId, text, mrkdwn: false, parse: 'none', link_names: false, unfurl_links: false, unfurl_media: false,
+      blocks: [{ type: 'section', text: { type: 'plain_text', text } }] };
+  }
+
+  async showAutoReview(origin: Origin, id: string): Promise<string> {
+    if (!this.state.connected || !this.callbacks.inspectAutoReview || !this.callbacks.autoReview || !AUTO_REVIEW_ID.test(id))
+      throw new ChannelError('Некорректное действие Auto-review в Slack.');
+    const body = this.autoReviewCard(origin, 'Codex Auto-review отклонил действие. Подробности доступны владельцу.');
+    body.blocks.push({ type: 'actions', elements: [{ type: 'button', action_id: AUTO_REVIEW_ACTION, value: id,
+      text: { type: 'plain_text', text: 'Посмотреть действие' } }] });
+    const signal = this.abort.signal;
+    const result = await this.api('chat.postMessage', { ...body, thread_ts: origin.threadId }, this.botToken, true);
+    this.requireAccount(origin.accountId, signal);
+    if (result.channel !== origin.chatId || typeof result.ts !== 'string' || !SLACK_TS.test(result.ts) || result.ts === origin.threadId
+        || result.message?.thread_ts !== undefined && result.message.thread_ts !== origin.threadId)
+      throw new ChannelError('Slack не подтвердил адрес карточки Auto-review.', false, true);
+    return result.ts;
+  }
+
+  async updateAutoReview(origin: Origin, messageId: string, state: 'recorded' | 'uncertain'): Promise<void> {
+    if (!SLACK_TS.test(messageId) || messageId === origin.threadId) throw new ChannelError('Некорректный адрес карточки Auto-review в Slack.');
+    const body = this.autoReviewCard(origin, state === 'recorded'
+      ? 'Codex принял запрос подтверждения. Rele не повторяет команду.'
+      : 'Получение решения Codex не подтверждено. Rele не отправит его повторно.');
+    const result = await this.api('chat.update', { ...body, ts: messageId }, this.botToken, true);
+    if (result.channel !== origin.chatId || result.ts !== messageId) throw new ChannelError('Slack не подтвердил обновление карточки Auto-review.', false, true);
+  }
+
+  private async autoReviewClick(payload: Json, socket: WebSocket): Promise<void> {
+    const action = payload.actions?.[0], container = payload.container;
+    const accountId = this.requireAccount(), signal = this.abort.signal;
+    const chatId = payload.channel?.id, threadId = payload.message?.thread_ts, messageId = payload.message?.ts, userId = payload.user?.id;
+    if (!this.callbacks.inspectAutoReview || !this.callbacks.autoReview
+        || !Array.isArray(payload.actions) || payload.actions.length !== 1 || action?.type !== 'button'
+        || typeof payload.trigger_id !== 'string' || !payload.trigger_id || payload.trigger_id.length > 300
+        || container !== undefined && (container?.type !== 'message' || container.channel_id !== chatId || container.message_ts !== messageId
+          || container.is_ephemeral === true || container.thread_ts !== undefined && container.thread_ts !== threadId)) return;
+    const ids = { approvalId: action.value, accountId, chatId, threadId, messageId, senderId: userId };
+    let context: ApprovalContext | undefined;
+    try {
+      const preview = await this.questionWithinDeadline(async () => {
+        context = await this.autoReviewContext(payload, ids, socket);
+        return this.callbacks.inspectAutoReview!(context);
+      });
+      this.requireAccount(accountId, signal);
+      if (socket !== this.socket || typeof preview !== 'string' || !preview.trim() || preview.length > 2500) return;
+      await this.api('views.open', { trigger_id: payload.trigger_id, view: { type: 'modal', callback_id: AUTO_REVIEW_VIEW,
+        private_metadata: JSON.stringify(ids),
+        title: { type: 'plain_text', text: 'Действие Codex' }, close: { type: 'plain_text', text: 'Отмена' },
+        submit: { type: 'plain_text', text: 'Передать подтверждение' }, blocks: [
+          { type: 'section', text: { type: 'plain_text', text: preview } },
+          { type: 'section', text: { type: 'plain_text', text: 'Codex проверит повторную попытку. Rele не запускает её автоматически.' } },
+        ] } }, this.botToken, true);
+    } catch {
+      if (context && socket === this.socket && signal === this.abort.signal && !signal.aborted)
+        await this.interactionFeedback(payload, context, 'Действие Auto-review недоступно. Проверьте состояние карточки в этом треде.');
+    }
+  }
+
+  private async autoReviewContext(payload: Json, ids: Json, socket: WebSocket): Promise<ApprovalContext> {
+    const { approvalId, accountId, chatId, threadId, messageId, senderId } = ids;
+    const userId = payload.user?.id, signal = this.abort.signal;
+    if (accountId !== this.requireAccount() || socket !== this.socket || payload.team?.id !== this.teamId
+        || typeof userId !== 'string' || !SLACK_USER.test(userId) || userId !== senderId
+        || typeof approvalId !== 'string' || !AUTO_REVIEW_ID.test(approvalId)
+        || typeof chatId !== 'string' || !/^[CDG][A-Z0-9]+$/u.test(chatId)
+        || typeof threadId !== 'string' || !SLACK_TS.test(threadId)
+        || typeof messageId !== 'string' || !SLACK_TS.test(messageId) || messageId === threadId) throw new Error('Auto-review source mismatch');
+    const actor = await this.person(userId, true);
+    this.requireAccount(accountId, signal);
+    if (socket !== this.socket || socket.readyState !== WebSocket.OPEN || actor?.isBot !== false) throw new Error('Auto-review requires a verified human');
+    return { approvalId, platform: 'slack', accountId, chatId, threadId, messageId,
+      senderId: actor.id, senderIsBot: false, senderName: actor.name };
+  }
+
+  private async autoReviewSubmit(payload: Json, socket: WebSocket, envelopeId: string): Promise<void> {
+    let context: ApprovalContext;
+    const signal = this.abort.signal;
+    try {
+      const metadata = payload.view?.private_metadata;
+      if (!this.callbacks.autoReview || payload.view?.type !== 'modal'
+          || typeof metadata !== 'string' || metadata.length > 1024) throw new Error('Invalid Auto-review modal');
+      const ids = JSON.parse(metadata);
+      if (!ids || typeof ids !== 'object' || Array.isArray(ids)
+          || Object.keys(ids).some(key => !['approvalId', 'accountId', 'chatId', 'threadId', 'messageId', 'senderId'].includes(key)))
+        throw new Error('Invalid Auto-review metadata');
+      context = await this.questionWithinDeadline(() => this.autoReviewContext(payload, ids, socket));
+      this.requireAccount(context.accountId, signal);
+      if (socket !== this.socket || socket.readyState !== WebSocket.OPEN) throw new Error('Auto-review connection changed');
+    } catch {
+      this.ack(socket, envelopeId, { response_action: 'update', view: { type: 'modal',
+        title: { type: 'plain_text', text: 'Действие недоступно' }, close: { type: 'plain_text', text: 'Закрыть' },
+        blocks: [{ type: 'section', text: { type: 'plain_text', text: 'Не удалось подтвердить карточку Auto-review. Проверьте исходный тред.' } }] } });
+      return;
+    }
+    // Close the private window before submitting the single native request.
+    this.ack(socket, envelopeId);
+    try { await this.callbacks.autoReview(context); }
+    catch {
+      if (socket === this.socket && signal === this.abort.signal && !signal.aborted)
+        await this.interactionFeedback(payload, context, 'Не удалось подтвердить, что Codex получил решение. Проверьте карточку; не отправляйте решение повторно.');
+    }
+  }
+
   private questionTask(run: () => Promise<void>): void {
     const task = run().catch(() => {}).finally(() => this.questionTasks.delete(task));
     this.questionTasks.add(task);
@@ -665,13 +807,13 @@ export class SlackChannel implements Channel {
     return approval;
   }
 
-  private async questionFeedback(payload: Json, context?: ApprovalContext): Promise<void> {
+  private async interactionFeedback(payload: Json, context?: ApprovalContext,
+    text = 'Ответ не принят: вопрос мог закрыться, доступ изменился или соединение прервано. Проверьте вопрос в Rele.'): Promise<void> {
     if (payload.team?.id !== this.teamId) return;
     const channel = context?.chatId ?? payload.channel?.id, user = payload.user?.id;
     if (!/^[CDG][A-Z0-9]+$/u.test(channel ?? '') || !SLACK_USER.test(user ?? '')) return;
     await this.api('chat.postEphemeral', { channel, user, ...(context?.threadId ? { thread_ts: context.threadId } : {}),
-      text: 'Ответ не принят: вопрос мог закрыться, доступ изменился или соединение прервано. Проверьте вопрос в Rele.',
-      parse: 'none', link_names: false }).catch(() => {});
+      text, parse: 'none', link_names: false }).catch(() => {});
   }
 
   private async questionClick(payload: Json): Promise<void> {
@@ -694,7 +836,7 @@ export class SlackChannel implements Channel {
         if (typeof payload.trigger_id !== 'string' || !payload.trigger_id) throw new Error('Missing modal trigger');
         await this.api('views.open', { trigger_id: payload.trigger_id, view: questionView(checked.approval, context, match[3] as 'all' | 'custom') });
       }
-    } catch { await this.questionFeedback(payload, context); }
+    } catch { await this.interactionFeedback(payload, context); }
   }
 
   private async questionSubmit(payload: Json, socket: WebSocket, envelopeId: string): Promise<void> {
@@ -719,7 +861,7 @@ export class SlackChannel implements Channel {
       await this.callbacks.action({ ...context, decision: 'accept', answers: result.answers });
     } catch {
       if (!acknowledged) this.ack(socket, envelopeId, expired);
-      else await this.questionFeedback(payload, context);
+      else await this.interactionFeedback(payload, context);
     }
   }
 
@@ -732,6 +874,53 @@ export class SlackChannel implements Channel {
     try { response = await this.fetcher(url, { headers: { Authorization: `Bearer ${this.botToken}` }, redirect: 'error', signal: AbortSignal.any([this.abort.signal, AbortSignal.timeout(60_000)]) }); }
     catch { throw new ChannelError('Не удалось скачать аудиофайл Slack.'); }
     await downloadBounded(response, file);
+  }
+
+  async downloadImage(image: SlackImageAttachment, accountId: string): Promise<string> {
+    const signal = this.abort.signal;
+    const checkAccount = () => {
+      if (!accountId || accountId !== this.accountId || this.stopped || signal.aborted || signal !== this.abort.signal) {
+        throw new ChannelError('Подключение Slack изменилось. Изображение недоступно.');
+      }
+    };
+    const unavailable = () => new ChannelError('Не удалось скачать изображение Slack.');
+    const oversized = () => new ChannelError('Изображение Slack превышает 2 МБ.');
+    checkAccount();
+    if (!SLACK_FILE.test(image.fileId) || !SLACK_IMAGE_TYPES.has(image.mimeType)) throw unavailable();
+    if ((image.size ?? 0) > MAX_SLACK_IMAGE_BYTES) throw oversized();
+    const { file } = await this.api('files.info', { file: image.fileId });
+    checkAccount();
+    const [resolved] = slackImageAttachments([file]);
+    if (resolved?.fileId !== image.fileId || resolved.mimeType !== image.mimeType) throw unavailable();
+    if ((resolved.size ?? 0) > MAX_SLACK_IMAGE_BYTES) throw oversized();
+    let url: URL;
+    try { url = new URL(file.url_private_download ?? file.url_private); } catch { throw unavailable(); }
+    if (url.protocol !== 'https:' || url.hostname !== 'files.slack.com' || !url.pathname.startsWith('/files-pri/') || url.username || url.password || url.port) throw unavailable();
+    let response: Response;
+    try { response = await this.fetcher(url, { headers: { Authorization: `Bearer ${this.botToken}` }, redirect: 'error', signal: AbortSignal.any([signal, AbortSignal.timeout(60_000)]) }); }
+    catch { throw unavailable(); }
+    const contentType = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
+    const reader = response.body?.getReader();
+    if (!reader) throw unavailable();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      checkAccount();
+      if (!response.ok || response.redirected || (contentType && contentType !== image.mimeType && contentType !== 'application/octet-stream')) throw unavailable();
+      if (Number(response.headers.get('content-length')) > MAX_SLACK_IMAGE_BYTES) throw oversized();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > MAX_SLACK_IMAGE_BYTES) throw oversized();
+        chunks.push(value);
+      }
+    } catch (error) { throw error instanceof ChannelError ? error : unavailable(); }
+    finally { await reader.cancel().catch(() => {}); }
+    checkAccount();
+    const bytes = Buffer.concat(chunks, total);
+    if (!matchesImageType(bytes, image.mimeType)) throw unavailable();
+    return `data:${image.mimeType};base64,${bytes.toString('base64')}`;
   }
 
   private async receive(raw: string, socket: WebSocket): Promise<void> {
@@ -769,12 +958,20 @@ export class SlackChannel implements Channel {
         void this.refreshNames(source.message, message.endpoint).catch(() => {});
         return;
       }
+    } else if (envelope.type === 'interactive' && envelope.payload?.view?.callback_id === AUTO_REVIEW_VIEW) {
+      if (envelope.payload.type === 'view_submission') this.questionTask(() => this.autoReviewSubmit(envelope.payload, socket, envelope.envelope_id));
+      else this.ack(socket, envelope.envelope_id);
+      return;
     } else if (envelope.type === 'interactive' && envelope.payload?.view?.callback_id === QUESTION_VIEW) {
       if (envelope.payload.type === 'view_submission') this.questionTask(() => this.questionSubmit(envelope.payload, socket, envelope.envelope_id));
       else this.ack(socket, envelope.envelope_id);
       return;
     } else if (envelope.type === 'interactive' && envelope.payload?.type === 'block_actions') {
       const payload = envelope.payload as Json;
+      if (payload.actions?.[0]?.action_id === AUTO_REVIEW_ACTION) {
+        this.ack(socket, envelope.envelope_id);
+        this.questionTask(() => this.autoReviewClick(payload, socket)); return;
+      }
       const value = payload.actions?.[0]?.value;
       if (typeof value === 'string' && value.startsWith('relep:')) {
         this.ack(socket, envelope.envelope_id);
@@ -839,12 +1036,14 @@ export class SlackChannel implements Channel {
     };
     this.endpoints.set(id, endpoint);
     const file = (Array.isArray(event.files) ? event.files : []).find((entry: Json) => String(entry.mimetype).startsWith('audio/') && entry.url_private_download);
+    const images = slackImageAttachments(event.files);
     return {
       // app_mention and message may describe the same message with distinct envelope/event IDs.
       eventId: `message:${event.channel}:${event.ts}${kind === 'message' ? '' : `:${kind}:${createHash('sha256').update(JSON.stringify(slack.payload)).digest('hex').slice(0, 16)}`}`, endpoint, sender: person, messageId: event.ts, text, slack, directMention,
       contextOnly: kind !== 'message' || !!event.subtype && !['file_share', 'bot_message', 'me_message', 'thread_broadcast'].includes(event.subtype)
-        || !(stableUser || stableBot && !!this.botId) || self || person.id === 'USLACKBOT' || !text && !file,
+        || !(stableUser || stableBot && !!this.botId) || self || person.id === 'USLACKBOT' || !text && !file && !images.length,
       ...(file ? { audio: { platform: 'slack' as const, fileId: String(file.id), url: file.url_private_download, name: readableTitle(file.name, 'audio'), mimeType: file.mimetype, size: file.size } } : {}),
+      ...(images.length ? { images } : {}),
     };
   }
 
@@ -874,9 +1073,9 @@ export class SlackChannel implements Channel {
     const signal = this.abort.signal;
     let response: Response;
     // These Slack read methods ignore JSON arguments on the live bot API.
-    const form = ['users.conversations', 'conversations.members', 'users.info', 'conversations.replies'].includes(method);
+    const form = ['users.conversations', 'conversations.members', 'users.info', 'conversations.replies', 'files.info'].includes(method);
     const payload = form ? new URLSearchParams(body).toString() : JSON.stringify(body);
-    try { response = await this.fetcher(`https://slack.com/api/${method}`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': form ? 'application/x-www-form-urlencoded; charset=utf-8' : 'application/json; charset=utf-8' }, body: payload, signal: AbortSignal.any([signal, AbortSignal.timeout(20_000)]) }); }
+    try { response = await this.fetcher(`https://slack.com/api/${method}`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': form ? 'application/x-www-form-urlencoded; charset=utf-8' : 'application/json; charset=utf-8' }, body: payload, ...(method === 'files.info' ? { redirect: 'error' as const } : {}), signal: AbortSignal.any([signal, AbortSignal.timeout(20_000)]) }); }
     catch { throw new ChannelError('Соединение со Slack прервано.', !sending, sending); }
     const retrySeconds = Number(response.headers.get('retry-after'));
     const retryAfterMs = Number.isFinite(retrySeconds) && retrySeconds > 0 ? Math.max(1000, Math.min(3600_000, retrySeconds * 1000)) : 30_000;

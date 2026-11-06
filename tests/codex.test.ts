@@ -660,6 +660,16 @@ describe('Codex shared-runtime adapter', () => {
     expect(f.calls.some(call => ['turn/start', 'thread/queue/start'].includes(call.method || ''))).toBe(false);
   });
 
+  it('keeps a Slack image in the same native queue submission as its attributed text', async () => {
+    const f = await fixture({ 'thread/queue/add': () => ({ queuedSubmission: { id: 'image-queue-id' } }) });
+    const clientId = randomUUID(), url = 'data:image/png;base64,iVBORw0KGgo=';
+    await f.client.connect();
+    await f.client.enqueue(threadId, 'Slack screenshot', clientId, [url]);
+    expect(f.calls.filter(call => call.method === 'thread/queue/add').map(call => call.params)).toEqual([
+      { threadId, clientUserMessageId: clientId, input: [{ type: 'text', text: 'Slack screenshot' }, { type: 'image', url }] },
+    ]);
+  });
+
   it('refuses writes on an untested runtime and never falls back to turn/start', async () => {
     const f = await fixture({ initialize: () => ({ userAgent: 'rele/0.164.0 (Linux)', codexHome: '/isolated', platformFamily: 'unix', platformOs: 'linux' }) });
     await f.client.connect();
@@ -1534,6 +1544,25 @@ describe('Codex managed runtime', () => {
 });
 
 describe('Codex addressed steering and own input receipts', () => {
+  it.each([
+    { name: 'repeated markers', parts: ['NOREPLY', ' \tNOREPLY\n', ' '], expected: 'NOREPLY' },
+    { name: 'mixed marker and real finals', parts: ['NOREPLY', 'First paragraph', '\nNOREPLY ', 'Mention NOREPLY in the second paragraph.'],
+      expected: 'First paragraph\n\nMention NOREPLY in the second paragraph.' },
+    { name: 'legacy history', parts: [], expected: 'Legacy final' },
+  ])('aggregates final history without leaking markers ($name)', async ({ parts, expected }) => {
+    const clientId = randomUUID(), turnId = randomUUID();
+    const turn = { id: turnId, status: 'completed', items: [
+      { type: 'userMessage', clientId },
+      { type: 'agentMessage', phase: 'commentary', id: 'progress', text: 'Working' },
+      { type: 'agentMessage', text: 'Legacy final' },
+      ...parts.map(text => ({ type: 'agentMessage', phase: 'final_answer', text })),
+    ] };
+    const f = await fixture({ 'thread/turns/list': () => ({ data: [turn], nextCursor: null }) });
+    await f.client.connect();
+    expect(await f.client.findRequest(threadId, clientId)).toMatchObject({ state: 'completed', turnId, text: expected,
+      commentary: [{ id: `${turnId}:progress`, text: 'Working' }] });
+  });
+
   it.each(['request', 'steer'])('reconciles a composite turn over 32 MiB using single-item %s receipt pages', async kind => {
     const rootId = randomUUID(), clientId = randomUUID(), turnId = randomUUID();
     const turn = { id: turnId, status: 'completed', items: [
