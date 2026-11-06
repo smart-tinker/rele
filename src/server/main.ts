@@ -76,8 +76,7 @@ async function main(): Promise<void> {
   const codexOptions = { setupPlugin: (rpc: (method: string, params: Record<string, unknown>) => Promise<unknown>, runtime: CodexRuntime) =>
     registerRelePlugin(rpc, { dataDirectory: config.directory, applicationRoot: root, version, codexHome: runtime.codexHome }) };
   let codex = new CodexClient(config.config.codex, codexOptions);
-  const engine = new Engine(store, codex, { config: () => config.config, temporaryRoot, redact: value => config.redact(value),
-    slackAutoReviewScope: process.env.RELE_SLACK_AUTO_REVIEW_SCOPE });
+  const engine = new Engine(store, codex, { config: () => config.config, temporaryRoot, redact: value => config.redact(value) });
   const activity = new SlackActivity(() => store.activeRequests(), async (origin, status) => {
     const channel = engine.channels.slack;
     if (!channel?.state.connected || !channel.setThreadStatus) throw new Error('Slack отключён; индикатор будет обновлён после подключения.');
@@ -94,8 +93,6 @@ async function main(): Promise<void> {
       endpoint: endpoint => { store.upsertEndpoint(endpoint); },
       action: action => engine.action(action), status: () => { engine.channelStatus(); activity.refresh(true); },
       question: context => engine.question(context),
-      inspectAutoReview: context => engine.inspectAutoReview(context),
-      autoReview: context => engine.confirmAutoReview(context),
     };
     const next = config.config;
     engine.channels = {

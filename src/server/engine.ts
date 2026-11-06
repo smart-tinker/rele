@@ -14,23 +14,18 @@ import { effectiveSharedCodexHome } from './codex-shared.js';
 import { requestInput } from './inbound-context.js';
 import { MessageToolValidationError } from '../shared/message-tool.js';
 import { ASYNC_QUESTION_METHOD, asyncQuestions, encodeAsyncAnswers, matchAsyncAnswer, parseAsyncAnswers } from './async-questions.js';
-import { parseGuardianDenial } from './guardian-approval.js';
 
-export type CodexGateway = Pick<CodexClient, 'status' | 'isVerifiedVersion' | 'createThread' | 'setThreadName' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'steer' | 'findSteerReceipt' | 'interrupt' | 'backgroundTerminals' | 'terminateBackgroundTerminal' | 'findRequest' | 'retryOverloaded' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Partial<Pick<CodexClient, 'hasPendingRequest' | 'asyncQuestionState' | 'supportsGuardianApproval' | 'approveGuardianDeniedAction'>> & Pick<EventEmitter, 'on' | 'off'>;
+export type CodexGateway = Pick<CodexClient, 'status' | 'isVerifiedVersion' | 'createThread' | 'setThreadName' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'steer' | 'findSteerReceipt' | 'interrupt' | 'backgroundTerminals' | 'terminateBackgroundTerminal' | 'findRequest' | 'retryOverloaded' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Partial<Pick<CodexClient, 'hasPendingRequest' | 'asyncQuestionState'>> & Pick<EventEmitter, 'on' | 'off'>;
 export interface EngineOptions {
   config: () => AppConfig;
   temporaryRoot: string;
   redact: (error: unknown) => string;
   transcribe?: typeof transcribeAudio;
-  slackAutoReviewScope?: string;
 }
 const terminal = (status: ReleRequest['status']) => ['completed', 'failed', 'cancelled', 'interrupted'].includes(status);
 const mixedMessage = 'В ход Rele добавлено сообщение из другого клиента Codex. Смешанный ответ не отправляется в мессенджер.';
 const uncertainProgress = 'Проверяю состояние Codex';
 const overloadDelays = [15, 30, 60, 120];
-const guardianCardLifetimeMs = 5 * 60_000;
-type GuardianDenial = NonNullable<ReturnType<typeof parseGuardianDenial>>;
-type GuardianCard = { denial: GuardianDenial; requestId: string; messageId: string; channel: Channel; epoch: string; target: string };
 interface OverloadRetry { turnId: string; attempts: number; dueAt: number; sending?: boolean; target: string }
 interface CancelCleanup {
   epoch: string; target: string; done: boolean; turnId?: string; interruptAttempted?: boolean; terminalAttempts?: CodexTerminal[];
@@ -61,7 +56,6 @@ export class Engine extends EventEmitter {
   private connected = false;
   private epoch = randomUUID();
   private approvals = new Map<string, { accept: boolean; decline: string }>();
-  private guardianCards = new Map<string, GuardianCard>();
   private fileChanges = new Map<string, string>();
   private resolutions = new Set<string>();
   private startingQueued = new Map<string, Promise<void>>();
@@ -257,88 +251,6 @@ export class Engine extends EventEmitter {
     if (approval?.questions?.length) this.question(action);
     await this.resolveApproval(action.approvalId, action.decision, action.answers,
       { source: action.platform, senderId: action.senderId, ...(action.senderName ? { senderName: action.senderName } : {}) });
-  }
-
-  private guardianOwner(request: ReleRequest, denial: GuardianDenial): boolean {
-    const source = request.origin;
-    const team = source.accountId.split(':')[0];
-    const scope = this.options.slackAutoReviewScope;
-    const conversation = this.store.getConversation(request.conversationId);
-    return !this.stopped && !this.suspended && this.codex.supportsGuardianApproval?.() === true
-      && !!scope && /^T[A-Z0-9]+:[UW][A-Z0-9]+:[CDG][A-Z0-9]+:\d{1,16}\.\d{6}$/u.test(scope)
-      && scope === `${team}:${source.senderId}:${source.chatId}:${source.threadId}`
-      && source.platform === 'slack' && source.senderIsBot === false && request.turnId === denial.turnId
-      && conversation?.threadId === denial.threadId && !conversation.paused
-      && this.store.allowsSlackRequest(request)
-      && ['running', 'completed'].includes(request.status) && !request.steeredInto
-      && !this.isMixed(request.id) && this.ownInputIds(request.id).length === 1
-      && !this.store.getMeta(`cancel-requested:${request.id}`) && !this.cancelling.has(request.id)
-      && Date.now() >= denial.completedAtMs && Date.now() - denial.completedAtMs < guardianCardLifetimeMs;
-  }
-
-  private async showGuardianDenial(params: unknown): Promise<void> {
-    const client = this.codex, epoch = this.epoch, target = this.targetFingerprint();
-    if (!this.options.slackAutoReviewScope || !client.approveGuardianDeniedAction) return;
-    const denial = parseGuardianDenial(params), channel = this.channels.slack;
-    if (!denial || !channel?.state.connected || !channel.showAutoReview
-      || this.options.redact(denial.preview) !== denial.preview) return;
-    const request = this.store.listRequests(250).find(row => this.guardianOwner(row, denial));
-    if (!request || request.origin.accountId !== channel.state.accountId) return;
-    const found = await this.findOwnRequest(client, denial.threadId, request.id).catch(() => undefined);
-    const eligible = () => {
-      const row = this.store.getRequest(request.id);
-      return !!row && this.guardianOwner(row, denial) && this.codex === client && this.epoch === epoch && this.targetFingerprint() === target
-        && this.channels.slack === channel && channel.state.connected && channel.state.accountId === row.origin.accountId;
-    };
-    if (!found || found.turnId !== denial.turnId || found.mixed || found.asyncAnswers?.length || !['running', 'completed'].includes(found.state) || !eligible()) return;
-    for (const [id, card] of this.guardianCards) if (Date.now() - card.denial.completedAtMs >= guardianCardLifetimeMs) this.guardianCards.delete(id);
-    if (this.guardianCards.size >= 20) return;
-    const key = `guardian-card:${createHash('sha256').update(JSON.stringify([denial.threadId, denial.reviewId])).digest('hex')}`;
-    if (this.store.getMeta(key)) return;
-    // No replay on a lost Slack ACK, including after restart. The action stays in memory only.
-    this.store.setMeta(key, 'seen');
-    const id = randomUUID();
-    let messageId: string;
-    try { messageId = await channel.showAutoReview(request.origin, id); }
-    catch { this.emit('diagnostic', 'Не удалось подтвердить доставку карточки Auto-review в Slack.'); return; }
-    if (eligible())
-      this.guardianCards.set(id, { denial, requestId: request.id, messageId, channel, epoch, target });
-  }
-
-  private checkGuardianCard(context: ApprovalContext) {
-    const card = this.guardianCards.get(context.approvalId);
-    const client = this.codex, approve = client.approveGuardianDeniedAction;
-    const request = card && this.store.getRequest(card.requestId);
-    const unavailable = () => new Error('Карточка Auto-review недоступна или устарела.');
-    if (!card || !request || !approve || context.senderIsBot !== false || !context.messageId || context.messageId !== card.messageId
-      || !this.sameOrigin(request, { endpoint: { platform: context.platform, accountId: context.accountId, chatId: context.chatId,
-        threadId: context.threadId ?? '' }, sender: { id: context.senderId, isBot: false } })) throw unavailable();
-    const current = () => {
-      const row = this.store.getRequest(request.id);
-      return !!row && this.guardianOwner(row, card.denial) && client === this.codex && this.epoch === card.epoch && this.targetFingerprint() === card.target
-        && this.channels.slack === card.channel && card.channel.state.connected && card.channel.state.accountId === row.origin.accountId;
-    };
-    if (!current()) throw unavailable();
-    return { card, request, client, approve, current, unavailable };
-  }
-
-  inspectAutoReview(context: ApprovalContext): string {
-    return this.checkGuardianCard(context).card.denial.preview;
-  }
-
-  async confirmAutoReview(context: ApprovalContext): Promise<void> {
-    const { card, request, client, approve, current, unavailable } = this.checkGuardianCard(context);
-    this.guardianCards.delete(context.approvalId);
-    const found = await this.findOwnRequest(client, card.denial.threadId, request.id).catch(() => undefined);
-    if (!found || found.turnId !== card.denial.turnId || found.mixed || found.asyncAnswers?.length || !['running', 'completed'].includes(found.state) || !current()) throw unavailable();
-    let recorded: boolean;
-    try { recorded = await approve.call(client, card.denial.threadId, card.denial.event, current); }
-    catch {
-      await card.channel.updateAutoReview?.(request.origin, card.messageId, 'uncertain').catch(() => {});
-      throw new Error('Codex не подтвердил запись решения. Не отправляйте его повторно.');
-    }
-    if (!recorded) throw unavailable();
-    await card.channel.updateAutoReview?.(request.origin, card.messageId, 'recorded').catch(() => {});
   }
 
   question(context: ApprovalContext): Approval {
@@ -1095,7 +1007,7 @@ export class Engine extends EventEmitter {
       for (const row of queued) {
         const channel = this.channels.slack;
         const error = this.waitsForSource(row) ? blockedReason : row.images?.length
-          && (!channel?.downloadImage || channel.state.accountId !== row.origin.accountId || !this.store.allowsSlackRequest(row)) ? imageBlockedReason : undefined;
+          && (!channel?.downloadImage || channel.state.accountId !== row.origin.accountId || !this.store.canDispatchSlackImages(row)) ? imageBlockedReason : undefined;
         if (!error) { waiting ??= row; continue; }
         if (row.error !== error) this.store.updateRequest(row.id, { error });
       }
@@ -1132,7 +1044,7 @@ export class Engine extends EventEmitter {
         const epoch = this.epoch;
         imageSourceCurrent = () => client === this.codex && epoch === this.epoch && !this.stopped && !this.suspended
           && this.channels.slack === channel && channel?.state.accountId === source.accountId
-          && this.store.getConversation(conversationId)?.paused === false && this.store.allowsSlackRequest(original);
+          && this.store.getConversation(conversationId)?.paused === false && this.store.canDispatchSlackImages(original);
         if (source.platform !== 'slack' || !channel?.downloadImage || !imageSourceCurrent()) {
           if (original.error !== imageBlockedReason) this.store.updateRequest(original.id, { error: imageBlockedReason });
           return;
@@ -1435,7 +1347,6 @@ export class Engine extends EventEmitter {
   }
 
   private async onNotification({ method, params }: CodexNotification): Promise<void> {
-    if (method === 'item/autoApprovalReview/completed') { this.track(this.showGuardianDenial(params)); return; }
     const p = params as Record<string, any>;
     const nativeQuestions = ['item/started', 'item/completed'].includes(method) ? asyncQuestions(p.item) : [];
     if (nativeQuestions.length) {
@@ -1928,7 +1839,6 @@ export class Engine extends EventEmitter {
     this.pendingQuestions.clear();
     this.store.expirePendingApprovals();
     this.approvals.clear();
-    this.guardianCards.clear();
   }
   private connectionChanged(): void {
     if (this.stopped) return;
