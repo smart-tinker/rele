@@ -46,8 +46,6 @@ export interface ChannelCallbacks {
   endpoint(endpoint: Endpoint): void;
   action(action: ApprovalAction): Promise<void>;
   question?(context: ApprovalContext): Approval | Promise<Approval>;
-  inspectAutoReview?(context: ApprovalContext): string | Promise<string>;
-  autoReview?(context: ApprovalContext): Promise<void>;
   status(): void;
 }
 
@@ -67,8 +65,6 @@ export interface Channel {
   setThreadStatus?(origin: Origin, status: SlackSessionStatus): Promise<void>;
   updateProgress?(requestId: string, origin: Origin, progress: RequestProgress): Promise<void>;
   updateApproval?(delivery: Delivery, approval: Approval, resolution?: ApprovalResolution): Promise<void>;
-  showAutoReview?(origin: Origin, id: string): Promise<string>;
-  updateAutoReview?(origin: Origin, messageId: string, state: 'recorded' | 'uncertain'): Promise<void>;
   readThreadPage?(target: Pick<Origin, 'endpointId' | 'accountId' | 'chatId' | 'threadId'>, options?: { cursor?: string; oldest?: string; latest?: string }): Promise<{ messages: SlackTranscriptMessage[]; nextCursor?: string }>;
 }
 

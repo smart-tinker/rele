@@ -46,8 +46,6 @@ async function makeChannel(
     message?: ChannelCallbacks['message'];
     action?: ChannelCallbacks['action'];
     question?: ChannelCallbacks['question'];
-    inspectAutoReview?: ChannelCallbacks['inspectAutoReview'];
-    autoReview?: ChannelCallbacks['autoReview'];
     postMessage?: () => Promise<Response>;
     api?: (method: string, body: Record<string, unknown>) => Response | undefined | Promise<Response | undefined>;
     knownEndpoints?: Endpoint[];
@@ -114,7 +112,7 @@ async function makeChannel(
   const channel = new SlackChannel(
     'SLACK_TOKEN_PLACEHOLDER_4051722',
     'SLACK_TOKEN_PLACEHOLDER_6612940',
-    { message, endpoint: endpoints, action, question: options.question, inspectAutoReview: options.inspectAutoReview, autoReview: options.autoReview, status },
+    { message, endpoint: endpoints, action, question: options.question, status },
     {
       fetch: fetcher,
       knownEndpoints: options.knownEndpoints,
@@ -207,93 +205,6 @@ function questionInteraction(id: string, action: Record<string, unknown>) {
 const questionApi = (method: string, body: Record<string, unknown>) => method === 'views.open' ? Response.json({ ok: true, view: { id: 'VMODAL' } })
   : method === 'chat.postEphemeral' ? Response.json({ ok: true, message_ts: '1000.3000' })
     : method === 'chat.update' ? Response.json({ ok: true, channel: body.channel, ts: body.ts }) : undefined;
-
-describe('Slack Auto-review card', () => {
-  const approvalId = '12345678-1234-4123-8123-123456789abc';
-
-  it('keeps the command out of the thread and approves only after a private modal submission', async () => {
-    const autoReview = vi.fn<NonNullable<ChannelCallbacks['autoReview']>>().mockResolvedValue(undefined);
-    const preview = 'Команда: printf \'<@UOTHER> & hello\'\nКаталог: /tmp';
-    const inspectAutoReview = vi.fn<NonNullable<ChannelCallbacks['inspectAutoReview']>>().mockReturnValue(preview);
-    const { channel, calls, socket, action } = await makeChannel({ inspectAutoReview, autoReview, api: questionApi });
-    const { origin } = progressFixture();
-    await expect(channel.showAutoReview({ ...origin, accountId: 'TOTHER:UBOT' }, approvalId)).rejects.toThrow();
-    const messageId = await channel.showAutoReview(origin, approvalId);
-    expect(messageId).toBe('1000.2000');
-    const posts = calls.filter(call => call.url.endsWith('/chat.postMessage'));
-    expect(posts).toHaveLength(1);
-    const post = JSON.parse(String(posts[0].init!.body));
-    expect(post).toMatchObject({ channel: origin.chatId, thread_ts: origin.threadId, mrkdwn: false, link_names: false });
-    expect(JSON.stringify(post)).not.toContain('printf');
-    expect(post.blocks[0].text).toMatchObject({ type: 'plain_text' });
-    const [button] = post.blocks[1].elements;
-    expect(button).toMatchObject({ type: 'button', action_id: 'rele_auto_review_inspect', value: approvalId,
-      text: { type: 'plain_text', text: 'Посмотреть действие' } });
-    const event = questionInteraction('auto-review', button);
-    socket.receive({ ...event, payload: { ...event.payload, container: { type: 'message', channel_id: origin.chatId, message_ts: messageId, is_ephemeral: false } } });
-    await vi.waitFor(() => expect(calls.some(call => call.url.endsWith('/views.open'))).toBe(true));
-    const context = { approvalId, platform: 'slack', accountId: origin.accountId, chatId: origin.chatId, threadId: origin.threadId,
-      messageId, senderId: 'UANNA', senderName: 'Анна (пример)', senderIsBot: false };
-    expect(inspectAutoReview).toHaveBeenCalledWith(context);
-    expect(autoReview).not.toHaveBeenCalled();
-    const view = JSON.parse(String(calls.find(call => call.url.endsWith('/views.open'))!.init!.body)).view;
-    expect(view.blocks[0].text).toEqual({ type: 'plain_text', text: preview });
-    const ids = { approvalId, accountId: origin.accountId, chatId: origin.chatId, threadId: origin.threadId, messageId, senderId: 'UANNA' };
-    expect(JSON.parse(view.private_metadata)).toEqual(ids);
-    const submission = { type: 'view_submission', team: { id: 'TEXAMPLE' }, user: { id: 'UANNA' }, view };
-    for (const [index, changed] of [{ ...submission, user: { id: 'UOTHER' } },
-      { ...submission, view: { ...view, private_metadata: JSON.stringify({ ...ids, preview: 'tampered' }) } }].entries()) {
-      socket.receive({ envelope_id: `auto-review-tampered-${index}`, type: 'interactive', payload: changed });
-      await vi.waitFor(() => expect(socket.sent.map(value => JSON.parse(value))).toContainEqual(expect.objectContaining({
-        envelope_id: `auto-review-tampered-${index}`, payload: expect.objectContaining({ response_action: 'update' }),
-      })));
-    }
-    expect(autoReview).not.toHaveBeenCalled();
-    socket.receive({ envelope_id: 'auto-review-submit', type: 'interactive', payload: submission });
-    await vi.waitFor(() => expect(autoReview).toHaveBeenCalledWith(context));
-    expect(calls.filter(call => call.url.endsWith('/users.info'))).toHaveLength(2);
-    expect(action).not.toHaveBeenCalled();
-    await channel.updateAutoReview(origin, messageId, 'recorded');
-    const update = JSON.parse(String(calls.find(call => call.url.endsWith('/chat.update'))!.init!.body));
-    expect(update).toMatchObject({ channel: origin.chatId, ts: messageId });
-    expect(update.text).toContain('Codex принял запрос подтверждения. Rele не повторяет команду.');
-    expect(update.blocks).toHaveLength(1);
-    expect(JSON.stringify(update)).not.toContain('printf');
-    autoReview.mockRejectedValueOnce(new Error('private native detail'));
-    socket.receive({ envelope_id: 'auto-review-stale', type: 'interactive', payload: submission });
-    await vi.waitFor(() => expect(calls.some(call => call.url.endsWith('/chat.postEphemeral'))).toBe(true));
-    const feedback = JSON.parse(String(calls.find(call => call.url.endsWith('/chat.postEphemeral'))!.init!.body));
-    expect(feedback).toMatchObject({ channel: origin.chatId, thread_ts: origin.threadId, user: 'UANNA' });
-    expect(feedback.text).toContain('не отправляйте решение повторно');
-    expect(feedback.text).not.toContain('не принято');
-    expect(feedback.text).not.toContain('private native detail');
-  });
-
-  it('keeps generic approvals isolated and does not trust stale or ambiguous human flags', async () => {
-    const autoReview = vi.fn<NonNullable<ChannelCallbacks['autoReview']>>().mockResolvedValue(undefined);
-    const inspectAutoReview = vi.fn<NonNullable<ChannelCallbacks['inspectAutoReview']>>().mockReturnValue('Команда: true');
-    let profile: Record<string, unknown> = { id: 'UANNA', is_bot: false };
-    const { calls, socket, action } = await makeChannel({ inspectAutoReview, autoReview, api: (method, body) => method === 'users.info'
-      ? Response.json({ ok: true, user: profile }) : questionApi(method, body) });
-    const button = { type: 'button', action_id: 'rele_auto_review_inspect', value: approvalId };
-    socket.receive(questionInteraction('verified-first', button));
-    await vi.waitFor(() => expect(inspectAutoReview).toHaveBeenCalledOnce());
-    profile = { id: 'UANNA' };
-    const event = questionInteraction('unverified-second', button);
-    socket.receive(event);
-    socket.receive({ ...event, envelope_id: 'bad-team', payload: { ...event.payload, team: { id: 'TOTHER' } } });
-    socket.receive({ ...event, envelope_id: 'missing-thread', payload: { ...event.payload, message: { ts: '1000.2000' } } });
-    socket.receive({ ...event, envelope_id: 'wrong-container', payload: { ...event.payload,
-      container: { type: 'message', channel_id: 'CEXAMPLE', message_ts: '1000.4000' } } });
-    socket.receive(questionInteraction('generic-value', { ...button, value: `rele:${approvalId}:accept` }));
-    await vi.waitFor(() => expect(socket.sent.map(value => JSON.parse(value).envelope_id))
-      .toEqual(['verified-first', 'unverified-second', 'bad-team', 'missing-thread', 'wrong-container', 'generic-value']));
-    expect(calls.filter(call => call.url.endsWith('/users.info'))).toHaveLength(2);
-    expect(inspectAutoReview).toHaveBeenCalledOnce();
-    expect(autoReview).not.toHaveBeenCalled();
-    expect(action).not.toHaveBeenCalled();
-  });
-});
 
 describe('Slack question choices and forms', () => {
   it('repairs a stale bot account and accepts its human question action after an app-assisted file share', async () => {
