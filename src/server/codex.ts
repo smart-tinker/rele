@@ -17,6 +17,7 @@ import { CodexStdioError, CodexStdioTransport } from './codex-stdio.js';
 import { codexNativeGeneration, type CodexNativePeer } from './codex-native-generation.js';
 import { effectiveSharedCodexHome, ensureSharedCodex, SharedCodexError } from './codex-shared.js';
 import { asyncQuestions, matchAsyncAnswer, parseAsyncAnswers, type AsyncAnswer, type AsyncQuestion } from './async-questions.js';
+import { GUARDIAN_APPROVAL_CODEX_VERSION } from './guardian-approval.js';
 
 export { SUPPORTED_CODEX_VERSION } from '../shared/codex-runtime.js';
 // Keep user conversations from every normal client; technical subagents are not binding targets.
@@ -765,6 +766,33 @@ export class CodexClient extends EventEmitter {
     if (!this.serverRequests.has(rpcId)) throw new Error('Запрос подтверждения Codex уже завершён или соединение изменилось.');
     await this.send({ id: rpcId, result });
     this.serverRequests.delete(rpcId);
+  }
+
+  supportsGuardianApproval(): boolean {
+    return this.state.connected && this.state.queueSupported && this.version === GUARDIAN_APPROVAL_CODEX_VERSION;
+  }
+
+  async approveGuardianDeniedAction(threadId: string, event: Record<string, unknown>, beforeSend: () => boolean): Promise<boolean> {
+    if (!this.supportsGuardianApproval()) throw new Error('Для подтверждения Auto-review нужен подключённый Codex 0.166.0-alpha.6 с доступной очередью.');
+    if (typeof event.turn_id !== 'string' || !event.turn_id || event.status !== 'denied') throw new Error('У подтверждения Auto-review нет исходного отказа Codex.');
+    const runtime = this.runtime;
+    const current = () => runtime === this.runtime && this.supportsGuardianApproval();
+    const queue = await this.call<Page<QueueEntry>>('thread/queue/list', { threadId, limit: 1 });
+    if (!Array.isArray(queue?.data) || (queue.nextCursor !== null && (typeof queue.nextCursor !== 'string' || !queue.nextCursor))) {
+      throw new CodexTransportError('Codex вернул некорректную очередь Auto-review.', 'invalid-protocol');
+    }
+    if (!current() || queue.data.length || queue.nextCursor) return false;
+    const page = await this.call<Page<HistoryTurn>>('thread/turns/list', { threadId, limit: 1, itemsView: 'notLoaded', sortDirection: 'desc' });
+    if (!Array.isArray(page?.data) || page.data.length > 1 || (page.data.length === 1 && (typeof page.data[0]?.id !== 'string' || !page.data[0].id))) {
+      throw new CodexTransportError('Codex вернул некорректный исходный ход Auto-review.', 'invalid-protocol');
+    }
+    // shortcut: native has no atomic expected-turn fence here; recheck history and local ownership immediately before sending.
+    if (!current() || page.data[0]?.id !== event.turn_id || !beforeSend()) return false;
+    const response = await this.call('thread/approveGuardianDeniedAction', { threadId, event });
+    if (!current() || !response || typeof response !== 'object' || Array.isArray(response) || Object.keys(response).length) {
+      throw new CodexTransportError('Codex не подтвердил запись решения Auto-review. Требуется сверка без повтора.', 'guardian-approval-unconfirmed');
+    }
+    return true;
   }
 
   hasPendingRequest(rpcId: RpcId): boolean { return this.serverRequests.has(rpcId); }

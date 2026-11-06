@@ -935,6 +935,13 @@ export class Store {
     return (access.mode !== 'mention' || message.directMention === true) && this.acceptsRequest(message, access.allowedSenderIds,
       { allowAllSenders: !this.isDirectMessage(message.endpoint), requireMention: false });
   }
+
+  allowsSlackRequest(request: ReleRequest): boolean {
+    const binding = this.bindingForEndpoint(request.origin.endpointId);
+    if (request.origin.platform !== 'slack' || binding?.conversationId !== request.conversationId) return false;
+    const receipt = this.db.prepare('SELECT payload FROM inbound_events WHERE request_id=?').get(request.id);
+    return !!receipt && this.acceptsSourceRequest(json<InboundMessage>(receipt.payload), binding);
+  }
   private writeRequest(message: InboundMessage, binding: Binding): ReleRequest {
     const endpoint = message.endpoint;
     const now = new Date().toISOString();
