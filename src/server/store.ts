@@ -938,9 +938,9 @@ export class Store {
     return (access.mode !== 'mention' || message.directMention === true) && this.acceptsRequest(message, access.allowedSenderIds,
       { allowAllSenders: !this.isDirectMessage(message.endpoint), requireMention: false });
   }
-  canDispatchSlackImages(request: ReleRequest): boolean {
+  allowsSlackRequest(request: ReleRequest): boolean {
     const binding = this.bindingForEndpoint(request.origin.endpointId);
-    if (!binding || binding.conversationId !== request.conversationId) return false;
+    if (request.origin.platform !== 'slack' || binding?.conversationId !== request.conversationId) return false;
     const receipt = this.db.prepare('SELECT payload FROM inbound_events WHERE request_id=?').get(request.id);
     return !!receipt && this.acceptsSourceRequest(json<InboundMessage>(receipt.payload), binding);
   }

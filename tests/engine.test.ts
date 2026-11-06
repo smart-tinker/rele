@@ -32,6 +32,8 @@ class FakeCodex extends EventEmitter implements CodexGateway {
   connected = true;
   verifiedVersion = true;
   isVerifiedVersion = () => this.verifiedVersion;
+  supportsGuardianApproval = () => this.connected && this.verifiedVersion && this.queueSupported;
+  approveGuardianDeniedAction = vi.fn(async (_threadId: string, _event: Record<string, unknown>, beforeSend: () => boolean) => beforeSend());
   queueSupported = true;
   pendingRequests = new Set<string | number>();
   hasPendingRequest = (id: string | number) => this.pendingRequests.has(id);
@@ -106,6 +108,8 @@ function fakeChannel(platform: Platform) {
     start: vi.fn(async () => {}), stop: vi.fn(async () => {}), download: vi.fn(async () => {}),
     deliver: vi.fn(async (_delivery: Delivery, _approval?: Approval): Promise<string> => `${platform}-remote-${channel.deliver.mock.calls.length}`),
     updateProgress: vi.fn(async (_id: string, _origin: ReleRequest['origin'], _progress: import('../src/server/channels/common.js').RequestProgress) => {}),
+    showAutoReview: vi.fn<NonNullable<Channel['showAutoReview']>>().mockResolvedValue('170001.000001'),
+    updateAutoReview: vi.fn<NonNullable<Channel['updateAutoReview']>>().mockResolvedValue(undefined),
   } satisfies Channel;
   return channel;
 }
@@ -517,7 +521,8 @@ function endpoints(): Record<Platform, Endpoint> {
   };
 }
 
-function fixture(options: { path?: string; start?: boolean; initialized?: boolean; transcribe?: EngineOptions['transcribe'] } = {}) {
+const guardianScope = 'T1:U1:C1:170000.000123';
+function fixture(options: { path?: string; start?: boolean; initialized?: boolean; transcribe?: EngineOptions['transcribe']; guardian?: boolean } = {}) {
   let path = options.path;
   if (!path) {
     const dir = mkdtempSync(join(tmpdir(), 'rele-engine-'));
@@ -526,6 +531,7 @@ function fixture(options: { path?: string; start?: boolean; initialized?: boolea
   }
   const store = new Store(path);
   const eps = endpoints();
+  if (options.guardian) Object.assign(eps.slack, { accountId: 'T1:U2', chatId: 'C1', threadId: '170000.000123', people: [{ id: 'U1', name: 'Alex', isBot: false }] });
   if (!store.listConversations().length) {
     for (const ep of Object.values(eps)) store.upsertEndpoint(ep);
     store.createConversation({ name: 'Shared infrastructure', threadId: THREAD, cwd: '/projects/infra', bindings: Object.values(eps).map(ep => ({ platform: ep.platform, endpointId: ep.id, allowedSenderIds: [ep.people[0].id] })) });
@@ -533,11 +539,13 @@ function fixture(options: { path?: string; start?: boolean; initialized?: boolea
   const codex = new FakeCodex();
   if (options.initialized !== false) store.setMeta(initialMessageKey('/test/codex-home', THREAD), JSON.stringify({ applied: true }));
   const slack = fakeChannel('slack');
+  if (options.guardian) slack.state.accountId = eps.slack.accountId;
   const telegram = fakeChannel('telegram');
   const diagnostics: string[] = [];
   const config = structuredClone(defaultConfig);
   const engine = new Engine(store, codex, { config: () => config, temporaryRoot: dirname(path),
-    redact: error => error instanceof Error ? error.message : String(error), transcribe: options.transcribe });
+    redact: error => error instanceof Error ? error.message : String(error), transcribe: options.transcribe,
+    ...(options.guardian ? { slackAutoReviewScope: guardianScope } : {}) });
   engine.channels = { slack, telegram };
   engine.on('diagnostic', (error: string) => diagnostics.push(error));
   fixtures.push({ engine, store });
@@ -561,6 +569,59 @@ async function running(f: ReturnType<typeof fixture>, request: ReleRequest, turn
   f.codex.running(request.id, turnId);
   await f.engine.settled();
 }
+
+async function guardianDenial(f: ReturnType<typeof fixture>, patch: Record<string, unknown> = {}) {
+  const now = Date.now();
+  f.codex.notification({ method: 'item/autoApprovalReview/completed', params: { threadId: THREAD, turnId: 'turn-1', reviewId: 'review-1',
+    startedAtMs: now - 500, completedAtMs: now, targetItemId: 'command-1', decisionSource: 'agent',
+    review: { status: 'denied', riskLevel: 'medium', userAuthorization: 'low', rationale: null },
+    action: { type: 'command', source: 'unifiedExec', command: 'printf rele-test', cwd: '/projects/infra' }, ...patch } });
+  await f.engine.settled();
+  return { approvalId: f.slack.showAutoReview.mock.calls.at(-1)?.[1] ?? '', platform: 'slack' as const, accountId: f.eps.slack.accountId,
+    chatId: f.eps.slack.chatId, threadId: f.eps.slack.threadId, senderId: 'U1', senderIsBot: false, messageId: '170001.000001' };
+}
+
+describe('Engine Slack Auto-review confirmation', () => {
+  it('delivers one card and forwards the exact denial once, without starting or steering a turn', async () => {
+    const f = fixture({ guardian: true });
+    const request = await acceptRequest(f); await running(f, request);
+    const action = await guardianDenial(f);
+    await guardianDenial(f);
+    expect(f.slack.showAutoReview).toHaveBeenCalledTimes(1);
+    expect(f.slack.showAutoReview).toHaveBeenCalledExactlyOnceWith(request.origin, action.approvalId);
+    expect(f.codex.approveGuardianDeniedAction).not.toHaveBeenCalled();
+    expect(() => f.engine.inspectAutoReview({ ...action, senderId: 'U3' })).toThrow('устарела');
+    expect(f.engine.inspectAutoReview(action)).toContain('printf rele-test');
+    await expect(f.engine.confirmAutoReview({ ...action, senderId: 'U3' })).rejects.toThrow('устарела');
+    await expect(f.engine.confirmAutoReview({ ...action, senderIsBot: true })).rejects.toThrow('устарела');
+    await expect(f.engine.confirmAutoReview({ ...action, senderIsBot: undefined })).rejects.toThrow('устарела');
+    await expect(f.engine.confirmAutoReview({ ...action, messageId: '170001.000002' })).rejects.toThrow('устарела');
+    await expect(f.engine.confirmAutoReview({ ...action, threadId: '170002.000001' })).rejects.toThrow('устарела');
+    f.codex.complete(request.id, 'NOREPLY'); await f.engine.settled();
+    await f.engine.confirmAutoReview(action);
+    await expect(f.engine.confirmAutoReview(action)).rejects.toThrow('устарела');
+    expect(f.codex.approveGuardianDeniedAction).toHaveBeenCalledExactlyOnceWith(THREAD, expect.objectContaining({ id: 'review-1',
+      turn_id: 'turn-1', status: 'denied', action: expect.objectContaining({ command: 'printf rele-test' }) }), expect.any(Function));
+    expect(f.slack.updateAutoReview).toHaveBeenCalledExactlyOnceWith(request.origin, action.messageId, 'recorded');
+    expect(f.codex.enqueue).toHaveBeenCalledTimes(1);
+    expect(f.codex.steer).not.toHaveBeenCalled();
+  });
+
+  it.each(['wrong-turn', 'expired', 'mixed', 'source-disabled', 'disabled', 'disconnected', 'lost-ack'] as const)('does not grant or replay an invalid or uncertain card: %s', async mode => {
+    const f = fixture({ guardian: mode !== 'disabled' });
+    const request = await acceptRequest(f); await running(f, request);
+    const action = await guardianDenial(f, mode === 'expired' ? { completedAtMs: Date.now() - 360_000, startedAtMs: Date.now() - 361_000 } : {});
+    if (mode === 'wrong-turn') f.codex.locations.set(request.id, { state: 'running', turnId: 'different-turn' });
+    if (mode === 'mixed') f.codex.locations.set(request.id, { state: 'running', turnId: 'turn-1', mixed: true });
+    if (mode === 'source-disabled') f.store.setSourceAccess(f.eps.slack.id, { mode: 'off' });
+    if (mode === 'disconnected') f.codex.connection(false);
+    if (mode === 'lost-ack') f.codex.approveGuardianDeniedAction.mockRejectedValueOnce(new Error('transport lost'));
+    await expect(f.engine.confirmAutoReview(action)).rejects.toThrow();
+    await expect(f.engine.confirmAutoReview(action)).rejects.toThrow();
+    expect(f.codex.approveGuardianDeniedAction).toHaveBeenCalledTimes(mode === 'lost-ack' ? 1 : 0);
+    if (mode === 'lost-ack') expect(f.slack.updateAutoReview).toHaveBeenCalledExactlyOnceWith(request.origin, action.messageId, 'uncertain');
+  });
+});
 async function requestApproval(f: ReturnType<typeof fixture>, request: ReleRequest, question = false): Promise<Approval> {
   await running(f, request);
   f.codex.request({ id: 'approval-rpc', method: question ? 'item/tool/requestUserInput' : 'item/commandExecution/requestApproval', params: {
