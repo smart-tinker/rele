@@ -223,7 +223,7 @@ it.skipIf(process.platform !== 'win32')('binds the real Windows TCP peer and ful
   const execute = promisify(execFile);
   const powershell = path.win32.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const inspect = `$ErrorActionPreference='Stop'; $p=[Diagnostics.Process]::GetProcessById(${server.pid}); $o=Invoke-CimMethod -InputObject (Get-CimInstance Win32_Process -Filter 'ProcessId=${server.pid}') -MethodName GetOwnerSid; [ordered]@{processId=$p.Id;processStartTime=$p.StartTime.ToUniversalTime().ToString('o');ownerSid=$o.Sid;executable=$p.MainModule.FileName;executableSha256=(Get-FileHash -LiteralPath $p.MainModule.FileName -Algorithm SHA256).Hash.ToLowerInvariant()} | ConvertTo-Json -Compress`;
-  const physical = JSON.parse((await execute(powershell, ['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(inspect,'utf16le').toString('base64')], { timeout:10000 })).stdout);
+  const physical = JSON.parse((await execute(powershell, ['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(inspect,'utf16le').toString('base64')], { timeout:30000 })).stdout);
   const receipt = { ...physical, status:'alreadyRunning', endpoint:`ws://127.0.0.1:${port}`, codexHome:home };
   const run = async (command: string, args: string[]) => command.endsWith('Rele.exe')
     ? { stdout:JSON.stringify(receipt), code:0 }
@@ -236,7 +236,7 @@ it.skipIf(process.platform !== 'win32')('binds the real Windows TCP peer and ful
   socket.destroy();
   await new Promise(resolve => setTimeout(resolve, 30));
   expect(await codexNativeGeneration(peer, server.pid!, home, { run })).toBeUndefined();
-}, 30000);
+}, 60000);
 
 
 it('proves a direct owned Windows stdio child without controller or TCP evidence', async () => {

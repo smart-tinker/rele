@@ -39,7 +39,11 @@ async function fixture() {
   const run = vi.fn(async (command: string, args: string[]) => {
     if (args[0] === 'codex-status') return { code: 0, stdout: JSON.stringify(native) };
     if (args.length === 1 && args[0] === '--version') {
-      const version = discovery.installations.find(item => item.executable === command)?.version;
+      const executable = await realpath(command).catch(() => undefined);
+      const version = executable && (await Promise.all(discovery.installations.map(async item => {
+        try { return (await realpath(item.executable)).toLowerCase() === executable.toLowerCase() ? item.version : undefined; }
+        catch { return undefined; }
+      }))).find(Boolean);
       return { code: version ? 0 : 1, stdout: version ? `codex-cli ${version}\n` : '' };
     }
     if (args[0] === 'codex-apply-update') {
@@ -89,6 +93,14 @@ async function linuxFixture() {
 }
 
 describe('Linux controlled update API policy', () => {
+  it('matches the selected executable when discovery and execution use different path spellings', async () => {
+    const f = await linuxFixture();
+    const alias = path.join(f.root, 'path-alias');
+    await mkdir(alias);
+    f.discovery.installations[1]!.executable = `${alias}${path.sep}..${path.sep}installed-codex.exe`;
+    await expect(f.update.prepare()).resolves.toMatchObject({ phase: 'ready', pendingVersion: '0.164.0-alpha.11.1' });
+  });
+
   it('recognizes the verified native-managed copy of a pinned source package instead of offering the same update again', async () => {
     const f = await linuxFixture();
     f.target.executable = f.installed;

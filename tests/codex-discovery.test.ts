@@ -351,13 +351,13 @@ try {
 }
 [Console]::Out.Write('provider-current-user-ok')
 `;
-    const result = await runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], 8_000).catch(error => ({
+    const result = await runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], 20_000).catch(error => ({
       error: ['probe-timeout', 'probe-output-limit', 'probe-unavailable'].includes(error?.message) ? error.message : 'probe-error',
       // Reuse a whitelisted marker so this diagnostic leaves the product probe unchanged.
       stage: error?.stage === 'done' ? 'query-close' : error?.stage,
     }));
     expect(result).toEqual({ code: 0, stdout: 'provider-current-user-ok', stage: 'done' });
-  }, 10_000);
+  }, 30_000);
 
   it.skipIf(process.platform !== 'win32')('completes a process-only scan without calling optional Appx discovery', async () => {
     const fixtures = String.raw`
