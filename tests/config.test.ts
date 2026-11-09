@@ -1,4 +1,4 @@
-import { syntheticSlackBotToken } from './fixtures/slack.js';
+import { syntheticSlackAppToken, syntheticSlackBotToken } from './fixtures/slack.js';
 import {
   mkdtemp,
   readFile,
@@ -27,7 +27,7 @@ const syntheticSecrets = {
   codex: 'synthetic-codex-secret',
   telegram: '123456:synthetic_telegram_secret_123456',
   slackBot: syntheticSlackBotToken,
-  slackApp: 'SLACK_TOKEN_PLACEHOLDER_3378106',
+  slackApp: syntheticSlackAppToken,
 };
 const directories: string[] = [];
 afterEach(async () => {

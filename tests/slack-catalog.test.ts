@@ -1,4 +1,4 @@
-import { syntheticSlackBotToken } from './fixtures/slack.js';
+import { syntheticSlackAppToken, syntheticSlackBotToken } from './fixtures/slack.js';
 import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type WebSocket from 'ws';
@@ -49,7 +49,7 @@ async function fixture(handlers: Record<string, Handler> = {}, knownEndpoints: E
     const result = await handler(body);
     return result instanceof Response ? result : Response.json(result);
   });
-  const channel = new SlackChannel(syntheticSlackBotToken, 'SLACK_TOKEN_PLACEHOLDER_3805900', callbacks, {
+  const channel = new SlackChannel(syntheticSlackBotToken, syntheticSlackAppToken, callbacks, {
     fetch: fetcher, knownEndpoints,
     socket: () => {
       const socket = new FakeSocket();

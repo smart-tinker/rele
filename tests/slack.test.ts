@@ -1,4 +1,4 @@
-import { syntheticSlackBotToken } from './fixtures/slack.js';
+import { syntheticSlackAppToken, syntheticSlackBotToken } from './fixtures/slack.js';
 import { EventEmitter } from 'node:events';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -112,7 +112,7 @@ async function makeChannel(
     });
   const channel = new SlackChannel(
     syntheticSlackBotToken,
-    'SLACK_TOKEN_PLACEHOLDER_6612940',
+    syntheticSlackAppToken,
     { message, endpoint: endpoints, action, question: options.question, status },
     {
       fetch: fetcher,

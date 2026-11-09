@@ -1,4 +1,4 @@
-import { syntheticSlackBotToken } from './fixtures/slack.js';
+import { syntheticSlackAppToken, syntheticSlackBotToken } from './fixtures/slack.js';
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -46,7 +46,7 @@ async function fixture(codex: Partial<CodexConnectionTarget & { token?: string }
   await config.save(mergeConfig(defaultConfig, {
     codex: { transport: 'managed', executable: 'codex', endpoint: '', codexHome: home },
     telegram: { enabled: false, token: '123456:synthetic_telegram_token_123456' },
-    slack: { enabled: false, botToken: syntheticSlackBotToken, appToken: 'SLACK_TOKEN_PLACEHOLDER_9130938' },
+    slack: { enabled: false, botToken: syntheticSlackBotToken, appToken: syntheticSlackAppToken },
     autoLinkRules: [rule],
   }));
   if (Object.keys(codex).length) await config.save({ ...config.config, codex: { ...config.config.codex, ...codex } });
