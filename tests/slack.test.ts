@@ -1250,12 +1250,16 @@ describe('Slack origin-bound delivery', () => {
 });
 
 describe('Slack private audio URL restrictions', () => {
+  const credentialedUrl = new URL('https://files.slack.com');
+  credentialedUrl.username = 'fixture-user';
+  credentialedUrl.pathname = '/files-pri/example';
+
   it.each([
     'http://files.slack.com/files-pri/example',
     'https://files.slack.com.evil.invalid/files-pri/example',
     'https://127.0.0.1/files-pri/example',
-    'https://files.slack.com/files-pri/T00000000-F00000000/fixture-1984453',
-    'https://files.slack.com/files-pri/T00000000-F00000000/fixture-9889589',
+    'https://files.slack.com/files-public/example',
+    credentialedUrl.href,
     'https://files.slack.com:8443/files-pri/example',
   ])('rejects unsafe URL before attaching a bot token: %s', async (url) => {
     const { channel, calls } = await makeChannel();
