@@ -236,7 +236,7 @@ describe('Telegram connection and incoming events', () => {
       text: 'Listen to this', replyToMessageId: '500', audio: { platform: 'telegram', fileId: 'voice-file', size: 1024, mimeType: 'audio/ogg' } });
     h.push([{ update_id: 41, message: privateMessage({ chat: { id: 123, type: 'private', first_name: 'Alex', last_name: 'Example' } }) }]);
     await vi.waitFor(() => expect(h.offset).toBe(42));
-    expect(vi.mocked(h.callbacks.message).mock.calls[1][0].endpoint).toMatchObject({ title: 'Alex', threadId: '' });
+    expect(vi.mocked(h.callbacks.message).mock.calls[1][0].endpoint).toMatchObject({ title: 'Alex Example', threadId: '' });
   });
 
   it.each([
