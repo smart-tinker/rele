@@ -1,14 +1,14 @@
 name: Rele CI
 
-# Standard hosted runners are free for public repositories. Private jobs stay skipped.
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   push:
     branches: [main]
   workflow_dispatch:
     inputs:
-      native_only:
-        description: Run only the Ubuntu native shared Codex diagnostic (no packaging or release)
+      release:
+        description: Create a draft RC from verified main packages
         type: boolean
         default: false
 
@@ -16,67 +16,25 @@ permissions:
   contents: read
 
 concurrency:
-  group: rele-${{ github.workflow }}-${{ github.ref }}-${{ inputs.native_only && 'native' || 'full' }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+  group: rele-ci-${{ inputs.release && 'release' || github.ref }}
+  cancel-in-progress: ${{ !inputs.release }}
 
 jobs:
-  checks:
-    name: Checks (${{ matrix.os }})
-    if: github.event.repository.private == false && github.event_name != 'workflow_dispatch'
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, windows-2025]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        with:
-          node-version: 24.19.0
-          package-manager-cache: false
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
-      - run: npm run build
-
-  native-diagnostic:
-    name: Native shared Codex diagnostic (Ubuntu)
-    if: github.event.repository.private == false && github.event_name == 'workflow_dispatch' && inputs.native_only
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        with:
-          node-version: 24.19.0
-          package-manager-cache: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: '3.13'
-      - run: npm ci
-      - run: npx tsc -p tsconfig.server.json
-      - name: Run the existing isolated native shared probe
-        shell: bash
-        run: |
-          python -m pip install -r scripts/protocol-requirements.txt
-          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11 0.163.0-alpha.11.2 0.164.0-alpha.11.1 0.165.0-alpha.1.2 0.166.0-alpha.5.1; do
-            npm install --prefix "$RUNNER_TEMP/codex-probe-$version" --ignore-scripts --no-audit --no-fund --no-package-lock "@openai/codex@$version"
-            python scripts/shared-protocol-probe.py --codex-prefix "$RUNNER_TEMP/codex-probe-$version" --expected-version "$version" --report "shared-results-$version.json"
-          done
   verify:
-    if: github.event.repository.private == false && github.event_name == 'workflow_dispatch' && !inputs.native_only
-    name: Verify and package (${{ matrix.os }})
+    if: github.event.repository.private == false && (!inputs.release || github.ref == 'refs/heads/main')
+    name: ${{ github.event.pull_request.draft && 'Fast' || 'Verify' }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         os: [ubuntu-24.04, windows-2025]
+    env:
+      FULL: ${{ !github.event.pull_request.draft }}
     defaults:
       run:
         shell: bash
@@ -88,28 +46,45 @@ jobs:
         with:
           node-version: 24.19.0
           package-manager-cache: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+      - if: env.FULL == 'true'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.13'
       - run: npm ci
+        id: install
       - run: npm run typecheck
+        id: types
+      - run: node --test tests/ci-contract.test.mjs
+        id: ci_contract
       - run: npm test
+        id: unit
       - run: npm run build
+        id: build
+      - name: Read the supported Codex contract
+        if: env.FULL == 'true'
+        run: |
+          node --input-type=module -e "import { SUPPORTED_CODEX_VERSIONS } from './src/shared/codex-runtime.ts'; console.log('CODEX_VERSIONS='+SUPPORTED_CODEX_VERSIONS.join(' '))" >> "$GITHUB_ENV"
       - name: Install the isolated protocol fixture
+        id: fixture
+        if: env.FULL == 'true'
         run: |
           python -m pip install -r scripts/protocol-requirements.txt
-          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11 0.163.0-alpha.11.2 0.164.0-alpha.11.1 0.165.0-alpha.1.2 0.166.0-alpha.5.1; do
+          for version in $CODEX_VERSIONS; do
             npm install --prefix "$RUNNER_TEMP/codex-probe-$version" --ignore-scripts --no-audit --no-fund --no-package-lock "@openai/codex@$version"
           done
       - name: Build installers and portable runtime, verify the extracted archive
+        id: package
+        if: env.FULL == 'true'
         run: |
           npm run package
           node scripts/smoke-package.mjs
       - name: Verify bounded Windows fixture cleanup with a real file lock
-        if: runner.os == 'Windows'
+        id: cleanup
+        if: env.FULL == 'true' && runner.os == 'Windows'
         run: node scripts/probe-installer-cleanup.mjs
       - name: Prepare the signed Desktop backend and verify the noninteractive owner primitive
-        if: runner.os == 'Windows'
+        id: desktop
+        if: env.FULL == 'true' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $desktopRoot = Join-Path $env:RUNNER_TEMP 'desktop-native-gate'
@@ -120,46 +95,114 @@ jobs:
           node scripts/smoke-windows-desktop-tools-pipe.mjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify Windows installer and native shared gates as a standard user
-        if: runner.os == 'Windows'
+        id: standard_user
+        if: env.FULL == 'true' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $desktopRoot = Join-Path $env:RUNNER_TEMP 'desktop-native-gate'
           & ./scripts/windows/ci-standard-user-canary.ps1 -RunGates -DesktopBundle (Join-Path $desktopRoot 'payload') -DesktopInventory (Join-Path $desktopRoot 'desktop-package-inventory.json')
       - name: Verify the real Debian package and systemd lifecycle
-        if: runner.os == 'Linux'
+        id: debian
+        if: env.FULL == 'true' && runner.os == 'Linux'
         env:
           RELE_TEST_CODEX_PREFIX: ${{ runner.temp }}/codex-probe-0.163.0
           RELE_TEST_CODEX_VERSION: 0.163.0
         run: node scripts/smoke-linux-installer.mjs
       - name: Verify the actual Codex protocol without credentials or a real model
+        id: protocol
+        if: env.FULL == 'true'
         run: |
-          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11 0.163.0-alpha.11.2 0.164.0-alpha.11.1 0.165.0-alpha.1.2 0.166.0-alpha.5.1; do
+          for version in $CODEX_VERSIONS; do
             python scripts/protocol-probe.py --codex-prefix "$RUNNER_TEMP/codex-probe-$version" --expected-version "$version" --report "protocol-results-$version.json"
           done
       - name: Verify managed Rele, shared history, ownership and origin delivery
+        id: managed
+        if: env.FULL == 'true'
         run: |
-          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11 0.163.0-alpha.11.2 0.164.0-alpha.11.1 0.165.0-alpha.1.2 0.166.0-alpha.5.1; do
+          for version in $CODEX_VERSIONS; do
             python scripts/managed-protocol-probe.py --codex-prefix "$RUNNER_TEMP/codex-probe-$version" --expected-version "$version" --report "managed-results-$version.json"
           done
       - name: Verify the Ubuntu native shared daemon and Rele recovery
-        if: runner.os == 'Linux'
+        id: shared
+        if: env.FULL == 'true' && runner.os == 'Linux'
         run: |
-          for version in 0.163.0 0.163.0-alpha.10.2 0.163.0-alpha.11 0.163.0-alpha.11.2 0.164.0-alpha.11.1 0.165.0-alpha.1.2 0.166.0-alpha.5.1; do
+          for version in $CODEX_VERSIONS; do
             python scripts/shared-protocol-probe.py --codex-prefix "$RUNNER_TEMP/codex-probe-$version" --expected-version "$version" --report "shared-results-$version.json"
           done
       - name: Install the pinned local speech environment and public fixture
+        id: voice_fixture
+        if: env.FULL == 'true'
         run: |
           python -m pip install -r scripts/voice-requirements.txt
           python scripts/fetch-voice-fixture.py --directory "$RUNNER_TEMP/voice-fixture"
       - name: Verify actual CPU transcription with network syscalls denied
-        if: runner.os == 'Linux'
+        id: voice_linux
+        if: env.FULL == 'true' && runner.os == 'Linux'
         run: python scripts/probe-voice-offline.py --model "$RUNNER_TEMP/voice-fixture/tiny" --input "$RUNNER_TEMP/voice-fixture/jfk.flac" --assert-text 'what your country can do for you' --report voice-results.json
       - name: Verify actual Windows CPU transcription from local files
-        if: runner.os == 'Windows'
+        id: voice_windows
+        if: env.FULL == 'true' && runner.os == 'Windows'
         run: |
           python scripts/transcribe.py --input "$RUNNER_TEMP/voice-fixture/jfk.flac" --model "$RUNNER_TEMP/voice-fixture/tiny" --language en --device cpu > voice-results.json
           python -c 'import json; text=json.load(open("voice-results.json"))["text"]; assert "what your country can do for you" in text.lower()'
       - run: npx playwright install --with-deps chromium
+        id: browser_install
       - run: npm run test:e2e
+        id: browser
       - name: Verify the real production UI and HTTP API
+        id: ui
         run: node scripts/smoke-ui.mjs
+      - name: Require every applicable check
+        if: always()
+        env:
+          STEPS: ${{ toJSON(steps) }}
+          REQUIRED: install types ci_contract unit build browser_install browser ui ${{ env.FULL == 'true' && 'fixture package protocol managed voice_fixture' || '' }} ${{ env.FULL == 'true' && runner.os == 'Linux' && 'debian shared voice_linux' || '' }} ${{ env.FULL == 'true' && runner.os == 'Windows' && 'cleanup desktop standard_user voice_windows' || '' }}
+        run: node scripts/ci.mjs steps
+      - name: Check account storage approval before uploading
+        if: github.event_name == 'workflow_dispatch' && inputs.release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STORAGE_APPROVAL: ${{ vars.CI_STORAGE_APPROVAL }}
+        run: node scripts/ci.mjs quota
+      - name: Bind packages to this verified commit and run
+        if: github.event_name == 'workflow_dispatch' && inputs.release
+        run: node scripts/ci.mjs bundle
+      - name: Transfer verified packages for one day
+        if: github.event_name == 'workflow_dispatch' && inputs.release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rele-${{ github.run_id }}-${{ github.run_attempt }}-${{ runner.os }}
+          path: ci-bundle/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    name: Draft RC from verified packages
+    needs: verify
+    if: github.event.repository.private == false && github.event_name == 'workflow_dispatch' && inputs.release && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24.19.0
+          package-manager-cache: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: rele-${{ github.run_id }}-${{ github.run_attempt }}-Linux
+          path: incoming/linux
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: rele-${{ github.run_id }}-${{ github.run_attempt }}-Windows
+          path: incoming/windows
+      - name: Verify provenance, create draft, confirm uploads, remove only these transfers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/ci.mjs publish
