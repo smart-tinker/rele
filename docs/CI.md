@@ -10,7 +10,7 @@ flowchart TD
   PR --> W[Windows 2025]
   L --> G{Обе ОС прошли?}
   W --> G
-  G --> CHECK[PR checks]
+  G --> CHECK[CI gate]
   G -->|Только manual release из main| P[Ubuntu publisher]
   P --> D[Draft RC: те же проверенные пакеты]
   D --> A[Отдельная приёмка установленного приложения]
@@ -18,11 +18,15 @@ flowchart TD
 
 | Режим | Runner-ы | Что выполняется |
 |---|---|---|
-| Draft PR | 2 одновременно | npm ci, типы, контракт CI, unit, build, Chromium E2E, production UI/API smoke |
-| Ready PR, main, ручная проверка | те же 2 | Всё выше + сборка пакетов, установка/удаление, protocol и managed для всех поддерживаемых версий Codex, CPU voice |
+| Draft PR | 2 одновременно, затем CI gate | npm ci, типы, контракт CI, unit, build, Chromium E2E, production UI/API smoke |
+| Ready PR, main, ручная проверка | те же 2, затем CI gate | Всё выше + сборка пакетов, установка/удаление, protocol и managed для всех поддерживаемых версий Codex, CPU voice |
 | Windows, полный режим | Windows job | Заблокированные файлы при cleanup, Desktop backend, owner/pipe, installer/native shared под обычным пользователем |
 | Linux, полный режим | Ubuntu job | Debian/systemd lifecycle, native shared/recovery, voice с запрещёнными network syscalls |
-| Ручной release из main | 2, затем 1 Ubuntu | Проверки → временные пакеты → сверка SHA/commit/run → draft release без пересборки |
+| Ручной release из main | 2, затем CI gate и publisher на Ubuntu | Проверки → временные пакеты → сверка SHA/commit/run → draft release без пересборки |
+
+`CI gate` — единый required check для branch protection. Он запускается после
+matrix и завершается ошибкой, если хотя бы одна ОС не прошла. Gate выполняется
+последовательно, поэтому одновременно работают максимум два runner-а.
 
 Версии Codex берутся из `SUPPORTED_CODEX_VERSIONS`, отдельного списка в YAML нет.
 Фикстуры используют изолированные профили и подменённый model endpoint; реальные
@@ -37,10 +41,10 @@ GUI/DPAPI в сессии владельца: эти проверки остаю
    ссылки на run и assertion: ошибка установки или импорта не считается RED.
 3. Добавить исправление, получить GREEN того же теста и остальных проверок.
 4. Перевести PR в ready: это запускает полный набор на тех же двух ОС.
-5. После public настроить required checks `Verify (ubuntu-24.04)` и
-   `Verify (windows-2025)`. Draft `Fast (...)` не заменяют эти проверки.
+5. После public настроить единственный required check `CI gate`. Draft `Fast (...)`
+   не заменяет этот gate.
 
-RED и GREEN — отдельные push/run, поэтому не нужен дополнительный runner или
+RED и GREEN — отдельные push/run, поэтому не нужен отдельный постоянный runner или
 небезопасный автоматический перенос тестов в старую рабочую копию. До public
 этот цикл выполняется локально; ссылок на hosted RED/GREEN пока нет.
 

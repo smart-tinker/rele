@@ -1,3 +1,4 @@
+import { syntheticSlackBotToken } from './fixtures/slack.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { resolve } from 'node:path';
@@ -35,7 +36,7 @@ function makeApp() {
     telegram: { enabled: true, token: telegramToken },
     slack: {
       enabled: true,
-      botToken: 'SLACK_TOKEN_PLACEHOLDER_4051722',
+      botToken: syntheticSlackBotToken,
       appToken: 'SLACK_TOKEN_PLACEHOLDER_6612940',
     },
     codex: { token: 'synthetic-codex-secret' },
@@ -487,7 +488,7 @@ describe('local panel request boundary', () => {
     for (const secret of [
       panelToken,
       telegramToken,
-      'SLACK_TOKEN_PLACEHOLDER_4051722',
+      syntheticSlackBotToken,
       'SLACK_TOKEN_PLACEHOLDER_6612940',
       'synthetic-codex-secret',
     ])

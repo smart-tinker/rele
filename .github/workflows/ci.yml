@@ -177,9 +177,21 @@ jobs:
           retention-days: 1
           compression-level: 0
 
+  gate:
+    name: CI gate
+    needs: verify
+    if: ${{ always() && github.event.repository.private == false && (!inputs.release || github.ref == 'refs/heads/main') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require both OS jobs
+        env:
+          VERIFY_RESULT: ${{ needs.verify.result }}
+        run: test "$VERIFY_RESULT" = success
+
   publish:
     name: Draft RC from verified packages
-    needs: verify
+    needs: [verify, gate]
     if: github.event.repository.private == false && github.event_name == 'workflow_dispatch' && inputs.release && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 10

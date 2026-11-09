@@ -1,3 +1,4 @@
+import { syntheticSlackBotToken } from './fixtures/slack.js';
 import { EventEmitter } from 'node:events';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -110,7 +111,7 @@ async function makeChannel(
       throw new Error(`Unexpected URL in isolated Slack test: ${url}`);
     });
   const channel = new SlackChannel(
-    'SLACK_TOKEN_PLACEHOLDER_4051722',
+    syntheticSlackBotToken,
     'SLACK_TOKEN_PLACEHOLDER_6612940',
     { message, endpoint: endpoints, action, question: options.question, status },
     {
@@ -1286,7 +1287,7 @@ describe('Slack private audio URL restrictions', () => {
     const request = calls.at(-1)!;
     expect(request.init).toMatchObject({
       redirect: 'error',
-      headers: { Authorization: 'Bearer SLACK_TOKEN_PLACEHOLDER_4051722' },
+      headers: { Authorization: `Bearer ${syntheticSlackBotToken}` },
     });
   });
 });
@@ -1306,7 +1307,7 @@ describe('Slack image downloads', () => {
     expect(lookup.url).toBe('https://slack.com/api/files.info');
     expect(new URLSearchParams(String(lookup.init?.body)).get('file')).toBe(image.fileId);
     expect(download.url).toBe(url);
-    for (const request of [lookup, download]) expect(request.init).toMatchObject({ redirect: 'error', headers: { Authorization: 'Bearer SLACK_TOKEN_PLACEHOLDER_4051722' } });
+    for (const request of [lookup, download]) expect(request.init).toMatchObject({ redirect: 'error', headers: { Authorization: `Bearer ${syntheticSlackBotToken}` } });
   });
 
   it('does not use the bot token for a different Slack account or an untrusted file host', async () => {

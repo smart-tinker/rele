@@ -1,3 +1,4 @@
+import { syntheticSlackBotToken } from './fixtures/slack.js';
 import {
   mkdtemp,
   readFile,
@@ -25,7 +26,7 @@ vi.mock('node:child_process', { spy: true });
 const syntheticSecrets = {
   codex: 'synthetic-codex-secret',
   telegram: '123456:synthetic_telegram_secret_123456',
-  slackBot: 'SLACK_TOKEN_PLACEHOLDER_6819402',
+  slackBot: syntheticSlackBotToken,
   slackApp: 'SLACK_TOKEN_PLACEHOLDER_3378106',
 };
 const directories: string[] = [];
@@ -138,7 +139,7 @@ describe('configuration validation and public projection', () => {
     { arbitrary: true },
     { telegram: { enabled: 'true' } },
     { telegram: { enabled: true } },
-    { slack: { enabled: true, botToken: 'xoxb-test' } },
+    { slack: { enabled: true, botToken: syntheticSlackBotToken } },
     { codex: { transport: 'stdio' } },
     { codex: { executable: 'codex\nextra' } },
     {

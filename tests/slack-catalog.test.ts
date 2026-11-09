@@ -1,3 +1,4 @@
+import { syntheticSlackBotToken } from './fixtures/slack.js';
 import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type WebSocket from 'ws';
@@ -48,7 +49,7 @@ async function fixture(handlers: Record<string, Handler> = {}, knownEndpoints: E
     const result = await handler(body);
     return result instanceof Response ? result : Response.json(result);
   });
-  const channel = new SlackChannel('SLACK_TOKEN_PLACEHOLDER_7827226', 'SLACK_TOKEN_PLACEHOLDER_3805900', callbacks, {
+  const channel = new SlackChannel(syntheticSlackBotToken, 'SLACK_TOKEN_PLACEHOLDER_3805900', callbacks, {
     fetch: fetcher, knownEndpoints,
     socket: () => {
       const socket = new FakeSocket();
@@ -186,7 +187,7 @@ describe('Slack bot conversation catalog', () => {
       { types: 'public_channel,private_channel,im,mpim', exclude_archived: 'true', limit: '100' },
       { types: 'public_channel,private_channel,im,mpim', exclude_archived: 'true', limit: '100', cursor: 'chat-page-2' },
     ]);
-    expect(callsFor('users.conversations').every(call => call.form && call.authorization === 'Bearer SLACK_TOKEN_PLACEHOLDER_7827226')).toBe(true);
+    expect(callsFor('users.conversations').every(call => call.form && call.authorization === `Bearer ${syntheticSlackBotToken}`)).toBe(true);
     expect(callsFor('users.info').filter(call => call.body.user === 'UANNA')).toHaveLength(1);
     expect(callbacks.message).not.toHaveBeenCalled();
     expect(callbacks.action).not.toHaveBeenCalled();
@@ -532,7 +533,7 @@ describe('Slack bot conversation catalog', () => {
   it('reports missing scopes without echoing API data or tokens', async () => {
     const { channel } = await fixture({
       'auth.test': () => Response.json({ ok: true, team_id: 'TONE', user_id: 'UBOT', team: 'Команда' }, { headers: { 'x-oauth-scopes': 'channels:read,groups:read,im:read' } }),
-      'users.conversations': () => ({ ok: false, error: 'missing_scope', needed: 'SLACK_TOKEN_PLACEHOLDER_7827226' }),
+      'users.conversations': () => ({ ok: false, error: 'missing_scope', needed: syntheticSlackBotToken }),
     });
     await expect(channel.listChats()).rejects.toMatchObject({
       message: 'Приложению Slack не хватает разрешений. Обновите разрешения и переустановите приложение в workspace.',
