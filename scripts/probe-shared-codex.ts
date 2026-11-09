@@ -195,7 +195,18 @@ if (values['expect-error']) {
           if (!request?.turnId) throw new Error('Missing cancellation fixture turn');
           cancellationProcess = { id: command.processId, threadId: threadId!, turnId: request.turnId };
         }
-        await engine!.cancel(command.requestId!);
+        try { await engine!.cancel(command.requestId!); } catch (error) {
+          let terminals: unknown;
+          try { terminals = await codex!.backgroundTerminals(threadId!); }
+          catch (diagnostic) { terminals = { errorCode: (diagnostic as { code?: unknown }).code ?? 'unavailable' }; }
+          const state = await snapshot(command.processId);
+          const request = store.listRequests().find(row => row.id === command.requestId);
+          process.stderr.write(JSON.stringify({ event: 'shared-cancel-diagnostic', errorCode: (error as { code?: unknown }).code,
+            requestId: command.requestId, turnId: request?.turnId, cleanup: state.cancelCleanups[command.requestId!],
+            terminals, cancellationInterruptWitnesses: state.cancellationInterruptWitnesses,
+            probeProcessAlive: state.probeProcessAlive }) + '\n');
+          throw error;
+        }
       } else if (command.action === 'close') {
         const pid = (await codex!.diagnostics()).process.id;
         await engine!.stop(); await codex!.close();
