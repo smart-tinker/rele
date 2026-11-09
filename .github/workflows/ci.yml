@@ -1,7 +1,10 @@
-name: Rele CI and release candidate
+name: Rele CI
 
-# Development checks run locally; dispatch the complete final matrix once before release.
+# Standard hosted runners are free for public repositories. Private jobs stay skipped.
 on:
+  pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       native_only:
@@ -14,12 +17,34 @@ permissions:
 
 concurrency:
   group: rele-${{ github.workflow }}-${{ github.ref }}-${{ inputs.native_only && 'native' || 'full' }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
+  checks:
+    name: Checks (${{ matrix.os }})
+    if: github.event.repository.private == false && github.event_name != 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24.19.0
+          package-manager-cache: false
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
   native-diagnostic:
     name: Native shared Codex diagnostic (Ubuntu)
-    if: github.event_name == 'workflow_dispatch' && inputs.native_only
+    if: github.event.repository.private == false && github.event_name == 'workflow_dispatch' && inputs.native_only
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -29,7 +54,7 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24.19.0
-          cache: npm
+          package-manager-cache: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.13'
@@ -43,17 +68,8 @@ jobs:
             npm install --prefix "$RUNNER_TEMP/codex-probe-$version" --ignore-scripts --no-audit --no-fund --no-package-lock "@openai/codex@$version"
             python scripts/shared-protocol-probe.py --codex-prefix "$RUNNER_TEMP/codex-probe-$version" --expected-version "$version" --report "shared-results-$version.json"
           done
-      - name: Keep native diagnostic evidence
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: native-shared-diagnostic-${{ github.run_id }}
-          path: shared-results-*.json
-          if-no-files-found: warn
-          retention-days: 30
-
   verify:
-    if: ${{ !inputs.native_only }}
+    if: github.event.repository.private == false && github.event_name == 'workflow_dispatch' && !inputs.native_only
     name: Verify and package (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -71,7 +87,7 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24.19.0
-          cache: npm
+          package-manager-cache: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.13'
@@ -147,127 +163,3 @@ jobs:
       - run: npm run test:e2e
       - name: Verify the real production UI and HTTP API
         run: node scripts/smoke-ui.mjs
-      - name: Keep diagnostic reports
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: verification-${{ matrix.os }}
-          path: |
-            protocol-results-*.json
-            managed-results-*.json
-            shared-results-*.json
-            voice-results.json
-            installer-results.json
-            installer-failure-results.json
-            windows-standard-user-results.json
-            desktop-standard-user-results.json
-            ${{ runner.temp }}/desktop-native-gate/desktop-package-inventory.json
-            installer-cleanup-probe-results.json
-            installer-native-cleanup-results.json
-            playwright-report/
-            test-results/
-          if-no-files-found: ignore
-          retention-days: 14
-      - name: Keep verified installers and portable packages
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: portable-${{ matrix.os }}
-          path: |
-            release/*.zip
-            release/*.tar.gz
-            release/*-setup.exe
-            release/*.deb
-            release/*.sha256
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 30
-
-  prerelease:
-    name: Publish verified release candidate
-    needs: verify
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && !inputs.native_only
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        with:
-          node-version: 24.19.0
-          package-manager-cache: false
-      - name: Accept only an explicit RC version
-        id: candidate
-        run: |
-          node --input-type=module <<'JS'
-          import { readFileSync, appendFileSync } from 'node:fs';
-          const {version} = JSON.parse(readFileSync('package.json', 'utf8'));
-          const candidate = /^\d+\.\d+\.\d+-rc\.\d+$/.test(version);
-          appendFileSync(process.env.GITHUB_OUTPUT, `publish=${candidate}\nversion=${candidate ? version : ''}\n`);
-          if (!candidate) console.log('Stable publishing is disabled until the real Desktop and messenger acceptance gates are closed.');
-          JS
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        if: steps.candidate.outputs.publish == 'true'
-        with:
-          pattern: portable-*
-          path: release-assets
-          merge-multiple: true
-      - name: Publish a new prerelease
-        if: steps.candidate.outputs.publish == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RELE_CANDIDATE_VERSION: ${{ steps.candidate.outputs.version }}
-        run: |
-          set -euo pipefail
-          tag="v$RELE_CANDIDATE_VERSION"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release $tag already exists and will remain unchanged; bump the RC version for another candidate."
-            exit 0
-          fi
-          (cd release-assets && sha256sum -c ./*.sha256)
-          cat > release-notes.md <<'NOTES'
-          Rele release candidate for native Windows x64 and Ubuntu Server x64.
-
-          Recommended Windows download: rele-VERSION-windows-x64-setup.exe. Install under your Codex Desktop account, then open Rele from the Start menu. The installer manages a per-user background task, a native launcher, upgrades with backups, and standard Windows uninstallation. Program files go to LOCALAPPDATA/Programs/Rele; data stays in LOCALAPPDATA/Rele. Close an old portable Rele terminal with Ctrl+C before migrating.
-
-          Recommended Ubuntu Server download: rele-VERSION-linux-x64.deb. Install with sudo apt install ./rele-VERSION-linux-x64.deb. The package uses /opt/rele, /usr/bin/rele, and systemd under the invoking sudo user's account. If installed directly as root, select the Codex owner with sudo rele service install --user NAME. Removal, including purge, keeps user conversation data. See docs/INSTALLATION.md.
-
-          Both installers include Node.js 24.19.0 and production dependencies. Codex discovery checks Desktop backend locations, versioned Windows CLI directories, running process metadata, and local CLI installations. Opening the installed application uses an expiring single-use login link. Existing chat bindings and saved tokens survive upgrades. Portable ZIP/TAR packages remain available.
-
-          New in rc.16: Windows installer checks the preserved Codex target and early Desktop policy RPCs before enabling the ordinary-launch adapter. Incompatible legacy WebSocket targets, missing executables and unreadable protected settings skip integration and remove only a previously owned hook, preserving settings and foreign environment values. A confirmed running private Desktop defers the check until the allowed Quit/relaunch; unknown ownership still blocks. Explicit Desktop launch shares the preflight, and changing a Codex target while integration is active requires disabling it first. Isolated installer regressions cover this upgrade failure and protected-settings preservation; real GUI/phone/reboot acceptance remains open. See docs/RC16.md.
-
-          Previously in rc.15: The Desktop adapter recognizes the actual global -c prefix before app-server, validates the shared profile/effective code_mode_host on a separate read-only connection, and follows shared WebSocket semantics for the two known private plugin startup hints; unknown startup overrides fail without a private fallback or config writes. Ordinary Windows Codex Desktop integration stays enabled across Rele upgrades; an explicit opt-out is remembered, conflicting settings are preserved, and default install/upgrade are checked without forcing /TASKS. Fully quit an already running private Desktop once, then launch it normally. Ubuntu ordinary interactive codex uses the native default shared daemon in the same user profile, without a PATH wrapper or shell edits. Explicit no-daemon/profile/special startup modes remain native choices; codex exec is not a shared remote client. Real Desktop GUI/Explorer launch and phone/reboot acceptance remain open. See docs/RC15.md.
-
-          Previously in rc.14: An installed supported Windows Codex Desktop is sufficient for the first shared daemon bootstrap, without manually installing CLI. Rele validates and snapshots the five native components of one local Desktop bundle, then lets the native lifecycle install its own durable package in the original profile. A healthy daemon keeps priority. Partial bundles, source changes, escaping links, cache tampering and unknown versions fail closed. The launcher prefers the actual ChatGPT.exe GUI with compatibility for Codex.exe. Windows acceptance separately uses the backend from the signed official Desktop MSIX, no npm CLI, and preserves original thread/history and recovery; actual GUI and real phone/messenger acceptance remain open. No dependencies or database migration. See docs/RC14.md.
-
-          Previously in rc.13: Recommended native shared Codex policy attaches to or starts one daemon in the original profile, discovers its private control socket again after restart, and preserves original conversation IDs and uncertain request UUIDs. Windows supplies immutable Desktop/interactive CLI adapters and owner-checked optional Desktop integration; Ubuntu uses an independent systemd starter/timer without a Desktop or user D-Bus session. Installer gates keep the actual native PID and an open Windows adapter connection through Rele restart/upgrade/uninstall. Exact Codex 0.163.0, alpha.10.2 and alpha.11 run raw, managed and shared native probes. Initial daemon setup requires a complete supported local Codex package. Rele does not change Codex's native updater policy; an unverified updated version blocks shared access while keeping accepted requests. Existing explicit targets require a deliberate shared-mode transition and one Quit/relaunch of a private Desktop. codex exec does not support the shared remote transport in these versions. Real Desktop GUI and phone/messenger acceptance remain open. See docs/RC13.md.
-
-          Previously in rc.12: Source-first Telegram/Slack tabs map discovered chats and threads to named Codex conversations. Separate per-source off/mention/all access defaults new sources to off, preserves legacy restrictions until an explicit change, and requires human-only DM allowlists. Per-source automatic creation and explicit recovery protect already accepted messages. SQLite migrates v5 to v6; back up before upgrading and use a compatible pre-v6 backup for rollback. Limited diagnostics runs before config loading and reads only the instance marker and public loopback health, without config/DPAPI/database/history access. Real Windows/Defender and messenger acceptance remain open. See docs/RC12.md.
-
-          Previously in rc.11: Slack conversation discovery uses form-encoded types and cursor, filters conversation types by granted bot read scopes, and reports partial catalogs without blocking available direct messages. Membership validation stays authoritative; accessible DM entries recover their availability. See docs/RC11.md.
-
-          Previously in rc.10: Mention settings refer to the connected agent by its messenger identity, with no invented @Rele handle. Local source renaming is explicitly labelled as affecting Rele only. Mention parsing, permissions, and SQLite schema remain unchanged. See docs/RC10.md.
-
-          Previously in rc.9: One Codex thread accepts multiple Slack and Telegram origins with independent routing. Explicit per-chat rules create one new native thread for an unbound authorized conversation; human-only DM allowlists and group-wide optional mention gates are preserved in the resulting binding. Unknown thread/start acknowledgements are never retried automatically. Terminal interruption requires completion evidence, avoiding a transient history race. SQLite migrates v4 to v5; back up before upgrading and use a compatible pre-migration backup for rollback. See docs/RC9.md.
-
-          Previously in rc.8: Slack uses agents.sessions processing/active/suspended statuses and accepts the native Stop event through the existing origin-authorized cancellation path. Update the Slack app's agent declaration and subscribe to agent_session_stopped; upgrading Rele alone does not enable Stop. New apps use the supplied agent_view manifest; existing assistant_view apps can keep that view. See docs/RC8.md and docs/CHANNELS.md. The exact spinner in ordinary Slack Activity/Threads lists still requires visual acceptance.
-
-          Previously in rc.7: Shared local Codex servers support passive Slack context with exact persisted JSONL receipts. Lost acknowledgements are checked before re-injection. Cancel an original request from Slack with rele:cancel or Telegram with /rele_cancel; answer multiple ordinary questions with numbered lines. Working status excludes waiting states. Concurrent Desktop requires both clients on the same app-server; upgrading Rele does not reconfigure Desktop. See docs/RC7.md.
-
-          Previously in rc.6: Native Slack activity indicators and rich Markdown blocks including tables. All available messages in a bound Slack thread, including peer bots and Rele output, are durably journaled and passively projected before authorized tasks. Selected peer bots need a fresh direct mention to start work. Full history requires Server Rele (managed); passive entries are model-visible but not Desktop bubbles. SQLite migrates v3 to v4; rollback requires a pre-upgrade backup. See docs/RC6.md.
-
-          Previously in rc.5: Slack member/profile reads use form encoding while message delivery remains JSON. Telegram registration shows the short /rele_register command and retains an addressed fallback for group privacy routing. The Codex catalog lists ordinary cli/vscode/exec/appServer conversations, excludes technical subagents by metadata, and uses the state index for fast initial loading. Explicit Refresh performs a full scan for older unindexed conversations. See docs/RC5.md.
-
-          Since rc.4: Server Rele is the default mode for a new installation. Rele starts and supervises its own Codex app-server using the selected existing user profile. Existing Codex threads retain their original IDs and names. If another process owns a thread, the incoming request remains queued in Rele. After reconciliation Rele unsubscribes and waits for the thread to close before handing it back. Closing Desktop does not stop the Rele server; Windows still requires the user's logged-in session.
-
-          Upgrade from rc.3: saved proxy/WebSocket settings are preserved. Open Codex settings, select Server Rele, choose the recommended installed Codex, check the profile and save. Existing bindings remain. No manual socket or daemon setup is needed for managed mode. External proxy/WebSocket connections remain available under advanced options.
-
-          Exact protocol allowlist: Codex 0.163.0, 0.163.0-alpha.10.2, 0.163.0-alpha.11, 0.163.0-alpha.11.2, 0.164.0-alpha.11.1, 0.165.0-alpha.1.2 and 0.166.0-alpha.5.1. Compatibility evidence for the release commit and artifacts is recorded in these release notes. The Windows and Ubuntu raw, managed and shared protocol gates use isolated profiles, clients of the same native daemon, a local fake model and synthetic Slack/Telegram delivery. They check busy ownership, context handoff, origin routing, recovery and owned process shutdown.
-
-          This is an unsigned prerelease. Shared persisted history does not establish instant Desktop GUI synchronization or release behavior of a particular Desktop build. Real Windows Desktop and authorized messenger acceptance remain open before stable publishing. Rele does not fork or replace a bound thread when resume fails. See docs/RC8.md, docs/RC7.md, docs/RC6.md, docs/RC5.md, docs/RC4.md and docs/ACCEPTANCE.md.
-          NOTES
-          sed -i "s/VERSION/$RELE_CANDIDATE_VERSION/g" release-notes.md
-          gh release create "$tag" release-assets/* --target "$GITHUB_SHA" --prerelease --title "Rele $RELE_CANDIDATE_VERSION" --notes-file release-notes.md
