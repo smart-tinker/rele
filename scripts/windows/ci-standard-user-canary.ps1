@@ -1,7 +1,7 @@
-param([ValidateSet('Parent', 'Child')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce, [switch]$RunGates, [ValidateSet('Shared', 'Installer')][string]$Phase = 'Installer', [string]$DesktopBundle, [string]$DesktopInventory, [Alias('Standalone')][switch]$StandaloneShared, [string]$PowerShell7Path)
+param([ValidateSet('Parent', 'Child')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce, [switch]$RunGates, [ValidateSet('Shared', 'Installer')][string]$Phase = 'Installer', [string]$DesktopBundle, [string]$DesktopInventory, [Alias('Standalone')][switch]$StandaloneShared, [string]$PowerShell7Path, [string]$AcceptanceComputerName)
 $ErrorActionPreference = 'Stop'
 if ($StandaloneShared -and ($Mode -ne 'Parent' -or -not $RunGates)) { throw 'Standalone mode requires Parent -RunGates.' }
-if ($StandaloneShared -and $Phase -eq 'Installer' -and [Environment]::MachineName -ine 'windows-test-host') { throw 'Standalone installer acceptance is limited to windows-test-host.' }
+if ($StandaloneShared -and $Phase -eq 'Installer' -and ([string]::IsNullOrWhiteSpace($AcceptanceComputerName) -or [Environment]::MachineName -ine $AcceptanceComputerName)) { throw 'Standalone installer acceptance requires an explicit matching -AcceptanceComputerName.' }
 if ($Phase -eq 'Shared' -and -not $RunGates) { throw 'Shared-only mode requires -RunGates.' }
 if (($DesktopBundle -or $DesktopInventory) -and ($Mode -ne 'Parent' -or -not $RunGates -or -not $DesktopBundle -or -not $DesktopInventory)) { throw 'Actual Desktop inputs require Parent -RunGates and both payload and inventory paths.' }
 $sourceRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))

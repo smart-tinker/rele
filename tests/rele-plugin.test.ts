@@ -89,6 +89,6 @@ describe('owned Rele native plugin', () => {
     const skill = await readFile(path.join(applicationRoot, 'integrations/rele/skills/rele-messages/SKILL.md'), 'utf8');
     expect(skill.match(/output exactly\s+`([^`]+)`/u)?.[1]).toBe('NOREPLY');
     expect(skill).not.toContain('NO_REPLY');
-    expect(skill).toContain('does not mean\nAlex');
+    expect(skill).toContain('does not mean\nthe repository owner');
   });
 });
