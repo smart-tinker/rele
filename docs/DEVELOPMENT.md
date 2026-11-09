@@ -1,10 +1,23 @@
 # Разработка, проверка и выпуск Rele
 
-GitHub Actions не используется: бесплатный лимит не расходуется ни на обычные
-изменения, ни на выпуск. Не запускать `workflow_dispatch`, rerun или автоматику
-запуска workflow. Сборка и автоматические проверки исходников выполняются
-в изолированных build-каталогах: **Windows — на windows-test-host**, **Linux — на linux-build-host**.
-Для Windows используется Windows-окружение windows-test-host; Wine на linux-build-host не нужен.
+Разработка ведётся через GitHub issues и PR. На PR и push в main CI выполняет
+установку зависимостей, typecheck, unit-тесты и build на стандартных
+`ubuntu-24.04` и `windows-2025`. Новые push отменяют устаревшие обычные проверки.
+Полная матрица пакетов, native/protocol, voice и browser проверок запускается
+вручную через `workflow_dispatch`; `native_only` оставляет узкую диагностику.
+
+Все jobs разрешены только в **публичном** репозитории. Пока он приватный,
+workflow не запускать: подготовка CI не является разрешением раскрывать историю.
+Стандартные hosted runners публичных репозиториев бесплатны; larger runners
+не использовать. Кэш npm и загрузка Actions artifacts отключены: результаты
+проверок доступны в логах, пакеты полной проверки временные и не публикуются.
+Текущий CI не заменяет процесс выпуска проверенных байтов и приёмку RC.
+[Правила оплаты GitHub](https://docs.github.com/en/billing/concepts/product-billing/github-actions).
+Эта конфигурация не удаляет старые artifacts и не меняет billing budgets аккаунта.
+
+До завершения перехода выпуск сохраняет существующий сборочный маршрут:
+**Windows — windows-test-host**, **Linux — linux-build-host**, в изолированных build-каталогах.
+Для Windows используется Windows-окружение; Wine на linux-build-host не нужен.
 
 Приёмка — отдельный этап: **windows-test-host — Windows**, **linux-test-host — Linux**.
 Он проверяет только готовое установленное приложение или штатный portable.
