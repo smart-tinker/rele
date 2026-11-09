@@ -16,16 +16,16 @@ workflow не запускать: подготовка CI не является 
 Эта конфигурация не удаляет старые artifacts и не меняет billing budgets аккаунта.
 
 До завершения перехода выпуск сохраняет существующий сборочный маршрут:
-**Windows — windows-test-host**, **Linux — linux-build-host**, в изолированных build-каталогах.
-Для Windows используется Windows-окружение; Wine на linux-build-host не нужен.
+**Windows — Windows test host**, **Linux — Linux build host**, в изолированных build-каталогах.
+Для Windows используется Windows-окружение; Wine на Linux build host не нужен.
 
-Приёмка — отдельный этап: **windows-test-host — Windows**, **linux-test-host — Linux**.
+Приёмка — отдельный этап: **Windows test host — Windows**, **Linux acceptance host — Linux**.
 Он проверяет только готовое установленное приложение или штатный portable.
-windows-test-host совмещает роли сборки и приёмки, но этапы и каталоги разделены:
+Windows test host совмещает роли сборки и приёмки, но этапы и каталоги разделены:
 исходники и dev-зависимости из build-каталога не подмешиваются в проверяемый пакет.
-linux-build-host остаётся Linux-builder и не используется для приёмки этого RC.
+Linux build host остаётся Linux-builder и не используется для приёмки этого RC.
 В этапе приёмки не запускаются `npm ci`, typecheck, Vitest, компиляция или
-build/package scripts. **linux-test-host используется только для приёмки**: туда передаются
+build/package scripts. **Linux acceptance host используется только для приёмки**: туда передаются
 готовые installers/portable и узкие операторские скрипты, без исходников репозитория
 и dev-окружения.
 
@@ -48,18 +48,18 @@ build/package scripts. **linux-test-host используется только �
    или stage; не повторять полную сборку и матрицу ради каждой диагностической
    правки.
 3. Заморозить RC и завершить обязательные unit/native/browser-проверки и сборку
-   штатных пакетов в build-каталогах windows-test-host и linux-build-host. Зафиксировать commit сборки,
+   штатных пакетов в build-каталогах Windows test host и Linux build host. Зафиксировать commit сборки,
    версии инструментов и SHA256 пакетов. Новый diff, сбой или изменение среды
    требуют соответствующей перепроверки; узкий probe не заменяет итоговые gates.
 4. Провести PR через review и main, затем опубликовать RC с проверенными байтами.
    Сборка до merge допустима при подтверждённом соответствии её исходников
    принятому коду main. Опубликованные assets/tag RC неизменяемы: последующие
    исправления выпускаются следующим RC, а не заменяют прежний пакет.
-5. После публикации RC в этапе приёмки на windows-test-host и linux-test-host
+5. После публикации RC в этапе приёмки на Windows test host и Linux acceptance host
    проверить SHA256 полученных installers/portable, установить готовое приложение
    и выполнить приёмку его работы, обновления и восстановления. Windows
    owner/SID/ACL/DPAPI проверяются в интерактивном сеансе владельца; SSH session 0
-   его не заменяет. Linux systemd проверяется на linux-test-host. Операторские
+   его не заменяет. Linux systemd проверяется на Linux acceptance host. Операторские
    скрипты работают с готовым приложением, не запускают source/dev-suite.
    Полный состав описан в [ACCEPTANCE.md](ACCEPTANCE.md).
 6. Закрыть issue только после выполнения и принятия его критериев, со ссылкой
@@ -80,3 +80,9 @@ provider. Там переиспользуются `scripts/protocol-probe.py`,
 `scripts/managed-protocol-probe.py` и `scripts/shared-protocol-probe.py`;
 их dev-окружение не используется для приёмки установленного приложения.
 Рабочие auth и история Codex не копируются в build- или тестовые профили.
+
+Standalone installer canary (`scripts/windows/ci-standard-user-canary.ps1`)
+requires `-AcceptanceComputerName` with the explicitly selected disposable Windows
+host name. Missing or nonmatching names stop the probe before changes. Other
+standalone scratch-tree and owner checks remain required. This parameter does
+not authorize using a production machine.

@@ -34,6 +34,9 @@ try {
   { env: { ...process.env, RELE_SMOKE_ARCHIVE: archive, RELE_SMOKE_DIRECTORY: temporary } });
   else run('tar', ['-xzf', archive, '-C', temporary]);
   const extracted = path.join(temporary, name);
+  for (const file of ['LICENSE', 'THIRD_PARTY_NOTICES.md']) {
+    assert.equal(await readFile(path.join(extracted, file), 'utf8'), await readFile(path.join(root, file), 'utf8'), `${file} must survive packaging`);
+  }
   const manifest = JSON.parse(await readFile(path.join(extracted, 'manifest.json'), 'utf8'));
   const runtime = path.join(extracted, 'runtime', process.platform === 'win32' ? 'node.exe' : 'node');
   assert.equal(run(runtime, ['--version']).trim(), 'v24.19.0');

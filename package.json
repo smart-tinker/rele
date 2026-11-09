@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Local Slack and Telegram gateway for shared Codex conversations",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "engines": {
     "node": ">=24.19.0 <25"
   },
