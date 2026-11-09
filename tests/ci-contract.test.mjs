@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtemp, writeFile, rm, mkdir, symlink } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm, mkdir, symlink, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -94,3 +94,18 @@ test('unconfirmed upload leaves transfers intact for reconciliation',()=>fixture
  await assert.rejects(publishCandidate(api,bundle,'owner/repo',version,sha,[11,12]));
  assert.equal(calls.includes('DELETE'),false);
 }));
+test('one required CI gate waits for every OS matrix job', async()=>{
+ const workflow=await readFile(new URL('../.github/workflows/ci.yml',import.meta.url),'utf8');
+ const start=workflow.indexOf('\n  gate:\n');
+ assert.notEqual(start,-1,'missing aggregate gate job');
+ const end=workflow.indexOf('\n  publish:\n',start);
+ assert.notEqual(end,-1,'gate must precede the publisher');
+ const gate=workflow.slice(start,end);
+ assert.match(gate,/name: CI gate/u);
+ assert.match(gate,/needs: verify/u);
+ assert.match(gate,/always\(\)/u);
+ assert.match(gate,/github\.event\.repository\.private == false/u);
+ assert.match(gate,/needs\.verify\.result/u);
+ const publisher=workflow.slice(workflow.indexOf('\n  publish:\n'));
+ assert.match(publisher,/needs: \[verify, gate\]/u);
+});
