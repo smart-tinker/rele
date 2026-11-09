@@ -164,18 +164,7 @@ async function desktopInstallation(f: Awaited<ReturnType<typeof fixture>>) {
 describe('controlled shared Codex update', () => {
   it('recognizes an unchanged manual Desktop source as the running cached package, but not source drift', async () => {
     const f = await fixture(), { source } = await desktopInstallation(f);
-    try { await f.update.prepare(); } catch (error) {
-      const cache = path.join(f.data, 'codex-desktop-packages');
-      const packages = await readdir(cache).catch(() => []);
-      const evidence = await Promise.all(packages.map(async directory => {
-        const manifest = JSON.parse(await readFile(path.join(cache, directory, 'codex-package.json'), 'utf8'));
-        const executable = await readFile(path.join(cache, directory, 'bin', 'codex.exe'));
-        return { version: manifest.version, sourceHash: createHash('sha256').update(await readFile(source)).digest('hex'),
-          preparedHash: createHash('sha256').update(executable).digest('hex'), manifestHash: manifest.files?.find((file: { path: string }) => file.path === 'bin/codex.exe')?.sha256 };
-      }));
-      console.error(`prepared-package-diagnostic ${JSON.stringify(evidence)}`);
-      throw error;
-    }
+    await f.update.prepare();
     await f.update.apply();
     f.current.executable = f.getNative().executable as string; f.current.name = 'Codex 0.164.0-alpha.11.1';
     expect(await f.service().status()).toMatchObject({ phase: 'current', selectedVersion: '0.164.0-alpha.11.1' });

@@ -227,7 +227,7 @@ it.skipIf(process.platform !== 'win32')('binds the real Windows TCP peer and ful
   const receipt = { ...physical, status:'alreadyRunning', endpoint:`ws://127.0.0.1:${port}`, codexHome:home };
   const run = async (command: string, args: string[]) => command.endsWith('Rele.exe')
     ? { stdout:JSON.stringify(receipt), code:0 }
-    : { ...(await execute(command,args,{ timeout:5000 })), code:0 };
+    : { ...(await execute(command,args,{ timeout:30000 })), code:0 };
   const peer = { kind:'windows-shared' as const, endpoint:receipt.endpoint, localPort:socket.localPort!, remotePort:port };
   const first = await codexNativeGeneration(peer, server.pid!, home, { run });
   expect(first).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));

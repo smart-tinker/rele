@@ -590,20 +590,15 @@ export class Engine extends EventEmitter {
       }
     };
     verifyServer(await client.backgroundTerminals(conversation.threadId));
-    if (found.state === 'running' && !state.interruptAttempted) {
-      state.interruptAttempted = true; this.store.setMeta(`cancel-cleanup:${id}`, JSON.stringify(state));
-      try { await client.interrupt(conversation.threadId, found.turnId); }
-      catch (error) { current(); this.emit('diagnostic', this.options.redact(error)); }
-    }
     this.store.setMeta(`cancel-cleanup:${id}`, JSON.stringify(state));
-    const attempted = new Set<string>(), deadline = performance.now() + 2000;
+    const attempted = new Set((state.terminalAttempts ?? []).map(entry => JSON.stringify(entry))), deadline = performance.now() + 2000;
     do {
       current();
       found = await this.findOwnRequest(client, conversation.threadId, id);
       current();
       if (found.mixed || this.isMixed(id) || found.turnId !== state.turnId) throw new Error('Ход отменяемого запроса больше не подтверждён как собственный. Фоновые команды сохранены.');
       const items = this.rememberCommandItems(id, found.commandItems ?? []);
-      if (['completed', 'failed', 'interrupted'].includes(found.state)) {
+      if (['running', 'completed', 'failed', 'interrupted'].includes(found.state)) {
         const snapshot = await client.backgroundTerminals(conversation.threadId);
         verifyServer(snapshot);
         const fresh = snapshot.terminals.filter(entry => !baseline.terminals.some(old => old.itemId === entry.itemId && old.processId === entry.processId));
@@ -623,14 +618,28 @@ export class Engine extends EventEmitter {
           await client.terminateBackgroundTerminal(conversation.threadId, { ...entry, serverId: snapshot.serverId, serverGeneration: snapshot.serverGeneration });
           current();
         }
-        const after = await client.backgroundTerminals(conversation.threadId);
-        verifyServer(after);
-        const latestItems = this.rememberCommandItems(id, []);
-        const pendingStarts = latestItems.some(item => !latestItems.some(other => other.id === item.id && other.completed)
-          && !state.terminalAttempts?.some(attempt => attempt.itemId === item.id));
-        if (!pendingStarts && !after.terminals.some(entry => !baseline.terminals.some(old => old.itemId === entry.itemId && old.processId === entry.processId))) {
-          state.done = true; this.store.setMeta(`cancel-cleanup:${id}`, JSON.stringify(state));
-          this.finishFromHistory(request, found); return;
+        if (found.state === 'running') {
+          const location = await this.findOwnRequest(client, conversation.threadId, id);
+          current();
+          if (location.mixed || this.isMixed(id) || location.turnId !== state.turnId) throw new Error('Ход отменяемого запроса больше не подтверждён как собственный. Фоновые команды сохранены.');
+          this.rememberCommandItems(id, location.commandItems ?? []);
+          if (location.state === 'running' && !state.interruptAttempted) {
+            state.interruptAttempted = true; this.store.setMeta(`cancel-cleanup:${id}`, JSON.stringify(state));
+            try { await client.interrupt(conversation.threadId, state.turnId); }
+            catch (error) { current(); this.emit('diagnostic', this.options.redact(error)); }
+          }
+          continue;
+        }
+        if (['completed', 'failed', 'interrupted'].includes(found.state)) {
+          const after = await client.backgroundTerminals(conversation.threadId);
+          verifyServer(after);
+          const latestItems = this.rememberCommandItems(id, []);
+          const pendingStarts = latestItems.some(item => !latestItems.some(other => other.id === item.id && other.completed)
+            && !state.terminalAttempts?.some(attempt => attempt.itemId === item.id));
+          if (!pendingStarts && !after.terminals.some(entry => !baseline.terminals.some(old => old.itemId === entry.itemId && old.processId === entry.processId))) {
+            state.done = true; this.store.setMeta(`cancel-cleanup:${id}`, JSON.stringify(state));
+            this.finishFromHistory(request, found); return;
+          }
         }
       }
       if (performance.now() >= deadline) break;

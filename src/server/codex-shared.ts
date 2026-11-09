@@ -188,7 +188,7 @@ async function packageFiles(directory: string): Promise<string[]> {
 
 /** Status reads bind metadata; prepare/apply separately verify every cached file. */
 export async function readPreparedDesktopCodexPackage(executable: string, options: SharedCodexOptions = {}, verifyFiles = false): Promise<PreparedDesktopPackage | undefined> {
-  const data = path.resolve(environmentValue(options.env ?? process.env, 'RELE_DATA_DIR') || defaultDataDirectory());
+  const data = await canonicalDirectory(path.resolve(environmentValue(options.env ?? process.env, 'RELE_DATA_DIR') || defaultDataDirectory()));
   const cache = path.join(data, 'codex-desktop-packages');
   const parts = path.relative(cache, path.resolve(executable)).split(path.sep);
   if (parts.length !== 3 || !/^[a-f0-9]{64}$/u.test(parts[0]) || parts[1] !== 'bin' || parts[2] !== 'codex.exe') return;

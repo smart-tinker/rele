@@ -1811,6 +1811,28 @@ describe('Engine scoped shell cancellation', () => {
     expect(f.codex.enqueue).toHaveBeenLastCalledWith(THREAD, requestInput(next), next.id);
   });
 
+  it('terminates the confirmed owned command before interrupt hides it from the native terminal list', async () => {
+    const f = fixture(), request = await shell(f), order: string[] = [];
+    f.codex.terminateBackgroundTerminal.mockImplementationOnce(async (_threadId, target) => {
+      order.push('terminate');
+      f.codex.terminals = f.codex.terminals.filter(row => row.itemId !== target.itemId || row.processId !== target.processId);
+    });
+    f.codex.interrupt.mockImplementationOnce(async (threadId, turnId) => {
+      order.push('interrupt');
+      f.codex.locations.set(request.id, { state: 'interrupted', turnId });
+      f.codex.terminals = [];
+      f.codex.notification({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'interrupted' } } });
+    });
+
+    await expect(f.engine.cancel(request.id)).resolves.toBeUndefined();
+
+    expect(order).toEqual(['terminate', 'interrupt']);
+    expect(f.codex.terminateBackgroundTerminal).toHaveBeenCalledExactlyOnceWith(THREAD, {
+      serverId: 42, serverGeneration: 'a'.repeat(64), itemId: 'own-command', processId: '1234',
+    });
+    expect(f.codex.terminals).toEqual([]);
+  });
+
   it.each(['running', 'interrupted'] as const)('reconciles a lost terminate ACK on the same connection from %s without replaying a persisted PID', async state => {
     const f = fixture(), request = await shell(f);
     if (state === 'interrupted') f.codex.locations.set(request.id, { state, turnId: 'shell-turn' });
@@ -1894,7 +1916,7 @@ describe('Engine scoped shell cancellation', () => {
       expect(f.store.listDeliveries().some(row => row.requestId === request.id && row.key === 'terminal:error')).toBe(false);
     });
 
-  it('refuses terminal cleanup when the generation changes after interrupt', async () => {
+  it('keeps cancellation uncertain when the generation changes after the exact terminal stop', async () => {
     const f = fixture(), request = await shell(f);
     f.codex.interrupt.mockImplementationOnce(async () => {
       f.codex.locations.set(request.id, { state: 'interrupted', turnId: 'shell-turn' });
@@ -1903,8 +1925,10 @@ describe('Engine scoped shell cancellation', () => {
 
     await expect(f.engine.cancel(request.id)).rejects.toThrow();
     expect(f.codex.interrupt).toHaveBeenCalledExactlyOnceWith(THREAD, 'shell-turn');
-    expect(f.codex.terminateBackgroundTerminal).not.toHaveBeenCalled();
-    expect(f.codex.terminals).toEqual([{ itemId: 'own-command', processId: '1234' }]);
+    expect(f.codex.terminateBackgroundTerminal).toHaveBeenCalledExactlyOnceWith(THREAD, {
+      serverId: 42, serverGeneration: 'a'.repeat(64), itemId: 'own-command', processId: '1234',
+    });
+    expect(f.codex.terminals).toEqual([]);
     expect(f.store.getRequest(request.id)?.status).toBe('uncertain');
     expect(f.store.listDeliveries().some(row => row.requestId === request.id && row.key === 'terminal:error')).toBe(false);
   });

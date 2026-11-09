@@ -8,7 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CodexConnectionTarget, CodexDiscoveryResult } from '../src/shared/types.js';
-import { ensureSharedCodex, ensureWindowsSharedCodex, isSharedCodexWebSocket, completeCodexPackage, prepareDesktopCodexPackage, resolveSharedCodexExecutable, type SharedCodexOptions } from '../src/server/codex-shared.js';
+import { ensureSharedCodex, ensureWindowsSharedCodex, isSharedCodexWebSocket, completeCodexPackage, prepareDesktopCodexPackage, readPreparedDesktopCodexPackage, resolveSharedCodexExecutable, type SharedCodexOptions } from '../src/server/codex-shared.js';
 import { runCodexProbe } from '../src/server/codex-discovery.js';
 
 const directories: string[] = [];
@@ -454,6 +454,17 @@ describe('local Desktop native package preparation', () => {
     expect(await readdir(path.dirname(root))).toEqual([path.basename(root)]);
     expect(f.run.mock.calls.every(([, args]) => args.join(' ') === '--version')).toBe(true);
     expect(await readdir(f.home)).not.toContain('packages');
+  });
+
+  it('reads a prepared package when RELE_DATA_DIR reaches the same directory through a junction', async () => {
+    const f = await fixture(), desktop = await desktopFixture(path.join(f.home, 'desktop'));
+    const prepared = (await prepareDesktopCodexPackage(desktop, f.options))!;
+    const alias = path.join(f.home, 'rele-data-alias');
+    await symlink(f.env.RELE_DATA_DIR, alias, process.platform === 'win32' ? 'junction' : 'dir');
+
+    await expect(readPreparedDesktopCodexPackage(prepared, {
+      ...f.options, env: { ...f.env, RELE_DATA_DIR: alias },
+    }, true)).resolves.toMatchObject({ version: '0.163.0' });
   });
 
   it.each(['helper', 'asar', 'gui'])('does not stage a partial or unrecognized Desktop missing %s', async missing => {
