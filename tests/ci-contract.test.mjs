@@ -94,6 +94,22 @@ test('unconfirmed upload leaves transfers intact for reconciliation',()=>fixture
  await assert.rejects(publishCandidate(api,bundle,'owner/repo',version,sha,[11,12]));
  assert.equal(calls.includes('DELETE'),false);
 }));
+test('the aggregate gate fails unless the matrix result is success', async()=>{
+ const workflow=await readFile(new URL('../.github/workflows/ci.yml',import.meta.url),'utf8');
+ const start=workflow.indexOf('\n  gate:\n');
+ const end=workflow.indexOf('\n  publish:\n',start);
+ const gate=workflow.slice(start,end);
+ const command=gate.match(/^\s+run: (.+)$/mu)?.[1];
+ assert.ok(command,'aggregate gate must have a one-line shell command');
+ const {spawnSync}=await import('node:child_process');
+ for(const [verifyResult,status] of [['success',0],['failure',1],['cancelled',1],['skipped',1]]) {
+  const result=spawnSync('bash',['-e','-o','pipefail','-c',command],{
+   env:{...process.env,VERIFY_RESULT:verifyResult},encoding:'utf8',
+  });
+  assert.ifError(result.error);
+  assert.equal(result.status,status,`VERIFY_RESULT=${verifyResult}`);
+ }
+});
 test('one required CI gate waits for every OS matrix job', async()=>{
  const workflow=await readFile(new URL('../.github/workflows/ci.yml',import.meta.url),'utf8');
  const start=workflow.indexOf('\n  gate:\n');
