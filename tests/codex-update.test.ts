@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { CodexConnectionState, CodexConnectionTarget, CodexDiscoveryResult } from '../src/shared/types.js';
@@ -162,6 +162,23 @@ async function desktopInstallation(f: Awaited<ReturnType<typeof fixture>>) {
 }
 
 describe('controlled shared Codex update', () => {
+  it('accepts a native owner directory returned through a Windows junction alias', async () => {
+    const f = await fixture(), alias = path.join(f.root, 'owners-alias');
+    await symlink(path.join(f.data, 'codex-websocket-owners'), alias, process.platform === 'win32' ? 'junction' : 'dir');
+    const original = f.run.getMockImplementation()!;
+    f.run.mockImplementation(async (command, args) => {
+      const result = await original(command, args);
+      if (args[0] !== 'codex-update') return result;
+      const native = JSON.parse(result.stdout) as Record<string, unknown>;
+      const successorDirectory = path.join(alias, path.basename(native.successorDirectory as string));
+      f.setNative({ ...f.getNative(), successorDirectory });
+      return { ...result, stdout: JSON.stringify({ ...native, successorDirectory }) };
+    });
+
+    await f.update.prepare();
+    expect(await f.service().status()).toMatchObject({ phase: 'ready', pendingVersion: '0.164.0-alpha.11.1' });
+  });
+
   it('recognizes an unchanged manual Desktop source as the running cached package, but not source drift', async () => {
     const f = await fixture(), { source } = await desktopInstallation(f);
     await f.update.prepare();

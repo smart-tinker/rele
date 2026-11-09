@@ -196,6 +196,22 @@ it('Windows proof survives a new client port and future controller while keeping
   expect(await prove()).not.toBe(first);
 });
 
+it('encodes only a fixed stage when Windows native proof fails', async () => {
+  const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
+  const home = 'C:\\Users\\Owner\\fixture', executable = 'C:\\native\\codex.exe';
+  const receipt = { status:'alreadyRunning', endpoint:'ws://127.0.0.1:62662', codexHome:home, executable, executableSha256:'a'.repeat(64), ownerSid:'S-1-5-21-1001', processId:10944, processStartTime:'2026-11-03T10:00:00.1234567Z' };
+  let proof = '';
+  const run = async (command: string, args: string[]) => {
+    if (command.endsWith('Rele.exe')) return { stdout:JSON.stringify(receipt), code:0 };
+    proof = Buffer.from(args.at(-1)!, 'base64').toString('utf16le');
+    return { stdout:'', code:1 };
+  };
+  const generation = await Reflect.apply(codexNativeGeneration, undefined, [{ kind:'windows-shared', endpoint:receipt.endpoint, localPort:55001, remotePort:62662 }, 10944, home, { platform:'win32', run, installationDirectory:'C:\\Rele' }]);
+  expect(generation).toBeUndefined();
+  expect(proof).toContain("[Console]::Error.WriteLine('rele-native-proof:' + $script:stage)");
+  expect(proof).toContain("$script:stage='tcp-query'");
+});
+
 it.each([
   { peerVerified:false }, { pid:10945 }, { owner:'S-1-5-21-1002' }, { sha256:'b'.repeat(64) },
   { codexHome:'C:\\Users\\Other\\fixture' }, { birth:'2026-11-03T10:00:00.1234568Z' },
@@ -225,12 +241,19 @@ it.skipIf(process.platform !== 'win32')('binds the real Windows TCP peer and ful
   const inspect = `$ErrorActionPreference='Stop'; $p=[Diagnostics.Process]::GetProcessById(${server.pid}); $o=Invoke-CimMethod -InputObject (Get-CimInstance Win32_Process -Filter 'ProcessId=${server.pid}') -MethodName GetOwnerSid; [ordered]@{processId=$p.Id;processStartTime=$p.StartTime.ToUniversalTime().ToString('o');ownerSid=$o.Sid;executable=$p.MainModule.FileName;executableSha256=(Get-FileHash -LiteralPath $p.MainModule.FileName -Algorithm SHA256).Hash.ToLowerInvariant()} | ConvertTo-Json -Compress`;
   const physical = JSON.parse((await execute(powershell, ['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(inspect,'utf16le').toString('base64')], { timeout:30000 })).stdout);
   const receipt = { ...physical, status:'alreadyRunning', endpoint:`ws://127.0.0.1:${port}`, codexHome:home };
-  const run = async (command: string, args: string[]) => command.endsWith('Rele.exe')
-    ? { stdout:JSON.stringify(receipt), code:0 }
-    : { ...(await execute(command,args,{ timeout:30000 })), code:0 };
+  let failureStage: string | undefined;
+  const run = async (command: string, args: string[]) => {
+    if (command.endsWith('Rele.exe')) return { stdout:JSON.stringify(receipt), code:0 };
+    try { return { ...(await execute(command,args,{ timeout:30000 })), code:0 }; }
+    catch (error) {
+      const failure = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string };
+      failureStage = failure.stderr?.match(/^rele-native-proof:([a-z-]+)$/mu)?.[1];
+      return { stdout:failure.stdout ?? '', code:typeof failure.code === 'number' ? failure.code : 1 };
+    }
+  };
   const peer = { kind:'windows-shared' as const, endpoint:receipt.endpoint, localPort:socket.localPort!, remotePort:port };
   const first = await codexNativeGeneration(peer, server.pid!, home, { run });
-  expect(first).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
+  expect(first, `Windows native proof failed at fixed stage: ${failureStage ?? 'unreported'}`).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
   expect(await codexNativeGeneration({ ...peer, localPort:peer.localPort+1 }, server.pid!, home, { run })).toBeUndefined();
   // Same listener/PID but no actual connected peer must never earn the proof.
   socket.destroy();

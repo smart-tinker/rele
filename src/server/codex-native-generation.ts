@@ -162,19 +162,25 @@ except Exception:
 // spawned child (or the exact installed Job Object helper and its direct child).
 const WINDOWS_PROOF = String.raw`
 $ErrorActionPreference='Stop'
+$script:stage='input'
 try {
   $inputProof=ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__INPUT__')))
   $r=$inputProof.receipt; $p=$inputProof.peer; $stdio=$p.kind -eq 'stdio'
   function Require($ok) { if (-not $ok) { throw 'unproven' } }
   function Identity {
+    $script:stage='process-query'
     $native=[Diagnostics.Process]::GetProcessById([int]$inputProof.serverId); $helper=$null
     try {
+      $script:stage='process-handle'
       Require ($native.Handle -ne [IntPtr]::Zero)
+      $script:stage='owner-query'
       $record=Get-CimInstance Win32_Process -Filter ("ProcessId="+$native.Id) -ErrorAction Stop
       $owner=Invoke-CimMethod -InputObject $record -MethodName GetOwnerSid -ErrorAction Stop
       Require ($owner.ReturnValue -eq 0)
+      $script:stage='image-query'
       $exe=$native.MainModule.FileName; $birth=$native.StartTime.ToUniversalTime().ToString('o')
       $hash=(Get-FileHash -LiteralPath $exe -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+      $script:stage='process-identity'
       if ($stdio) {
         $gatewayOwner=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         Require ($owner.Sid -eq $gatewayOwner -and [IO.Path]::GetFullPath($exe) -ieq [IO.Path]::GetFullPath($p.executable))
@@ -187,6 +193,7 @@ try {
         Require ($owner.Sid -eq $r.ownerSid -and $birth -ceq $r.processStartTime -and $hash -ceq $r.executableSha256 -and [IO.Path]::GetFullPath($exe) -ieq [IO.Path]::GetFullPath($r.executable))
         $nativeHome=[IO.Path]::GetFullPath($r.codexHome)
       }
+      $script:stage='boot-query'
       $boot=(Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime().ToString('o')
       $result=[ordered]@{pid=$native.Id;birth=$birth;boot=$boot;executable=[IO.Path]::GetFullPath($exe).ToLowerInvariant();sha256=$hash;owner=$owner.Sid;codexHome=$nativeHome.ToLowerInvariant()}
       if ($stdio) {
@@ -207,20 +214,29 @@ try {
   }
   function Peer {
     if ($stdio) { return }
+    $script:stage='tcp-query'
     $rows=@(Get-NetTCPConnection -State Established -ErrorAction Stop)
+    $script:stage='tcp-match'
     $server=@($rows | Where-Object { $_.LocalAddress -eq '127.0.0.1' -and $_.LocalPort -eq $p.remotePort -and $_.RemoteAddress -eq '127.0.0.1' -and $_.RemotePort -eq $p.localPort })
     $client=@($rows | Where-Object { $_.LocalAddress -eq '127.0.0.1' -and $_.LocalPort -eq $p.localPort -and $_.RemoteAddress -eq '127.0.0.1' -and $_.RemotePort -eq $p.remotePort })
     Require ($server.Count -eq 1 -and $server[0].OwningProcess -eq $r.processId -and $client.Count -eq 1 -and $client[0].OwningProcess -eq $inputProof.gatewayId)
   }
+  $script:stage='peer-before'
   Peer
+  $script:stage='identity-before'
   $before=Identity
+  $script:stage='peer-after'
   Peer
+  $script:stage='identity-after'
   $after=Identity
+  $script:stage='identity-compare'
   Require (($before | ConvertTo-Json -Compress) -ceq ($after | ConvertTo-Json -Compress))
   $before.peerVerified=$true; $before.gatewayId=$inputProof.gatewayId
   if (-not $stdio) { $before.localPort=$p.localPort; $before.remotePort=$p.remotePort }
+  $script:stage='proof-output'
   $before | ConvertTo-Json -Compress
-} catch { exit 1 }
+  $script:stage='complete'
+} catch { [Console]::Error.WriteLine('rele-native-proof:' + $script:stage); exit 1 }
 `;
 
 interface CommandResult { stdout: string; code: number | null }

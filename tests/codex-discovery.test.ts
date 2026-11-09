@@ -309,7 +309,7 @@ describe('Codex installation and existing Desktop discovery', () => {
     await expect(runCodexProbe(process.execPath, ['-e', 'require("node:fs").writeSync(1, "x".repeat(200000))'], 4_000)).rejects.toThrow('probe-output-limit');
   });
 
-  it.each(['process-provider', 'owner-query', 'json-provider'])('captures fixed %s stage without publishing other child stderr', async stage => {
+  it.each(['process-provider', 'owner-query', 'json-provider', 'query-row-close', 'query-collection-close', 'query-searcher-close'])('captures fixed %s stage without publishing other child stderr', async stage => {
     const error = await runCodexProbe(process.execPath, ['-e', `process.stderr.write("synthetic-secret\\nrele-discovery:${stage}\\nrele-discovery:synthetic-secret\\n"); setInterval(() => {}, 1000)`], 250).catch(error => error);
     expect(error).toMatchObject({ message: 'probe-timeout', stage });
     expect(JSON.stringify(error)).not.toContain('synthetic-secret');

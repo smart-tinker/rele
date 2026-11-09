@@ -216,7 +216,7 @@ export class CodexUpdate {
         || typeof pendingExecutable !== 'string' || !path.isAbsolute(pendingExecutable)
         || typeof pendingHash !== 'string' || !/^[a-f0-9]{64}$/u.test(pendingHash)
         || typeof native.successorDirectory !== 'string' || !/^[a-f0-9]{64}$/u.test(path.basename(native.successorDirectory))
-        || !samePath(path.dirname(native.successorDirectory), path.join(await realpath(this.dataDirectory), 'codex-websocket-owners'))) throw new CodexUpdateError(failure, 502);
+        || !samePath(await realpath(path.dirname(native.successorDirectory)), path.join(await realpath(this.dataDirectory), 'codex-websocket-owners'))) throw new CodexUpdateError(failure, 502);
       const pending = normalized.find(item => samePath(item.executable, pendingExecutable));
       if (prepared) {
         if (prepared.executableSha256 !== pendingHash) throw new CodexUpdateError('Подготовленный пакет Codex не соответствует сохранённому SHA-256.', 409);
@@ -419,7 +419,7 @@ export class CodexUpdate {
         || typeof native.successorExe !== 'string' || !samePath(native.successorExe, executable)
         || native.successorSha256 !== digest
         || typeof native.successorDirectory !== 'string' || !/^[a-f0-9]{64}$/u.test(path.basename(native.successorDirectory))
-        || !samePath(path.dirname(native.successorDirectory), path.join(await realpath(this.dataDirectory), 'codex-websocket-owners'))) throw new CodexUpdateError(failure, 502);
+        || !samePath(await realpath(path.dirname(native.successorDirectory)), path.join(await realpath(this.dataDirectory), 'codex-websocket-owners'))) throw new CodexUpdateError(failure, 502);
       this.last = { ...before.state, phase: 'ready', pendingVersion: before.candidate.version };
       return { ...this.last };
     } catch (error) {
