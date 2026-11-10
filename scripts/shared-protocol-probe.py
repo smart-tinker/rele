@@ -564,6 +564,7 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
             for event in peer.events if event.get('method') in ('turn/started', 'turn/completed')
         ][-8:]
         evidence['queuedProviderActionTypes'] = [action for action, _ in actions[-8:]]
+        evidence['driverOperations'] = snapshot.get('driverOperations', [])
         return evidence
 
     async def wait_records(count):

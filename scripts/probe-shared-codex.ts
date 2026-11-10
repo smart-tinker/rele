@@ -68,6 +68,22 @@ if (values['expect-error']) {
     sender: { id: 'fixture-agent', name: 'Other agent', isBot: true }, text: 'shared-passive-agent-context',
     payload: { text: 'shared-passive-agent-context', preserved: { full: true } }, kind: 'message' }];
   const diagnostics: string[] = [];
+  const driverOperations: string[] = [];
+  const recordDriverOperation = (operation: string) => {
+    driverOperations.push(operation);
+    if (driverOperations.length > 64) driverOperations.shift();
+  };
+  const observe = <TArgs extends unknown[], TResult>(name: string, operation: (...args: TArgs) => Promise<TResult>) => async (...args: TArgs): Promise<TResult> => {
+    recordDriverOperation(`${name}:start`);
+    try {
+      const result = await operation(...args);
+      recordDriverOperation(`${name}:done`);
+      return result;
+    } catch (error) {
+      recordDriverOperation(`${name}:error`);
+      throw error;
+    }
+  };
   const observedTurns: Array<{ method: string; threadId: string; turnId: string }> = [];
   const cancellationProcessChecks: Array<{ turnId: string; processAlive: boolean }> = [];
   const cancellationInterruptWitnesses: Array<{ threadId: string; turnId: string; processId: number; processAlive: boolean; markerExists: boolean }> = [];
@@ -93,6 +109,12 @@ if (values['expect-error']) {
       }
     });
     await codex.connect();
+    codex.diagnostics = observe('diagnostics', codex.diagnostics.bind(codex));
+    codex.subscribe = observe('subscribe', codex.subscribe.bind(codex));
+    codex.backgroundTerminals = observe('backgroundTerminals', codex.backgroundTerminals.bind(codex));
+    const internals = codex as unknown as { pages: <T>(method: string, params: Record<string, unknown>) => Promise<T[]> };
+    const pages = internals.pages.bind(codex);
+    internals.pages = async <T>(method: string, params: Record<string, unknown>) => observe('pages', () => pages<T>(method, params))();
     const interrupt = codex.interrupt.bind(codex);
     codex.interrupt = async (...args) => {
       const owned = cancellationProcess;
@@ -103,11 +125,11 @@ if (values['expect-error']) {
       return interrupt(...args);
     };
     const enqueue = codex.enqueue.bind(codex);
-    codex.enqueue = async (...args) => {
+    codex.enqueue = observe('enqueue', async (...args) => {
       const result = await enqueue(...args);
       if (loseNextQueueAck) { loseNextQueueAck = false; droppedQueueAcks++; throw new Error('Synthetic lost queue ACK after native acceptance'); }
       return result;
-    };
+    });
     const previous = store.listConversations()[0];
     threadId = previous?.threadId ?? threadId;
     if (!threadId) {
@@ -147,7 +169,8 @@ if (values['expect-error']) {
     return { threadId, configuredExecutable: config.codex.executable, status: codex.status(), runtime: codex.runtimeInfo(), runtimeProcessId,
       droppedQueueAcks, catalogValidated, observedTurns, cancellationProcessChecks, cancellationInterruptWitnesses,
       ...(processId ? { probeProcessAlive: alive(processId) } : {}),
-      requests, cancelCleanups, deliveries: store.listDeliveries(), approvals: store.listApprovals(), diagnostics };
+      requests, cancelCleanups, deliveries: store.listDeliveries(), approvals: store.listApprovals(), diagnostics,
+      driverOperations: driverOperations.slice(-40) };
   }
   const input = createInterface({ input: process.stdin });
   try {

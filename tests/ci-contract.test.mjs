@@ -203,8 +203,11 @@ test('shared native gate records bounded request state without payloads on timeo
  assert.ok(start>=0 && end>start,'shared probe must define bounded timeout evidence');
  const evidence=probe.slice(start,end);
  for(const field of ['providerRequestCount','engineRequests','nativeTurnStatus','observedTurns','eventId','status','turnId']) assert.ok(evidence.includes(field),`timeout evidence must include ${field}`);
- for(const field of ['engineApprovals','queuedProviderActionTypes']) assert.ok(evidence.includes(field),`timeout evidence must include ${field}`);
+ for(const field of ['engineApprovals','queuedProviderActionTypes','driverOperations']) assert.ok(evidence.includes(field),`timeout evidence must include ${field}`);
  for(const field of ['text','payload','input','content','prompt']) assert.ok(!evidence.includes(field),`timeout evidence must exclude ${field}`);
+ const driver=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');
+ for(const field of ['subscribe','backgroundTerminals','enqueue','driverOperations']) assert.ok(driver.includes(field),`shared driver must trace ${field}`);
+ assert.match(driver,/driverOperations:\s*driverOperations\.slice\(-\d+\)/u,'bound the operation trace in snapshots');
  assert.match(probe,/except \(TimeoutError, RuntimeError\):\s*report\['heldRequestTimeout'\] = await held_request_evidence\(engine, peer, thread\)/u,'capture the safe snapshot when the native wait or provider wait fails');
  const cancel=probe.indexOf("await engine.command('ingest', platform='telegram', eventId='cancel'");
  const afterCancel=probe.indexOf('await asyncio.wait_for(wait_records(before + 2), 25)',cancel);
