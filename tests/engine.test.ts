@@ -1916,7 +1916,7 @@ describe('Engine scoped shell cancellation', () => {
       expect(f.store.listDeliveries().some(row => row.requestId === request.id && row.key === 'terminal:error')).toBe(false);
     });
 
-  it('keeps cancellation uncertain when the generation changes after the exact terminal stop', async () => {
+  it('keeps cancellation uncertain when the generation changes after interrupt before terminal cleanup', async () => {
     const f = fixture(), request = await shell(f);
     f.codex.interrupt.mockImplementationOnce(async () => {
       f.codex.locations.set(request.id, { state: 'interrupted', turnId: 'shell-turn' });
@@ -1925,10 +1925,8 @@ describe('Engine scoped shell cancellation', () => {
 
     await expect(f.engine.cancel(request.id)).rejects.toThrow();
     expect(f.codex.interrupt).toHaveBeenCalledExactlyOnceWith(THREAD, 'shell-turn');
-    expect(f.codex.terminateBackgroundTerminal).toHaveBeenCalledExactlyOnceWith(THREAD, {
-      serverId: 42, serverGeneration: 'a'.repeat(64), itemId: 'own-command', processId: '1234',
-    });
-    expect(f.codex.terminals).toEqual([]);
+    expect(f.codex.terminateBackgroundTerminal).not.toHaveBeenCalled();
+    expect(f.codex.terminals).toEqual([{ itemId: 'own-command', processId: '1234' }]);
     expect(f.store.getRequest(request.id)?.status).toBe('uncertain');
     expect(f.store.listDeliveries().some(row => row.requestId === request.id && row.key === 'terminal:error')).toBe(false);
   });
