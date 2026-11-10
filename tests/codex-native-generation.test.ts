@@ -1,4 +1,5 @@
 import { afterEach, expect, it } from 'vitest';
+import { realpathSync, statSync } from 'node:fs';
 import { spawn, execFile, execFileSync } from 'node:child_process';
 import net from 'node:net';
 import { promisify } from 'node:util';
@@ -57,9 +58,31 @@ it.skipIf(process.platform !== 'win32')('proves an owned Windows stdio process w
   cleanup.push(async () => { if (child.exitCode === null && child.signalCode === null) { child.kill(); await once(child, 'close'); } });
   await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
   let proofStage: string | undefined;
+  const sameFile = (left: unknown, right: string) => {
+    if (typeof left !== 'string') return false;
+    if (path.win32.normalize(left).toLowerCase() === path.win32.normalize(right).toLowerCase()) return true;
+    try {
+      const a = statSync(left, { bigint:true }), b = statSync(right, { bigint:true });
+      if (a.dev !== 0n && b.dev !== 0n && a.ino !== 0n && b.ino !== 0n) return a.dev === b.dev && a.ino === b.ino;
+      return path.win32.normalize(realpathSync.native(left)).toLowerCase() === path.win32.normalize(realpathSync.native(right)).toLowerCase();
+    } catch { return false; }
+  };
   const run = async (command:string, args:string[]) => {
     try {
       const result = await promisify(execFile)(command, args, { timeout:30_000, maxBuffer:128*1024, windowsHide:true });
+      try {
+        const proof = JSON.parse(result.stdout) as Record<string, unknown>;
+        const checks = [
+          ['peer', proof.peerVerified === true], ['pid', proof.pid === child.pid], ['gateway', proof.gatewayId === process.pid],
+          ['birth', typeof proof.birth === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$/u.test(proof.birth) && Number.isFinite(Date.parse(proof.birth))],
+          ['owner', typeof proof.owner === 'string' && /^S-1-\d+(?:-\d+)+$/u.test(proof.owner)],
+          ['hash', typeof proof.sha256 === 'string' && /^[a-f0-9]{64}$/u.test(proof.sha256)],
+          ['executable', sameFile(proof.executable, shortExecutable)], ['home', sameFile(proof.codexHome, home)],
+          ['boot', typeof proof.boot === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$/u.test(proof.boot) && Number.isFinite(Date.parse(proof.boot))],
+          ['parent', proof.parentPid === process.pid], ['gateway-owner', proof.gatewayOwner === proof.owner],
+        ];
+        proofStage = `proof-fields:${checks.filter(([, ok]) => !ok).map(([name]) => name).join(',') || 'ok'}`;
+      } catch { proofStage = `proof-output:${result.stdout.trim() ? 'invalid-json' : 'empty'}`; }
       return { stdout:result.stdout, code:0 };
     } catch (error) {
       const stderr = String((error as { stderr?:string }).stderr ?? '');
