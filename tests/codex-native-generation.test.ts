@@ -1,6 +1,6 @@
 import { afterEach, expect, it } from 'vitest';
 import { realpathSync, statSync } from 'node:fs';
-import { spawn, execFile, execFileSync } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import net from 'node:net';
 import { promisify } from 'node:util';
 import { once } from 'node:events';
@@ -45,16 +45,14 @@ it('accepts a short executable alias only when Windows proof confirms matching b
   expect(await codexNativeGeneration(peer, process.pid, home, { platform:'win32', run:async () => ({ stdout:JSON.stringify({ ...proof, executableContentMatchesExpected:false }), code:0 }) })).toBeUndefined();
 });
 
-it.skipIf(process.platform !== 'win32')('proves an owned Windows stdio process when its executable is supplied by an 8.3 alias', async () => {
+it.skipIf(process.platform !== 'win32')('proves an owned Windows stdio process when the expected executable has matching bytes at another path', async () => {
   const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
-  const root = path.join(tmpdir(), `R${process.pid.toString(36).slice(-4)}${Date.now().toString(36).slice(-3)}`);
-  await mkdir(root);
+  const root = await mkdtemp(path.join(tmpdir(), 'rele-native-proof-'));
   cleanup.push(() => rm(root, { recursive:true, force:true }));
   const home = path.join(root, 'home'), executable = path.join(root, 'node.exe');
   await mkdir(home);
   await copyFile(process.execPath, executable);
-  const shortExecutable = execFileSync(process.env.ComSpec || 'cmd.exe', ['/d', '/c', `for %I in ("${executable}") do @echo %~sI`], { encoding:'utf8' }).trim();
-  expect(shortExecutable.toLowerCase()).not.toBe(executable.toLowerCase());
+  const expectedExecutable = process.execPath;
   const child = spawn(executable, ['-e', 'setInterval(() => {}, 1000)'], { stdio:'ignore', windowsHide:true });
   cleanup.push(async () => { if (child.exitCode === null && child.signalCode === null) { child.kill(); await once(child, 'close'); } });
   await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
@@ -68,7 +66,6 @@ it.skipIf(process.platform !== 'win32')('proves an owned Windows stdio process w
       return path.win32.normalize(realpathSync.native(left)).toLowerCase() === path.win32.normalize(realpathSync.native(right)).toLowerCase();
     } catch { return false; }
   };
-  expect(sameFile(shortExecutable, executable)).toBe(true);
   const run = async (command:string, args:string[]) => {
     try {
       const result = await promisify(execFile)(command, args, { timeout:30_000, maxBuffer:128*1024, windowsHide:true });
@@ -82,7 +79,7 @@ it.skipIf(process.platform !== 'win32')('proves an owned Windows stdio process w
           ['executable-path', typeof proof.executable === 'string' && /^[A-Za-z]:\\/u.test(proof.executable) && path.win32.isAbsolute(proof.executable)],
           ['home-path', typeof proof.codexHome === 'string' && /^[A-Za-z]:\\/u.test(proof.codexHome) && path.win32.isAbsolute(proof.codexHome)],
           ['image-hash', proof.executableContentMatchesExpected === true],
-          ['executable', sameFile(proof.executable, shortExecutable)], ['home', sameFile(proof.codexHome, home)],
+          ['executable', sameFile(proof.executable, expectedExecutable)], ['home', sameFile(proof.codexHome, home)],
           ['boot', typeof proof.boot === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$/u.test(proof.boot) && Number.isFinite(Date.parse(proof.boot))],
           ['parent', proof.parentPid === process.pid], ['gateway-owner', proof.gatewayOwner === proof.owner],
         ];
@@ -96,7 +93,7 @@ it.skipIf(process.platform !== 'win32')('proves an owned Windows stdio process w
       return { stdout:'', code:1 };
     }
   };
-  const generation = await codexNativeGeneration({ kind:'stdio', pid:child.pid!, codexHome:home, executable:shortExecutable }, child.pid!, home, { platform:'win32', run });
+  const generation = await codexNativeGeneration({ kind:'stdio', pid:child.pid!, codexHome:home, executable:expectedExecutable }, child.pid!, home, { platform:'win32', run });
   if (!generation) throw new Error(`Windows native proof failed at ${proofStage ?? 'unknown stage'}`);
   expect(generation).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
 }, 60000);
