@@ -208,12 +208,36 @@ test('shared native gate records bounded request state without payloads on timeo
 });
 test('Windows canary forwards only bounded timeout evidence from the failed Desktop probe', async()=>{
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
- const start=canary.indexOf("$timeoutReportPath = Join-Path $sourceRoot 'shared-results-actual-desktop.json'");
+ const start=canary.indexOf("$timeoutReportPath = Join-Path $FixtureRoot 'reports\\shared-results-actual-desktop.json'");
  const end=canary.indexOf("foreach ($log in @('stdout.log'",start);
- assert.ok(start>=0 && end>start,'failed Windows canary must read the copied Desktop probe report');
+ assert.ok(start>=0 && end>start,'failed Windows canary must read the Desktop report from its fixture directory');
  const relay=canary.slice(start,end);
  assert.match(relay,/\.heldRequestTimeout/u,'forward the probe timeout snapshot');
  assert.match(relay,/NotePropertyName heldRequestTimeout/u,'attach only the bounded snapshot to the failure receipt');
  assert.doesNotMatch(relay,/NotePropertyName (?:report|sharedReport)/u,'do not forward the full probe report');
  assert.ok(canary.indexOf('$result | ConvertTo-Json -Depth 6',end)>end,'serialize the bounded evidence into the canary receipt');
+});
+test('shared cancellation diagnostics preserve the original error if snapshot fails', async()=>{
+ const probe=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');
+ const start=probe.indexOf('try { await engine!.cancel(command.requestId!); } catch (error) {');
+ const end=probe.indexOf("\n      } else if (command.action === 'close')",start);
+ assert.ok(start>=0 && end>start,'shared probe must define cancellation failure diagnostics');
+ const failure=probe.slice(start,end);
+ assert.match(failure,/try\s*\{\s*state = await snapshot\(command\.processId\);\s*\}\s*catch\s*\(diagnostic\)/u,
+  'contain a failed native snapshot while handling a cancel error');
+ assert.match(failure,/snapshotErrorType/u,'record only the diagnostic exception type');
+ assert.ok(failure.indexOf("event: 'shared-cancel-diagnostic'")<failure.indexOf('throw error;'),
+  'emit best-effort diagnostics and rethrow the original cancel error');
+});
+test('shared Windows cancellation probe waits for bounded native generation proofs', async()=>{
+ const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ const driverStart=probe.indexOf('class EngineDriver:');
+ const driverEnd=probe.indexOf('\n    async def close(self):',driverStart);
+ assert.ok(driverStart>=0 && driverEnd>driverStart,'shared probe must define its Engine driver');
+ const driver=probe.slice(driverStart,driverEnd);
+ assert.match(probe,/ENGINE_CANCEL_READ_TIMEOUT_SECONDS\s*=\s*720/u,
+  'allow the finite sequence of 30-second Windows process proofs in the cancellation path');
+ assert.match(driver,/timeout = ENGINE_CANCEL_READ_TIMEOUT_SECONDS if action == 'cancel' else ENGINE_READ_TIMEOUT_SECONDS/u,
+  'apply the longer read deadline only to the cancellation diagnostic path');
+ assert.match(driver,/return await self\.read\(timeout\)/u,'use the action-specific response deadline');
 });

@@ -199,12 +199,15 @@ if (values['expect-error']) {
           let terminals: unknown;
           try { terminals = await codex!.backgroundTerminals(threadId!); }
           catch (diagnostic) { terminals = { errorCode: (diagnostic as { code?: unknown }).code ?? 'unavailable' }; }
-          const state = await snapshot(command.processId);
+          let state: Awaited<ReturnType<typeof snapshot>> | undefined;
+          let snapshotErrorType: string | undefined;
+          try { state = await snapshot(command.processId); }
+          catch (diagnostic) { snapshotErrorType = diagnostic instanceof Error ? diagnostic.name : 'UnknownError'; }
           const request = store.listRequests().find(row => row.id === command.requestId);
           process.stderr.write(JSON.stringify({ event: 'shared-cancel-diagnostic', errorCode: (error as { code?: unknown }).code,
-            requestId: command.requestId, turnId: request?.turnId, cleanup: state.cancelCleanups[command.requestId!],
-            terminals, cancellationInterruptWitnesses: state.cancellationInterruptWitnesses,
-            probeProcessAlive: state.probeProcessAlive }) + '\n');
+            requestId: command.requestId, turnId: request?.turnId, cleanup: state?.cancelCleanups[command.requestId!],
+            terminals, cancellationInterruptWitnesses: state?.cancellationInterruptWitnesses,
+            probeProcessAlive: state?.probeProcessAlive, snapshotErrorType }) + '\n');
           throw error;
         }
       } else if (command.action === 'close') {

@@ -30,6 +30,8 @@ REPO = Path(__file__).resolve().parent.parent
 NODE = shutil.which('node')
 DRIVER = REPO / 'scripts/probe-shared-codex.ts'
 SHIM = REPO / 'dist/server/codex-cli.js'
+ENGINE_READ_TIMEOUT_SECONDS = 55
+ENGINE_CANCEL_READ_TIMEOUT_SECONDS = 720
 
 
 def arguments():
@@ -188,8 +190,8 @@ class EngineDriver:
     def __init__(self, process):
         self.process = process
 
-    async def read(self):
-        line = await asyncio.wait_for(self.process.stdout.readline(), 55)
+    async def read(self, timeout=ENGINE_READ_TIMEOUT_SECONDS):
+        line = await asyncio.wait_for(self.process.stdout.readline(), timeout)
         if not line:
             raise RuntimeError('Shared Engine driver exited before responding')
         return json.loads(line)
@@ -197,7 +199,9 @@ class EngineDriver:
     async def command(self, action, **fields):
         self.process.stdin.write((json.dumps({'action': action, **fields}) + '\n').encode())
         await self.process.stdin.drain()
-        return await self.read()
+        # Cancellation may repeat Windows generation proofs, each with 30-second subprocess limits.
+        timeout = ENGINE_CANCEL_READ_TIMEOUT_SECONDS if action == 'cancel' else ENGINE_READ_TIMEOUT_SECONDS
+        return await self.read(timeout)
 
     async def close(self):
         if self.process.returncode is not None:

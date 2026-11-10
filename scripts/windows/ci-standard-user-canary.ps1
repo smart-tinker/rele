@@ -434,7 +434,7 @@ try {
                 $result | Add-Member -NotePropertyName event332Template -NotePropertyValue $template.Substring(0, [Math]::Min(1024, $template.Length))
             } catch { $result | Add-Member -NotePropertyName event332TemplateErrorHResult -NotePropertyValue ('0x{0:X8}' -f $_.Exception.HResult) }
         }
-        $timeoutReportPath = Join-Path $sourceRoot 'shared-results-actual-desktop.json'
+        $timeoutReportPath = Join-Path $FixtureRoot 'reports\shared-results-actual-desktop.json'
         if ($RunGates -and $Phase -eq 'Installer' -and $child.ExitCode -ne 0 -and (Test-Path -LiteralPath $timeoutReportPath -PathType Leaf)) {
             try {
                 $timeoutReport = Get-Content -LiteralPath $timeoutReportPath -Raw | ConvertFrom-Json
