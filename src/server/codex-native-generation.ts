@@ -284,7 +284,7 @@ function sameWindowsPath(left: string, right: string): boolean {
 }
 async function windowsGeneration(peer: Exclude<CodexNativePeer, { kind: 'proxy' }>, serverId: number, home: string, options: CodexNativeGenerationOptions): Promise<string | undefined> {
   if (!windowsPath(home)) return;
-  const run = options.run ?? (async (command: string, args: string[]) => ({ ...(await execute(command, args, { timeout: 15_000, maxBuffer: 128 * 1024, windowsHide: true })), code: 0 }));
+  const run = options.run ?? (async (command: string, args: string[]) => ({ ...(await execute(command, args, { timeout: 30_000, maxBuffer: 128 * 1024, windowsHide: true })), code: 0 }));
   const directory = options.installationDirectory ?? fileURLToPath(new URL('../../', import.meta.url));
   let receipt: any;
   if (peer.kind === 'stdio') {
