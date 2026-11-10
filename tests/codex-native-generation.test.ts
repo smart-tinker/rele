@@ -47,7 +47,8 @@ it('accepts a short executable alias only when Windows proof confirms matching b
 
 it.skipIf(process.platform !== 'win32')('proves an owned Windows stdio process when its executable is supplied by an 8.3 alias', async () => {
   const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
-  const root = await mkdtemp(path.join(tmpdir(), 'rele-native-short-path-'));
+  const root = path.join(tmpdir(), `R${process.pid.toString(36).slice(-4)}${Date.now().toString(36).slice(-3)}`);
+  await mkdir(root);
   cleanup.push(() => rm(root, { recursive:true, force:true }));
   const home = path.join(root, 'home'), executable = path.join(root, 'node.exe');
   await mkdir(home);
@@ -67,6 +68,7 @@ it.skipIf(process.platform !== 'win32')('proves an owned Windows stdio process w
       return path.win32.normalize(realpathSync.native(left)).toLowerCase() === path.win32.normalize(realpathSync.native(right)).toLowerCase();
     } catch { return false; }
   };
+  expect(sameFile(shortExecutable, executable)).toBe(true);
   const run = async (command:string, args:string[]) => {
     try {
       const result = await promisify(execFile)(command, args, { timeout:30_000, maxBuffer:128*1024, windowsHide:true });
