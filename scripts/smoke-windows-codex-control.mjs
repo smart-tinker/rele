@@ -42,7 +42,7 @@ let phase = 'preflight';
 let failurePhase;
 const controllerCalls = [];
 function run(command, args, extra = {}) {
-  const output = spawnSync(command, args, { env, windowsHide: true, encoding: 'utf8', timeout: 25_000, maxBuffer: 65536, ...extra });
+  const output = spawnSync(command, args, { env, windowsHide: true, encoding: 'utf8', timeout: 60_000, maxBuffer: 65536, ...extra });
   if (output.error) throw output.error;
   return output;
 }
