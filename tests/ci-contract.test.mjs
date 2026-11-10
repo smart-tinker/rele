@@ -241,6 +241,11 @@ test('shared Windows cancellation probe waits for bounded native generation proo
   'apply the longer read deadline only to the cancellation diagnostic path');
  assert.match(driver,/return await self\.read\(timeout\)/u,'use the action-specific response deadline');
 });
+test('shared Windows lost-ACK probe allows one bounded native proof window before timing out', async()=>{
+ const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ assert.match(probe,/await asyncio\.wait_for\(wait_records\(before \+ 1\), ENGINE_READ_TIMEOUT_SECONDS\)/u,
+  'allow the bounded Windows owner proof to finish before checking whether the native request reached the provider');
+});
 test('Windows owner probe avoids an immediate duplicate Task Scheduler COM query', async()=>{
  const probe=await readFile(new URL('../scripts/smoke-windows-codex-control.mjs',import.meta.url),'utf8');
  const native=await readFile(new URL('../scripts/windows/Rele.cs',import.meta.url),'utf8');

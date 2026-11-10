@@ -820,7 +820,7 @@ enabled=false
             before = len(records)
             await engine.command('ingest', platform='telegram', eventId='held-telegram', text='held-original-request', loseAck=True)
             try:
-                await asyncio.wait_for(wait_records(before + 1), 25)
+                await asyncio.wait_for(wait_records(before + 1), ENGINE_READ_TIMEOUT_SECONDS)
             except TimeoutError:
                 report['heldRequestTimeout'] = await held_request_evidence(engine, peer, thread)
                 raise
