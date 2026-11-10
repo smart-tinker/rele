@@ -274,7 +274,7 @@ try {
                 if (-not $path.StartsWith($runnerRoot, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $path)) { throw 'Desktop gate inputs must be existing paths under this disposable RUNNER_TEMP.' }
             }
             $inventory = Get-Content -LiteralPath $marker.desktopInventory -Raw | ConvertFrom-Json
-            if ($inventory.result -ne 'passed' -or $inventory.nativeGatePrepared -ne $true -or $inventory.package.signature.status -ne 'Valid' -or $inventory.backendVersion -notin @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6')) { throw 'The actual Desktop inventory is not a successful signed and versioned preparation.' }
+            if ($inventory.result -ne 'passed' -or $inventory.nativeGatePrepared -ne $true -or $inventory.package.signature.status -ne 'Valid' -or $inventory.backendVersion -isnot [string] -or $inventory.backendVersion -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?$') { throw 'The actual Desktop inventory is not a successful signed and versioned preparation.' }
             $marker.desktopVersion = $inventory.backendVersion
             $desktopReadPaths = @($marker.desktopBundle, (Split-Path $marker.desktopInventory))
         }
