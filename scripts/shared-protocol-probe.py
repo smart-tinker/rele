@@ -40,11 +40,13 @@ def arguments():
     source.add_argument('--desktop-bundle', type=Path)
     parser.add_argument('--desktop-inventory', type=Path)
     parser.add_argument('--installed-desktop', action='store_true')
-    parser.add_argument('--expected-version', choices=VERSIONS, required=True)
+    parser.add_argument('--expected-version', required=True)
     parser.add_argument('--report', type=Path, required=True)
     parser.add_argument('--windows-app-template', type=Path)
     parser.add_argument('--windows-runtime', choices=['source', 'packaged'], default='source')
     args = parser.parse_args()
+    if args.expected_version not in VERSIONS and not args.desktop_bundle:
+        parser.error('Unlisted versions require a measured Desktop inventory.')
     args.retain_fixture = False
     if args.installed_desktop and (os.name != 'nt' or not args.desktop_bundle or not args.desktop_inventory):
         parser.error('Installed Desktop mode requires Windows, --desktop-bundle and the signed --desktop-inventory.')

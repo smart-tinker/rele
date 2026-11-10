@@ -125,3 +125,9 @@ test('one required CI gate waits for every OS matrix job', async()=>{
  const publisher=workflow.slice(workflow.indexOf('\n  publish:\n'));
  assert.match(publisher,/needs: \[verify, gate\]/u);
 });
+test('shared protocol gate only allows unlisted versions for the exact measured Desktop backend', async()=>{
+ const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ assert.ok(probe.includes("parser.add_argument('--expected-version', required=True)"));
+ assert.ok(probe.includes('if args.expected_version not in VERSIONS and not args.desktop_bundle:'));
+ assert.ok(probe.includes("evidence.get('backendVersion') != args.expected_version"));
+});
