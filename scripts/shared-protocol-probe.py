@@ -543,20 +543,21 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
     async def held_request_evidence(engine, peer, thread):
         evidence = {'providerRequestCount': len(records)}
         try:
-            snapshot = await asyncio.wait_for(engine.command('snapshot'), 5)
+            engine_snapshot = await asyncio.wait_for(engine.command('snapshot'), 5)
             evidence['engineRequests'] = [
                 {key: row.get(key) for key in ('eventId', 'status', 'turnId')}
-                for row in snapshot.get('requests', [])[-8:]
+                for row in engine_snapshot.get('requests', [])[-8:]
             ]
             evidence['engineApprovals'] = [
                 {key: row.get(key) for key in ('id', 'requestId', 'method', 'status', 'turnId')}
-                for row in snapshot.get('approvals', [])[-8:]
+                for row in engine_snapshot.get('approvals', [])[-8:]
             ]
+            evidence['driverOperations'] = engine_snapshot.get('driverOperations', [])
         except Exception as error:
             evidence['engineSnapshotError'] = type(error).__name__
         try:
-            snapshot = await asyncio.wait_for(peer.call('thread/read', {'threadId': thread}), 5)
-            evidence['nativeTurnStatus'] = snapshot.get('thread', {}).get('status', {}).get('type')
+            native_snapshot = await asyncio.wait_for(peer.call('thread/read', {'threadId': thread}), 5)
+            evidence['nativeTurnStatus'] = native_snapshot.get('thread', {}).get('status', {}).get('type')
         except Exception as error:
             evidence['nativeThreadReadError'] = type(error).__name__
         evidence['observedTurns'] = [
@@ -564,7 +565,6 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
             for event in peer.events if event.get('method') in ('turn/started', 'turn/completed')
         ][-8:]
         evidence['queuedProviderActionTypes'] = [action for action, _ in actions[-8:]]
-        evidence['driverOperations'] = snapshot.get('driverOperations', [])
         return evidence
 
     async def wait_records(count):
