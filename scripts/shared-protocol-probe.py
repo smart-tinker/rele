@@ -1073,7 +1073,15 @@ enabled=false
 
 if __name__ == '__main__':
     args = arguments()
-    directory = Path(tempfile.mkdtemp(prefix='rs-', dir=os.environ.get('RUNNER_TEMP')))
+    fixture_parent = os.environ.get('USERPROFILE') if os.name == 'nt' else os.environ.get('RUNNER_TEMP')
+    if not fixture_parent or not Path(fixture_parent).is_dir():
+        raise SystemExit('Isolated fixture parent is unavailable.')
+    if os.name == 'nt':
+        temp_parent = Path(os.environ['RUNNER_TEMP']).resolve()
+        profile_parent = Path(fixture_parent).resolve()
+        if profile_parent == temp_parent or temp_parent in profile_parent.parents:
+            raise SystemExit('Windows Codex fixtures must be created outside RUNNER_TEMP.')
+    directory = Path(tempfile.mkdtemp(prefix='rs-', dir=fixture_parent))
     try:
         asyncio.run(gate(args, directory))
     finally:

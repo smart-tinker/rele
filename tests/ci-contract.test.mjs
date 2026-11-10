@@ -131,6 +131,11 @@ test('shared protocol gate only allows unlisted versions for the exact measured 
  assert.ok(probe.includes('if args.expected_version not in VERSIONS and not args.desktop_bundle:'));
  assert.ok(probe.includes("evidence.get('backendVersion') != args.expected_version"));
 });
+test('Windows shared protocol fixture keeps CODEX_HOME outside RUNNER_TEMP', async()=>{
+ const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ assert.ok(/fixture_parent\s*=\s*os\.environ\.get\('USERPROFILE'\)\s+if os\.name == 'nt'\s+else os\.environ\.get\('RUNNER_TEMP'\)/u.test(probe));
+ assert.ok(/tempfile\.mkdtemp\(prefix='rs-', dir=fixture_parent\)/u.test(probe));
+});
 test('the current signed Desktop backend is covered by every supported Codex probe', async()=>{
  const version='0.167.0-alpha.3.2';
  for(const file of ['../scripts/protocol-probe.py','../scripts/managed-protocol-probe.py','../scripts/shared-protocol-probe.py','../scripts/windows/ci-standard-user-canary.ps1']) {
