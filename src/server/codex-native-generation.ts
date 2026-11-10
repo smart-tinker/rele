@@ -185,13 +185,14 @@ public static class ReleWindowsPath {
 }
 '@ -ErrorAction Stop
   function FileSha256($path) {
-    $script:stage='image-path-expand'
+    $pathStage=$script:stage
+    $script:stage=$pathStage+'-path-expand'
     $path=[ReleWindowsPath]::Expand($path)
-    $script:stage='image-hash-open'
+    $script:stage=$pathStage+'-hash-open'
     $algorithm=[Security.Cryptography.SHA256]::Create()
     try {
       $stream=[IO.File]::OpenRead($path)
-      try { $script:stage='image-hash-compute'; return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
+      try { $script:stage=$pathStage+'-hash-compute'; return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
       finally { $stream.Dispose() }
     } finally { $algorithm.Dispose() }
   }
@@ -207,6 +208,7 @@ public static class ReleWindowsPath {
       Require ($owner.ReturnValue -eq 0)
       $script:stage='image-query'
       $exe=$native.MainModule.FileName; $birth=$native.StartTime.ToUniversalTime().ToString('o')
+      $script:stage='process-image-hash'
       $hash=FileSha256 $exe
       $script:stage='process-identity'
       if ($stdio) {
@@ -243,8 +245,10 @@ public static class ReleWindowsPath {
           Require ($helper.Handle -ne [IntPtr]::Zero)
           $helperRecord=Get-CimInstance Win32_Process -Filter ("ProcessId="+$helper.Id) -ErrorAction Stop
           $helperOwner=Invoke-CimMethod -InputObject $helperRecord -MethodName GetOwnerSid -ErrorAction Stop
+          $script:stage='helper-image-hash'
           $helperHash=FileSha256 $helper.MainModule.FileName
           try {
+            $script:stage='expected-helper-image-hash'
             $expectedHelperHash=FileSha256 $p.helperExecutable
             $helperExecutableContentMatchesExpected=$helperHash -ceq $expectedHelperHash
           } catch [System.ArgumentException] { $helperExecutableContentMatchesExpected=$false }
