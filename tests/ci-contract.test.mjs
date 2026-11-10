@@ -81,6 +81,23 @@ test('workflow requirement lists tolerate empty conditional groups', async()=>{
   assert.equal(result.status,0,result.stderr);
  }
 });
+test('shared wait timeout reports bounded request correlation without message bodies', async()=>{
+ let summarize;
+ try { ({summarizeSharedWaitFailure:summarize}=await import('../scripts/shared-probe-diagnostics.mjs')); }
+ catch(error) { if(error?.code==='ERR_MODULE_NOT_FOUND') assert.fail('shared timeout diagnostics must be available'); throw error; }
+ assert.deepEqual(summarize('waiting_approval',{
+  requests:[{id:'request-1',eventId:'approval',status:'uncertain',turnId:'turn-1',queuedSubmissionId:'queue-1',text:'private message'}],
+  approvals:[{id:'approval-1',requestId:'request-1',method:'item/commandExecution/requestApproval',status:'pending',turnId:'turn-1',details:'private approval'}],
+  observedTurns:[{method:'turn/started',threadId:'thread-1',turnId:'turn-1'}],
+  driverOperations:Array.from({length:50},(_,index)=>`operation-${index}`),
+ }),{
+  expectedStatus:'waiting_approval',
+  requests:[{id:'request-1',eventId:'approval',status:'uncertain',turnId:'turn-1',queuedSubmissionId:'queue-1'}],
+  approvals:[{id:'approval-1',requestId:'request-1',method:'item/commandExecution/requestApproval',status:'pending',turnId:'turn-1'}],
+  observedTurns:[{method:'turn/started',turnId:'turn-1'}],
+  driverOperations:Array.from({length:40},(_,index)=>`operation-${index+10}`),
+ });
+});
 test('unconfirmed upload leaves transfers intact for reconciliation',()=>fixture(async root=>{
  const {publishCandidate}=await import('../scripts/ci-publish.mjs');
  const bundle=await verifyBundles(root,version,sha,run,attempt),calls=[];

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
+import { summarizeSharedWaitFailure } from './shared-probe-diagnostics.mjs';
 import { ConfigStore, defaultConfig, defaultDataDirectory } from '../src/server/config.js';
 import { CodexClient as SourceCodexClient } from '../src/server/codex.js';
 import { Engine as SourceEngine } from '../src/server/engine.js';
@@ -115,6 +116,17 @@ if (values['expect-error']) {
     const internals = codex as unknown as { pages: <T>(method: string, params: Record<string, unknown>) => Promise<T[]> };
     const pages = internals.pages.bind(codex);
     internals.pages = async <T>(method: string, params: Record<string, unknown>) => observe('pages', () => pages<T>(method, params))();
+    const findRequest = codex.findRequest.bind(codex);
+    codex.findRequest = async (...args) => {
+      try {
+        const found = await findRequest(...args);
+        recordDriverOperation(`findRequest:${found.state}${found.turnId ? ':turn' : ''}${found.queuedSubmissionId ? ':queue' : ''}`);
+        return found;
+      } catch (error) {
+        recordDriverOperation('findRequest:error');
+        throw error;
+      }
+    };
     const interrupt = codex.interrupt.bind(codex);
     codex.interrupt = async (...args) => {
       const owned = cancellationProcess;
@@ -213,7 +225,12 @@ if (values['expect-error']) {
           event.method === 'turn/completed' && event.threadId === threadId && event.turnId === command.turnId) : command.status ? !store.listRequests().some(request =>
           (!command.requestId || request.id === command.requestId) && request.status === command.status) : store.activeRequests().length > 0;
         while (pending() && Date.now() < until) { await engine!.pump(); await engine!.settled(); await delay(50); }
-        if (pending()) throw new Error(`Shared requests did not reach expected state: ${JSON.stringify(store.listRequests())}`);
+        if (pending()) {
+          let evidence;
+          try { evidence = summarizeSharedWaitFailure(command.status ?? 'active', await snapshot()); }
+          catch (error) { evidence = { snapshotErrorType: error instanceof Error ? error.name : 'UnknownError' }; }
+          throw new Error(`Shared requests did not reach expected state: ${JSON.stringify(evidence)}`);
+        }
         await engine!.pump(); await engine!.settled();
       } else if (command.action === 'answer') {
         if (command.decision !== undefined && !['accept', 'decline'].includes(command.decision)) throw new Error('Invalid fixture approval decision');
