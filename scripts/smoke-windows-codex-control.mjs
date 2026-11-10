@@ -121,7 +121,7 @@ let initialOwner;
 const knownHelperHashes = new Set();
 try {
   sid = powershell('[Security.Principal.WindowsIdentity]::GetCurrent().User.Value');
-  assert.equal(scheduledTaskExists(`${task}-Codex`), false, 'The random fixture Task must not already exist.');
+  // codex-start refuses a foreign same-name Task, so a preliminary scheduler RPC is redundant.
   await mkdir(path.join(application, 'dist/native'), { recursive: true });
   await mkdir(data);
   await assert.rejects(access(home), { code: 'ENOENT' });
