@@ -818,16 +818,22 @@ enabled=false
             # A real Rele request is active while its client/engine process is closed.
             hold = asyncio.Event(); holds.append(hold); actions.append(('hold', hold))
             before = len(records)
-            await engine.command('ingest', platform='telegram', eventId='held-telegram', text='held-original-request', loseAck=True)
+            started_before = {event.get('params', {}).get('turn', {}).get('id') for event in peer.events
+                              if event.get('method') == 'turn/started'}
             try:
-                running = await engine.command('wait', status='running')
-                assert running['droppedQueueAcks'] == 1, 'The synthetic queue ACK was not withheld'
-                await asyncio.wait_for(wait_records(before + 1), ENGINE_READ_TIMEOUT_SECONDS)
+                await engine.command('ingest', platform='telegram', eventId='held-telegram', text='held-original-request', loseAck=True)
+                turn_started = await peer.wait(lambda event: event.get('method') == 'turn/started'
+                    and event.get('params', {}).get('threadId') == thread
+                    and event.get('params', {}).get('turn', {}).get('id') not in started_before,
+                    timeout=ENGINE_READ_TIMEOUT_SECONDS)
+                accepted = await engine.command('snapshot')
+                assert accepted['droppedQueueAcks'] == 1, 'The synthetic queue ACK was not withheld'
             except (TimeoutError, RuntimeError):
                 report['heldRequestTimeout'] = await held_request_evidence(engine, peer, thread)
                 raise
-            request = next(row for row in running['requests'] if row['eventId'] == 'held-telegram')
+            request = next(row for row in accepted['requests'] if row['eventId'] == 'held-telegram')
             assert str(uuid.UUID(request['id'])) == request['id']
+            turn_id = turn_started['params']['turn']['id']
             await engine.close(); engine = None
             assert (await peer.call('server/diagnostics'))['process']['id'] == pid
             assert (await peer.call('thread/read', {'threadId': thread}))['thread']['status']['type'] != 'idle'
@@ -836,14 +842,14 @@ enabled=false
             hold.set()
             completed = await engine.command('wait')
             recovered = next(row for row in completed['requests'] if row['id'] == request['id'])
-            assert recovered['status'] == 'completed' and recovered['origin'] == request['origin']
+            assert recovered['status'] == 'completed' and recovered['origin'] == request['origin'] and recovered['turnId'] == turn_id
             assert len(records) == before + 1, 'Rele restart replayed an accepted native request'
             assert any(row['requestId'] == request['id'] and row['origin']['platform'] == 'telegram' and row['status'] == 'sent'
                        for row in completed['deliveries'])
             report['checks']['rele_restart_after_lost_ack_preserves_active_native_turn_uuid_without_resend'] = True
             if args.desktop_bundle:
                 report['desktopBootstrap']['recoveredRequestId'] = request['id']
-                report['desktopBootstrap']['recoveredTurnId'] = request['turnId']
+                report['desktopBootstrap']['recoveredTurnId'] = turn_id
                 report['desktopBootstrap']['recoveryNativeProcessId'] = restarted['runtimeProcessId']
             # An origin-owned approval is resolved by the real Engine; Desktop sees it.
             actions.append(('approval', None))

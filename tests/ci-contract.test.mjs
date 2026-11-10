@@ -216,7 +216,7 @@ test('shared fixture settles ordinary intake but not the synthetic lost queue AC
  assert.match(ingest,/if \(command\.loseAck !== true\) await engine!\.settled\(\);/u,'keep ordinary fixture processing deterministic but let lost-ACK reconciliation stay asynchronous');
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
  const held=probe.indexOf("await engine.command('ingest', platform='telegram', eventId='held-telegram'");
- const next=probe.indexOf("running = await engine.command('wait', status='running')",held);
+ const next=probe.indexOf('turn_started = await peer.wait(',held);
  assert.ok(held>=0 && next>held,'lost-ACK probe must ingest before waiting for the native request');
  assert.match(probe.slice(held,next),/loseAck=True/u,'only the held native request bypasses settled reconciliation');
 });
@@ -268,15 +268,19 @@ test('shared Windows cancellation fixture outlives the bounded native proof wind
  assert.doesNotMatch(probe,/await asyncio\.sleep\(max\(0,\s*shell_deadline/u,
   'do not wait for the marker timer after proving the exact process is stopped');
 });
-test('shared Windows lost-ACK probe allows one bounded native proof window before timing out', async()=>{
+test('shared Windows lost-ACK probe recovers from native turn start before provider completion', async()=>{
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
  const held=probe.indexOf("await engine.command('ingest', platform='telegram', eventId='held-telegram'");
- const running=probe.indexOf("running = await engine.command('wait', status='running')",held);
- const provider=probe.indexOf('await asyncio.wait_for(wait_records(before + 1), ENGINE_READ_TIMEOUT_SECONDS)',held);
- assert.ok(held>=0 && running>held && provider>running,
-  'wait for native request recovery before checking the downstream provider request');
- assert.match(probe,/await asyncio\.wait_for\(wait_records\(before \+ 1\), ENGINE_READ_TIMEOUT_SECONDS\)/u,
-  'allow the bounded Windows owner proof to finish before checking whether the native request reached the provider');
+ const started=probe.indexOf('turn_started = await peer.wait(',held);
+ const close=probe.indexOf('await engine.close(); engine = None',started);
+ const restart=probe.indexOf('engine, restarted = await driver(env, workspace, thread=thread)',close);
+ const release=probe.indexOf('hold.set()',restart);
+ const completed=probe.indexOf("completed = await engine.command('wait')",release);
+ const provider=probe.indexOf("assert len(records) == before + 1",completed);
+ assert.ok(held>=0 && started>held && close>started && restart>close && release>restart && completed>release && provider>completed,
+  'confirm native turn start, restart Rele, release the provider and only then assert exactly one model request');
+ assert.doesNotMatch(probe.slice(held,close),/engine\.command\('wait', status='running'\)/u,
+  'do not wait for Engine.settled while the provider response is deliberately held');
 });
 test('Windows owner probe avoids an immediate duplicate Task Scheduler COM query', async()=>{
  const probe=await readFile(new URL('../scripts/smoke-windows-codex-control.mjs',import.meta.url),'utf8');
