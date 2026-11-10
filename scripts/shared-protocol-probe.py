@@ -548,6 +548,10 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
                 {key: row.get(key) for key in ('eventId', 'status', 'turnId')}
                 for row in snapshot.get('requests', [])[-8:]
             ]
+            evidence['engineApprovals'] = [
+                {key: row.get(key) for key in ('id', 'requestId', 'method', 'status', 'turnId')}
+                for row in snapshot.get('approvals', [])[-8:]
+            ]
         except Exception as error:
             evidence['engineSnapshotError'] = type(error).__name__
         try:
@@ -559,6 +563,7 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
             {'method': event.get('method'), 'turnId': event.get('params', {}).get('turn', {}).get('id')}
             for event in peer.events if event.get('method') in ('turn/started', 'turn/completed')
         ][-8:]
+        evidence['queuedProviderActionTypes'] = [action for action, _ in actions[-8:]]
         return evidence
 
     async def wait_records(count):
@@ -931,7 +936,10 @@ enabled=false
                 shell_approvals = [item for item in pending['approvals'] if item['status'] == 'pending']
                 if shell_approvals or ready_file.is_file():
                     break
-                assert asyncio.get_running_loop().time() < deadline, 'Shell neither started nor requested approval'
+                if asyncio.get_running_loop().time() >= deadline:
+                    report['cancellationRequestTimeout'] = await held_request_evidence(engine, peer, thread)
+                    report['cancellationRequestTimeout']['readyFileExists'] = ready_file.is_file()
+                    raise AssertionError('Shell neither started nor requested approval')
                 await asyncio.sleep(.05)
             assert len(shell_approvals) <= 1 and all(item['method'] == 'item/commandExecution/requestApproval' and item['requestId'] == next(row['id'] for row in pending['requests'] if row['eventId'] == 'cancel') for item in shell_approvals), 'Unexpected shell approval'
             if shell_approvals:

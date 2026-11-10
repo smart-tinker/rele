@@ -203,8 +203,13 @@ test('shared native gate records bounded request state without payloads on timeo
  assert.ok(start>=0 && end>start,'shared probe must define bounded timeout evidence');
  const evidence=probe.slice(start,end);
  for(const field of ['providerRequestCount','engineRequests','nativeTurnStatus','observedTurns','eventId','status','turnId']) assert.ok(evidence.includes(field),`timeout evidence must include ${field}`);
+ for(const field of ['engineApprovals','queuedProviderActionTypes']) assert.ok(evidence.includes(field),`timeout evidence must include ${field}`);
  for(const field of ['text','payload','input','content','prompt']) assert.ok(!evidence.includes(field),`timeout evidence must exclude ${field}`);
  assert.match(probe,/except \(TimeoutError, RuntimeError\):\s*report\['heldRequestTimeout'\] = await held_request_evidence\(engine, peer, thread\)/u,'capture the safe snapshot when the native wait or provider wait fails');
+ const cancel=probe.indexOf("await engine.command('ingest', platform='telegram', eventId='cancel'");
+ const afterCancel=probe.indexOf('await asyncio.wait_for(wait_records(before + 2), 25)',cancel);
+ assert.ok(cancel>=0 && afterCancel>cancel,'bounded shell probe must wait for the request result');
+ assert.match(probe.slice(cancel,afterCancel),/report\['cancellationRequestTimeout'\] = await held_request_evidence\(engine, peer, thread\)/u,'capture queue and request state before failing the shell timeout');
 });
 test('shared fixture settles ordinary intake but not the synthetic lost queue ACK', async()=>{
  const driver=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');
