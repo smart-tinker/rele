@@ -162,3 +162,13 @@ test('actual Desktop CI provisions the verified MSIX before standard-user discov
  assert.ok(canary.includes(').Hash.ToLowerInvariant() -ne $inventory.package.sha256'),'bind installation to the verified MSIX bytes');
  assert.match(workflow,/ci-standard-user-canary\.ps1 -RunGates .*?-DesktopPackage/u,'pass the verified MSIX to the canary');
 });
+test('actual Desktop discovery diagnostics reach only the isolated Rele driver', async()=>{
+ const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ const driverStart=probe.indexOf('    async def driver('),driverEnd=probe.indexOf('\n    async def desktop(',driverStart);
+ assert.ok(driverStart>=0 && driverEnd>driverStart,'shared probe must define its isolated Rele driver');
+ const driver=probe.slice(driverStart,driverEnd),baseEnv=probe.slice(probe.indexOf('    base_env = {'),probe.indexOf('\n    base_env.update',probe.indexOf('    base_env = {')));
+ assert.doesNotMatch(baseEnv,/RELE_CI_SHARED_DIAGNOSTICS/u,'do not pass the diagnostic flag to every isolated child');
+ assert.match(driver,/args\.desktop_bundle and not args\.installed_desktop/u,'scope diagnostics to automatic discovery of the signed Desktop fixture');
+ assert.match(driver,/os\.environ\.get\('RELE_CI_SHARED_DIAGNOSTICS'\) == '1'/u,'require the explicit CI diagnostic switch');
+ assert.match(driver,/spawn\(command, driver_env, REPO\)/u,'forward the switch only to the Rele driver');
+});
