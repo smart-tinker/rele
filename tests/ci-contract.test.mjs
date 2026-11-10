@@ -267,3 +267,13 @@ test('Windows owner probe avoids an immediate duplicate Task Scheduler COM query
  assert.ok(probe.includes('assert.equal(scheduledTaskExists(`${task}-Codex`), false);'),
   'retain the independent check that stopping Codex removes its Task');
 });
+test('fixture cleanup skips a reused host PID and still drains its exact Task', async()=>{
+ const cleanup=await readFile(new URL('../scripts/installer-codex-fixture.mjs',import.meta.url),'utf8');
+ const hostStart=cleanup.indexOf('$hostProcess = Get-Process -Id $receipt.hostPid');
+ const identityStart=cleanup.indexOf('$identity = Get-CimInstance Win32_Process',hostStart);
+ assert.ok(hostStart>=0 && identityStart>hostStart,'fixture cleanup must verify the receipt host process');
+ assert.match(cleanup.slice(hostStart,identityStart),/if \(\$hostProcess\.Path -ne \(Join-Path \$directory 'Rele\.Process\.exe'\) -or[\s\S]*?\) \{ continue \}/u,
+  'a reused PID must be left untouched while cleanup proceeds to other owned receipts');
+ assert.match(cleanup,/if \(\$task\.State -notin @\(1,3\) -or \$task\.GetInstances\(0\)\.Count -ne 0\) \{ throw/u,
+  'cleanup must retain the fixture if its exact Task still has an instance');
+});

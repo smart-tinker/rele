@@ -174,7 +174,7 @@ export function stopInstallerCodex(target, scheduledDirectory) {
         if (-not $hostProcess) { continue }
         $hostPin=$hostProcess.Handle;
         if ($hostProcess.Path -ne (Join-Path $directory 'Rele.Process.exe') -or
-          $hostProcess.StartTime.ToUniversalTime().ToString('o') -ne [string]$receipt.hostStartedAt) { throw 'Stale fixture host PID.' }
+          $hostProcess.StartTime.ToUniversalTime().ToString('o') -ne [string]$receipt.hostStartedAt) { continue }
         $identity = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $hostProcess.Id);
         if ((Invoke-CimMethod -InputObject $identity -MethodName GetOwnerSid).Sid -ne $sid) { throw 'Foreign fixture process.' }
         $native = Get-Process -Id $receipt.nativePid -ErrorAction SilentlyContinue;
