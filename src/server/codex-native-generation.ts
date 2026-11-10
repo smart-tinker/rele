@@ -282,7 +282,14 @@ public static class ReleWindowsPath {
   $script:stage='proof-output'
   $before | ConvertTo-Json -Compress
   $script:stage='complete'
-} catch { [Console]::Error.WriteLine('rele-native-proof:' + $script:stage + ':' + $_.Exception.GetType().Name + ':' + $_.CategoryInfo.Category); exit 1 }
+} catch {
+  $detail=$_.Exception
+  while ($detail.InnerException) { $detail=$detail.InnerException }
+  $failureType=$detail.GetType().Name
+  if ($detail -is [System.ComponentModel.Win32Exception]) { $failureType += '-' + $detail.NativeErrorCode }
+  [Console]::Error.WriteLine('rele-native-proof:' + $script:stage + ':' + $_.Exception.GetType().Name + ':' + $_.CategoryInfo.Category + ':' + $failureType)
+  exit 1
+}
 `;
 
 interface CommandResult { stdout: string; code: number | null }

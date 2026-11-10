@@ -89,8 +89,8 @@ it.skipIf(process.platform !== 'win32')('proves an owned Windows stdio process w
       return { stdout:result.stdout, code:0 };
     } catch (error) {
       const stderr = String((error as { stderr?:string }).stderr ?? '');
-      const marker = /rele-native-proof:([a-z-]+)(?::([A-Za-z]+):([A-Za-z]+))?/u.exec(stderr);
-      proofStage = marker ? [marker[1], marker[2], marker[3]].filter(Boolean).join(':') : 'powershell-invocation';
+      const marker = /rele-native-proof:([a-z-]+)(?::([A-Za-z]+):([A-Za-z]+)(?::([A-Za-z0-9-]+))?)?/u.exec(stderr);
+      proofStage = marker ? [marker[1], marker[2], marker[3], marker[4]].filter(Boolean).join(':') : 'powershell-invocation';
       return { stdout:'', code:1 };
     }
   };
@@ -295,7 +295,8 @@ it('limits Windows proof diagnostics to a fixed stage, exception type and catego
   };
   const generation = await Reflect.apply(codexNativeGeneration, undefined, [{ kind:'windows-shared', endpoint:receipt.endpoint, localPort:55001, remotePort:62662 }, 10944, home, { platform:'win32', run, installationDirectory:'C:\\Rele' }]);
   expect(generation).toBeUndefined();
-  expect(proof).toContain("[Console]::Error.WriteLine('rele-native-proof:' + $script:stage + ':' + $_.Exception.GetType().Name + ':' + $_.CategoryInfo.Category)");
+  expect(proof).toContain("$failureType += '-' + $detail.NativeErrorCode");
+  expect(proof).toContain("[Console]::Error.WriteLine('rele-native-proof:' + $script:stage + ':' + $_.Exception.GetType().Name + ':' + $_.CategoryInfo.Category + ':' + $failureType)");
   expect(proof).not.toContain('$_.Exception.Message');
   expect(proof).toContain("$script:stage='tcp-query'");
 });
