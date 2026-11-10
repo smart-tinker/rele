@@ -1,9 +1,9 @@
-param([ValidateSet('Parent', 'Child')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce, [switch]$RunGates, [ValidateSet('Shared', 'Installer')][string]$Phase = 'Installer', [string]$DesktopBundle, [string]$DesktopInventory, [Alias('Standalone')][switch]$StandaloneShared, [string]$PowerShell7Path, [string]$AcceptanceComputerName)
+param([ValidateSet('Parent', 'Child')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce, [switch]$RunGates, [ValidateSet('Shared', 'Installer')][string]$Phase = 'Installer', [string]$DesktopBundle, [string]$DesktopInventory, [string]$DesktopPackage, [Alias('Standalone')][switch]$StandaloneShared, [string]$PowerShell7Path, [string]$AcceptanceComputerName)
 $ErrorActionPreference = 'Stop'
 if ($StandaloneShared -and ($Mode -ne 'Parent' -or -not $RunGates)) { throw 'Standalone mode requires Parent -RunGates.' }
 if ($StandaloneShared -and $Phase -eq 'Installer' -and ([string]::IsNullOrWhiteSpace($AcceptanceComputerName) -or [Environment]::MachineName -ine $AcceptanceComputerName)) { throw 'Standalone installer acceptance requires an explicit matching -AcceptanceComputerName.' }
 if ($Phase -eq 'Shared' -and -not $RunGates) { throw 'Shared-only mode requires -RunGates.' }
-if (($DesktopBundle -or $DesktopInventory) -and ($Mode -ne 'Parent' -or -not $RunGates -or -not $DesktopBundle -or -not $DesktopInventory)) { throw 'Actual Desktop inputs require Parent -RunGates and both payload and inventory paths.' }
+if (($DesktopBundle -or $DesktopInventory -or $DesktopPackage) -and ($Mode -ne 'Parent' -or -not $RunGates -or -not $DesktopBundle -or -not $DesktopInventory -or -not $DesktopPackage)) { throw 'Actual Desktop inputs require Parent -RunGates and payload, inventory, and signed MSIX paths.' }
 $sourceRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $shell = if ($PowerShell7Path) { $PowerShell7Path } else { Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'PowerShell\7\pwsh.exe' }
 if (-not [IO.Path]::IsPathFullyQualified($shell) -or [IO.Path]::GetFileName($shell) -ine 'pwsh.exe' -or -not (Test-Path -LiteralPath $shell -PathType Leaf) -or [Diagnostics.FileVersionInfo]::GetVersionInfo($shell).FileMajorPart -ne 7) { throw 'A fully qualified PowerShell 7 executable is required for this canary.' }
@@ -116,6 +116,32 @@ if ($Mode -eq 'Child') {
         }
         function Invoke-SharedGates {
             if ($marker.desktopBundle) {
+                $evidence.stage = 'desktop-appx-registration'
+                $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+                $env:RELE_CI_DESKTOP_MSIX = $marker.desktopPackage
+                $env:RELE_CI_DESKTOP_APPX_NAME = [string]$marker.desktopIdentityName
+                $env:RELE_CI_DESKTOP_APPX_VERSION = [string]$marker.desktopIdentityVersion
+                $registrationScript = @'
+$ErrorActionPreference = 'Stop'
+$name = $env:RELE_CI_DESKTOP_APPX_NAME
+if ($name -notin @('OpenAI.Codex', 'OpenAI.ChatGPT')) { throw 'Unexpected Desktop package identity.' }
+if (@(Get-AppxPackage -Name $name).Count -ne 0) { throw 'The disposable standard-user profile already has the Desktop package.' }
+Add-AppxPackage -Path $env:RELE_CI_DESKTOP_MSIX
+$packages = @(Get-AppxPackage -Name $name)
+if ($packages.Count -ne 1 -or $packages[0].Version.ToString() -ne $env:RELE_CI_DESKTOP_APPX_VERSION -or -not $packages[0].InstallLocation) { throw 'The signed Desktop package was not registered for this user.' }
+[Console]::Out.WriteLine('RELE_DESKTOP_APPX_REGISTERED=' + $packages[0].Name + ':' + $packages[0].Version)
+'@
+                try {
+                    $registration = @(& $windowsPowerShell -NoProfile -NonInteractive -Command $registrationScript 2>&1)
+                    $registrationExit = $LASTEXITCODE
+                    if ($registrationExit -ne 0 -or -not ($registration -match ('^RELE_DESKTOP_APPX_REGISTERED=' + [regex]::Escape($marker.desktopIdentityName) + ':' + [regex]::Escape($marker.desktopIdentityVersion) + '$'))) {
+                        $registration | ForEach-Object { Write-Output $_ }
+                        throw 'The verified Desktop MSIX could not be registered for the standard user.'
+                    }
+                    $evidence.gates += 'desktop-appx-registration'
+                } finally {
+                    Remove-Item Env:\RELE_CI_DESKTOP_MSIX, Env:\RELE_CI_DESKTOP_APPX_NAME, Env:\RELE_CI_DESKTOP_APPX_VERSION -ErrorAction SilentlyContinue
+                }
                 $evidence.stage = 'shared-actual-desktop'
                 & $marker.python (Join-Path $sourceRoot 'scripts\shared-protocol-probe.py') --desktop-bundle $marker.desktopBundle --desktop-inventory $marker.desktopInventory --expected-version $marker.desktopVersion --windows-app-template $applicationTemplate --windows-runtime packaged --report (Join-Path $env:RELE_TEST_REPORT_DIR 'shared-results-actual-desktop.json')
                 if ($LASTEXITCODE -ne 0) { throw 'The standard-user actual Desktop bootstrap gate failed.' }
@@ -257,7 +283,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant fixture source read access.' }
     & icacls.exe $FixtureRoot /grant ('*' + $sid + ':(OI)(CI)(M)') /T /C | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant fixture write access.' }
-    $marker = @{ nonce = $Nonce; sid = $sid; phase = 'Installer'; runGates = $RunGates.IsPresent; desktopBundle = $null; desktopInventory = $null }
+    $marker = @{ nonce = $Nonce; sid = $sid; phase = 'Installer'; runGates = $RunGates.IsPresent; desktopBundle = $null; desktopInventory = $null; desktopPackage = $null }
     if ($RunGates) {
         $marker.node = (Get-Command node.exe -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
         $marker.python = (Get-Command python.exe -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
@@ -269,14 +295,18 @@ try {
         if ($DesktopBundle) {
             $marker.desktopBundle = [IO.Path]::GetFullPath($DesktopBundle)
             $marker.desktopInventory = [IO.Path]::GetFullPath($DesktopInventory)
+            $marker.desktopPackage = [IO.Path]::GetFullPath($DesktopPackage)
             $runnerRoot = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
-            foreach ($path in @($marker.desktopBundle, $marker.desktopInventory)) {
+            foreach ($path in @($marker.desktopBundle, $marker.desktopInventory, $marker.desktopPackage)) {
                 if (-not $path.StartsWith($runnerRoot, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $path)) { throw 'Desktop gate inputs must be existing paths under this disposable RUNNER_TEMP.' }
             }
             $inventory = Get-Content -LiteralPath $marker.desktopInventory -Raw | ConvertFrom-Json
             if ($inventory.result -ne 'passed' -or $inventory.nativeGatePrepared -ne $true -or $inventory.package.signature.status -ne 'Valid' -or $inventory.backendVersion -isnot [string] -or $inventory.backendVersion -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?$') { throw 'The actual Desktop inventory is not a successful signed and versioned preparation.' }
+            if ([IO.Path]::GetFileName($marker.desktopPackage) -ine 'ChatGPT-x64.msix' -or [IO.Path]::GetExtension($marker.desktopPackage) -ine '.msix' -or $inventory.package.identity.name -notin @('OpenAI.Codex', 'OpenAI.ChatGPT') -or $inventory.package.identity.version -notmatch '^\d+(?:\.\d+){3}$' -or $inventory.package.sha256 -notmatch '^[a-f0-9]{64}$' -or (Get-FileHash -LiteralPath $marker.desktopPackage -Algorithm SHA256).Hash.ToLowerInvariant() -ne $inventory.package.sha256) { throw 'The Desktop MSIX does not match the verified signed package inventory.' }
             $marker.desktopVersion = $inventory.backendVersion
-            $desktopReadPaths = @($marker.desktopBundle, (Split-Path $marker.desktopInventory))
+            $marker.desktopIdentityName = $inventory.package.identity.name
+            $marker.desktopIdentityVersion = $inventory.package.identity.version
+            $desktopReadPaths = @($marker.desktopBundle, (Split-Path $marker.desktopInventory), (Split-Path $marker.desktopPackage))
         }
         $portableShellPaths = if ($StandaloneShared) { @((Split-Path $shell)) } else { @() }
         foreach ($path in (@((Split-Path $marker.node), (Split-Path $marker.python)) + $marker.prefixes + $desktopReadPaths + $portableShellPaths)) {

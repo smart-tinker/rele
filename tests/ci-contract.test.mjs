@@ -142,3 +142,13 @@ test('signed Desktop fixture defines complete inert MCP transports for its enabl
  assert.equal((fixture.match(/enabled=false/gu)??[]).length,2);
  assert.ok(fixture.includes('disabled-mcp-fixture'));
 });
+test('actual Desktop CI registers the verified MSIX for the standard-user discovery gate', async()=>{
+ const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ const workflow=await readFile(new URL('../.github/workflows/ci.yml',import.meta.url),'utf8');
+ const register=canary.indexOf('Add-AppxPackage');
+ const discover=canary.indexOf('shared-actual-desktop');
+ assert.ok(register>=0 && register<discover,'register the package in the standard-user canary before auto-discovery');
+ assert.match(canary,/Get-AppxPackage/u,'verify registration in the same user profile');
+ assert.ok(canary.includes(').Hash.ToLowerInvariant() -ne $inventory.package.sha256'),'bind installation to the verified MSIX bytes');
+ assert.match(workflow,/ci-standard-user-canary\.ps1 -RunGates .*?-DesktopPackage/u,'pass the verified MSIX to the canary');
+});

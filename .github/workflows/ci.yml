@@ -100,7 +100,7 @@ jobs:
         shell: pwsh
         run: |
           $desktopRoot = Join-Path $env:RUNNER_TEMP 'desktop-native-gate'
-          & ./scripts/windows/ci-standard-user-canary.ps1 -RunGates -DesktopBundle (Join-Path $desktopRoot 'payload') -DesktopInventory (Join-Path $desktopRoot 'desktop-package-inventory.json')
+          & ./scripts/windows/ci-standard-user-canary.ps1 -RunGates -DesktopBundle (Join-Path $desktopRoot 'payload') -DesktopInventory (Join-Path $desktopRoot 'desktop-package-inventory.json') -DesktopPackage (Join-Path $desktopRoot 'downloads/ChatGPT-x64.msix')
       - name: Verify the real Debian package and systemd lifecycle
         id: debian
         if: env.FULL == 'true' && runner.os == 'Linux'
