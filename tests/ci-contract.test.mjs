@@ -206,14 +206,19 @@ test('shared native gate records bounded request state without payloads on timeo
  for(const field of ['text','payload','input','content','prompt']) assert.ok(!evidence.includes(field),`timeout evidence must exclude ${field}`);
  assert.match(probe,/except TimeoutError:\s*report\['heldRequestTimeout'\] = await held_request_evidence\(engine, peer, thread\)/u,'capture the safe snapshot only when the held provider request times out');
 });
-test('shared fixture ingest returns after durable receive and leaves provider polling explicit', async()=>{
+test('shared fixture settles ordinary intake but not the synthetic lost queue ACK', async()=>{
  const driver=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');
  const start=driver.indexOf("if (command.action === 'ingest') {");
  const end=driver.indexOf("} else if (command.action === 'wait')",start);
  assert.ok(start>=0 && end>start,'shared driver must define an ingest action before provider polling');
  const ingest=driver.slice(start,end);
  assert.match(ingest,/await engine!\.receive\(/u,'persist the inbound fixture event before replying');
- assert.doesNotMatch(ingest,/engine!\.settled\(/u,'do not hold the ingest ACK on background native reconciliation');
+ assert.match(ingest,/if \(command\.loseAck !== true\) await engine!\.settled\(\);/u,'keep ordinary fixture processing deterministic but let lost-ACK reconciliation stay asynchronous');
+ const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ const held=probe.indexOf("await engine.command('ingest', platform='telegram', eventId='held-telegram'");
+ const next=probe.indexOf("running = await engine.command('wait', status='running')",held);
+ assert.ok(held>=0 && next>held,'lost-ACK probe must ingest before waiting for the native request');
+ assert.match(probe.slice(held,next),/loseAck=True/u,'only the held native request bypasses settled reconciliation');
 });
 test('Windows canary forwards only bounded timeout evidence from the failed Desktop probe', async()=>{
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');

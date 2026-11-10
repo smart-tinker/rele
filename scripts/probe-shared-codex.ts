@@ -175,6 +175,7 @@ if (values['expect-error']) {
         if (slack) history.push(slack);
         await engine!.receive({ eventId: command.eventId!, endpoint: endpoints[platform], sender: endpoints[platform].people[0],
           messageId, text: command.text!, ...(slack ? { slack } : {}) });
+        if (command.loseAck !== true) await engine!.settled();
       } else if (command.action === 'wait') {
         const until = Date.now() + 40_000;
         const pending = () => command.turnId ? !observedTurns.some(event =>
