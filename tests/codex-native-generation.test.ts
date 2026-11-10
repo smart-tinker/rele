@@ -56,7 +56,19 @@ it.skipIf(process.platform !== 'win32')('proves an owned Windows stdio process w
   const child = spawn(executable, ['-e', 'setInterval(() => {}, 1000)'], { stdio:'ignore', windowsHide:true });
   cleanup.push(async () => { if (child.exitCode === null && child.signalCode === null) { child.kill(); await once(child, 'close'); } });
   await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
-  const generation = await codexNativeGeneration({ kind:'stdio', pid:child.pid!, codexHome:home, executable:shortExecutable }, child.pid!, home, { platform:'win32' });
+  let proofStage: string | undefined;
+  const run = async (command:string, args:string[]) => {
+    try {
+      const result = await promisify(execFile)(command, args, { timeout:30_000, maxBuffer:128*1024, windowsHide:true });
+      return { stdout:result.stdout, code:0 };
+    } catch (error) {
+      const stderr = String((error as { stderr?:string }).stderr ?? '');
+      proofStage = /rele-native-proof:([a-z-]+)/u.exec(stderr)?.[1] ?? 'powershell-invocation';
+      return { stdout:'', code:1 };
+    }
+  };
+  const generation = await codexNativeGeneration({ kind:'stdio', pid:child.pid!, codexHome:home, executable:shortExecutable }, child.pid!, home, { platform:'win32', run });
+  if (!generation) throw new Error(`Windows native proof failed at ${proofStage ?? 'unknown stage'}`);
   expect(generation).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
 }, 60000);
 
