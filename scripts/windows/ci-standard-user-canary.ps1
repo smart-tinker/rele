@@ -441,6 +441,9 @@ try {
                 if ($null -ne $timeoutReport.heldRequestTimeout) {
                     $result | Add-Member -Force -NotePropertyName heldRequestTimeout -NotePropertyValue $timeoutReport.heldRequestTimeout
                 }
+                if ($null -ne $timeoutReport.cancellationRequestTimeout) {
+                    $result | Add-Member -Force -NotePropertyName cancellationRequestTimeout -NotePropertyValue $timeoutReport.cancellationRequestTimeout
+                }
             } catch {
                 $result | Add-Member -Force -NotePropertyName timeoutEvidenceReadHResult -NotePropertyValue ('0x{0:X8}' -f $_.Exception.HResult)
             }
