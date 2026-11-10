@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { realpathSync, statSync } from 'node:fs';
 import { realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -250,7 +251,14 @@ const execute = promisify(execFile);
 const SHA = /^[a-f0-9]{64}$/u;
 const WINDOWS_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$/u;
 function windowsPath(value: unknown): value is string { return typeof value === 'string' && /^[A-Za-z]:\\/u.test(value) && path.win32.isAbsolute(value); }
-function sameWindowsPath(left: string, right: string): boolean { return path.win32.normalize(left).toLowerCase() === path.win32.normalize(right).toLowerCase(); }
+function sameWindowsPath(left: string, right: string): boolean {
+  if (path.win32.normalize(left).toLowerCase() === path.win32.normalize(right).toLowerCase()) return true;
+  try {
+    const a = statSync(left, { bigint:true }), b = statSync(right, { bigint:true });
+    if (a.dev !== 0n && b.dev !== 0n && a.ino !== 0n && b.ino !== 0n) return a.dev === b.dev && a.ino === b.ino;
+    return path.win32.normalize(realpathSync.native(left)).toLowerCase() === path.win32.normalize(realpathSync.native(right)).toLowerCase();
+  } catch { return false; }
+}
 async function windowsGeneration(peer: Exclude<CodexNativePeer, { kind: 'proxy' }>, serverId: number, home: string, options: CodexNativeGenerationOptions): Promise<string | undefined> {
   if (!windowsPath(home)) return;
   const run = options.run ?? (async (command: string, args: string[]) => ({ ...(await execute(command, args, { timeout: 15_000, maxBuffer: 128 * 1024, windowsHide: true })), code: 0 }));

@@ -3,7 +3,7 @@ import { spawn, execFile } from 'node:child_process';
 import net from 'node:net';
 import { promisify } from 'node:util';
 import { once } from 'node:events';
-import { copyFile, lstat, lutimes, mkdir, mkdtemp, readFile, rename, rm, stat, unlink, utimes, writeFile } from 'node:fs/promises';
+import { copyFile, lstat, lutimes, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, unlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -11,6 +11,25 @@ import { CodexClient } from '../src/server/codex.js';
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
+
+it('matches filesystem aliases for an owned Windows stdio profile', async () => {
+  const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
+  const name = `rele-native-generation-${process.pid}-${Date.now()}`;
+  const root = process.platform === 'win32' ? await mkdtemp(path.join(tmpdir(), name)) : `C:\\Users\\Owner\\${name}`;
+  if (process.platform === 'win32') cleanup.push(() => rm(root, { recursive:true, force:true }));
+  const home = path.win32.join(root, 'home'), aliasHome = path.win32.join(root, 'home-alias');
+  await mkdir(home, { recursive:true });
+  await symlink(home, aliasHome, process.platform === 'win32' ? 'junction' : 'dir');
+  cleanup.push(async () => { await rm(aliasHome, { recursive:true, force:true }); await rm(home, { recursive:true, force:true }); });
+
+  const executable = process.platform === 'win32' ? process.execPath : 'C:\\native\\codex.exe';
+  const proof = { pid:process.pid, birth:'2026-11-03T10:00:00.1234567Z', boot:'2026-11-01T01:02:03.0000000Z', executable,
+    sha256:'a'.repeat(64), owner:'S-1-5-21-1001', gatewayOwner:'S-1-5-21-1001', codexHome:aliasHome,
+    peerVerified:true, parentPid:process.pid, gatewayId:process.pid };
+  const peer = { kind:'stdio' as const, pid:process.pid, executable, codexHome:aliasHome };
+  const run = async () => ({ stdout:JSON.stringify(proof), code:0 });
+  expect(await codexNativeGeneration(peer, process.pid, home, { platform:'win32', run })).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
+});
 
 async function proxyFixture(churn = false, coldExecutable = false, symlinkEndpoint = false, pidRecord = true) {
   const home = await mkdtemp(path.join(tmpdir(), 'rele-generation-'));
@@ -247,7 +266,7 @@ it.skipIf(process.platform !== 'win32')('binds the real Windows TCP peer and ful
     try { return { ...(await execute(command,args,{ timeout:30000 })), code:0 }; }
     catch (error) {
       const failure = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string };
-      failureStage = failure.stderr?.match(/^rele-native-proof:([a-z-]+)$/mu)?.[1];
+      failureStage = `${failure.stderr ?? ''}\n${failure.stdout ?? ''}`.match(/rele-native-proof:([a-z-]+)/u)?.[1];
       return { stdout:failure.stdout ?? '', code:typeof failure.code === 'number' ? failure.code : 1 };
     }
   };

@@ -522,7 +522,11 @@ export class CodexClient extends EventEmitter {
     const current = await this.backgroundTerminals(threadId);
     const matching = current.terminals.filter(entry => entry.itemId === target.itemId);
     if (target.serverGeneration !== undefined && (!/^[a-f0-9]{64}$/u.test(target.serverGeneration) || current.serverGeneration !== target.serverGeneration)
-      || current.serverId !== target.serverId || matching.length !== 1 || matching[0].processId !== target.processId) {
+      || current.serverId !== target.serverId) {
+      throw new CodexTransportError('Фоновая команда или сервер изменились. Адресное завершение не отправлено.', 'terminal-identity-changed');
+    }
+    if (matching.length === 0) return;
+    if (matching.length !== 1 || matching[0].processId !== target.processId) {
       throw new CodexTransportError('Фоновая команда или сервер изменились. Адресное завершение не отправлено.', 'terminal-identity-changed');
     }
     // Native has no expected-item CAS: revalidate immediately, never terminate a stored PID blindly.

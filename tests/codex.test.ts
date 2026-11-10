@@ -981,6 +981,22 @@ describe('Codex shared-runtime adapter', () => {
     expect(f.calls.filter(call => call.method === 'thread/backgroundTerminals/terminate')).toHaveLength(1);
   });
 
+  it('does not terminate a process when the exact background terminal already disappeared', async () => {
+    const generation = 'a'.repeat(64);
+    const f = await fixture({
+      'server/diagnostics': () => ({ process: { id: 42 }, gauges: [] }),
+      'thread/backgroundTerminals/terminate': () => ({ terminated: true }),
+    });
+    await f.client.connect();
+    const terminateCalls = f.calls.filter(call => call.method === 'thread/backgroundTerminals/terminate').length;
+    vi.spyOn(f.client, 'backgroundTerminals')
+      .mockResolvedValueOnce({ serverId: 42, serverGeneration: generation, terminals: [{ itemId: 'own-command', processId: '1234' }] })
+      .mockResolvedValueOnce({ serverId: 42, serverGeneration: generation, terminals: [] });
+    const snapshot = await f.client.backgroundTerminals(threadId);
+    await expect(f.client.terminateBackgroundTerminal(threadId, { ...snapshot.terminals[0], serverId:snapshot.serverId, serverGeneration:generation })).resolves.toBeUndefined();
+    expect(f.calls.filter(call => call.method === 'thread/backgroundTerminals/terminate')).toHaveLength(terminateCalls);
+  });
+
   it('forwards approval requests and rejects responses after another client resolves them', async () => {
     const f = await fixture();
     await f.client.connect();
