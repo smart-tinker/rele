@@ -233,6 +233,14 @@ test('shared fixture settles ordinary intake but not the synthetic lost queue AC
  assert.ok(held>=0 && next>held,'lost-ACK probe must ingest before waiting for the native request');
  assert.match(probe.slice(held,next),/loseAck=True/u,'only the held native request bypasses settled reconciliation');
 });
+test('Windows shared shell startup wait includes both bounded native identity proofs', async()=>{
+ const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ assert.match(probe,/ENGINE_SHARED_SHELL_START_TIMEOUT_SECONDS\s*=\s*65/u);
+ const cancel=probe.indexOf("await engine.command('ingest', platform='telegram', eventId='cancel'");
+ const afterCancel=probe.indexOf("raise AssertionError('Shell neither started nor requested approval')",cancel);
+ assert.ok(cancel>=0 && afterCancel>cancel,'shell startup wait must remain bounded');
+ assert.match(probe.slice(cancel,afterCancel),/deadline\s*=\s*asyncio\.get_running_loop\(\)\.time\(\)\s*\+\s*ENGINE_SHARED_SHELL_START_TIMEOUT_SECONDS/u);
+});
 test('Windows canary forwards only bounded timeout evidence from the failed Desktop probe', async()=>{
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
  const start=canary.indexOf("$timeoutReportPath = Join-Path $FixtureRoot 'reports\\shared-results-actual-desktop.json'");

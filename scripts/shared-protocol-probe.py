@@ -32,6 +32,8 @@ DRIVER = REPO / 'scripts/probe-shared-codex.ts'
 SHIM = REPO / 'dist/server/codex-cli.js'
 ENGINE_READ_TIMEOUT_SECONDS = 55
 ENGINE_CANCEL_READ_TIMEOUT_SECONDS = 720
+# backgroundTerminals performs two Windows native identity proofs, each bounded at 30s.
+ENGINE_SHARED_SHELL_START_TIMEOUT_SECONDS = 65
 
 
 def arguments():
@@ -931,7 +933,7 @@ enabled=false
                 ('hold', hold_cancel)])
             before = len(records)
             await engine.command('ingest', platform='telegram', eventId='cancel', text='shared-cancel-request')
-            deadline = asyncio.get_running_loop().time() + 25
+            deadline = asyncio.get_running_loop().time() + ENGINE_SHARED_SHELL_START_TIMEOUT_SECONDS
             while True:
                 pending = await engine.command('snapshot')
                 shell_approvals = [item for item in pending['approvals'] if item['status'] == 'pending']
