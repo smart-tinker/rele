@@ -534,7 +534,9 @@ describe('controlled shared Codex update', () => {
     expect(command).toBe(path.join(f.root, 'Rele.exe'));
     expect(args.slice(0, 3)).toEqual(['codex-update', '--quiet', '--codex-executable']);
     expect(await sameFilesystemPath(args[3], f.installed)).toBe(true);
-    expect(args.slice(4)).toEqual(['--expected-sha256', digest, '--codex-home', f.home]);
+    expect(args.slice(4, 6)).toEqual(['--expected-sha256', digest]);
+    expect(args[6]).toBe('--codex-home');
+    expect(await sameFilesystemPath(args[7], f.home)).toBe(true);
     expect({ target: f.target, current: f.current }).toEqual(before);
     expect(await readFile(f.config, 'utf8')).toBe(settings);
     expect((await f.update.status()).phase).toBe('ready');

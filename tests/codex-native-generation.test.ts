@@ -1,5 +1,5 @@
 import { afterEach, expect, it } from 'vitest';
-import { spawn, execFile } from 'node:child_process';
+import { spawn, execFile, execFileSync } from 'node:child_process';
 import net from 'node:net';
 import { promisify } from 'node:util';
 import { once } from 'node:events';
@@ -30,6 +30,22 @@ it('matches filesystem aliases for an owned Windows stdio profile', async () => 
   const run = async () => ({ stdout:JSON.stringify(proof), code:0 });
   expect(await codexNativeGeneration(peer, process.pid, home, { platform:'win32', run })).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
 });
+
+it.skipIf(process.platform !== 'win32')('proves an owned Windows stdio process when its executable is supplied by an 8.3 alias', async () => {
+  const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
+  const root = await mkdtemp(path.join(tmpdir(), 'rele-native-short-path-'));
+  cleanup.push(() => rm(root, { recursive:true, force:true }));
+  const home = path.join(root, 'home'), executable = path.join(root, 'node.exe');
+  await mkdir(home);
+  await copyFile(process.execPath, executable);
+  const shortExecutable = execFileSync(process.env.ComSpec || 'cmd.exe', ['/d', '/c', `for %I in ("${executable}") do @echo %~sI`], { encoding:'utf8' }).trim();
+  expect(shortExecutable.toLowerCase()).not.toBe(executable.toLowerCase());
+  const child = spawn(executable, ['-e', 'setInterval(() => {}, 1000)'], { stdio:'ignore', windowsHide:true });
+  cleanup.push(async () => { if (child.exitCode === null && child.signalCode === null) { child.kill(); await once(child, 'close'); } });
+  await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+  const generation = await codexNativeGeneration({ kind:'stdio', pid:child.pid!, codexHome:home, executable:shortExecutable }, child.pid!, home, { platform:'win32' });
+  expect(generation).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
+}, 60000);
 
 async function proxyFixture(churn = false, coldExecutable = false, symlinkEndpoint = false, pidRecord = true) {
   const home = await mkdtemp(path.join(tmpdir(), 'rele-generation-'));
