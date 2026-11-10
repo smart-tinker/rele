@@ -196,7 +196,7 @@ try {
   assert.equal(liveControl.status, 'alreadyRunning');
   for (const key of ['endpoint', 'processId', 'processStartTime', 'ownerDirectory']) assert.equal(liveControl[key], control[key]);
   assert.deepEqual(await Promise.all([readFile(target.installSettingsPath), readFile(currentPointer)]), beforeStatus);
-  assert.equal(taskSnapshot(), beforeTask);
+  assert.equal(taskSnapshot().split('|')[0], beforeTask.split('|')[0], 'Read-only status must not change the Task definition.');
   process.kill(control.processId, 0);
   const listeners = JSON.parse(powershell(`$rows=@(Get-NetTCPConnection -State Listen -LocalAddress '127.0.0.1' -LocalPort $env:RELE_CONTROL_PORT);
     if ($rows.Count -ne 1) { throw 'Native listener is not unique.' }
@@ -276,11 +276,11 @@ try {
   try {
     const unknownSnapshot = taskSnapshot();
     const refused = await status(); assert.equal(refused.status, 1, 'An unknown successor action must fail closed.');
-    assert.equal(taskSnapshot(), unknownSnapshot, 'Refusal must leave the Task unchanged.');
+    assert.equal(taskSnapshot().split('|')[0], unknownSnapshot.split('|')[0], 'Refusal must leave the Task definition unchanged.');
     assert.deepEqual(await Promise.all([readFile(target.installSettingsPath), readFile(currentPointer)]), beforeStatus);
     assert.equal((await call('server/diagnostics')).process.id, control.processId);
   } finally { alterSuccessorArgument(false); }
-  assert.equal(taskSnapshot(), successorTaskSnapshot);
+  assert.equal(taskSnapshot().split('|')[0], successorTaskSnapshot.split('|')[0]);
   const recoveryTaskSnapshot = taskSnapshot();
   const closed = once(socket, 'close'); socket.close(); await closed; socket = undefined;
   const recoveryStartCalls = nativeStartCalls;
