@@ -441,6 +441,9 @@ try {
                 if ($null -ne $timeoutReport.heldRequestTimeout) {
                     $result | Add-Member -Force -NotePropertyName heldRequestTimeout -NotePropertyValue $timeoutReport.heldRequestTimeout
                 }
+                if ($null -ne $timeoutReport.afterShellCancelWaitFailure) {
+                    $result | Add-Member -Force -NotePropertyName afterShellCancelWaitFailure -NotePropertyValue $timeoutReport.afterShellCancelWaitFailure
+                }
                 if ($null -ne $timeoutReport.cancellationRequestTimeout) {
                     $result | Add-Member -Force -NotePropertyName cancellationRequestTimeout -NotePropertyValue $timeoutReport.cancellationRequestTimeout
                 }

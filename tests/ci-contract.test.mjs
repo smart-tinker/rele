@@ -254,6 +254,8 @@ test('Windows canary forwards only bounded timeout evidence from the failed Desk
  const relay=canary.slice(start,end);
  assert.match(relay,/\.heldRequestTimeout/u,'forward the probe timeout snapshot');
  assert.match(relay,/NotePropertyName heldRequestTimeout/u,'attach only the bounded snapshot to the failure receipt');
+ assert.match(relay,/\.afterShellCancelWaitFailure/u,'forward bounded evidence from the Windows shell-cancel recovery failure');
+ assert.match(relay,/NotePropertyName afterShellCancelWaitFailure/u,'attach only the bounded shell-cancel evidence to the failure receipt');
  assert.doesNotMatch(relay,/NotePropertyName (?:report|sharedReport)/u,'do not forward the full probe report');
  assert.ok(canary.indexOf('$result | ConvertTo-Json -Depth 6',end)>end,'serialize the bounded evidence into the canary receipt');
 });
