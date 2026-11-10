@@ -22,7 +22,7 @@
     "package": "node scripts/package.mjs"
   },
   "dependencies": {
-    "@fastify/static": "10.1.6",
+    "@fastify/static": "10.1.10",
     "fastify": "5.12.7",
     "react": "19.3.1",
     "react-dom": "19.3.1",
