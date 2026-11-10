@@ -201,8 +201,10 @@ try {
         $nativeHome=[IO.Path]::GetFullPath($r.codexHome)
       }
       $script:stage='expected-image-hash'
-      $expectedHash=(Get-FileHash -LiteralPath $expectedExecutable -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
-      $executableContentMatchesExpected=$hash -ceq $expectedHash
+      try {
+        $expectedHash=(Get-FileHash -LiteralPath $expectedExecutable -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        $executableContentMatchesExpected=$hash -ceq $expectedHash
+      } catch [System.ArgumentException] { $executableContentMatchesExpected=$false }
       $script:stage='boot-query'
       $boot=(Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime().ToString('o')
       $result=[ordered]@{pid=$native.Id;birth=$birth;boot=$boot;executable=[IO.Path]::GetFullPath($exe).ToLowerInvariant();sha256=$hash;owner=$owner.Sid;codexHome=$nativeHome.ToLowerInvariant()}
@@ -215,8 +217,10 @@ try {
           $helperRecord=Get-CimInstance Win32_Process -Filter ("ProcessId="+$helper.Id) -ErrorAction Stop
           $helperOwner=Invoke-CimMethod -InputObject $helperRecord -MethodName GetOwnerSid -ErrorAction Stop
           $helperHash=(Get-FileHash -LiteralPath $helper.MainModule.FileName -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
-          $expectedHelperHash=(Get-FileHash -LiteralPath $p.helperExecutable -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
-          $helperExecutableContentMatchesExpected=$helperHash -ceq $expectedHelperHash
+          try {
+            $expectedHelperHash=(Get-FileHash -LiteralPath $p.helperExecutable -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+            $helperExecutableContentMatchesExpected=$helperHash -ceq $expectedHelperHash
+          } catch [System.ArgumentException] { $helperExecutableContentMatchesExpected=$false }
           Require ($helperRecord.ParentProcessId -eq $inputProof.gatewayId -and $helperOwner.ReturnValue -eq 0 -and $helperOwner.Sid -eq $gatewayOwner)
           $result.helperPid=$helper.Id; $result.helperParentPid=[int]$helperRecord.ParentProcessId; $result.helperExecutable=[IO.Path]::GetFullPath($helper.MainModule.FileName).ToLowerInvariant()
           $result.helperExecutableContentMatchesExpected=$helperExecutableContentMatchesExpected
