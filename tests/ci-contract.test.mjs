@@ -208,7 +208,8 @@ test('shared native gate records bounded request state without payloads on timeo
  assert.match(evidence,/engine_snapshot = await asyncio\.wait_for\(engine\.command\('snapshot'\), 5\)[\s\S]*?evidence\['driverOperations'\] = engine_snapshot\.get\('driverOperations', \[\]\)/u,'preserve driver operations from the Rele engine snapshot');
  assert.match(evidence,/native_snapshot = await asyncio\.wait_for\(peer\.call\('thread\/read'[\s\S]*?evidence\['nativeTurnStatus'\] = native_snapshot/u,'keep native thread state separate from the engine snapshot');
  const driver=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');
- for(const field of ['subscribe','backgroundTerminals','enqueue','driverOperations']) assert.ok(driver.includes(field),`shared driver must trace ${field}`);
+ for(const field of ['dispatch','initialMessage.ensure','slackSync.drain','subscribe','backgroundTerminals','enqueue','driverOperations']) assert.ok(driver.includes(field),`shared driver must trace ${field}`);
+ assert.doesNotMatch(driver,/codex\.diagnostics\s*=\s*observe\('diagnostics'/u,'snapshot polling must not evict useful driver operations from the bounded trace');
  assert.match(driver,/driverOperations:\s*driverOperations\.slice\(-\d+\)/u,'bound the operation trace in snapshots');
  assert.match(probe,/except \(TimeoutError, RuntimeError\):\s*report\['heldRequestTimeout'\] = await held_request_evidence\(engine, peer, thread\)/u,'capture the safe snapshot when the native wait or provider wait fails');
  const cancel=probe.indexOf("await engine.command('ingest', platform='telegram', eventId='cancel'");

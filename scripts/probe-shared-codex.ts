@@ -109,7 +109,7 @@ if (values['expect-error']) {
       }
     });
     await codex.connect();
-    codex.diagnostics = observe('diagnostics', codex.diagnostics.bind(codex));
+    // Snapshot polling would evict the dispatch stages from this bounded trace.
     codex.subscribe = observe('subscribe', codex.subscribe.bind(codex));
     codex.backgroundTerminals = observe('backgroundTerminals', codex.backgroundTerminals.bind(codex));
     const internals = codex as unknown as { pages: <T>(method: string, params: Record<string, unknown>) => Promise<T[]> };
@@ -149,6 +149,14 @@ if (values['expect-error']) {
     if (!previous) store.createConversation({ name: 'Original shared fixture', threadId, cwd: values.directory!,
       bindings: Object.values(endpoints).map(endpoint => ({ platform: endpoint.platform, endpointId: endpoint.id, allowedSenderIds: ['fixture-user'] })) });
     engine = new Engine(store, codex, { config: () => config, temporaryRoot: values.directory!, redact: value => String(value) });
+    const engineInternals = engine as unknown as {
+      dispatch: (conversationId: string) => Promise<void>;
+      initialMessages: { ensure: (conversationId: string) => Promise<boolean> };
+      slackSync: { drain: (conversationId: string, cutoff?: string) => Promise<boolean> };
+    };
+    engineInternals.dispatch = observe('dispatch', engineInternals.dispatch.bind(engine));
+    engineInternals.initialMessages.ensure = observe('initialMessage.ensure', engineInternals.initialMessages.ensure.bind(engineInternals.initialMessages));
+    engineInternals.slackSync.drain = observe('slackSync.drain', engineInternals.slackSync.drain.bind(engineInternals.slackSync));
     for (const platform of ['slack', 'telegram'] as const) engine.channels[platform] = {
       state: { configured: true, connected: true, name: platform, accountId: endpoints[platform].accountId },
       readThreadPage: async () => ({ messages: platform === 'slack' ? [...history] : [] }),
