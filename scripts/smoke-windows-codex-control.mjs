@@ -51,6 +51,12 @@ function powershell(code, extra = {}) {
   assert.equal(output.status, 0, output.stderr || output.stdout);
   return output.stdout.trim();
 }
+function scheduledTaskExists(name) {
+  return powershell(`$scheduler=New-Object -ComObject 'Schedule.Service'; $scheduler.Connect(); $folder=$scheduler.GetFolder('\\');
+    try { $null=$folder.GetTask($env:RELE_CONTROL_TASK); 'true' }
+    catch { $inner=$_.Exception.InnerException; $hresult=if ($inner) { $inner.HResult } else { $_.Exception.HResult }; if ($hresult -ne -2147024894) { throw }; 'false' }`,
+  { env: { ...env, RELE_CONTROL_TASK: name } }) === 'true';
+}
 const samePath = (first, second) => path.resolve(first).toLowerCase() === path.resolve(second).toLowerCase();
 async function exited(pid) {
   for (let count = 0; count < 100; count++) {
@@ -115,8 +121,7 @@ let initialOwner;
 const knownHelperHashes = new Set();
 try {
   sid = powershell('[Security.Principal.WindowsIdentity]::GetCurrent().User.Value');
-  assert.equal(powershell("(@(Get-ScheduledTask -TaskName $env:RELE_CONTROL_TASK -ErrorAction SilentlyContinue)).Count",
-    { env: { ...env, RELE_CONTROL_TASK: `${task}-Codex` } }), '0', 'The random fixture Task must not already exist.');
+  assert.equal(scheduledTaskExists(`${task}-Codex`), false, 'The random fixture Task must not already exist.');
   await mkdir(path.join(application, 'dist/native'), { recursive: true });
   await mkdir(data);
   await assert.rejects(access(home), { code: 'ENOENT' });
@@ -171,6 +176,7 @@ try {
   assert.ok(samePath(control.codexHome, await realpath(home)), 'UTF-8 original profile must round-trip.');
   assert.ok(samePath(control.executable, executable)); assert.equal(control.executableSha256, nativeHash);
   assert.equal(control.ownerSid, sid); assert.equal(control.taskName, `${task}-Codex`);
+  assert.equal(scheduledTaskExists(`${task}-Codex`), true, 'The native owner Task must be registered.');
   assert.ok(Number.isSafeInteger(control.processId) && control.processId > 0);
   assert.ok(Number.isFinite(Date.parse(control.processStartTime)));
   await readOwnedState(sid, helperHash);
@@ -449,8 +455,7 @@ try {
   phase = 'status-after-stop';
   const stopped = await status(); assert.equal(stopped.status, 0, stopped.errorReceipt || stopped.stderr);
   assert.deepEqual(JSON.parse(stopped.stdout), { status: 'notRunning' });
-  assert.equal(powershell("(@(Get-ScheduledTask -TaskName $env:RELE_CONTROL_TASK -ErrorAction SilentlyContinue)).Count",
-    { env: { ...env, RELE_CONTROL_TASK: `${task}-Codex` } }), '0');
+  assert.equal(scheduledTaskExists(`${task}-Codex`), false);
   assert.deepEqual(await Promise.all([readFile(target.installSettingsPath), readFile(currentPointer)]), promotedState);
   const address = new URL(control.endpoint);
   foreign = createServer(connection => connection.end());
