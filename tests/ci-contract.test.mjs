@@ -241,6 +241,19 @@ test('shared Windows cancellation probe waits for bounded native generation proo
   'apply the longer read deadline only to the cancellation diagnostic path');
  assert.match(driver,/return await self\.read\(timeout\)/u,'use the action-specific response deadline');
 });
+test('shared Windows cancellation fixture outlives the bounded native proof window without sleeping it out', async()=>{
+ const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ assert.ok(/shell_delay\s*=\s*ENGINE_CANCEL_READ_TIMEOUT_SECONDS\s*\+\s*120 if os\.name == 'nt' else 60/u.test(probe),
+  'keep the delayed marker beyond the 12-minute native cancellation read window');
+ const cancel=probe.indexOf("cancelled = await engine.command('cancel'");
+ const stopped=probe.indexOf("assert not cancelled['probeProcessAlive']",cancel);
+ const deadline=probe.indexOf('assert asyncio.get_running_loop().time() < shell_deadline',stopped);
+ const marker=probe.indexOf('assert not late_file.exists()',deadline);
+ assert.ok(cancel>=0 && stopped>cancel && deadline>stopped && marker>deadline,
+  'confirm process stop and marker absence before the bounded fixture timer can fire');
+ assert.doesNotMatch(probe,/await asyncio\.sleep\(max\(0,\s*shell_deadline/u,
+  'do not wait for the marker timer after proving the exact process is stopped');
+});
 test('shared Windows lost-ACK probe allows one bounded native proof window before timing out', async()=>{
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
  assert.match(probe,/await asyncio\.wait_for\(wait_records\(before \+ 1\), ENGINE_READ_TIMEOUT_SECONDS\)/u,
