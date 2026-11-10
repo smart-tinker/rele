@@ -241,3 +241,29 @@ test('shared Windows cancellation probe waits for bounded native generation proo
   'apply the longer read deadline only to the cancellation diagnostic path');
  assert.match(driver,/return await self\.read\(timeout\)/u,'use the action-specific response deadline');
 });
+test('Windows owner probe avoids an immediate duplicate Task Scheduler COM query', async()=>{
+ const probe=await readFile(new URL('../scripts/smoke-windows-codex-control.mjs',import.meta.url),'utf8');
+ const native=await readFile(new URL('../scripts/windows/Rele.cs',import.meta.url),'utf8');
+ const start=probe.indexOf("phase = 'start-initial';");
+ const snapshot=probe.indexOf('const taskSnapshot = () => powershell(',start);
+ assert.ok(start>=0 && snapshot>start,'owner probe must start Codex before capturing the Task Scheduler snapshot');
+ const nativeStart=native.indexOf('private static Dictionary<string, object> StartCodexWebSocket(');
+ const nativeEnd=native.indexOf('\n    private static void RemoveCodexWebSocketStartup()',nativeStart);
+ assert.ok(nativeStart>=0 && nativeEnd>nativeStart,'native start command must have a bounded implementation');
+ const nativeBody=native.slice(nativeStart,nativeEnd);
+ const registration=nativeBody.indexOf('RegisterCodexWebSocketTask(owner, directory);');
+ const verification=nativeBody.indexOf('OwnedCodexWebSocketTask(TaskFolder(), owner, directory);',registration);
+ const launch=nativeBody.indexOf('task.Run(null);',verification);
+ const success=nativeBody.indexOf('return receipt;',launch);
+ assert.ok(registration>=0 && verification>registration && launch>verification && success>launch,
+  'the native command must register and verify the Task before returning a successful start receipt');
+ const initial=probe.slice(start,snapshot);
+ assert.match(initial,/const first = await start\(\);[\s\S]*?assert\.equal\(control\.taskName, `\$\{task\}-Codex`\)/u,
+  'validate the task identity returned by the native command');
+ assert.doesNotMatch(initial,/scheduledTaskExists|powershell\(/u,
+  'the native start path already registers and verifies the Task before the later detailed snapshot');
+ assert.match(probe.slice(snapshot),/\$task=\$scheduler\.GetFolder\('\\\\'\)\.GetTask\(\$env:RELE_CONTROL_TASK\)/u,
+  'retain the later detailed Task Scheduler inspection');
+ assert.ok(probe.includes('assert.equal(scheduledTaskExists(`${task}-Codex`), false);'),
+  'retain the independent check that stopping Codex removes its Task');
+});

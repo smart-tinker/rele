@@ -176,7 +176,6 @@ try {
   assert.ok(samePath(control.codexHome, await realpath(home)), 'UTF-8 original profile must round-trip.');
   assert.ok(samePath(control.executable, executable)); assert.equal(control.executableSha256, nativeHash);
   assert.equal(control.ownerSid, sid); assert.equal(control.taskName, `${task}-Codex`);
-  assert.equal(scheduledTaskExists(`${task}-Codex`), true, 'The native owner Task must be registered.');
   assert.ok(Number.isSafeInteger(control.processId) && control.processId > 0);
   assert.ok(Number.isFinite(Date.parse(control.processStartTime)));
   await readOwnedState(sid, helperHash);
