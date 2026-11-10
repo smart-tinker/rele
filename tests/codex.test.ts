@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { execFile } from 'node:child_process';
 import { once } from 'node:events';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -11,9 +12,13 @@ import { SharedCodexError } from '../src/server/codex-shared.js';
 import { Engine } from '../src/server/engine.js';
 import { Store } from '../src/server/store.js';
 import { defaultConfig } from '../src/server/config.js';
+import { codexNativeGeneration, type CodexNativePeer } from '../src/server/codex-native-generation.js';
 import { initialMessageKey } from '../src/server/initial-message.js';
 import { asyncQuestions, encodeAsyncAnswers } from '../src/server/async-questions.js';
 import type { Endpoint } from '../src/shared/types.js';
+import { promisify } from 'node:util';
+
+const execute = promisify(execFile);
 
 interface Rpc { id?: string | number; method?: string; params: Record<string, unknown>; result?: unknown; error?: { code: number; message: string } }
 type Handler = (message: Rpc, socket: WebSocket) => unknown | Promise<unknown>;
@@ -1388,7 +1393,23 @@ describe('Codex managed runtime', () => {
     await f.client.connect();
     const first = await f.client.backgroundTerminals(threadId);
     expect(first.serverId).toBe((await f.records())[0].pid);
-    expect(first).toHaveProperty('serverGeneration', expect.stringMatching(/^[a-f0-9]{64}$/u));
+    let proofFailure = 'preflight';
+    if (process.platform === 'win32' && !first.serverGeneration) {
+      const peer = Reflect.get(f.client, 'nativePeer') as CodexNativePeer | undefined;
+      const run = async (command: string, args: string[]) => {
+        try {
+          const result = await execute(command, args, { timeout:30_000, maxBuffer:128*1024, windowsHide:true });
+          proofFailure = 'proof-validation';
+          return { ...result, code:0 };
+        } catch (error) {
+          const stderr = String((error as { stderr?:string }).stderr ?? '');
+          proofFailure = stderr.match(/rele-native-proof:([a-z-]+)/u)?.[1] ?? 'powershell-invocation';
+          return { stdout:'', code:1 };
+        }
+      };
+      await codexNativeGeneration(peer, first.serverId, home, { platform:'win32', run });
+    }
+    expect(first, `Windows native proof returned no generation (${proofFailure})`).toHaveProperty('serverGeneration', expect.stringMatching(/^[a-f0-9]{64}$/u));
     expect(await f.client.backgroundTerminals(threadId)).toEqual(first);
     await expect(f.client.terminateBackgroundTerminal(threadId, { serverId:first.serverId, serverGeneration:'0'.repeat(64), itemId:'fixture-command', processId:'1234' })).rejects.toMatchObject({ code:'terminal-identity-changed' });
     expect((await f.calls()).filter(call => call.method === 'thread/backgroundTerminals/terminate')).toHaveLength(0);
