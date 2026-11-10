@@ -206,6 +206,15 @@ test('shared native gate records bounded request state without payloads on timeo
  for(const field of ['text','payload','input','content','prompt']) assert.ok(!evidence.includes(field),`timeout evidence must exclude ${field}`);
  assert.match(probe,/except TimeoutError:\s*report\['heldRequestTimeout'\] = await held_request_evidence\(engine, peer, thread\)/u,'capture the safe snapshot only when the held provider request times out');
 });
+test('shared fixture ingest returns after durable receive and leaves provider polling explicit', async()=>{
+ const driver=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');
+ const start=driver.indexOf("if (command.action === 'ingest') {");
+ const end=driver.indexOf("} else if (command.action === 'wait')",start);
+ assert.ok(start>=0 && end>start,'shared driver must define an ingest action before provider polling');
+ const ingest=driver.slice(start,end);
+ assert.match(ingest,/await engine!\.receive\(/u,'persist the inbound fixture event before replying');
+ assert.doesNotMatch(ingest,/engine!\.settled\(/u,'do not hold the ingest ACK on background native reconciliation');
+});
 test('Windows canary forwards only bounded timeout evidence from the failed Desktop probe', async()=>{
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
  const start=canary.indexOf("$timeoutReportPath = Join-Path $FixtureRoot 'reports\\shared-results-actual-desktop.json'");
