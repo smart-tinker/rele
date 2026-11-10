@@ -94,6 +94,26 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node scripts/smoke-windows-desktop-tools-pipe.mjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Provision the signed Desktop package for disposable users
+        id: desktop_provision
+        if: env.FULL == 'true' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $desktopRoot = Join-Path $env:RUNNER_TEMP 'desktop-native-gate'
+          $inventory = Get-Content -LiteralPath (Join-Path $desktopRoot 'desktop-package-inventory.json') -Raw | ConvertFrom-Json
+          $package = Join-Path $desktopRoot 'downloads/ChatGPT-x64.msix'
+          $runnerRoot = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
+          if (-not [IO.Path]::GetFullPath($package).StartsWith($runnerRoot, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $package -PathType Leaf)) { throw 'The Desktop package must be a local file under this disposable RUNNER_TEMP.' }
+          $signature = Get-AuthenticodeSignature -LiteralPath $package
+          if ($inventory.result -ne 'passed' -or $inventory.nativeGatePrepared -ne $true -or $inventory.package.signature.status -ne 'Valid' -or $signature.Status -ne 'Valid' -or $inventory.package.identity.name -notin @('OpenAI.Codex', 'OpenAI.ChatGPT') -or $inventory.package.identity.architecture -ne 'x64' -or $inventory.package.identity.version -notmatch '^\d+(?:\.\d+){3}$' -or $inventory.package.sha256 -notmatch '^[a-f0-9]{64}$') { throw 'The Desktop package inventory is not a valid signed x64 package.' }
+          $hash = (Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $inventory.package.sha256) { throw 'The Desktop MSIX bytes do not match the signed package inventory.' }
+          $existing = @(Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq $inventory.package.identity.name })
+          if ($existing.Count -ne 0) { throw 'The disposable runner already has a provisioned Desktop package.' }
+          Add-AppxProvisionedPackage -Online -PackagePath $package -SkipLicense | Out-Null
+          $provisioned = @(Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq $inventory.package.identity.name -and $_.Version.ToString() -eq $inventory.package.identity.version })
+          if ($provisioned.Count -ne 1) { throw 'The signed Desktop package was not provisioned for new users.' }
+          Write-Output ('RELE_DESKTOP_APPX_PROVISIONED=' + $inventory.package.identity.name + ':' + $inventory.package.identity.version)
       - name: Verify Windows installer and native shared gates as a standard user
         id: standard_user
         if: env.FULL == 'true' && runner.os == 'Windows'
@@ -156,7 +176,7 @@ jobs:
         if: always()
         env:
           STEPS: ${{ toJSON(steps) }}
-          REQUIRED: install types ci_contract unit build browser_install browser ui ${{ env.FULL == 'true' && 'fixture package protocol managed voice_fixture' || '' }} ${{ env.FULL == 'true' && runner.os == 'Linux' && 'debian shared voice_linux' || '' }} ${{ env.FULL == 'true' && runner.os == 'Windows' && 'cleanup desktop standard_user voice_windows' || '' }}
+          REQUIRED: install types ci_contract unit build browser_install browser ui ${{ env.FULL == 'true' && 'fixture package protocol managed voice_fixture' || '' }} ${{ env.FULL == 'true' && runner.os == 'Linux' && 'debian shared voice_linux' || '' }} ${{ env.FULL == 'true' && runner.os == 'Windows' && 'cleanup desktop desktop_provision standard_user voice_windows' || '' }}
         run: node scripts/ci.mjs steps
       - name: Check account storage approval before uploading
         if: github.event_name == 'workflow_dispatch' && inputs.release

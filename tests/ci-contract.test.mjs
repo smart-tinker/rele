@@ -142,13 +142,21 @@ test('signed Desktop fixture defines complete inert MCP transports for its enabl
  assert.equal((fixture.match(/enabled=false/gu)??[]).length,2);
  assert.ok(fixture.includes('disabled-mcp-fixture'));
 });
-test('actual Desktop CI registers the verified MSIX for the standard-user discovery gate', async()=>{
+test('actual Desktop CI provisions the verified MSIX before standard-user discovery', async()=>{
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
  const workflow=await readFile(new URL('../.github/workflows/ci.yml',import.meta.url),'utf8');
- const register=canary.indexOf('Add-AppxPackage');
+ const provision=workflow.indexOf('name: Provision the signed Desktop package for disposable users');
+ const standardUser=workflow.indexOf('name: Verify Windows installer and native shared gates as a standard user');
  const discover=canary.indexOf('shared-actual-desktop');
- assert.ok(register>=0 && register<discover,'register the package in the standard-user canary before auto-discovery');
- assert.match(canary,/Get-AppxPackage/u,'verify registration in the same user profile');
+ assert.ok(provision>=0 && provision<standardUser,'provision the signed package before the standard-user profile is created');
+ const provisioningStep=workflow.slice(provision,standardUser);
+ assert.match(provisioningStep,/Get-AuthenticodeSignature/u,'verify the package signature before provisioning');
+ assert.match(provisioningStep,/Get-FileHash .*SHA256/u,'bind provisioning to the inspected package bytes');
+ assert.match(provisioningStep,/Add-AppxProvisionedPackage -Online -PackagePath \$package -SkipLicense/u,'provision the package for new users on the disposable runner');
+ assert.match(provisioningStep,/Get-AppxProvisionedPackage -Online/u,'verify the package is provisioned before creating the test user');
+ assert.match(workflow,/cleanup desktop desktop_provision standard_user voice_windows/u,'require successful provisioning as part of the Windows CI gate');
+ assert.doesNotMatch(canary,/Add-AppxPackage/u,'the ordinary-user canary must not install a packaged service');
+ assert.match(canary,/Get-AppxPackage -Name \$name/u,'verify registration in the same user profile');
  assert.ok(canary.includes(').Hash.ToLowerInvariant() -ne $inventory.package.sha256'),'bind installation to the verified MSIX bytes');
  assert.match(workflow,/ci-standard-user-canary\.ps1 -RunGates .*?-DesktopPackage/u,'pass the verified MSIX to the canary');
 });

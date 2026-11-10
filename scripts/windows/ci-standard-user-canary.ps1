@@ -118,15 +118,12 @@ if ($Mode -eq 'Child') {
             if ($marker.desktopBundle) {
                 $evidence.stage = 'desktop-appx-registration'
                 $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-                $env:RELE_CI_DESKTOP_MSIX = $marker.desktopPackage
                 $env:RELE_CI_DESKTOP_APPX_NAME = [string]$marker.desktopIdentityName
                 $env:RELE_CI_DESKTOP_APPX_VERSION = [string]$marker.desktopIdentityVersion
                 $registrationScript = @'
 $ErrorActionPreference = 'Stop'
 $name = $env:RELE_CI_DESKTOP_APPX_NAME
 if ($name -notin @('OpenAI.Codex', 'OpenAI.ChatGPT')) { throw 'Unexpected Desktop package identity.' }
-if (@(Get-AppxPackage -Name $name).Count -ne 0) { throw 'The disposable standard-user profile already has the Desktop package.' }
-Add-AppxPackage -Path $env:RELE_CI_DESKTOP_MSIX
 $packages = @(Get-AppxPackage -Name $name)
 if ($packages.Count -ne 1 -or $packages[0].Version.ToString() -ne $env:RELE_CI_DESKTOP_APPX_VERSION -or -not $packages[0].InstallLocation) { throw 'The signed Desktop package was not registered for this user.' }
 [Console]::Out.WriteLine('RELE_DESKTOP_APPX_REGISTERED=' + $packages[0].Name + ':' + $packages[0].Version)
@@ -140,7 +137,7 @@ if ($packages.Count -ne 1 -or $packages[0].Version.ToString() -ne $env:RELE_CI_D
                     }
                     $evidence.gates += 'desktop-appx-registration'
                 } finally {
-                    Remove-Item Env:\RELE_CI_DESKTOP_MSIX, Env:\RELE_CI_DESKTOP_APPX_NAME, Env:\RELE_CI_DESKTOP_APPX_VERSION -ErrorAction SilentlyContinue
+                    Remove-Item Env:\RELE_CI_DESKTOP_APPX_NAME, Env:\RELE_CI_DESKTOP_APPX_VERSION -ErrorAction SilentlyContinue
                 }
                 $evidence.stage = 'shared-actual-desktop'
                 & $marker.python (Join-Path $sourceRoot 'scripts\shared-protocol-probe.py') --desktop-bundle $marker.desktopBundle --desktop-inventory $marker.desktopInventory --expected-version $marker.desktopVersion --windows-app-template $applicationTemplate --windows-runtime packaged --report (Join-Path $env:RELE_TEST_REPORT_DIR 'shared-results-actual-desktop.json')
