@@ -30,7 +30,7 @@ REPO = Path(__file__).resolve().parent.parent
 NODE = shutil.which('node')
 DRIVER = REPO / 'scripts/probe-shared-codex.ts'
 SHIM = REPO / 'dist/server/codex-cli.js'
-ENGINE_READ_TIMEOUT_SECONDS = 55
+ENGINE_READ_TIMEOUT_SECONDS = 70
 ENGINE_CANCEL_READ_TIMEOUT_SECONDS = 720
 # backgroundTerminals performs two Windows native identity proofs, each bounded at 30s.
 ENGINE_SHARED_SHELL_START_TIMEOUT_SECONDS = 65

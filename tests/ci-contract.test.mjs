@@ -241,6 +241,11 @@ test('Windows shared shell startup wait includes both bounded native identity pr
  assert.ok(cancel>=0 && afterCancel>cancel,'shell startup wait must remain bounded');
  assert.match(probe.slice(cancel,afterCancel),/deadline\s*=\s*asyncio\.get_running_loop\(\)\.time\(\)\s*\+\s*ENGINE_SHARED_SHELL_START_TIMEOUT_SECONDS/u);
 });
+test('Windows shared driver read deadline covers both native identity proofs', async()=>{
+ const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ const timeout=Number(probe.match(/ENGINE_READ_TIMEOUT_SECONDS\s*=\s*(\d+)/u)?.[1]);
+ assert.ok(timeout >= 65,'allow the two 30-second native identity proofs plus fixture overhead');
+});
 test('Windows canary forwards only bounded timeout evidence from the failed Desktop probe', async()=>{
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
  const start=canary.indexOf("$timeoutReportPath = Join-Path $FixtureRoot 'reports\\shared-results-actual-desktop.json'");
