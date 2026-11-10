@@ -206,3 +206,14 @@ test('shared native gate records bounded request state without payloads on timeo
  for(const field of ['text','payload','input','content','prompt']) assert.ok(!evidence.includes(field),`timeout evidence must exclude ${field}`);
  assert.match(probe,/except TimeoutError:\s*report\['heldRequestTimeout'\] = await held_request_evidence\(engine, peer, thread\)/u,'capture the safe snapshot only when the held provider request times out');
 });
+test('Windows canary forwards only bounded timeout evidence from the failed Desktop probe', async()=>{
+ const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ const start=canary.indexOf("$timeoutReportPath = Join-Path $sourceRoot 'shared-results-actual-desktop.json'");
+ const end=canary.indexOf("foreach ($log in @('stdout.log'",start);
+ assert.ok(start>=0 && end>start,'failed Windows canary must read the copied Desktop probe report');
+ const relay=canary.slice(start,end);
+ assert.match(relay,/\.heldRequestTimeout/u,'forward the probe timeout snapshot');
+ assert.match(relay,/NotePropertyName heldRequestTimeout/u,'attach only the bounded snapshot to the failure receipt');
+ assert.doesNotMatch(relay,/NotePropertyName (?:report|sharedReport)/u,'do not forward the full probe report');
+ assert.ok(canary.indexOf('$result | ConvertTo-Json -Depth 6',end)>end,'serialize the bounded evidence into the canary receipt');
+});

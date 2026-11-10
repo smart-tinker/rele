@@ -434,11 +434,25 @@ try {
                 $result | Add-Member -NotePropertyName event332Template -NotePropertyValue $template.Substring(0, [Math]::Min(1024, $template.Length))
             } catch { $result | Add-Member -NotePropertyName event332TemplateErrorHResult -NotePropertyValue ('0x{0:X8}' -f $_.Exception.HResult) }
         }
+        $timeoutReportPath = Join-Path $sourceRoot 'shared-results-actual-desktop.json'
+        if ($RunGates -and $Phase -eq 'Installer' -and $child.ExitCode -ne 0 -and (Test-Path -LiteralPath $timeoutReportPath -PathType Leaf)) {
+            try {
+                $timeoutReport = Get-Content -LiteralPath $timeoutReportPath -Raw | ConvertFrom-Json
+                if ($null -ne $timeoutReport.heldRequestTimeout) {
+                    $result | Add-Member -Force -NotePropertyName heldRequestTimeout -NotePropertyValue $timeoutReport.heldRequestTimeout
+                }
+            } catch {
+                $result | Add-Member -Force -NotePropertyName timeoutEvidenceReadHResult -NotePropertyValue ('0x{0:X8}' -f $_.Exception.HResult)
+            }
+        }
         $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $resultPath -Encoding UTF8
         Get-Content -LiteralPath $resultPath -Raw | Write-Output
         Copy-Item -LiteralPath $resultPath -Destination (Join-Path $sourceRoot 'windows-standard-user-results.json')
     } else { throw 'The standard-user installer phase did not produce a receipt.' }
-    if ($result.result -ne 'passed') { foreach ($log in @('stdout.log', 'stderr.log')) { Get-Content -LiteralPath (Join-Path $FixtureRoot $log) -Tail 30 | Write-Output }; throw 'The standard-user canary or native gate failed; see the bounded fixture reports.' }
+    if ($result.result -ne 'passed') {
+        foreach ($log in @('stdout.log', 'stderr.log')) { Get-Content -LiteralPath (Join-Path $FixtureRoot $log) -Tail 30 | Write-Output }
+        throw 'The standard-user canary or native gate failed; see the bounded fixture reports.'
+    }
 } catch {
     $publishedResult = Join-Path $sourceRoot 'windows-standard-user-results.json'
     if (-not (Test-Path -LiteralPath $publishedResult)) {
