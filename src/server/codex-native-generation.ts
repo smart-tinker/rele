@@ -168,7 +168,24 @@ try {
   $inputProof=ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__INPUT__')))
   $r=$inputProof.receipt; $p=$inputProof.peer; $stdio=$p.kind -eq 'stdio'
   function Require($ok) { if (-not $ok) { throw 'unproven' } }
+  Add-Type -TypeDefinition @'
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class ReleWindowsPath {
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  private static extern uint GetLongPathName(string shortPath, StringBuilder longPath, uint bufferLength);
+  public static string Expand(string path) {
+    var buffer = new StringBuilder(32768);
+    var length = GetLongPathName(path, buffer, (uint)buffer.Capacity);
+    if (length == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+    if (length >= buffer.Capacity) throw new System.IO.PathTooLongException();
+    return buffer.ToString();
+  }
+}
+'@ -ErrorAction Stop
   function FileSha256($path) {
+    $path=[ReleWindowsPath]::Expand($path)
     $algorithm=[Security.Cryptography.SHA256]::Create()
     try {
       $stream=[IO.File]::OpenRead($path)
