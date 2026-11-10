@@ -862,7 +862,8 @@ trust_level="trusted"
             # The command is bounded and writes only inside this disposable workspace.
             ready_file, late_file = workspace / 'cancel-ready.json', workspace / 'cancel-late.txt'
             command_file = workspace / 'cancel-child.cjs'
-            shell_delay = 90 if os.name == 'nt' else 12
+            # Keep the marker timer beyond hosted cancellation cleanup and the next-turn handoff.
+            shell_delay = 90 if os.name == 'nt' else 60
             # PowerShell 5 strips embedded JS quotes from native -e arguments.
             command_file.write_text(f'const f=require("node:fs");f.writeFileSync(process.argv[2],JSON.stringify({{pid:process.pid}}));setTimeout(()=>f.writeFileSync(process.argv[3],"not-stopped"),{shell_delay * 1000});', encoding='utf-8')
             command_args = [str(Path(NODE).resolve(strict=True)), str(command_file), str(ready_file), str(late_file)]
