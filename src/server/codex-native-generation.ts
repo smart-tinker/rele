@@ -168,21 +168,6 @@ try {
   $inputProof=ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__INPUT__')))
   $r=$inputProof.receipt; $p=$inputProof.peer; $stdio=$p.kind -eq 'stdio'
   function Require($ok) { if (-not $ok) { throw 'unproven' } }
-  Add-Type -TypeDefinition @'
-using System.Runtime.InteropServices;
-using System.Text;
-public static class RelePath {
-  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-  public static extern uint GetLongPathName(string shortPath, StringBuilder longPath, uint bufferLength);
-}
-'@
-  function CanonicalPath($value) {
-    $buffer=New-Object Text.StringBuilder 32768
-    $length=[RelePath]::GetLongPathName($value,$buffer,[uint32]$buffer.Capacity)
-    Require ($length -gt 0 -and $length -lt $buffer.Capacity)
-    return [IO.Path]::GetFullPath($buffer.ToString())
-  }
-  function SameFilePath($left,$right) { return (CanonicalPath $left) -ieq (CanonicalPath $right) }
   function Identity {
     $script:stage='process-query'
     $native=[Diagnostics.Process]::GetProcessById([int]$inputProof.serverId); $helper=$null
@@ -199,14 +184,14 @@ public static class RelePath {
       $script:stage='process-identity'
       if ($stdio) {
         $gatewayOwner=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-        Require ($owner.Sid -eq $gatewayOwner -and (SameFilePath $exe $p.executable))
+        Require ($owner.Sid -eq $gatewayOwner)
         $expectedParent=$inputProof.gatewayId
         if ($p.helperExecutable) { $expectedParent=$p.pid } else { Require ($native.Id -eq $p.pid) }
         Require ($record.ParentProcessId -eq $expectedParent)
         $nativeHome=[IO.Path]::GetFullPath($p.codexHome)
         Require ([IO.Directory]::Exists($nativeHome))
       } else {
-        Require ($owner.Sid -eq $r.ownerSid -and $birth -ceq $r.processStartTime -and $hash -ceq $r.executableSha256 -and (SameFilePath $exe $r.executable))
+        Require ($owner.Sid -eq $r.ownerSid -and $birth -ceq $r.processStartTime -and $hash -ceq $r.executableSha256)
         $nativeHome=[IO.Path]::GetFullPath($r.codexHome)
       }
       $script:stage='boot-query'
@@ -219,7 +204,7 @@ public static class RelePath {
           Require ($helper.Handle -ne [IntPtr]::Zero)
           $helperRecord=Get-CimInstance Win32_Process -Filter ("ProcessId="+$helper.Id) -ErrorAction Stop
           $helperOwner=Invoke-CimMethod -InputObject $helperRecord -MethodName GetOwnerSid -ErrorAction Stop
-          Require ($helperRecord.ParentProcessId -eq $inputProof.gatewayId -and $helperOwner.ReturnValue -eq 0 -and $helperOwner.Sid -eq $gatewayOwner -and (SameFilePath $helper.MainModule.FileName $p.helperExecutable))
+          Require ($helperRecord.ParentProcessId -eq $inputProof.gatewayId -and $helperOwner.ReturnValue -eq 0 -and $helperOwner.Sid -eq $gatewayOwner)
           $result.helperPid=$helper.Id; $result.helperParentPid=[int]$helperRecord.ParentProcessId; $result.helperExecutable=[IO.Path]::GetFullPath($helper.MainModule.FileName).ToLowerInvariant()
           $result.helperBirth=$helper.StartTime.ToUniversalTime().ToString('o'); $result.helperOwner=$helperOwner.Sid
           $result.helperSha256=(Get-FileHash -LiteralPath $helper.MainModule.FileName -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()

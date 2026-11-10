@@ -599,15 +599,9 @@ export class Engine extends EventEmitter {
       if (found.mixed || this.isMixed(id) || found.turnId !== state.turnId) throw new Error('Ход отменяемого запроса больше не подтверждён как собственный. Фоновые команды сохранены.');
       const items = this.rememberCommandItems(id, found.commandItems ?? []);
       if (found.state === 'running' && !state.interruptAttempted) {
-        const location = await this.findOwnRequest(client, conversation.threadId, id);
-        current();
-        if (location.mixed || this.isMixed(id) || location.turnId !== state.turnId) throw new Error('Ход отменяемого запроса больше не подтверждён как собственный. Фоновые команды сохранены.');
-        this.rememberCommandItems(id, location.commandItems ?? []);
-        if (location.state === 'running') {
-          state.interruptAttempted = true; this.store.setMeta(`cancel-cleanup:${id}`, JSON.stringify(state));
-          try { await client.interrupt(conversation.threadId, state.turnId); }
-          catch (error) { current(); this.emit('diagnostic', this.options.redact(error)); }
-        }
+        state.interruptAttempted = true; this.store.setMeta(`cancel-cleanup:${id}`, JSON.stringify(state));
+        try { await client.interrupt(conversation.threadId, state.turnId); }
+        catch (error) { current(); this.emit('diagnostic', this.options.redact(error)); }
         continue;
       }
       if (['running', 'completed', 'failed', 'interrupted'].includes(found.state)) {
