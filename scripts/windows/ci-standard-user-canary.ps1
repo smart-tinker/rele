@@ -91,6 +91,7 @@ if ($Mode -eq 'Child') {
     $env:SystemRoot = $windows; $env:WINDIR = $windows; $env:ComSpec = Join-Path $system 'cmd.exe'; $env:PATH = $system
     $env:USERPROFILE = $profile; $env:LOCALAPPDATA = Join-Path $profile 'AppData\Local'; $env:APPDATA = Join-Path $profile 'AppData\Roaming'
     $env:TEMP = Join-Path $FixtureRoot 'tmp'; $env:TMP = $env:TEMP
+    if ([bool]$marker.sharedDiagnostics) { $env:RELE_CI_SHARED_DIAGNOSTICS = '1' }
     New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
     $evidence = @{ nonce = $Nonce; sid = $sid; phase = $Phase; result = 'failed'; selfElevated = $null; taskElevated = $null; stage = 'token'; selfSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId }
     $task = $null; $running = $null
@@ -280,7 +281,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant fixture source read access.' }
     & icacls.exe $FixtureRoot /grant ('*' + $sid + ':(OI)(CI)(M)') /T /C | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant fixture write access.' }
-    $marker = @{ nonce = $Nonce; sid = $sid; phase = 'Installer'; runGates = $RunGates.IsPresent; desktopBundle = $null; desktopInventory = $null; desktopPackage = $null }
+    $marker = @{ nonce = $Nonce; sid = $sid; phase = 'Installer'; runGates = $RunGates.IsPresent; sharedDiagnostics = [bool]($RunGates.IsPresent -and $DesktopBundle -and $env:RELE_CI_SHARED_DIAGNOSTICS -eq '1'); desktopBundle = $null; desktopInventory = $null; desktopPackage = $null }
     if ($RunGates) {
         $marker.node = (Get-Command node.exe -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
         $marker.python = (Get-Command python.exe -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
