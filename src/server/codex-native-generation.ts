@@ -185,17 +185,22 @@ try {
       if ($stdio) {
         $gatewayOwner=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         $expectedExecutable=$p.executable
+        $script:stage='stdio-owner-check'
         Require ($owner.Sid -eq $gatewayOwner)
         $expectedParent=$inputProof.gatewayId
-        if ($p.helperExecutable) { $expectedParent=$p.pid } else { Require ($native.Id -eq $p.pid) }
+        if ($p.helperExecutable) { $expectedParent=$p.pid } else { $script:stage='stdio-process-id-check'; Require ($native.Id -eq $p.pid) }
+        $script:stage='stdio-parent-check'
         Require ($record.ParentProcessId -eq $expectedParent)
+        $script:stage='stdio-home-path'
         $nativeHome=[IO.Path]::GetFullPath($p.codexHome)
+        $script:stage='stdio-home-check'
         Require ([IO.Directory]::Exists($nativeHome))
       } else {
         $expectedExecutable=$r.executable
         Require ($owner.Sid -eq $r.ownerSid -and $birth -ceq $r.processStartTime -and $hash -ceq $r.executableSha256)
         $nativeHome=[IO.Path]::GetFullPath($r.codexHome)
       }
+      $script:stage='expected-image-hash'
       $expectedHash=(Get-FileHash -LiteralPath $expectedExecutable -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
       $executableContentMatchesExpected=$hash -ceq $expectedHash
       $script:stage='boot-query'
