@@ -264,6 +264,19 @@ test('shared cancellation diagnostics preserve the original error if snapshot fa
  assert.ok(failure.indexOf("event: 'shared-cancel-diagnostic'")<failure.indexOf('throw error;'),
   'emit best-effort diagnostics and rethrow the original cancel error');
 });
+test('shared cancellation failure records bounded provider and native completion evidence', async()=>{
+ const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ const wait=probe.indexOf("completed = await engine.command('wait')",probe.indexOf("eventId='after-shell-cancel'"));
+ assert.ok(wait>=0,'shared cancellation fixture must wait for the next origin request');
+ const failure=probe.slice(wait-180,wait+260);
+ assert.match(failure,/try:\s*\n\s*completed = await engine\.command\('wait'\)\s*\n\s*except RuntimeError:/u,
+  'capture evidence when the native Engine driver exits during the completion wait');
+ assert.match(failure,/held_request_evidence\(engine, peer, thread\)/u,
+  'reuse the bounded native snapshot and observed turn evidence');
+ assert.match(probe,/providerTrace/u,'failure evidence must include mock-provider action/response stages');
+ assert.match(probe,/provider_trace\[-8:\]/u,'limit the diagnostic to the latest provider events');
+ assert.doesNotMatch(probe,/provider_trace.*body|providerTrace.*body/u,'never include synthetic request bodies in the report');
+});
 test('shared Windows cancellation probe waits for bounded native generation proofs', async()=>{
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
  const driverStart=probe.indexOf('class EngineDriver:');

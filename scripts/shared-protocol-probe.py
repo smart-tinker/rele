@@ -223,7 +223,7 @@ async def gate(args, root):
     report = {'codexVersion': args.expected_version, 'platform': os.name, 'actualDesktopTested': False, 'actualDesktopGui': False,
               'actualDesktopBundle': bool(args.desktop_bundle), 'installedDesktop': args.installed_desktop, 'actualDesktopBackendExecuted': False,
               'realModelRequests': 0, 'realMessengerRequests': 0, 'checks': {}}
-    records, actions, holds, errors, drainers, processes = [], [], [], [], [], []
+    records, actions, holds, errors, drainers, processes, provider_trace = [], [], [], [], [], [], []
     native_executables = {}
     windows_fixtures = {}
     if os.name == 'nt':
@@ -247,6 +247,8 @@ async def gate(args, root):
         initial = any(part.get('text', '').endswith('На это сообщение ответь NOREPLY.')
                       for part in latest_user.get('content', []) if isinstance(part, dict))
         action, event = ('initial', None) if initial else actions.pop(0) if actions else ('final', None)
+        trace = {'index': index, 'action': action, 'result': 'pending'}
+        provider_trace.append(trace)
         records.append(body)
         response = web.StreamResponse(headers={'Content-Type': 'text/event-stream'})
         await response.prepare(request)
@@ -283,7 +285,9 @@ async def gate(args, root):
             await response.write(frame({'type': 'response.completed', 'response': {'id': f'resp-{index}',
                 'usage': {'input_tokens': 10, 'output_tokens': 3, 'total_tokens': 13}}}))
             await response.write_eof()
+            trace['result'] = 'sent'
         except ConnectionError:
+            trace['result'] = 'disconnected'
             pass  # The shared cancellation intentionally closes a held synthetic stream.
         return response
 
@@ -566,6 +570,7 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
             {'method': event.get('method'), 'turnId': event.get('params', {}).get('turn', {}).get('id')}
             for event in peer.events if event.get('method') in ('turn/started', 'turn/completed')
         ][-8:]
+        evidence['providerTrace'] = provider_trace[-8:]
         evidence['queuedProviderActionTypes'] = [action for action, _ in actions[-8:]]
         return evidence
 
@@ -985,7 +990,11 @@ enabled=false
             aborted = await peer.completed(cancel['turnId'])
             assert aborted['params']['turn']['status'] == 'interrupted'
             hold_cancel.set()
-            completed = await engine.command('wait')
+            try:
+                completed = await engine.command('wait')
+            except RuntimeError:
+                report['afterShellCancelWaitFailure'] = await held_request_evidence(engine, peer, thread)
+                raise
             following_rows = [row for row in completed['requests'] if row['id'] == following['id']]
             assert len(following_rows) == 1 and following_rows[0]['status'] == 'completed'
             assert following_rows[0]['origin'] == following['origin']
