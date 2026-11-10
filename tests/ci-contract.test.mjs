@@ -125,6 +125,17 @@ test('one required CI gate waits for every OS matrix job', async()=>{
  const publisher=workflow.slice(workflow.indexOf('\n  publish:\n'));
  assert.match(publisher,/needs: \[verify, gate\]/u);
 });
+test('Windows job timeout leaves room for its bounded standard-user native gate', async()=>{
+ const workflow=await readFile(new URL('../.github/workflows/ci.yml',import.meta.url),'utf8');
+ const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ const verify=workflow.slice(workflow.indexOf('\n  verify:\n'),workflow.indexOf('\n  gate:\n'));
+ const jobTimeout=verify.match(/^\s+timeout-minutes:\s*\$\{\{\s*matrix\.os\s*==\s*'windows-2025'\s*&&\s*(\d+)\s*\|\|\s*(\d+)\s*\}\}\s*$/mu);
+ const gateTimeout=canary.match(/AddMinutes\(\$\(if \(\$Phase -eq 'Shared'\) \{ (\d+) \} else \{ (\d+) \}\)\)/u);
+ assert.ok(jobTimeout,'give Windows its own timeout without extending Ubuntu');
+ assert.ok(gateTimeout,'read the native gate deadline from the canary');
+ assert.ok(Number(jobTimeout[1])>=Number(gateTimeout[2])+20,'leave twenty minutes for runner setup, later checks, and cleanup');
+ assert.equal(Number(jobTimeout[2]),60,'keep the Ubuntu timeout unchanged');
+});
 test('shared protocol gate only allows unlisted versions for the exact measured Desktop backend', async()=>{
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
  assert.ok(probe.includes("parser.add_argument('--expected-version', required=True)"));
