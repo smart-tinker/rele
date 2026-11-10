@@ -168,6 +168,24 @@ try {
   $inputProof=ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__INPUT__')))
   $r=$inputProof.receipt; $p=$inputProof.peer; $stdio=$p.kind -eq 'stdio'
   function Require($ok) { if (-not $ok) { throw 'unproven' } }
+  Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+using System.Text;
+public static class RelePath {
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  public static extern uint GetLongPathName(string shortPath, StringBuilder longPath, uint bufferLength);
+}
+'@
+  function CanonicalPath($value) {
+    $buffer=New-Object Text.StringBuilder 32768
+    $length=[RelePath]::GetLongPathName($value,$buffer,[uint32]$buffer.Capacity)
+    if ($length -le 0 -or $length -ge $buffer.Capacity) { return $null }
+    return [IO.Path]::GetFullPath($buffer.ToString())
+  }
+  function SameFilePath($left,$right) {
+    $a=CanonicalPath $left; $b=CanonicalPath $right
+    return ($null -ne $a -and $null -ne $b -and $a -ieq $b)
+  }
   function Identity {
     $script:stage='process-query'
     $native=[Diagnostics.Process]::GetProcessById([int]$inputProof.serverId); $helper=$null
@@ -184,6 +202,7 @@ try {
       $script:stage='process-identity'
       if ($stdio) {
         $gatewayOwner=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $executableMatchesExpected=SameFilePath $exe $p.executable
         Require ($owner.Sid -eq $gatewayOwner)
         $expectedParent=$inputProof.gatewayId
         if ($p.helperExecutable) { $expectedParent=$p.pid } else { Require ($native.Id -eq $p.pid) }
@@ -191,12 +210,14 @@ try {
         $nativeHome=[IO.Path]::GetFullPath($p.codexHome)
         Require ([IO.Directory]::Exists($nativeHome))
       } else {
+        $executableMatchesExpected=SameFilePath $exe $r.executable
         Require ($owner.Sid -eq $r.ownerSid -and $birth -ceq $r.processStartTime -and $hash -ceq $r.executableSha256)
         $nativeHome=[IO.Path]::GetFullPath($r.codexHome)
       }
       $script:stage='boot-query'
       $boot=(Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime().ToString('o')
       $result=[ordered]@{pid=$native.Id;birth=$birth;boot=$boot;executable=[IO.Path]::GetFullPath($exe).ToLowerInvariant();sha256=$hash;owner=$owner.Sid;codexHome=$nativeHome.ToLowerInvariant()}
+      $result.executableMatchesExpected=$executableMatchesExpected
       if ($stdio) {
         $result.parentPid=[int]$record.ParentProcessId; $result.gatewayOwner=$gatewayOwner
         if ($p.helperExecutable) {
@@ -204,8 +225,10 @@ try {
           Require ($helper.Handle -ne [IntPtr]::Zero)
           $helperRecord=Get-CimInstance Win32_Process -Filter ("ProcessId="+$helper.Id) -ErrorAction Stop
           $helperOwner=Invoke-CimMethod -InputObject $helperRecord -MethodName GetOwnerSid -ErrorAction Stop
+          $helperExecutableMatchesExpected=SameFilePath $helper.MainModule.FileName $p.helperExecutable
           Require ($helperRecord.ParentProcessId -eq $inputProof.gatewayId -and $helperOwner.ReturnValue -eq 0 -and $helperOwner.Sid -eq $gatewayOwner)
           $result.helperPid=$helper.Id; $result.helperParentPid=[int]$helperRecord.ParentProcessId; $result.helperExecutable=[IO.Path]::GetFullPath($helper.MainModule.FileName).ToLowerInvariant()
+          $result.helperExecutableMatchesExpected=$helperExecutableMatchesExpected
           $result.helperBirth=$helper.StartTime.ToUniversalTime().ToString('o'); $result.helperOwner=$helperOwner.Sid
           $result.helperSha256=(Get-FileHash -LiteralPath $helper.MainModule.FileName -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
         }
@@ -291,12 +314,14 @@ async function windowsGeneration(peer: Exclude<CodexNativePeer, { kind: 'proxy' 
     || !windowsPath(proof.executable) || !windowsPath(proof.codexHome) || !sameWindowsPath(proof.codexHome, home)
     || typeof proof.boot !== 'string' || !WINDOWS_TIME.test(proof.boot) || !Number.isFinite(Date.parse(proof.boot))) return;
   if (peer.kind === 'stdio') {
-    if (proof.parentPid !== (peer.helperExecutable ? peer.pid : process.pid) || proof.gatewayOwner !== proof.owner || !sameWindowsPath(proof.executable, peer.executable!)) return;
+    if (proof.parentPid !== (peer.helperExecutable ? peer.pid : process.pid) || proof.gatewayOwner !== proof.owner
+      || (proof.executableMatchesExpected !== true && !sameWindowsPath(proof.executable, peer.executable!))) return;
     if (peer.helperExecutable && (proof.helperPid !== peer.pid || proof.helperParentPid !== process.pid || proof.helperOwner !== proof.owner
-      || !windowsPath(proof.helperExecutable) || !sameWindowsPath(proof.helperExecutable, peer.helperExecutable)
+      || !windowsPath(proof.helperExecutable) || (proof.helperExecutableMatchesExpected !== true && !sameWindowsPath(proof.helperExecutable, peer.helperExecutable))
       || typeof proof.helperBirth !== 'string' || !WINDOWS_TIME.test(proof.helperBirth) || !Number.isFinite(Date.parse(proof.helperBirth)) || !SHA.test(proof.helperSha256))) return;
   } else if (proof.birth !== receipt.processStartTime || proof.localPort !== peer.localPort || proof.remotePort !== peer.remotePort
-    || proof.owner !== receipt.ownerSid || proof.sha256 !== receipt.executableSha256 || !sameWindowsPath(proof.executable, receipt.executable)) return;
+    || proof.owner !== receipt.ownerSid || proof.sha256 !== receipt.executableSha256
+    || (proof.executableMatchesExpected !== true && !sameWindowsPath(proof.executable, receipt.executable))) return;
   return createHash('sha256').update(JSON.stringify({ platform: 'win32', pid: proof.pid, birth: proof.birth, boot: proof.boot, executable: path.win32.normalize(proof.executable).toLowerCase(), sha256: proof.sha256, owner: proof.owner, codexHome: path.win32.normalize(proof.codexHome).toLowerCase() })).digest('hex');
 }
 

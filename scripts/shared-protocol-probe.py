@@ -898,10 +898,17 @@ trust_level="trusted"
                 and event['params'].get('turnId') == cancel['turnId']
                 and event['params'].get('item', {}).get('type') == 'commandExecution')
             item_id = command_item['params']['item']['id']
-            terminal_page = await peer.call('thread/backgroundTerminals/list', {'threadId': thread, 'limit': 100})
-            assert not terminal_page.get('nextCursor'), 'Unexpected terminal pagination in the disposable fixture'
-            terminals = terminal_page['data']
-            assert len([item for item in terminals if item['itemId'] == item_id]) == 1
+            terminal_deadline = asyncio.get_running_loop().time() + 2
+            while True:
+                terminal_page = await peer.call('thread/backgroundTerminals/list', {'threadId': thread, 'limit': 100})
+                assert not terminal_page.get('nextCursor'), 'Unexpected terminal pagination in the disposable fixture'
+                terminals = terminal_page['data']
+                matching_terminals = [item for item in terminals if item['itemId'] == item_id]
+                if matching_terminals:
+                    break
+                assert asyncio.get_running_loop().time() < terminal_deadline, 'Started command did not appear as a background terminal'
+                await asyncio.sleep(.05)
+            assert len(matching_terminals) == 1
             assert (await engine.command('snapshot', processId=child_pid))['probeProcessAlive']
             queued = await engine.command('ingest', platform='slack', eventId='after-shell-cancel', text='shared-after-shell-cancel')
             following = next(row for row in queued['requests'] if row['eventId'] == 'after-shell-cancel')
