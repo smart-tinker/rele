@@ -197,3 +197,12 @@ test('actual Desktop discovery diagnostics reach only the isolated Rele driver',
  assert.match(driver,/os\.environ\.get\('RELE_CI_SHARED_DIAGNOSTICS'\) == '1'/u,'require the explicit CI diagnostic switch');
  assert.match(driver,/spawn\(command, driver_env, REPO\)/u,'forward the switch only to the Rele driver');
 });
+test('shared native gate records bounded request state without payloads on timeout', async()=>{
+ const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ const start=probe.indexOf('    async def held_request_evidence('),end=probe.indexOf('\n    async def wait_records',start);
+ assert.ok(start>=0 && end>start,'shared probe must define bounded timeout evidence');
+ const evidence=probe.slice(start,end);
+ for(const field of ['providerRequestCount','engineRequests','nativeTurnStatus','observedTurns','eventId','status','turnId']) assert.ok(evidence.includes(field),`timeout evidence must include ${field}`);
+ for(const field of ['text','payload','input','content','prompt']) assert.ok(!evidence.includes(field),`timeout evidence must exclude ${field}`);
+ assert.match(probe,/except TimeoutError:\s*report\['heldRequestTimeout'\] = await held_request_evidence\(engine, peer, thread\)/u,'capture the safe snapshot only when the held provider request times out');
+});

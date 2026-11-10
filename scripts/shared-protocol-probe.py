@@ -536,6 +536,27 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
                 variants.append(flags)
         return client
 
+    async def held_request_evidence(engine, peer, thread):
+        evidence = {'providerRequestCount': len(records)}
+        try:
+            snapshot = await asyncio.wait_for(engine.command('snapshot'), 5)
+            evidence['engineRequests'] = [
+                {key: row.get(key) for key in ('eventId', 'status', 'turnId')}
+                for row in snapshot.get('requests', [])[-8:]
+            ]
+        except Exception as error:
+            evidence['engineSnapshotError'] = type(error).__name__
+        try:
+            snapshot = await asyncio.wait_for(peer.call('thread/read', {'threadId': thread}), 5)
+            evidence['nativeTurnStatus'] = snapshot.get('thread', {}).get('status', {}).get('type')
+        except Exception as error:
+            evidence['nativeThreadReadError'] = type(error).__name__
+        evidence['observedTurns'] = [
+            {'method': event.get('method'), 'turnId': event.get('params', {}).get('turn', {}).get('id')}
+            for event in peer.events if event.get('method') in ('turn/started', 'turn/completed')
+        ][-8:]
+        return evidence
+
     async def wait_records(count):
         while len(records) < count:
             await asyncio.sleep(.02)
@@ -794,7 +815,11 @@ enabled=false
             hold = asyncio.Event(); holds.append(hold); actions.append(('hold', hold))
             before = len(records)
             await engine.command('ingest', platform='telegram', eventId='held-telegram', text='held-original-request', loseAck=True)
-            await asyncio.wait_for(wait_records(before + 1), 25)
+            try:
+                await asyncio.wait_for(wait_records(before + 1), 25)
+            except TimeoutError:
+                report['heldRequestTimeout'] = await held_request_evidence(engine, peer, thread)
+                raise
             running = await engine.command('wait', status='running')
             assert running['droppedQueueAcks'] == 1, 'The synthetic queue ACK was not withheld'
             request = next(row for row in running['requests'] if row['eventId'] == 'held-telegram')
