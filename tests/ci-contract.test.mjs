@@ -131,3 +131,14 @@ test('shared protocol gate only allows unlisted versions for the exact measured 
  assert.ok(probe.includes('if args.expected_version not in VERSIONS and not args.desktop_bundle:'));
  assert.ok(probe.includes("evidence.get('backendVersion') != args.expected_version"));
 });
+test('signed Desktop fixture defines complete inert MCP transports for its enable overrides', async()=>{
+ const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ const start=probe.indexOf("scenario_config += f'''");
+ assert.notEqual(start,-1,'Desktop fixture must add isolated MCP definitions');
+ const fixture=probe.slice(start,probe.indexOf("\n        (home / 'config.toml')",start));
+ assert.ok(fixture.includes('[mcp_servers.codex_app]'));
+ assert.ok(fixture.includes('[mcp_servers.code-review]'));
+ assert.equal((fixture.match(/command=/gu)??[]).length,2);
+ assert.equal((fixture.match(/enabled=false/gu)??[]).length,2);
+ assert.ok(fixture.includes('disabled-mcp-fixture'));
+});

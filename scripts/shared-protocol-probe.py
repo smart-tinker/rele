@@ -656,6 +656,16 @@ screen_reader_detection_done=true
 [projects.{json.dumps(str(workspace))}]
 trust_level="trusted"
 '''
+        if args.desktop_bundle:
+            # Desktop's enabled-only MCP overrides need a complete, inert stdio definition.
+            scenario_config += f'''
+[mcp_servers.codex_app]
+command={json.dumps(str(home / 'disabled-mcp-fixture'))}
+enabled=false
+[mcp_servers.code-review]
+command={json.dumps(str(home / 'disabled-mcp-fixture'))}
+enabled=false
+'''
         (home / 'config.toml').write_text(scenario_config, encoding='utf-8')
         env = {**base_env, 'CODEX_HOME': str(home), 'RELE_DATA_DIR': str(directory / 'rele')}
         # Disable the optional native updater before any start: package installation
