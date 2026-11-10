@@ -97,6 +97,29 @@ async function windowsFixture() {
 }
 
 describe('Windows direct shared Codex', () => {
+  it('prints bounded Desktop discovery codes on a CI bootstrap failure without publishing paths or messages', async () => {
+    const f = await windowsFixture(), privateMarker = 'private-codex-ci-diagnostic';
+    Object.assign(f.env, { RELE_CI_SHARED_DIAGNOSTICS: '1' });
+    const executable = path.join(f.home, privateMarker, 'codex.exe');
+    f.discover.mockResolvedValue({
+      installations: [{ executable, name: 'Desktop', source: 'desktop-install', version: '0.166.0-alpha.6', running: false }],
+      issues: [{ code: 'cli-probe-failed', message: privateMarker, executable }],
+    });
+    const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).rejects.toMatchObject({ code: 'shared-cli-unavailable' });
+      expect(diagnostic).toHaveBeenCalledTimes(1);
+      const line = String(diagnostic.mock.calls[0][0]);
+      expect(line).toMatch(/^RELE_CI_WINDOWS_DESKTOP_DISCOVERY=/u);
+      expect(JSON.parse(line.slice(line.indexOf('=') + 1))).toEqual({
+        installations: [{ source: 'desktop-install', version: '0.166.0-alpha.6', running: false }],
+        issues: ['cli-probe-failed'],
+        candidates: [{ source: 'desktop-install', version: '0.166.0-alpha.6', result: 'candidate-resolution-failed' }],
+      });
+      expect(line).not.toContain(privateMarker);
+    } finally { diagnostic.mockRestore(); }
+  });
+
   it('cold-starts a complete Rele-owned Desktop snapshot that survives source removal', async () => {
     const f = await windowsFixture(), source = f.executable, original = f.run.getMockImplementation()!;
     f.run.mockImplementation(async (command, args, ...rest) => {

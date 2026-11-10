@@ -149,6 +149,8 @@ test('actual Desktop CI provisions the verified MSIX before standard-user discov
  const standardUser=workflow.indexOf('name: Verify Windows installer and native shared gates as a standard user');
  const discover=canary.indexOf('shared-actual-desktop');
  assert.ok(provision>=0 && provision<standardUser,'provision the signed package before the standard-user profile is created');
+ const standardUserStep=workflow.slice(standardUser,workflow.indexOf('\n      - name:',standardUser+1));
+ assert.match(standardUserStep,/RELE_CI_SHARED_DIAGNOSTICS:\s*['"]?1/u,'enable bounded discovery diagnostics only for the Windows standard-user gate');
  const provisioningStep=workflow.slice(provision,standardUser);
  assert.match(provisioningStep,/Get-AuthenticodeSignature/u,'verify the package signature before provisioning');
  assert.match(provisioningStep,/Get-FileHash .*SHA256/u,'bind provisioning to the inspected package bytes');
