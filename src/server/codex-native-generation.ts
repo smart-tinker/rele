@@ -185,11 +185,13 @@ public static class ReleWindowsPath {
 }
 '@ -ErrorAction Stop
   function FileSha256($path) {
+    $script:stage='image-path-expand'
     $path=[ReleWindowsPath]::Expand($path)
+    $script:stage='image-hash-open'
     $algorithm=[Security.Cryptography.SHA256]::Create()
     try {
       $stream=[IO.File]::OpenRead($path)
-      try { return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
+      try { $script:stage='image-hash-compute'; return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
       finally { $stream.Dispose() }
     } finally { $algorithm.Dispose() }
   }
