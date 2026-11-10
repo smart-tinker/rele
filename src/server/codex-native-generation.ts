@@ -168,6 +168,14 @@ try {
   $inputProof=ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__INPUT__')))
   $r=$inputProof.receipt; $p=$inputProof.peer; $stdio=$p.kind -eq 'stdio'
   function Require($ok) { if (-not $ok) { throw 'unproven' } }
+  function FileSha256($path) {
+    $algorithm=[Security.Cryptography.SHA256]::Create()
+    try {
+      $stream=[IO.File]::OpenRead($path)
+      try { return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
+      finally { $stream.Dispose() }
+    } finally { $algorithm.Dispose() }
+  }
   function Identity {
     $script:stage='process-query'
     $native=[Diagnostics.Process]::GetProcessById([int]$inputProof.serverId); $helper=$null
@@ -180,7 +188,7 @@ try {
       Require ($owner.ReturnValue -eq 0)
       $script:stage='image-query'
       $exe=$native.MainModule.FileName; $birth=$native.StartTime.ToUniversalTime().ToString('o')
-      $hash=(Get-FileHash -LiteralPath $exe -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+      $hash=FileSha256 $exe
       $script:stage='process-identity'
       if ($stdio) {
         $gatewayOwner=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -202,7 +210,7 @@ try {
       }
       $script:stage='expected-image-hash'
       try {
-        $expectedHash=(Get-FileHash -LiteralPath $expectedExecutable -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        $expectedHash=FileSha256 $expectedExecutable
         $executableContentMatchesExpected=$hash -ceq $expectedHash
       } catch [System.ArgumentException] { $executableContentMatchesExpected=$false }
       $script:stage='boot-query'
@@ -216,9 +224,9 @@ try {
           Require ($helper.Handle -ne [IntPtr]::Zero)
           $helperRecord=Get-CimInstance Win32_Process -Filter ("ProcessId="+$helper.Id) -ErrorAction Stop
           $helperOwner=Invoke-CimMethod -InputObject $helperRecord -MethodName GetOwnerSid -ErrorAction Stop
-          $helperHash=(Get-FileHash -LiteralPath $helper.MainModule.FileName -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+          $helperHash=FileSha256 $helper.MainModule.FileName
           try {
-            $expectedHelperHash=(Get-FileHash -LiteralPath $p.helperExecutable -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+            $expectedHelperHash=FileSha256 $p.helperExecutable
             $helperExecutableContentMatchesExpected=$helperHash -ceq $expectedHelperHash
           } catch [System.ArgumentException] { $helperExecutableContentMatchesExpected=$false }
           Require ($helperRecord.ParentProcessId -eq $inputProof.gatewayId -and $helperOwner.ReturnValue -eq 0 -and $helperOwner.Sid -eq $gatewayOwner)
