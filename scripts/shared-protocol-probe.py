@@ -820,12 +820,12 @@ enabled=false
             before = len(records)
             await engine.command('ingest', platform='telegram', eventId='held-telegram', text='held-original-request', loseAck=True)
             try:
+                running = await engine.command('wait', status='running')
+                assert running['droppedQueueAcks'] == 1, 'The synthetic queue ACK was not withheld'
                 await asyncio.wait_for(wait_records(before + 1), ENGINE_READ_TIMEOUT_SECONDS)
-            except TimeoutError:
+            except (TimeoutError, RuntimeError):
                 report['heldRequestTimeout'] = await held_request_evidence(engine, peer, thread)
                 raise
-            running = await engine.command('wait', status='running')
-            assert running['droppedQueueAcks'] == 1, 'The synthetic queue ACK was not withheld'
             request = next(row for row in running['requests'] if row['eventId'] == 'held-telegram')
             assert str(uuid.UUID(request['id'])) == request['id']
             await engine.close(); engine = None

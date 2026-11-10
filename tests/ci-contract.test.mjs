@@ -204,7 +204,7 @@ test('shared native gate records bounded request state without payloads on timeo
  const evidence=probe.slice(start,end);
  for(const field of ['providerRequestCount','engineRequests','nativeTurnStatus','observedTurns','eventId','status','turnId']) assert.ok(evidence.includes(field),`timeout evidence must include ${field}`);
  for(const field of ['text','payload','input','content','prompt']) assert.ok(!evidence.includes(field),`timeout evidence must exclude ${field}`);
- assert.match(probe,/except TimeoutError:\s*report\['heldRequestTimeout'\] = await held_request_evidence\(engine, peer, thread\)/u,'capture the safe snapshot only when the held provider request times out');
+ assert.match(probe,/except \(TimeoutError, RuntimeError\):\s*report\['heldRequestTimeout'\] = await held_request_evidence\(engine, peer, thread\)/u,'capture the safe snapshot when the native wait or provider wait fails');
 });
 test('shared fixture settles ordinary intake but not the synthetic lost queue ACK', async()=>{
  const driver=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');
@@ -270,6 +270,11 @@ test('shared Windows cancellation fixture outlives the bounded native proof wind
 });
 test('shared Windows lost-ACK probe allows one bounded native proof window before timing out', async()=>{
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ const held=probe.indexOf("await engine.command('ingest', platform='telegram', eventId='held-telegram'");
+ const running=probe.indexOf("running = await engine.command('wait', status='running')",held);
+ const provider=probe.indexOf('await asyncio.wait_for(wait_records(before + 1), ENGINE_READ_TIMEOUT_SECONDS)',held);
+ assert.ok(held>=0 && running>held && provider>running,
+  'wait for native request recovery before checking the downstream provider request');
  assert.match(probe,/await asyncio\.wait_for\(wait_records\(before \+ 1\), ENGINE_READ_TIMEOUT_SECONDS\)/u,
   'allow the bounded Windows owner proof to finish before checking whether the native request reached the provider');
 });
