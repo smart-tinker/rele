@@ -63,7 +63,8 @@ it.skipIf(process.platform !== 'win32')('proves an owned Windows stdio process w
       return { stdout:result.stdout, code:0 };
     } catch (error) {
       const stderr = String((error as { stderr?:string }).stderr ?? '');
-      proofStage = /rele-native-proof:([a-z-]+)/u.exec(stderr)?.[1] ?? 'powershell-invocation';
+      const marker = /rele-native-proof:([a-z-]+)(?::([A-Za-z]+):([A-Za-z]+))?/u.exec(stderr);
+      proofStage = marker ? [marker[1], marker[2], marker[3]].filter(Boolean).join(':') : 'powershell-invocation';
       return { stdout:'', code:1 };
     }
   };
@@ -256,7 +257,7 @@ it('Windows proof survives a new client port and future controller while keeping
   expect(await prove()).not.toBe(first);
 });
 
-it('encodes only a fixed stage when Windows native proof fails', async () => {
+it('limits Windows proof diagnostics to a fixed stage, exception type and category', async () => {
   const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
   const home = 'C:\\Users\\Owner\\fixture', executable = 'C:\\native\\codex.exe';
   const receipt = { status:'alreadyRunning', endpoint:'ws://127.0.0.1:62662', codexHome:home, executable, executableSha256:'a'.repeat(64), ownerSid:'S-1-5-21-1001', processId:10944, processStartTime:'2026-11-03T10:00:00.1234567Z' };
@@ -268,7 +269,8 @@ it('encodes only a fixed stage when Windows native proof fails', async () => {
   };
   const generation = await Reflect.apply(codexNativeGeneration, undefined, [{ kind:'windows-shared', endpoint:receipt.endpoint, localPort:55001, remotePort:62662 }, 10944, home, { platform:'win32', run, installationDirectory:'C:\\Rele' }]);
   expect(generation).toBeUndefined();
-  expect(proof).toContain("[Console]::Error.WriteLine('rele-native-proof:' + $script:stage)");
+  expect(proof).toContain("[Console]::Error.WriteLine('rele-native-proof:' + $script:stage + ':' + $_.Exception.GetType().Name + ':' + $_.CategoryInfo.Category)");
+  expect(proof).not.toContain('$_.Exception.Message');
   expect(proof).toContain("$script:stage='tcp-query'");
 });
 

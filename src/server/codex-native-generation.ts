@@ -251,7 +251,7 @@ try {
   $script:stage='proof-output'
   $before | ConvertTo-Json -Compress
   $script:stage='complete'
-} catch { [Console]::Error.WriteLine('rele-native-proof:' + $script:stage); exit 1 }
+} catch { [Console]::Error.WriteLine('rele-native-proof:' + $script:stage + ':' + $_.Exception.GetType().Name + ':' + $_.CategoryInfo.Category); exit 1 }
 `;
 
 interface CommandResult { stdout: string; code: number | null }
