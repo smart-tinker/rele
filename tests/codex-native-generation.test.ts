@@ -31,17 +31,17 @@ it('matches filesystem aliases for an owned Windows stdio profile', async () => 
   expect(await codexNativeGeneration(peer, process.pid, home, { platform:'win32', run })).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
 });
 
-it('accepts a short executable alias only when Windows proof confirms the same file', async () => {
+it('accepts a short executable alias only when Windows proof confirms matching bytes', async () => {
   const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
   const home = 'C:\\Users\\Owner\\fixture', executable = 'C:\\Users\\runneradmin\\AppData\\Local\\Temp\\node.exe';
   const shortExecutable = 'C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\node.exe';
   const proof = { pid:process.pid, birth:'2026-11-03T10:00:00.1234567Z', boot:'2026-11-01T01:02:03.0000000Z', executable,
-    executableMatchesExpected:true, sha256:'a'.repeat(64), owner:'S-1-5-21-1001', gatewayOwner:'S-1-5-21-1001', codexHome:home,
+    executableContentMatchesExpected:true, sha256:'a'.repeat(64), owner:'S-1-5-21-1001', gatewayOwner:'S-1-5-21-1001', codexHome:home,
     peerVerified:true, parentPid:process.pid, gatewayId:process.pid };
   const peer = { kind:'stdio' as const, pid:process.pid, executable:shortExecutable, codexHome:home };
   const run = async () => ({ stdout:JSON.stringify(proof), code:0 });
   expect(await codexNativeGeneration(peer, process.pid, home, { platform:'win32', run })).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
-  expect(await codexNativeGeneration(peer, process.pid, home, { platform:'win32', run:async () => ({ stdout:JSON.stringify({ ...proof, executableMatchesExpected:false }), code:0 }) })).toBeUndefined();
+  expect(await codexNativeGeneration(peer, process.pid, home, { platform:'win32', run:async () => ({ stdout:JSON.stringify({ ...proof, executableContentMatchesExpected:false }), code:0 }) })).toBeUndefined();
 });
 
 it.skipIf(process.platform !== 'win32')('proves an owned Windows stdio process when its executable is supplied by an 8.3 alias', async () => {
