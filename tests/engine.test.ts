@@ -3695,8 +3695,8 @@ describe('Engine chronological Slack dialogue', () => {
     const action = f.engine.action(asyncAction(f, approval));
     await vi.waitFor(() => expect(f.slack.deliver.mock.calls.some(([delivery]) => delivery.key.startsWith('question-answer:'))).toBe(true));
     const pump = f.engine.pump();
-    await vi.waitFor(() => expect(updateApproval).toHaveBeenCalled());
-    expect(updateApproval.mock.calls.at(-1)?.[1].decision).toBe('queued');
+    await vi.waitFor(() => expect(updateApproval.mock.calls.some(([, approval, resolution]) =>
+      approval.decision === 'queued' && resolution?.answerMarkerTs === undefined)).toBe(true));
     expect(updateApproval.mock.calls.at(-1)?.[2]?.answerMarkerTs).toBeUndefined();
     markerPost.resolve('1000.9999'); await action; await pump; await f.engine.settled(); await f.engine.pump();
     expect(updateApproval.mock.calls.some(([, , resolution]) => resolution?.answerMarkerTs === '1000.9999')).toBe(true);

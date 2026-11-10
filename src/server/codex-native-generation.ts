@@ -178,6 +178,11 @@ try {
       finally { $stream.Dispose() }
     } finally { $algorithm.Dispose() }
   }
+  function MatchesExpectedImage($actualPath,$expectedPath,$actualHash) {
+    if ([IO.Path]::GetFullPath($actualPath) -ieq [IO.Path]::GetFullPath($expectedPath)) { return $true }
+    try { $expectedHash=FileSha256 $expectedPath; return $expectedHash -ceq $actualHash }
+    catch [System.ArgumentException] { return $false }
+  }
   function Identity {
     $script:stage='process-query'
     $native=[Diagnostics.Process]::GetProcessById([int]$inputProof.serverId); $helper=$null
@@ -212,10 +217,7 @@ try {
         $nativeHome=[IO.Path]::GetFullPath($r.codexHome)
       }
       $script:stage='expected-image-hash'
-      try {
-        $expectedHash=FileSha256 $expectedExecutable
-        $executableContentMatchesExpected=$hash -ceq $expectedHash
-      } catch [System.ArgumentException] { $executableContentMatchesExpected=$false }
+      $executableContentMatchesExpected=MatchesExpectedImage $exe $expectedExecutable $hash
       $script:stage='boot-query'
       $boot=(Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime().ToString('o')
       $result=[ordered]@{pid=$native.Id;birth=$birth;boot=$boot;executable=[IO.Path]::GetFullPath($exe).ToLowerInvariant();sha256=$hash;owner=$owner.Sid;codexHome=$nativeHome.ToLowerInvariant()}
@@ -229,11 +231,8 @@ try {
           $helperOwner=Invoke-CimMethod -InputObject $helperRecord -MethodName GetOwnerSid -ErrorAction Stop
           $script:stage='helper-image-hash'
           $helperHash=FileSha256 $helper.MainModule.FileName
-          try {
-            $script:stage='expected-helper-image-hash'
-            $expectedHelperHash=FileSha256 $p.helperExecutable
-            $helperExecutableContentMatchesExpected=$helperHash -ceq $expectedHelperHash
-          } catch [System.ArgumentException] { $helperExecutableContentMatchesExpected=$false }
+          $script:stage='expected-helper-image-hash'
+          $helperExecutableContentMatchesExpected=MatchesExpectedImage $helper.MainModule.FileName $p.helperExecutable $helperHash
           Require ($helperRecord.ParentProcessId -eq $inputProof.gatewayId -and $helperOwner.ReturnValue -eq 0 -and $helperOwner.Sid -eq $gatewayOwner)
           $result.helperPid=$helper.Id; $result.helperParentPid=[int]$helperRecord.ParentProcessId; $result.helperExecutable=[IO.Path]::GetFullPath($helper.MainModule.FileName).ToLowerInvariant()
           $result.helperExecutableContentMatchesExpected=$helperExecutableContentMatchesExpected

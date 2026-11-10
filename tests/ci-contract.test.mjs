@@ -136,6 +136,13 @@ test('Windows shared protocol fixture keeps CODEX_HOME outside RUNNER_TEMP', asy
  assert.ok(/fixture_parent\s*=\s*os\.environ\.get\('USERPROFILE'\)\s+if os\.name == 'nt'\s+else os\.environ\.get\('RUNNER_TEMP'\)/u.test(probe));
  assert.ok(/tempfile\.mkdtemp\(prefix='rs-', dir=fixture_parent\)/u.test(probe));
 });
+test('Windows native process proof reuses hashes for matching expected image paths',async()=>{
+ const source=await readFile(new URL('../src/server/codex-native-generation.ts',import.meta.url),'utf8');
+ assert.match(source,/function MatchesExpectedImage\(\$actualPath,\$expectedPath,\$actualHash\)/u);
+ assert.match(source,/GetFullPath\(\$actualPath\) -ieq \[IO\.Path\]::GetFullPath\(\$expectedPath\)/u);
+ assert.ok(source.includes('MatchesExpectedImage $exe $expectedExecutable $hash'));
+ assert.ok(source.includes('MatchesExpectedImage $helper.MainModule.FileName $p.helperExecutable $helperHash'));
+});
 test('the current signed Desktop backend is covered by every supported Codex probe', async()=>{
  const version='0.167.0-alpha.3.2';
  for(const file of ['../scripts/protocol-probe.py','../scripts/managed-protocol-probe.py','../scripts/shared-protocol-probe.py','../scripts/windows/ci-standard-user-canary.ps1']) {
