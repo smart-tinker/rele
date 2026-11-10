@@ -190,6 +190,18 @@ describe('Codex installation and existing Desktop discovery', () => {
     expect(result.recommended).toEqual({ executable: desktop, transport: 'websocket', endpoint: 'ws://127.0.0.1:4500' });
   });
 
+  it('recognizes the signed Desktop backend version exercised by the hosted Windows gate', async () => {
+    const packageRoot = win.dirname(win.dirname(win.dirname(desktop)));
+    const metadata = { processes: [], packages: [{ name: 'OpenAI.Codex', location: packageRoot }], issues: [] };
+    const f = windowsFixture(metadata, [desktop]);
+    f.run.mockImplementation(async (command, args) => args.includes(WINDOWS_CODEX_METADATA_SCRIPT)
+      ? { stdout: JSON.stringify(metadata), code: 0 }
+      : { stdout: `codex-cli ${command === desktop ? '0.167.0-alpha.3.2' : '0.163.0'}`, code: 0 });
+    const result = await discoverCodex(f.options);
+    expect(result.recommendedManaged).toEqual({ executable: desktop, transport: 'managed', endpoint: '' });
+    expect(result.issues.map(item => item.code)).not.toContain('cli-version-unverified');
+  });
+
   it.each(['0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6'])('recommends supported %s even when a newer unsupported package is found first', async version => {
     const latest = desktop.replace('26.1_', '26.2_'), unsupported = desktop.replace('26.1_', '26.3_');
     const packages = [unsupported, desktop, latest].map(executable => ({ name: 'OpenAI.Codex', location: win.dirname(win.dirname(win.dirname(executable))) }));

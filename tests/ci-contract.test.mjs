@@ -131,6 +131,13 @@ test('shared protocol gate only allows unlisted versions for the exact measured 
  assert.ok(probe.includes('if args.expected_version not in VERSIONS and not args.desktop_bundle:'));
  assert.ok(probe.includes("evidence.get('backendVersion') != args.expected_version"));
 });
+test('the current signed Desktop backend is covered by every supported Codex probe', async()=>{
+ const version='0.167.0-alpha.3.2';
+ for(const file of ['../scripts/protocol-probe.py','../scripts/managed-protocol-probe.py','../scripts/shared-protocol-probe.py','../scripts/windows/ci-standard-user-canary.ps1']) {
+  const source=await readFile(new URL(file,import.meta.url),'utf8');
+  assert.ok(source.includes(version),`${file} must test the current signed Desktop backend`);
+ }
+});
 test('signed Desktop fixture defines complete inert MCP transports for its enable overrides', async()=>{
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
  const start=probe.indexOf("scenario_config += f'''");
