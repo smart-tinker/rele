@@ -48,6 +48,13 @@ export function summarizeSharedWaitFailure(expectedStatus, state) {
    approvalsAdded: Number.isSafeInteger(event.approvalsAdded) && event.approvalsAdded >= 0 ? event.approvalsAdded : 0,
    ...(typeof event.errorType === 'string' && /^[A-Za-z]{1,48}$/u.test(event.errorType) ? { errorType: event.errorType } : {}),
   })),
+  reconciliationStageTrace: (state.reconciliationStageTrace ?? []).slice(-32).map(event=>({
+   operation: ['releaseWait','subscribe','releaseThread','findCompletionHistory','findOwnRequest'].includes(event.operation) ? event.operation : 'other',
+   phase: ['start','done','error'].includes(event.phase) ? event.phase : 'other',
+   ...(Number.isSafeInteger(event.elapsedMs) && event.elapsedMs >= 0 ? { elapsedMs: event.elapsedMs } : {}),
+   ...(typeof event.resultState === 'string' && ['queued','starting','running','waiting_approval','completed','failed','interrupted','cancelled','uncertain','not_found','unknown'].includes(event.resultState) ? { resultState: event.resultState } : {}),
+   ...(typeof event.errorType === 'string' && /^[A-Za-z]{1,48}$/u.test(event.errorType) ? { errorType: event.errorType } : {}),
+  })),
   driverOperations: state.driverOperations.slice(-40),
  };
 }

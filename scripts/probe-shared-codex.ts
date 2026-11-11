@@ -89,6 +89,26 @@ if (values['expect-error']) {
   const observedTurns: Array<{ method: string; threadId: string; turnId: string }> = [];
   const completionObservations: Array<{ eventId: string; status: string; turnMatches: boolean }> = [];
   const reconciliationTrace: Array<{ eventId: string; phase: 'start' | 'done' | 'error'; status: string; completionNotification: boolean; turnProvided: boolean; elapsedMs?: number; errorType?: string }> = [];
+  type ReconciliationStage = { operation: 'releaseWait' | 'subscribe' | 'releaseThread' | 'findCompletionHistory' | 'findOwnRequest'; phase: 'start' | 'done' | 'error'; elapsedMs?: number; resultState?: string; errorType?: string };
+  const reconciliationStageTrace: ReconciliationStage[] = [];
+  const recordReconciliationStage = (event: ReconciliationStage) => {
+    reconciliationStageTrace.push(event);
+    if (reconciliationStageTrace.length > 128) reconciliationStageTrace.shift();
+  };
+  const traceReconciliationStage = <TArgs extends unknown[], TResult>(operation: ReconciliationStage['operation'], run: (...args: TArgs) => Promise<TResult>, resultState?: (result: TResult) => string) => async (...args: TArgs): Promise<TResult> => {
+    const started = Date.now();
+    recordReconciliationStage({ operation, phase: 'start' });
+    try {
+      const result = await run(...args);
+      recordReconciliationStage({ operation, phase: 'done', elapsedMs: Date.now() - started,
+        ...(resultState ? { resultState: resultState(result) } : {}) });
+      return result;
+    } catch (error) {
+      const errorType = error instanceof Error && /^[A-Za-z]{1,48}$/u.test(error.name) ? error.name : 'UnknownError';
+      recordReconciliationStage({ operation, phase: 'error', elapsedMs: Date.now() - started, errorType });
+      throw error;
+    }
+  };
   const rpcTrace: Array<{ attempt: number; method: string; phase: 'start' | 'done' | 'error'; elapsedMs?: number; errorType?: string }> = [];
   let rpcAttempt = 0;
   const observedProtocolEvents: Array<{ kind: 'request' | 'notification'; method: string; hasThreadId: boolean; hasTurnId: boolean; hasRequestId: boolean; hasItemId: boolean; hasApprovalId: boolean }> = [];
@@ -157,7 +177,8 @@ if (values['expect-error']) {
     };
     await codex.connect();
     // Snapshot polling would evict the dispatch stages from this bounded trace.
-    codex.subscribe = observe('subscribe', codex.subscribe.bind(codex));
+    codex.subscribe = observe('subscribe', traceReconciliationStage('subscribe', codex.subscribe.bind(codex)));
+    codex.releaseThread = observe('releaseThread', traceReconciliationStage('releaseThread', codex.releaseThread.bind(codex)));
     codex.backgroundTerminals = observe('backgroundTerminals', codex.backgroundTerminals.bind(codex));
     const internals = codex as unknown as { pages: <T>(method: string, params: Record<string, unknown>) => Promise<T[]> };
     const pages = internals.pages.bind(codex);
@@ -212,19 +233,37 @@ if (values['expect-error']) {
       reconcile: (id: string, completionNotification?: boolean, completionTurnId?: string) => Promise<void>;
       onServerRequest: (event: CodexServerRequest) => Promise<void>;
       findOwnRequest: (client: SourceCodexClient, threadId: string, requestId: string) => Promise<{ state: string; turnId?: string; mixed?: boolean }>;
+      findCompletionHistory: (client: SourceCodexClient, threadId: string, requestId: string) => Promise<{ state: string; turnId?: string; mixed?: boolean }>;
+      releasing: Map<string, Promise<void>>;
       initialMessages: { ensure: (conversationId: string) => Promise<boolean> };
       slackSync: { drain: (conversationId: string, cutoff?: string) => Promise<boolean> };
     };
     const activeCodex = codex!;
     const findOwnRequest = engineInternals.findOwnRequest.bind(engine);
     engineInternals.findOwnRequest = async (client, requestThread, requestId) => {
-      const found = await findOwnRequest(client, requestThread, requestId);
+      const found = await traceReconciliationStage('findOwnRequest', findOwnRequest, result => fixtureLabel(result.state))(client, requestThread, requestId);
       if (currentServerRequest?.requestId === requestId) {
         currentServerRequest.trace.historyState = found.state;
         currentServerRequest.trace.historyTurnMatches = typeof currentServerRequest.turnId === 'string' && found.turnId === currentServerRequest.turnId;
         currentServerRequest.trace.historyMixed = found.mixed === true;
       }
       return found;
+    };
+    const findCompletionHistory = engineInternals.findCompletionHistory.bind(engine);
+    engineInternals.findCompletionHistory = traceReconciliationStage('findCompletionHistory', findCompletionHistory, result => fixtureLabel(result.state));
+    const releasingGet = engineInternals.releasing.get.bind(engineInternals.releasing);
+    engineInternals.releasing.get = key => {
+      const pendingRelease = releasingGet(key);
+      if (pendingRelease) {
+        const started = Date.now();
+        recordReconciliationStage({ operation: 'releaseWait', phase: 'start' });
+        void pendingRelease.then(
+          () => recordReconciliationStage({ operation: 'releaseWait', phase: 'done', elapsedMs: Date.now() - started }),
+          error => recordReconciliationStage({ operation: 'releaseWait', phase: 'error', elapsedMs: Date.now() - started,
+            errorType: error instanceof Error && /^[A-Za-z]{1,48}$/u.test(error.name) ? error.name : 'UnknownError' }),
+        );
+      }
+      return pendingRelease;
     };
     const onServerRequest = engineInternals.onServerRequest.bind(engine);
     engineInternals.onServerRequest = async event => {
@@ -290,7 +329,7 @@ if (values['expect-error']) {
       requests, cancelCleanups, deliveries: store.listDeliveries(), approvals: store.listApprovals(), diagnostics,
       driverOperations: driverOperations.slice(-40), completionObservations: completionObservations.slice(-32),
       serverRequestTrace: serverRequestTrace.slice(-24),
-      reconciliationTrace: reconciliationTrace.slice(-48), rpcTrace: rpcTrace.slice(-64) };
+      reconciliationTrace: reconciliationTrace.slice(-48), reconciliationStageTrace: reconciliationStageTrace.slice(-32), rpcTrace: rpcTrace.slice(-64) };
   }
   const input = createInterface({ input: process.stdin });
   try {

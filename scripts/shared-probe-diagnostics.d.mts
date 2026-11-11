@@ -7,6 +7,7 @@ export function summarizeSharedWaitFailure(expectedStatus: string, state: {
   historyState?: string; historyTurnMatches?: boolean; historyMixed?: boolean; pendingAtExit: boolean;
   statusAfter?: string; approvalsAdded: number; errorType?: string;
  }>;
+ reconciliationStageTrace?: Array<{ operation?: string; phase?: string; elapsedMs?: number; resultState?: string; errorType?: string }>;
  driverOperations: string[];
 }): {
  expectedStatus: string;
@@ -17,6 +18,12 @@ export function summarizeSharedWaitFailure(expectedStatus: string, state: {
   method: string; pendingAtEntry: boolean; activeRequests: number; threadMatches: number; exactMatches: number;
   historyState?: string; historyTurnMatches?: boolean; historyMixed?: boolean; pendingAtExit: boolean;
   statusAfter?: string; approvalsAdded: number; errorType?: string;
+ }>;
+ reconciliationStageTrace: Array<{
+  operation: 'releaseWait' | 'subscribe' | 'releaseThread' | 'findCompletionHistory' | 'findOwnRequest' | 'other';
+  phase: 'start' | 'done' | 'error' | 'other'; elapsedMs?: number;
+  resultState?: 'queued' | 'starting' | 'running' | 'waiting_approval' | 'completed' | 'failed' | 'interrupted' | 'cancelled' | 'uncertain' | 'not_found' | 'unknown';
+  errorType?: string;
  }>;
  driverOperations: string[];
 };
