@@ -2008,6 +2008,21 @@ describe('Engine scoped shell cancellation', () => {
 });
 
 describe('Engine approvals', () => {
+  it('keeps a live approval waiting when native history briefly omits its turn', async () => {
+    const f = fixture();
+    const request = await acceptRequest(f, 'telegram');
+    const approval = await requestApproval(f, request);
+    f.codex.findRequest.mockResolvedValueOnce({ state: 'not_found' });
+
+    await f.engine.reconcile(request.id);
+
+    expect(approval.rpcId).not.toBeNull();
+    expect(f.codex.hasPendingRequest(approval.rpcId!)).toBe(true);
+    expect(f.store.getApproval(approval.id)?.status).toBe('pending');
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'waiting_approval', turnId: approval.turnId });
+    expect(f.codex.respond).not.toHaveBeenCalled();
+  });
+
   it.each(['lookup-error', 'mixed', 'wrong-turn', 'already-terminal'] as const)('rejects a managed approval when origin verification is %s', async reason => {
     const f = fixture();
     f.codex.transport = 'managed';

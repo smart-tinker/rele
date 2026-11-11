@@ -788,7 +788,14 @@ export class Engine extends EventEmitter {
         this.recoverProgress(request.id, found);
         this.syncAsyncQuestions(request, found);
       }
-      if (found.state === 'not_found') this.store.updateRequest(id, { status: 'uncertain', error: 'Запрос не найден в очереди и истории Codex. Автоматическая повторная отправка запрещена; требуется сверка.' });
+      if (found.state === 'not_found') {
+        const pendingApproval = this.store.listApprovals(1000).find(approval => approval.requestId === id && approval.status === 'pending'
+          && approval.method !== ASYNC_QUESTION_METHOD && approval.turnId === request.turnId && approval.rpcId !== null
+          && client.hasPendingRequest?.(approval.rpcId) === true);
+        if (pendingApproval && !this.store.getMeta(`cancel-requested:${id}`))
+          this.store.updateRequest(id, { status: 'waiting_approval', error: undefined });
+        else this.store.updateRequest(id, { status: 'uncertain', error: 'Запрос не найден в очереди и истории Codex. Автоматическая повторная отправка запрещена; требуется сверка.' });
+      }
       else if (found.state === 'queued') {
         this.store.updateRequest(id, { status: 'starting', queuedSubmissionId: found.queuedSubmissionId, error: undefined });
         await this.continueQueued(request, found, true);
