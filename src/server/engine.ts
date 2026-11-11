@@ -77,7 +77,19 @@ export class Engine extends EventEmitter {
   private nextAsyncQuestionRefresh = 0;
   private retryingOverloads = new Map<string, Promise<{ turnId: string } | undefined>>();
   private slackConnection?: string;
-  private readonly notification = (event: CodexNotification) => this.event(() => this.onNotification(event));
+  private readonly notification = (event: CodexNotification) => {
+    const epoch = this.epoch;
+    if (event.method === 'turn/completed') {
+      const p = event.params as Record<string, any>;
+      if (typeof p.turn?.id === 'string') for (const request of this.store.activeRequests()) {
+        if (request.turnId === p.turn.id || request.status === 'starting'
+          && this.store.getConversation(request.conversationId)?.threadId === p.threadId) {
+          this.track((async () => { if (!this.stopped && epoch === this.epoch) await this.reconcile(request.id); })());
+        }
+      }
+    }
+    this.event(() => this.onNotification(event));
+  };
   private readonly serverRequest = (event: CodexServerRequest) => this.event(() => this.onServerRequest(event));
   private readonly connection = () => this.connectionChanged();
 
@@ -1423,9 +1435,6 @@ export class Engine extends EventEmitter {
           }
         }
       }
-    } else if (method === 'turn/completed' && p.turn?.id) {
-      // A history read must not hold notifications from unrelated threads.
-      for (const request of this.store.activeRequests()) if (request.turnId === p.turn.id || (request.status === 'starting' && this.store.getConversation(request.conversationId)?.threadId === p.threadId)) this.track(this.reconcile(request.id));
     } else if (method === 'serverRequest/resolved') {
       for (const [key, pending] of this.pendingQuestions) if (pending.epoch === this.epoch
         && pending.event.id === p.requestId && (pending.event.params as Record<string, unknown>).threadId === p.threadId) this.pendingQuestions.delete(key);

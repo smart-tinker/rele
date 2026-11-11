@@ -3350,6 +3350,25 @@ describe('multiple origins and terminal reconciliation', () => {
     expect(f.codex.interrupt).not.toHaveBeenCalled();
   });
 
+  it('reconciles completion while an earlier native question read is pending', async () => {
+    const f = fixture(); const request = await acceptRequest(f, 'telegram'); await running(f, request);
+    const item = { id: 'blocked-native-question', type: 'agentMessage', delivery: 'async', text: 'Question',
+      questions: [{ title: 'Continue?' }] };
+    const question = asyncQuestions(item)[0].question;
+    const state = deferred<{ turnId: string; question: typeof question }>();
+    f.codex.asyncQuestionState.mockImplementationOnce(() => state.promise);
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1', item } });
+    await vi.waitFor(() => expect(f.codex.asyncQuestionState).toHaveBeenCalledWith(THREAD, question.id));
+    f.codex.complete(request.id, 'OK');
+    try {
+      await vi.waitFor(() => expect(f.store.getRequest(request.id)?.status).toBe('completed'));
+      await vi.waitFor(() => expect(f.telegram.deliver.mock.calls.map(([delivery]) => delivery.body)).toContain('OK'));
+    } finally {
+      state.resolve({ turnId: 'turn-1', question });
+      await f.engine.settled();
+    }
+  });
+
   it.each(['completion', 'question'] as const)('does not delay another thread %s behind a blocked completion history read', async event => {
     const f = fixture({ start: false });
     const otherThread = 'independent-codex-thread';
