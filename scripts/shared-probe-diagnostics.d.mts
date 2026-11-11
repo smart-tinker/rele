@@ -2,12 +2,22 @@ export function summarizeSharedWaitFailure(expectedStatus: string, state: {
  requests: Array<{id: string; eventId: string; status: string; turnId?: string; queuedSubmissionId?: string}>;
  approvals: Array<{id: string; requestId: string; method: string; status: string; turnId: string}>;
  observedTurns: Array<{method: string; turnId: string}>;
+ serverRequestTrace?: Array<{
+  method: string; pendingAtEntry: boolean; activeRequests: number; threadMatches: number; exactMatches: number;
+  historyState?: string; historyTurnMatches?: boolean; historyMixed?: boolean; pendingAtExit: boolean;
+  statusAfter?: string; approvalsAdded: number; errorType?: string;
+ }>;
  driverOperations: string[];
 }): {
  expectedStatus: string;
  requests: Array<{id: string; eventId: string; status: string; turnId?: string; queuedSubmissionId?: string}>;
  approvals: Array<{id: string; requestId: string; method: string; status: string; turnId: string}>;
  observedTurns: Array<{method: string; turnId: string}>;
+ serverRequestTrace: Array<{
+  method: string; pendingAtEntry: boolean; activeRequests: number; threadMatches: number; exactMatches: number;
+  historyState?: string; historyTurnMatches?: boolean; historyMixed?: boolean; pendingAtExit: boolean;
+  statusAfter?: string; approvalsAdded: number; errorType?: string;
+ }>;
  driverOperations: string[];
 };
 export function summarizeSharedNativeRequest(location: {

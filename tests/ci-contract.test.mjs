@@ -108,6 +108,8 @@ test('shared wait timeout reports bounded request correlation without message bo
   completionObservations:[{eventId:'after-shell-cancel',status:'running',turnMatches:true,turnId:'private-turn-id'}],
   reconciliationTrace:[{eventId:'after-shell-cancel',phase:'error',status:'uncertain',completionNotification:true,turnProvided:true,elapsedMs:123,errorType:'CodexTransportError',message:'private'}],
   rpcTrace:[{attempt:3,method:'thread/items/list',phase:'error',elapsedMs:123,errorType:'CodexTransportError',params:'private'}],
+  serverRequestTrace:[{method:'item/commandExecution/requestApproval',pendingAtEntry:true,activeRequests:2,threadMatches:1,exactMatches:1,
+   historyState:'running',historyTurnMatches:true,pendingAtExit:true,statusAfter:'waiting_approval',approvalsAdded:1,errorType:'private error'}],
  }),{
   expectedStatus:'waiting_approval',
   requests:[{id:'request-1',eventId:'approval',status:'uncertain',turnId:'turn-1',queuedSubmissionId:'queue-1'}],
@@ -121,6 +123,8 @@ test('shared wait timeout reports bounded request correlation without message bo
   completionObservations:[{eventId:'after-shell-cancel',status:'running',turnMatches:true}],
   reconciliationTrace:[{eventId:'after-shell-cancel',phase:'error',status:'uncertain',completionNotification:true,turnProvided:true,elapsedMs:123,errorType:'CodexTransportError'}],
   rpcTrace:[{attempt:3,method:'thread/items/list',phase:'error',elapsedMs:123,errorType:'CodexTransportError'}],
+  serverRequestTrace:[{method:'item/commandExecution/requestApproval',pendingAtEntry:true,activeRequests:2,threadMatches:1,exactMatches:1,
+   historyState:'running',historyTurnMatches:true,pendingAtExit:true,statusAfter:'waiting_approval',approvalsAdded:1}],
   driverOperations:Array.from({length:40},(_,index)=>`operation-${index+10}`),
  });
  assert.doesNotMatch(JSON.stringify(summarize('waiting_approval',{

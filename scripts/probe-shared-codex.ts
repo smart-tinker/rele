@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { summarizeSharedNativeRequest, summarizeSharedWaitFailure } from './shared-probe-diagnostics.mjs';
 import { ConfigStore, defaultConfig, defaultDataDirectory } from '../src/server/config.js';
-import { CodexClient as SourceCodexClient } from '../src/server/codex.js';
+import { CodexClient as SourceCodexClient, type CodexServerRequest } from '../src/server/codex.js';
 import { Engine as SourceEngine } from '../src/server/engine.js';
 import { Store as SourceStore } from '../src/server/store.js';
 import { ensureWindowsSharedCodex, readPreparedDesktopCodexPackage } from '../src/server/codex-shared.js';
@@ -92,6 +92,11 @@ if (values['expect-error']) {
   const rpcTrace: Array<{ attempt: number; method: string; phase: 'start' | 'done' | 'error'; elapsedMs?: number; errorType?: string }> = [];
   let rpcAttempt = 0;
   const observedProtocolEvents: Array<{ kind: 'request' | 'notification'; method: string; hasThreadId: boolean; hasTurnId: boolean; hasRequestId: boolean; hasItemId: boolean; hasApprovalId: boolean }> = [];
+  type ServerRequestTrace = { method: string; pendingAtEntry: boolean; activeRequests: number; threadMatches: number; exactMatches: number;
+    historyState?: string; historyTurnMatches?: boolean; historyMixed?: boolean; pendingAtExit: boolean; statusAfter?: string;
+    approvalsAdded: number; errorType?: string };
+  const serverRequestTrace: ServerRequestTrace[] = [];
+  let currentServerRequest: { requestId?: string; turnId?: string; trace: ServerRequestTrace } | undefined;
   const recordProtocolEvent = (kind: 'request' | 'notification', event: { method: string; params?: Record<string, unknown> }) => {
     const params = event.params ?? {};
     observedProtocolEvents.push({ kind, method: /^[A-Za-z0-9._/-]{1,100}$/u.test(event.method) ? event.method : 'other',
@@ -205,8 +210,44 @@ if (values['expect-error']) {
     const engineInternals = engine as unknown as {
       dispatch: (conversationId: string) => Promise<void>;
       reconcile: (id: string, completionNotification?: boolean, completionTurnId?: string) => Promise<void>;
+      onServerRequest: (event: CodexServerRequest) => Promise<void>;
+      findOwnRequest: (client: SourceCodexClient, threadId: string, requestId: string) => Promise<{ state: string; turnId?: string; mixed?: boolean }>;
       initialMessages: { ensure: (conversationId: string) => Promise<boolean> };
       slackSync: { drain: (conversationId: string, cutoff?: string) => Promise<boolean> };
+    };
+    const activeCodex = codex!;
+    const findOwnRequest = engineInternals.findOwnRequest.bind(engine);
+    engineInternals.findOwnRequest = async (client, requestThread, requestId) => {
+      const found = await findOwnRequest(client, requestThread, requestId);
+      if (currentServerRequest?.requestId === requestId) {
+        currentServerRequest.trace.historyState = found.state;
+        currentServerRequest.trace.historyTurnMatches = typeof currentServerRequest.turnId === 'string' && found.turnId === currentServerRequest.turnId;
+        currentServerRequest.trace.historyMixed = found.mixed === true;
+      }
+      return found;
+    };
+    const onServerRequest = engineInternals.onServerRequest.bind(engine);
+    engineInternals.onServerRequest = async event => {
+      const params = event.params as Record<string, unknown>;
+      const active = store.activeRequests();
+      const sameThread = active.filter(row => store.getConversation(row.conversationId)?.threadId === params.threadId);
+      const matches = sameThread.filter(row => !row.steeredInto && row.turnId === params.turnId);
+      const trace: ServerRequestTrace = { method: /^[A-Za-z0-9._/-]{1,100}$/u.test(event.method) ? event.method : 'other',
+        pendingAtEntry: activeCodex.hasPendingRequest(event.id), activeRequests: active.length,
+        threadMatches: sameThread.length, exactMatches: matches.length, pendingAtExit: false, approvalsAdded: 0 };
+      const previous = currentServerRequest;
+      currentServerRequest = { requestId: matches[0]?.id, turnId: typeof params.turnId === 'string' ? params.turnId : undefined, trace };
+      const approvalsBefore = store.listApprovals().length;
+      try { await onServerRequest(event); }
+      catch (error) { trace.errorType = error instanceof Error ? error.name : 'UnknownError'; throw error; }
+      finally {
+        trace.pendingAtExit = activeCodex.hasPendingRequest(event.id);
+        trace.statusAfter = matches[0] ? store.getRequest(matches[0].id)?.status ?? 'missing' : 'missing';
+        trace.approvalsAdded = Math.max(0, store.listApprovals().length - approvalsBefore);
+        serverRequestTrace.push(trace);
+        if (serverRequestTrace.length > 24) serverRequestTrace.shift();
+        currentServerRequest = previous;
+      }
     };
     engineInternals.dispatch = observe('dispatch', engineInternals.dispatch.bind(engine));
     const reconcile = engineInternals.reconcile.bind(engine);
@@ -248,6 +289,7 @@ if (values['expect-error']) {
       ...(processId ? { probeProcessAlive: alive(processId) } : {}),
       requests, cancelCleanups, deliveries: store.listDeliveries(), approvals: store.listApprovals(), diagnostics,
       driverOperations: driverOperations.slice(-40), completionObservations: completionObservations.slice(-32),
+      serverRequestTrace: serverRequestTrace.slice(-24),
       reconciliationTrace: reconciliationTrace.slice(-48), rpcTrace: rpcTrace.slice(-64) };
   }
   const input = createInterface({ input: process.stdin });

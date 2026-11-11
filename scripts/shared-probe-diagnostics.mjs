@@ -34,6 +34,20 @@ export function summarizeSharedWaitFailure(expectedStatus, state) {
    ...(Number.isSafeInteger(event.elapsedMs) && event.elapsedMs >= 0 ? { elapsedMs: event.elapsedMs } : {}),
    ...(typeof event.errorType === 'string' && /^[A-Za-z]{1,48}$/u.test(event.errorType) ? { errorType: event.errorType } : {}),
   })),
+  serverRequestTrace: (state.serverRequestTrace ?? []).slice(-8).map(event=>({
+   method: typeof event.method === 'string' && /^[A-Za-z0-9._/-]{1,100}$/u.test(event.method) ? event.method : 'other',
+   pendingAtEntry: event.pendingAtEntry === true,
+   activeRequests: Number.isSafeInteger(event.activeRequests) && event.activeRequests >= 0 ? event.activeRequests : 0,
+   threadMatches: Number.isSafeInteger(event.threadMatches) && event.threadMatches >= 0 ? event.threadMatches : 0,
+   exactMatches: Number.isSafeInteger(event.exactMatches) && event.exactMatches >= 0 ? event.exactMatches : 0,
+   ...(typeof event.historyState === 'string' && ['queued','running','completed','failed','interrupted','not_found'].includes(event.historyState) ? { historyState: event.historyState } : {}),
+   ...(typeof event.historyTurnMatches === 'boolean' ? { historyTurnMatches: event.historyTurnMatches } : {}),
+   ...(typeof event.historyMixed === 'boolean' ? { historyMixed: event.historyMixed } : {}),
+   pendingAtExit: event.pendingAtExit === true,
+   ...(typeof event.statusAfter === 'string' && ['queued','transcribing','starting','running','waiting_approval','completed','failed','interrupted','cancelled','uncertain','missing'].includes(event.statusAfter) ? { statusAfter: event.statusAfter } : {}),
+   approvalsAdded: Number.isSafeInteger(event.approvalsAdded) && event.approvalsAdded >= 0 ? event.approvalsAdded : 0,
+   ...(typeof event.errorType === 'string' && /^[A-Za-z]{1,48}$/u.test(event.errorType) ? { errorType: event.errorType } : {}),
+  })),
   driverOperations: state.driverOperations.slice(-40),
  };
 }
