@@ -621,6 +621,45 @@ try {
         if ($installerProgress.Count -ne 0) { $result | Add-Member -NotePropertyName installerProgress -NotePropertyValue ($installerProgress.ToArray()) }
         if ($cleanupFailures.Count -ne 0) { $result.result = 'failed'; $result | Add-Member -NotePropertyName cleanupErrors -NotePropertyValue $cleanupFailures }
         $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $publishedResult -Encoding UTF8
+        if ($RunGates -and $result.result -ne 'passed') {
+            $sharedDiagnosticPath = Join-Path $sourceRoot 'shared-results-actual-desktop.json'
+            $summary = [ordered]@{ stage = if ($parentStage -in @('shared', 'rdp-session', 'installer')) { $parentStage } else { 'unknown' }; reportAvailable = $false }
+            if (Test-Path -LiteralPath $sharedDiagnosticPath -PathType Leaf) {
+                try {
+                    $sharedDiagnostic = Get-Content -LiteralPath $sharedDiagnosticPath -Raw | ConvertFrom-Json
+                    $summary.reportAvailable = $true
+                    $summary.result = if ($sharedDiagnostic.result -in @('passed', 'failed')) { $sharedDiagnostic.result } else { 'unknown' }
+                    $summary.codexVersion = if ([string]$sharedDiagnostic.codexVersion -match '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$') { [string]$sharedDiagnostic.codexVersion } else { 'unknown' }
+                    $checks = @($sharedDiagnostic.checks.PSObject.Properties)
+                    $summary.checksPassed = @($checks | Where-Object { $_.Value -eq $true }).Count
+                    $summary.checksFailed = @($checks | Where-Object { $_.Value -eq $false }).Count
+                    $evidence = $sharedDiagnostic.heldRequestTimeout
+                    if (-not $evidence) { $evidence = $sharedDiagnostic.afterShellCancelWaitFailure }
+                    if (-not $evidence) { $evidence = $sharedDiagnostic.cancellationRequestTimeout }
+                    if ($evidence) {
+                        $summary.providerRequestCount = if ($evidence.providerRequestCount -is [int] -or $evidence.providerRequestCount -is [long]) { [Math]::Max(0, [int]$evidence.providerRequestCount) } else { 0 }
+                        $requestStatuses = [ordered]@{}
+                        foreach ($status in @('queued', 'transcribing', 'starting', 'running', 'waiting_approval', 'completed', 'failed', 'interrupted', 'cancelled', 'uncertain')) {
+                            $requestStatuses[$status] = @($evidence.engineRequests | Where-Object { $_.status -eq $status }).Count
+                        }
+                        $summary.engineRequestStatuses = $requestStatuses
+                        $approvalStatuses = [ordered]@{}
+                        foreach ($status in @('pending', 'answered', 'expired')) { $approvalStatuses[$status] = @($evidence.engineApprovals | Where-Object { $_.status -eq $status }).Count }
+                        $summary.approvalStatuses = $approvalStatuses
+                        $summary.nativeTurnStatus = if ($evidence.nativeTurnStatus -in @('idle', 'active', 'systemError')) { [string]$evidence.nativeTurnStatus } else { 'unknown' }
+                        $summary.observedTurnStarts = @($evidence.observedTurns | Where-Object { $_.method -eq 'turn/started' }).Count
+                        $summary.observedTurnCompletions = @($evidence.observedTurns | Where-Object { $_.method -eq 'turn/completed' }).Count
+                        $providerActions = [ordered]@{}
+                        foreach ($action in @('initial', 'final', 'hold', 'shell', 'approval', 'question')) { $providerActions[$action] = @($evidence.providerTrace | Where-Object { $_.action -eq $action }).Count }
+                        $summary.providerActions = $providerActions
+                        $providerResults = [ordered]@{}
+                        foreach ($status in @('pending', 'sent', 'disconnected')) { $providerResults[$status] = @($evidence.providerTrace | Where-Object { $_.result -eq $status }).Count }
+                        $summary.providerResults = $providerResults
+                    }
+                } catch { $summary.reportAvailable = $false }
+            }
+            Write-Output ('Windows canary bounded diagnostic: ' + ($summary | ConvertTo-Json -Compress -Depth 4))
+        }
     }
     if ($cleanupFailures.Count -ne 0) { throw 'The isolated Windows canary cleanup did not complete.' }
 }

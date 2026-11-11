@@ -287,6 +287,17 @@ test('Windows canary forwards only bounded timeout evidence from the failed Desk
  assert.doesNotMatch(relay,/NotePropertyName (?:report|sharedReport)/u,'do not forward the full probe report');
  assert.ok(canary.indexOf('$result | ConvertTo-Json -Depth 6',end)>end,'serialize the bounded evidence into the canary receipt');
 });
+test('Windows parent failure prints only bounded shared-gate counts and states', async()=>{
+ const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ const start=canary.indexOf("$sharedDiagnosticPath = Join-Path $sourceRoot 'shared-results-actual-desktop.json'");
+ const end=canary.indexOf("if ($cleanupFailures.Count -ne 0)",start);
+ assert.ok(start>=0 && end>start,'parent cleanup must summarize the copied shared-gate report');
+ const summary=canary.slice(start,end);
+ for(const field of ['providerRequestCount','engineRequestStatuses','approvalStatuses','nativeTurnStatus','observedTurnStarts','observedTurnCompletions','Write-Output']) {
+  assert.ok(summary.includes(field),`print the bounded timeout field ${field}`);
+ }
+ assert.doesNotMatch(summary,/stderrTail|exception|payload|requestId|turnId|sharedReport/u,'never print raw errors, payloads, IDs, or the complete report');
+});
 test('shared cancellation diagnostics preserve the original error if snapshot fails', async()=>{
  const probe=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');
  const start=probe.indexOf('try { await engine!.cancel(command.requestId!); } catch (error) {');
