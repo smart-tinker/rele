@@ -123,7 +123,7 @@ export class CodexThreadBusyError extends Error {
 // A dropped connection or timeout cannot establish whether a mutating RPC was accepted.
 export class CodexTransportError extends Error {
   readonly uncertain = true;
-  constructor(message: string, readonly code?: string) { super(message); this.name = 'CodexTransportError'; }
+  constructor(message: string, readonly code?: string, readonly identityFailure?: 'server-id-changed' | 'target-generation-invalid' | 'server-generation-unconfirmed' | 'server-generation-changed' | 'terminal-ambiguous' | 'terminal-process-changed') { super(message); this.name = 'CodexTransportError'; }
 }
 
 interface ConnectionFailure { code: string; message: string }
@@ -521,13 +521,16 @@ export class CodexClient extends EventEmitter {
   async terminateBackgroundTerminal(threadId: string, target: CodexTerminal & { serverId: number; serverGeneration?: string }): Promise<void> {
     const current = await this.backgroundTerminals(threadId);
     const matching = current.terminals.filter(entry => entry.itemId === target.itemId);
-    if (target.serverGeneration !== undefined && (!/^[a-f0-9]{64}$/u.test(target.serverGeneration) || current.serverGeneration !== target.serverGeneration)
-      || current.serverId !== target.serverId) {
-      throw new CodexTransportError('Фоновая команда или сервер изменились. Адресное завершение не отправлено.', 'terminal-identity-changed');
-    }
+    const identityFailure = current.serverId !== target.serverId ? 'server-id-changed'
+      : target.serverGeneration === undefined ? undefined
+        : !/^[a-f0-9]{64}$/u.test(target.serverGeneration) ? 'target-generation-invalid'
+          : current.serverGeneration === undefined ? 'server-generation-unconfirmed'
+            : current.serverGeneration !== target.serverGeneration ? 'server-generation-changed' : undefined;
+    if (identityFailure) throw new CodexTransportError('Фоновая команда или сервер изменились. Адресное завершение не отправлено.', 'terminal-identity-changed', identityFailure);
     if (matching.length === 0) return;
     if (matching.length !== 1 || matching[0].processId !== target.processId) {
-      throw new CodexTransportError('Фоновая команда или сервер изменились. Адресное завершение не отправлено.', 'terminal-identity-changed');
+      const failure = matching.length !== 1 ? 'terminal-ambiguous' : 'terminal-process-changed';
+      throw new CodexTransportError('Фоновая команда или сервер изменились. Адресное завершение не отправлено.', 'terminal-identity-changed', failure);
     }
     // Native has no expected-item CAS: revalidate immediately, never terminate a stored PID blindly.
     const result = await this.call<{ terminated: boolean }>('thread/backgroundTerminals/terminate', { threadId, processId: target.processId });

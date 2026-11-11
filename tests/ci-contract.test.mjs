@@ -354,6 +354,8 @@ test('shared cancellation diagnostics preserve the original error if snapshot fa
  assert.match(failure,/try\s*\{\s*state = await snapshot\(command\.processId\);\s*\}\s*catch\s*\(diagnostic\)/u,
   'contain a failed native snapshot while handling a cancel error');
  assert.match(failure,/snapshotErrorType/u,'record only the diagnostic exception type');
+ assert.match(failure,/identityFailure: safeIdentityFailure/u,'report only a bounded terminal identity failure category');
+ assert.match(failure,/\['server-id-changed', 'target-generation-invalid', 'server-generation-unconfirmed', 'server-generation-changed', 'terminal-ambiguous', 'terminal-process-changed'\]/u,'allowlist terminal identity diagnostics without reporting identifiers');
  assert.ok(failure.indexOf("event: 'shared-cancel-diagnostic'")<failure.indexOf('throw error;'),
   'emit best-effort diagnostics and rethrow the original cancel error');
 });

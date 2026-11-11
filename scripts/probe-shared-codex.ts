@@ -322,10 +322,13 @@ if (values['expect-error']) {
           try { state = await snapshot(command.processId); }
           catch (diagnostic) { snapshotErrorType = diagnostic instanceof Error ? diagnostic.name : 'UnknownError'; }
           const request = store.listRequests().find(row => row.id === command.requestId);
+          const identityFailures = ['server-id-changed', 'target-generation-invalid', 'server-generation-unconfirmed', 'server-generation-changed', 'terminal-ambiguous', 'terminal-process-changed'] as const;
+          const identityFailure = (error as { identityFailure?: unknown }).identityFailure;
+          const safeIdentityFailure = identityFailures.includes(identityFailure as typeof identityFailures[number]) ? identityFailure : undefined;
           process.stderr.write(JSON.stringify({ event: 'shared-cancel-diagnostic', errorCode: (error as { code?: unknown }).code,
             requestId: command.requestId, turnId: request?.turnId, cleanup: state?.cancelCleanups[command.requestId!],
             terminals, cancellationInterruptWitnesses: state?.cancellationInterruptWitnesses,
-            probeProcessAlive: state?.probeProcessAlive, snapshotErrorType }) + '\n');
+            probeProcessAlive: state?.probeProcessAlive, snapshotErrorType, identityFailure: safeIdentityFailure }) + '\n');
           throw error;
         }
       } else if (command.action === 'close') {

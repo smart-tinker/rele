@@ -982,7 +982,11 @@ describe('Codex shared-runtime adapter', () => {
     expect(f.calls.filter(call => call.method === 'thread/backgroundTerminals/terminate').map(call => call.params))
       .toEqual([{ threadId, processId: '1234' }]);
     terminals[0].processId = '9999';
-    await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, itemId: 'own-command', processId: '1234' })).rejects.toThrow();
+    await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, itemId: 'own-command', processId: '1234' }))
+      .rejects.toMatchObject({ identityFailure: 'terminal-process-changed' });
+    terminals.push({ itemId: 'own-command', processId: '1111', command: 'duplicate-command-body' });
+    await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, itemId: 'own-command', processId: '1234' }))
+      .rejects.toMatchObject({ identityFailure: 'terminal-ambiguous' });
     expect(f.calls.filter(call => call.method === 'thread/backgroundTerminals/terminate')).toHaveLength(1);
   });
 
@@ -1379,11 +1383,40 @@ describe('Codex managed runtime', () => {
       'thread/backgroundTerminals/terminate': () => ({ terminated: true }),
     });
     await f.client.connect();
-    for (const serverGeneration of ['a'.repeat(64), 'A'.repeat(64), 'a'.repeat(63), '']) {
-      await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, serverGeneration, itemId: 'own-command', processId: '1234' })).rejects.toMatchObject({ code: 'terminal-identity-changed' });
+    await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, serverGeneration: 'a'.repeat(64), itemId: 'own-command', processId: '1234' }))
+      .rejects.toMatchObject({ code: 'terminal-identity-changed', identityFailure: 'server-generation-unconfirmed' });
+    for (const serverGeneration of ['A'.repeat(64), 'a'.repeat(63), '']) {
+      await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, serverGeneration, itemId: 'own-command', processId: '1234' }))
+        .rejects.toMatchObject({ code: 'terminal-identity-changed', identityFailure: 'target-generation-invalid' });
     }
     expect(f.calls.some(call => call.method === 'thread/backgroundTerminals/terminate')).toBe(false);
     expect(await f.client.backgroundTerminals(threadId)).not.toHaveProperty('serverGeneration');
+  });
+
+  it('classifies a server identity change without sending native termination', async () => {
+    let serverId = 42;
+    const f = await fixture({
+      'server/diagnostics': () => ({ process: { id: serverId }, gauges: [] }),
+      'thread/backgroundTerminals/list': () => ({ data: [{ itemId: 'own-command', processId: '1234' }], nextCursor: null }),
+      'thread/backgroundTerminals/terminate': () => ({ terminated: true }),
+    });
+    await f.client.connect();
+    const snapshot = await f.client.backgroundTerminals(threadId);
+    serverId++;
+
+    await expect(f.client.terminateBackgroundTerminal(threadId, { ...snapshot.terminals[0], serverId: snapshot.serverId }))
+      .rejects.toMatchObject({ code: 'terminal-identity-changed', identityFailure: 'server-id-changed' });
+    expect(f.calls.some(call => call.method === 'thread/backgroundTerminals/terminate')).toBe(false);
+  });
+
+  it('classifies a confirmed server generation change without sending native termination', async () => {
+    const f = await fixture();
+    await f.client.connect();
+    vi.spyOn(f.client, 'backgroundTerminals').mockResolvedValue({ serverId: 42, serverGeneration: 'b'.repeat(64), terminals: [{ itemId: 'own-command', processId: '1234' }] });
+
+    await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, serverGeneration: 'a'.repeat(64), itemId: 'own-command', processId: '1234' }))
+      .rejects.toMatchObject({ code: 'terminal-identity-changed', identityFailure: 'server-generation-changed' });
+    expect(f.calls.some(call => call.method === 'thread/backgroundTerminals/terminate')).toBe(false);
   });
 
   it.skipIf(!['linux', 'win32'].includes(process.platform))('proves a stable generation for the actual owned stdio peer and changes it for a replacement process', async () => {
