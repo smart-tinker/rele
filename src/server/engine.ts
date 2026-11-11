@@ -84,7 +84,7 @@ export class Engine extends EventEmitter {
       if (typeof p.turn?.id === 'string') for (const request of this.store.activeRequests()) {
         if (request.turnId === p.turn.id || request.status === 'starting'
           && this.store.getConversation(request.conversationId)?.threadId === p.threadId) {
-          this.track((async () => { if (!this.stopped && epoch === this.epoch) await this.reconcile(request.id); })());
+          this.track((async () => { if (!this.stopped && epoch === this.epoch) await this.reconcile(request.id, true); })());
         }
       }
     }
@@ -732,14 +732,14 @@ export class Engine extends EventEmitter {
     this.changed();
   }
 
-  async reconcile(id: string): Promise<void> {
+  async reconcile(id: string, completionNotification = false): Promise<void> {
     // Do not block the notification queue behind cleanup; later canonical command items must flow.
     if (this.cancelling.has(id)) return;
     if (this.reconciling.has(id)) {
       this.reconcileAgain.add(id);
       const request = this.store.getRequest(id);
       const threadId = request && this.store.getConversation(request.conversationId)?.threadId;
-      if (!this.startingQueued.has(id) || !request?.turnId || !threadId || terminal(request.status)
+      if (!(completionNotification || this.startingQueued.has(id)) || !request?.turnId || !threadId || terminal(request.status)
         || this.store.getMeta(`cancel-requested:${id}`)) return;
       const client = this.codex, epoch = this.epoch;
       try {

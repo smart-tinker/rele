@@ -3343,7 +3343,11 @@ describe('multiple origins and terminal reconciliation', () => {
     const pendingRead = f.engine.reconcile(request.id);
     await vi.waitFor(() => expect(f.codex.findRequest).toHaveBeenCalled());
     f.codex.complete(request.id, 'OK'); await Promise.resolve(); await Promise.resolve();
-    gate.reject(new Error('Interrupted snapshot has no completion timestamp'));
+    try {
+      await vi.waitFor(() => expect(f.store.getRequest(request.id)?.status).toBe('completed'));
+    } finally {
+      gate.reject(new Error('Interrupted snapshot has no completion timestamp'));
+    }
     await pendingRead; await f.engine.settled(); await f.engine.pump();
     expect(f.store.getRequest(request.id)?.status).toBe('completed');
     expect(f.telegram.deliver.mock.calls.map(([delivery]) => delivery.body)).toContain('OK');
