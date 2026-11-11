@@ -1681,6 +1681,17 @@ describe('Engine continuation after native Stop', () => {
     expect(f.store.getRequest(request.id)?.queuedSubmissionId).toBe('accepted-native-entry');
   });
 
+  it('binds a queued turn from its start acknowledgement when Codex omits notifications', async () => {
+    const f = fixture(), request = await acceptRequest(f, 'telegram');
+    await f.engine.settled();
+    ownQueue(f, request);
+    f.codex.startQueued.mockImplementationOnce(async () => ({ turn: { id: 'queued-ack-turn', status: 'inProgress', items: [] } }));
+
+    await f.engine.reconcile(request.id);
+
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'running', turnId: 'queued-ack-turn' });
+  });
+
   it('rechecks a completed turn when history lags behind its notification during queue start', async () => {
     const f = fixture(), request = await acceptRequest(f, 'telegram');
     await f.engine.settled();

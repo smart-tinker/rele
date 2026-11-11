@@ -717,8 +717,24 @@ export class Engine extends EventEmitter {
       // Starting a queued item is a separate mutation; persist its fence before the wire write.
       this.store.setMeta(key, found.queuedSubmissionId);
       try {
-        await client.startQueued(this.store.getConversation(current.conversationId)!.threadId, found.queuedSubmissionId);
+        const { turn } = await client.startQueued(this.store.getConversation(current.conversationId)!.threadId, found.queuedSubmissionId);
         if (client !== this.codex || epoch !== this.epoch) throw new Error('Соединение изменилось во время запуска очереди. Требуется сверка.');
+        const latest = this.store.getRequest(current.id)!;
+        if (terminal(latest.status)) return;
+        if (this.store.getMeta(`cancel-requested:${current.id}`)) { this.track(this.cancel(current.id)); return; }
+        if (latest.turnId && latest.turnId !== turn.id) {
+          this.store.setMeta(`mixed:${current.id}`, '1');
+          this.store.updateRequest(current.id, { status: 'uncertain', error: mixedMessage });
+          return;
+        }
+        if (latest.turnId === turn.id) return;
+        if (turn.status === 'inProgress') {
+          const pending = this.store.listApprovals(1000).some(approval => approval.requestId === current.id && approval.status === 'pending' && approval.method !== ASYNC_QUESTION_METHOD);
+          const mixed = this.isMixed(current.id);
+          this.store.updateRequest(current.id, { turnId: turn.id, status: mixed ? 'uncertain' : pending ? 'waiting_approval' : 'running', error: mixed ? mixedMessage : undefined });
+        } else if (['completed', 'failed', 'interrupted'].includes(turn.status)) {
+          this.track(this.reconcile(current.id, true, turn.id));
+        }
       } catch (error) {
         if (error instanceof CodexThreadBusyError) this.store.setMeta(key, '');
         throw error;
