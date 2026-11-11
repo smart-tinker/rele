@@ -743,7 +743,7 @@ export class Engine extends EventEmitter {
         || this.store.getMeta(`cancel-requested:${id}`)) return;
       const client = this.codex, epoch = this.epoch;
       try {
-        const found = await this.findOwnRequest(client, threadId, id), current = this.store.getRequest(id);
+        const found = await this.findCompletionHistory(client, threadId, id), current = this.store.getRequest(id);
         if (client !== this.codex || epoch !== this.epoch || !current || terminal(current.status)
           || current.turnId !== request.turnId || found.turnId !== request.turnId
           || !['completed', 'failed', 'interrupted'].includes(found.state)) return;
@@ -781,7 +781,9 @@ export class Engine extends EventEmitter {
         else this.store.updateRequest(id, { status: 'uncertain', error: 'Результат отмены не подтверждён. Повторный запуск запроса запрещён.' });
         return;
       }
-      const found = await this.findOwnRequest(client, conversation.threadId, id);
+      const found = completionNotification
+        ? await this.findCompletionHistory(client, conversation.threadId, id)
+        : await this.findOwnRequest(client, conversation.threadId, id);
       if (client !== this.codex || epoch !== this.epoch || terminal(this.store.getRequest(id)!.status)) return;
       if (found.mixed) this.store.setMeta(`mixed:${id}`, '1');
       else {
@@ -934,6 +936,16 @@ export class Engine extends EventEmitter {
 
   private findOwnRequest(client: CodexGateway, threadId: string, requestId: string): Promise<RequestLocation> {
     return this.readOwnHistory(requestId, inputs => client.findRequest(threadId, requestId, inputs, true));
+  }
+
+  private async findCompletionHistory(client: CodexGateway, threadId: string, requestId: string): Promise<RequestLocation> {
+    let found = await this.findOwnRequest(client, threadId, requestId);
+    for (let attempt = 0; attempt < 4 && !found.mixed
+      && !['completed', 'failed', 'interrupted'].includes(found.state); attempt++) {
+      await delay(250);
+      found = await this.findOwnRequest(client, threadId, requestId);
+    }
+    return found;
   }
 
   private async readOwnHistory(requestId: string, read: (inputs: string[]) => Promise<RequestLocation>): Promise<RequestLocation> {

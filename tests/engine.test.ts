@@ -1662,6 +1662,31 @@ describe('Engine continuation after native Stop', () => {
     expect(f.store.getRequest(request.id)?.queuedSubmissionId).toBe('accepted-native-entry');
   });
 
+  it('rechecks a completed turn when history lags behind its notification during queue start', async () => {
+    const f = fixture(), request = await acceptRequest(f, 'telegram');
+    await f.engine.settled();
+    ownQueue(f, request);
+    const startAck = deferred<{ turn: { id: string; status: string; items: never[] } }>();
+    f.codex.startQueued.mockImplementationOnce(() => startAck.promise);
+    const continuing = f.engine.reconcile(request.id);
+    try {
+      await vi.waitFor(() => expect(f.codex.startQueued).toHaveBeenCalledOnce());
+      f.codex.running(request.id, 'queued-turn');
+      await vi.waitFor(() => expect(f.store.getRequest(request.id)?.status).toBe('running'));
+      const priorReads = f.codex.findRequest.mock.calls.length;
+      f.codex.notification({ method: 'turn/completed', params: { threadId: THREAD,
+        turn: { id: 'queued-turn', status: 'completed' } } });
+      await vi.waitFor(() => expect(f.codex.findRequest.mock.calls.length).toBe(priorReads + 1));
+      f.codex.locations.set(request.id, { state: 'completed', turnId: 'queued-turn', text: 'Queued final' });
+      await vi.waitFor(() => expect(f.store.getRequest(request.id)?.status).toBe('completed'), { timeout: 3000 });
+      expect(f.store.listDeliveries().filter(row => row.requestId === request.id && row.body === 'Queued final')).toHaveLength(1);
+    } finally {
+      startAck.resolve({ turn: { id: 'queued-turn', status: 'inProgress', items: [] } });
+      await continuing;
+      await f.engine.settled();
+    }
+  });
+
   it('persists a lost queue/start ACK fence across restart and recovers later completion without repeating either mutation', async () => {
     const f = fixture(), request = await acceptRequest(f, 'telegram');
     await f.engine.settled();
