@@ -3369,6 +3369,28 @@ describe('multiple origins and terminal reconciliation', () => {
     }
   });
 
+  it('reconciles a terminal turn when its queue start acknowledgement is pending and Codex omits turn/completed', async () => {
+    const f = fixture(); const request = await acceptRequest(f, 'telegram'); await f.engine.settled();
+    f.codex.locations.set(request.id, { state: 'queued', queuedSubmissionId: `queue-${request.id}`, soleQueuedSubmission: true });
+    const startAck = deferred<{ turn: { id: string; status: string; items: never[] } }>();
+    f.codex.startQueued.mockImplementationOnce(() => startAck.promise);
+    const continuing = f.engine.reconcile(request.id);
+    await vi.waitFor(() => expect(f.codex.startQueued).toHaveBeenCalledOnce());
+    f.codex.running(request.id, 'queued-turn');
+    await f.engine.settled();
+    f.codex.locations.set(request.id, { state: 'completed', turnId: 'queued-turn', text: 'Queued final' });
+    vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(Date.now() + 16_000);
+    try {
+      await f.engine.pump(); await f.engine.settled();
+      await vi.waitFor(() => expect(f.store.getRequest(request.id)?.status).toBe('completed'));
+      expect(f.store.listDeliveries().filter(row => row.requestId === request.id && row.body === 'Queued final')).toHaveLength(1);
+    } finally {
+      startAck.resolve({ turn: { id: 'queued-turn', status: 'inProgress', items: [] } });
+      await continuing;
+      await f.engine.settled();
+    }
+  });
+
   it.each(['completion', 'question'] as const)('does not delay another thread %s behind a blocked completion history read', async event => {
     const f = fixture({ start: false });
     const otherThread = 'independent-codex-thread';

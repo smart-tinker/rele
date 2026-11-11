@@ -735,7 +735,23 @@ export class Engine extends EventEmitter {
   async reconcile(id: string): Promise<void> {
     // Do not block the notification queue behind cleanup; later canonical command items must flow.
     if (this.cancelling.has(id)) return;
-    if (this.reconciling.has(id)) { this.reconcileAgain.add(id); return; }
+    if (this.reconciling.has(id)) {
+      this.reconcileAgain.add(id);
+      const request = this.store.getRequest(id);
+      const threadId = request && this.store.getConversation(request.conversationId)?.threadId;
+      if (!this.startingQueued.has(id) || !request?.turnId || !threadId || terminal(request.status)
+        || this.store.getMeta(`cancel-requested:${id}`)) return;
+      const client = this.codex, epoch = this.epoch;
+      try {
+        const found = await this.findOwnRequest(client, threadId, id), current = this.store.getRequest(id);
+        if (client !== this.codex || epoch !== this.epoch || !current || terminal(current.status)
+          || current.turnId !== request.turnId || found.turnId !== request.turnId
+          || !['completed', 'failed', 'interrupted'].includes(found.state)) return;
+        this.finishFromHistory(current, found);
+        this.changed(); this.track(this.deliver());
+      } catch (error) { this.emit('diagnostic', this.options.redact(error)); }
+      return;
+    }
     const request = this.store.getRequest(id);
     if (!request || terminal(request.status) || ['queued', 'transcribing'].includes(request.status)) return;
     if (request.steeredInto) {
