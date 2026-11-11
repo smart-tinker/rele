@@ -771,9 +771,9 @@ export class Engine extends EventEmitter {
         this.store.updateRequest(id, { status: 'uncertain', error: 'Исходное соединение отмены потеряно. Завершение прежних процессов требует сверки.' });
         return;
       }
-      // Do not duplicate a progress scan, but reconcile with fresh proof after it settles.
+      // A terminal event needs fresh proof without waiting for the Slack progress scan.
       const progressRead = this.progressReads.get(id);
-      if (progressRead) await progressRead.catch(() => {});
+      if (progressRead && !completionNotification) await progressRead.catch(() => {});
       if (this.stopped || client !== this.codex || epoch !== this.epoch) return;
       await this.releasing.get(conversation.id);
       await client.subscribe(conversation.threadId);

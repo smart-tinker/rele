@@ -1015,6 +1015,25 @@ describe('Engine public Slack progress', () => {
     expect(f.codex.interrupt).not.toHaveBeenCalled();
   });
 
+  it('reconciles a terminal event while a Slack progress history read is pending', async () => {
+    const f = fixture({ start: false }), request = await acceptRequest(f); await running(f, request);
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1',
+      item: { id: 'pending-comment', type: 'agentMessage', phase: 'commentary', text: 'Pending public step' } } });
+    await f.engine.settled();
+    const proof = deferred<RequestLocation>();
+    f.codex.findRequest.mockClear(); f.codex.findRequest.mockReturnValueOnce(proof.promise);
+    const flush = (f.engine as unknown as { flushProgress(): Promise<void> }).flushProgress();
+    await vi.waitFor(() => expect(f.codex.findRequest).toHaveBeenCalledTimes(1));
+    f.codex.complete(request.id, 'Fresh final');
+    try {
+      await vi.waitFor(() => expect(f.store.getRequest(request.id)?.status).toBe('completed'));
+    } finally {
+      proof.resolve({ state: 'running', turnId: 'turn-1' });
+      await flush; await f.engine.settled();
+    }
+    expect(f.store.listDeliveries().filter(row => row.requestId === request.id && row.body === 'Fresh final')).toHaveLength(1);
+  });
+
   it.each(['stop', 'replace', 'disconnect'] as const)('discards progress proof after %s while reconciliation waits for it', async change => {
     const f = fixture({ start: false }); f.codex.connection(true);
     const request = await acceptRequest(f); await running(f, request);
