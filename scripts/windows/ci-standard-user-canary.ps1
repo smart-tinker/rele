@@ -622,7 +622,9 @@ try {
         if ($cleanupFailures.Count -ne 0) { $result.result = 'failed'; $result | Add-Member -NotePropertyName cleanupErrors -NotePropertyValue $cleanupFailures }
         $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $publishedResult -Encoding UTF8
         if ($RunGates -and $result.result -ne 'passed') {
-            $sharedDiagnosticPath = Join-Path $sourceRoot 'shared-results-actual-desktop.json'
+            $sharedDiagnosticName = 'shared-results-actual-desktop.json'
+            if ([string]$result.stage -match '^shared-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)$') { $sharedDiagnosticName = 'shared-results-' + $Matches[1] + '.json' }
+            $sharedDiagnosticPath = Join-Path $sourceRoot $sharedDiagnosticName
             $summary = [ordered]@{ stage = if ($parentStage -in @('shared', 'rdp-session', 'installer')) { $parentStage } else { 'unknown' }; reportAvailable = $false }
             if (Test-Path -LiteralPath $sharedDiagnosticPath -PathType Leaf) {
                 try {
