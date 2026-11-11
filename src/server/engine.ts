@@ -79,12 +79,14 @@ export class Engine extends EventEmitter {
   private slackConnection?: string;
   private readonly notification = (event: CodexNotification) => {
     const epoch = this.epoch;
-    if (event.method === 'turn/completed') {
+    if (event.method === 'turn/completed' || event.method === 'item/completed') {
       const p = event.params as Record<string, any>;
-      if (typeof p.turn?.id === 'string') for (const request of this.store.activeRequests()) {
-        if (request.turnId === p.turn.id || request.status === 'starting'
+      const turnId = event.method === 'turn/completed' ? p.turn?.id
+        : p.item?.type === 'agentMessage' && p.item.phase === 'final_answer' ? p.turnId : undefined;
+      if (typeof turnId === 'string' && typeof p.threadId === 'string') for (const request of this.store.activeRequests()) {
+        if (request.turnId === turnId || request.status === 'starting'
           && this.store.getConversation(request.conversationId)?.threadId === p.threadId) {
-          this.track((async () => { if (!this.stopped && epoch === this.epoch) await this.reconcile(request.id, true, p.turn.id); })());
+          this.track((async () => { if (!this.stopped && epoch === this.epoch) await this.reconcile(request.id, true, turnId); })());
         }
       }
     }

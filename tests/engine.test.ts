@@ -3400,6 +3400,16 @@ describe('multiple origins and terminal reconciliation', () => {
     for (const delivery of sent) expect(delivery.body).toBe(`answer-${delivery.origin.endpointId}`);
   });
 
+  it('reconciles a final-answer item when Codex omits turn/completed', async () => {
+    const f = fixture(); const request = await acceptRequest(f, 'telegram'); await running(f, request);
+    f.codex.locations.set(request.id, { state: 'completed', turnId: 'turn-1', text: 'Final answer' });
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1',
+      item: { type: 'agentMessage', phase: 'final_answer', text: 'Final answer' } } });
+    await f.engine.settled();
+    expect(f.store.getRequest(request.id)?.status).toBe('completed');
+    expect(f.store.listDeliveries().some(delivery => delivery.requestId === request.id && delivery.body === 'Final answer')).toBe(true);
+  });
+
   it('rechecks a completion notification received during an earlier history read', async () => {
     const f = fixture(); const request = await acceptRequest(f, 'telegram'); await running(f, request);
     const gate = deferred<RequestLocation>(); f.codex.findRequest.mockReturnValueOnce(gate.promise);
