@@ -146,7 +146,7 @@ if ($packages.Count -ne 1 -or $packages[0].Version.ToString() -ne $env:RELE_CI_D
                 $evidence.gates += 'shared-actual-desktop'
                 $evidence.actualDesktopGui = $false
             }
-            $versions = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2')
+            $versions = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1')
             for ($index = 0; $index -lt $versions.Count; $index++) {
                 $version = $versions[$index]; $evidence.stage = 'shared-' + $version
                 & $marker.python (Join-Path $sourceRoot 'scripts\shared-protocol-probe.py') --codex-prefix $marker.prefixes[$index] --expected-version $version --windows-app-template $applicationTemplate --windows-runtime packaged --report (Join-Path $env:RELE_TEST_REPORT_DIR ('shared-results-' + $version + '.json'))
@@ -288,7 +288,7 @@ try {
         foreach ($executable in @($marker.node, $marker.python)) {
             if ($executable -isnot [string] -or -not [IO.Path]::IsPathFullyQualified($executable) -or [IO.Path]::GetExtension($executable) -ne '.exe' -or -not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw 'An isolated gate runtime must resolve to one fully qualified executable.' }
         }
-        $marker.prefixes = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2') | ForEach-Object { Join-Path $env:RUNNER_TEMP ('codex-probe-' + $_) }
+        $marker.prefixes = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1') | ForEach-Object { Join-Path $env:RUNNER_TEMP ('codex-probe-' + $_) }
         $desktopReadPaths = @()
         if ($DesktopBundle) {
             $marker.desktopBundle = [IO.Path]::GetFullPath($DesktopBundle)
@@ -548,7 +548,7 @@ try {
     # A timeout can end Python before its retainedFixture JSON is written. The
     # matching successful child receipt is the only destructive-cleanup permit.
     if ($installerChildStarted -and -not $installerCleanupConfirmed) { $retainedSharedFixtures += $FixtureRoot }
-    foreach ($name in @('shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json', 'shared-results-0.163.0-alpha.11.2.json', 'shared-results-0.164.0-alpha.11.1.json', 'shared-results-0.165.0-alpha.1.2.json', 'shared-results-0.166.0-alpha.5.1.json', 'shared-results-0.166.0-alpha.6.json', 'shared-results-0.167.0-alpha.3.2.json', 'shared-results-actual-desktop.json')) {
+    foreach ($name in @('shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json', 'shared-results-0.163.0-alpha.11.2.json', 'shared-results-0.164.0-alpha.11.1.json', 'shared-results-0.165.0-alpha.1.2.json', 'shared-results-0.166.0-alpha.5.1.json', 'shared-results-0.166.0-alpha.6.json', 'shared-results-0.167.0-alpha.3.2.json', 'shared-results-0.167.0-alpha.4.1.json', 'shared-results-actual-desktop.json')) {
         $reportPath = Join-Path $FixtureRoot ('reports\' + $name)
         if (Test-Path -LiteralPath $reportPath -PathType Leaf) {
             try {
@@ -587,7 +587,7 @@ try {
         { if ($user -and $retainedSharedFixtures.Count -eq 0) { Remove-FixtureProfile $user.SID.Value $profileCleanupFacts } },
         { if ($user -and $retainedSharedFixtures.Count -eq 0) { Remove-LocalUser -SID $user.SID } },
         { if ($RunGates) {
-            foreach ($name in @('installer-results.json', 'installer-failure-results.json', 'installer-native-cleanup-results.json', 'shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json', 'shared-results-0.163.0-alpha.11.2.json', 'shared-results-0.164.0-alpha.11.1.json', 'shared-results-0.165.0-alpha.1.2.json', 'shared-results-0.166.0-alpha.5.1.json', 'shared-results-0.166.0-alpha.6.json', 'shared-results-0.167.0-alpha.3.2.json', 'shared-results-actual-desktop.json')) { $report = Join-Path $FixtureRoot ('reports\' + $name); if (Test-Path -LiteralPath $report) { Copy-Item -LiteralPath $report -Destination (Join-Path $sourceRoot $name) } }
+            foreach ($name in @('installer-results.json', 'installer-failure-results.json', 'installer-native-cleanup-results.json', 'shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json', 'shared-results-0.163.0-alpha.11.2.json', 'shared-results-0.164.0-alpha.11.1.json', 'shared-results-0.165.0-alpha.1.2.json', 'shared-results-0.166.0-alpha.5.1.json', 'shared-results-0.166.0-alpha.6.json', 'shared-results-0.167.0-alpha.3.2.json', 'shared-results-0.167.0-alpha.4.1.json', 'shared-results-actual-desktop.json')) { $report = Join-Path $FixtureRoot ('reports\' + $name); if (Test-Path -LiteralPath $report) { Copy-Item -LiteralPath $report -Destination (Join-Path $sourceRoot $name) } }
             $stdout = Join-Path $FixtureRoot 'stdout.log'
             if (Test-Path -LiteralPath $stdout) {
                 $allowed = @('Windows installer smoke: an unknown startup script is preserved', 'Windows installer smoke: a previous portable process is not killed', 'Windows installer smoke: foreign Desktop settings are preserved without blocking installation', 'Windows installer smoke: the Codex wrapper preserves argv, profile, data and raw bytes', 'Windows installer smoke: launcher restart', 'Windows installer smoke: same-version upgrade with backup', 'Windows installer smoke: owned Desktop settings restore and later foreign changes survive uninstall', 'Windows installer smoke: uninstall preserves data', 'Windows installer cleanup: desktop-environment', 'Windows installer cleanup: held-adapter', 'Windows installer cleanup: native-daemon', 'Windows installer cleanup: files', 'Windows installer cleanup: complete')

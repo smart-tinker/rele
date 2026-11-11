@@ -196,7 +196,7 @@ describe('Codex installation and existing Desktop discovery', () => {
     const f = windowsFixture(metadata, [desktop]);
     f.run.mockImplementation(async (command, args) => args.includes(WINDOWS_CODEX_METADATA_SCRIPT)
       ? { stdout: JSON.stringify(metadata), code: 0 }
-      : { stdout: `codex-cli ${command === desktop ? '0.167.0-alpha.3.2' : '0.163.0'}`, code: 0 });
+      : { stdout: `codex-cli ${command === desktop ? '0.167.0-alpha.4.1' : '0.163.0'}`, code: 0 });
     const result = await discoverCodex(f.options);
     expect(result.recommendedManaged).toEqual({ executable: desktop, transport: 'managed', endpoint: '' });
     expect(result.issues.map(item => item.code)).not.toContain('cli-version-unverified');
