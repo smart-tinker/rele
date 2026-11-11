@@ -3446,6 +3446,34 @@ describe('multiple origins and terminal reconciliation', () => {
     expect(f.codex.interrupt).not.toHaveBeenCalled();
   });
 
+  it('preserves terminal reconciliation when an earlier history read returns stale running state', async () => {
+    const f = fixture({ start: false }), request = await acceptRequest(f, 'telegram'); await running(f, request);
+    const gate = deferred<RequestLocation>();
+    f.codex.findRequest.mockClear();
+    f.codex.findRequest.mockImplementation(async (_thread, id) => {
+      const read = f.codex.findRequest.mock.calls.length;
+      if (read === 1) return gate.promise;
+      if (read <= 6) return { state: 'running', turnId: 'turn-1' };
+      if (read === 7) {
+        f.codex.locations.set(id, { state: 'completed', turnId: 'turn-1', text: 'Final answer' });
+        return { state: 'running', turnId: 'turn-1' };
+      }
+      return f.codex.locations.get(id)!;
+    });
+    const pendingRead = f.engine.reconcile(request.id);
+    await vi.waitFor(() => expect(f.codex.findRequest).toHaveBeenCalledTimes(1));
+
+    f.codex.notification({ method: 'turn/completed', params: { threadId: THREAD,
+      turn: { id: 'turn-1', status: 'completed' } } });
+    await vi.waitFor(() => expect(f.codex.findRequest).toHaveBeenCalledTimes(6), { timeout: 5000 });
+
+    gate.resolve({ state: 'running', turnId: 'turn-1' });
+    await pendingRead;
+    await vi.waitFor(() => expect(f.store.getRequest(request.id)?.status).toBe('completed'));
+    await f.engine.settled();
+    expect(f.store.listDeliveries().filter(row => row.requestId === request.id && row.body === 'Final answer')).toHaveLength(1);
+  });
+
   it('reconciles completion while an earlier native question read is pending', async () => {
     const f = fixture(); const request = await acceptRequest(f, 'telegram'); await running(f, request);
     const item = { id: 'blocked-native-question', type: 'agentMessage', delivery: 'async', text: 'Question',

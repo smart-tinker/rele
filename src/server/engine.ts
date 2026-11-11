@@ -46,6 +46,7 @@ export class Engine extends EventEmitter {
   private dispatching = new Set<string>();
   private reconciling = new Set<string>();
   private reconcileAgain = new Set<string>();
+  private completionRechecks = new Map<string, string>();
   private provisioning = new Set<string>();
   private ownedThreads = new Set<string>();
   private releasing = new Map<string, Promise<void>>();
@@ -147,7 +148,7 @@ export class Engine extends EventEmitter {
   }
   replaceCodex(next: CodexGateway): void {
     this.codex.off('notification', this.notification); this.codex.off('request', this.serverRequest); this.codex.off('status', this.connection);
-    this.expireApprovals(); this.epoch = randomUUID(); this.connected = false;
+    this.expireApprovals(); this.epoch = randomUUID(); this.completionRechecks.clear(); this.connected = false;
     this.ownedThreads.clear(); this.releasing.clear(); this.retryThreadAfter.clear(); this.progressReads.clear();
     this.codex = next;
     next.on('notification', this.notification); next.on('request', this.serverRequest); next.on('status', this.connection);
@@ -742,6 +743,7 @@ export class Engine extends EventEmitter {
       const request = this.store.getRequest(id);
       const threadId = request && this.store.getConversation(request.conversationId)?.threadId;
       const turnId = request?.turnId ?? completionTurnId;
+      if (completionNotification && completionTurnId) this.completionRechecks.set(id, completionTurnId);
       if (!(completionNotification || this.startingQueued.has(id)) || !turnId || !threadId || terminal(request.status)
         || this.store.getMeta(`cancel-requested:${id}`)) return;
       const client = this.codex, epoch = this.epoch;
@@ -821,7 +823,11 @@ export class Engine extends EventEmitter {
         else if (JSON.parse(progress).statusText === uncertainProgress) this.recordProgress(id, { statusText: undefined });
       }
       this.reconciling.delete(id);
-      if (this.reconcileAgain.delete(id) && !this.stopped) this.track(this.reconcile(id));
+      if (this.reconcileAgain.delete(id) && !this.stopped) {
+        const completionTurnId = this.completionRechecks.get(id);
+        this.completionRechecks.delete(id);
+        this.track(this.reconcile(id, completionTurnId !== undefined, completionTurnId));
+      }
       await this.releaseIdleThread(request.conversationId);
       this.changed();
     }
@@ -1897,7 +1903,7 @@ export class Engine extends EventEmitter {
     if (this.stopped) return;
     const connected = this.codex.status().connected;
     if (!connected && this.connected) {
-      this.epoch = randomUUID(); this.expireApprovals();
+      this.epoch = randomUUID(); this.completionRechecks.clear(); this.expireApprovals();
       this.ownedThreads.clear(); this.retryThreadAfter.clear(); this.progressReads.clear();
       for (const request of this.store.activeRequests()) if (['starting', 'running', 'waiting_approval'].includes(request.status)) this.store.updateRequest(request.id, { status: 'uncertain', error: 'Соединение с Codex прервано. Требуется сверка очереди и истории.' });
     }
