@@ -74,6 +74,7 @@ if (values['expect-error']) {
     driverOperations.push(operation);
     if (driverOperations.length > 64) driverOperations.shift();
   };
+  const fixtureLabel = (value: unknown) => typeof value === 'string' && /^[A-Za-z0-9_-]{1,48}$/u.test(value) ? value : 'other';
   const observe = <TArgs extends unknown[], TResult>(name: string, operation: (...args: TArgs) => Promise<TResult>) => async (...args: TArgs): Promise<TResult> => {
     recordDriverOperation(`${name}:start`);
     try {
@@ -86,6 +87,10 @@ if (values['expect-error']) {
     }
   };
   const observedTurns: Array<{ method: string; threadId: string; turnId: string }> = [];
+  const completionObservations: Array<{ eventId: string; status: string; turnMatches: boolean }> = [];
+  const reconciliationTrace: Array<{ eventId: string; phase: 'start' | 'done' | 'error'; status: string; completionNotification: boolean; turnProvided: boolean; elapsedMs?: number; errorType?: string }> = [];
+  const rpcTrace: Array<{ attempt: number; method: string; phase: 'start' | 'done' | 'error'; elapsedMs?: number; errorType?: string }> = [];
+  let rpcAttempt = 0;
   const observedProtocolEvents: Array<{ kind: 'request' | 'notification'; method: string; hasThreadId: boolean; hasTurnId: boolean; hasRequestId: boolean; hasItemId: boolean; hasApprovalId: boolean }> = [];
   const recordProtocolEvent = (kind: 'request' | 'notification', event: { method: string; params?: Record<string, unknown> }) => {
     const params = event.params ?? {};
@@ -112,6 +117,12 @@ if (values['expect-error']) {
       if (['turn/started', 'turn/completed'].includes(event.method) && typeof event.params.threadId === 'string' && typeof event.params.turn?.id === 'string') {
         observedTurns.push({ method: event.method, threadId: event.params.threadId, turnId: event.params.turn.id });
         if (observedTurns.length > 100) observedTurns.shift();
+        if (event.method === 'turn/completed') {
+          for (const request of store.activeRequests().filter(row => store.getConversation(row.conversationId)?.threadId === event.params.threadId)) {
+            completionObservations.push({ eventId: fixtureLabel(request.eventId), status: request.status, turnMatches: request.turnId === event.params.turn.id });
+            if (completionObservations.length > 64) completionObservations.shift();
+          }
+        }
         if (event.method === 'turn/started' && event.params.threadId === threadId
             && cancellationProcess && event.params.turn.id !== cancellationProcess.turnId) {
           cancellationProcessChecks.push({ turnId: event.params.turn.id, processAlive: alive(cancellationProcess.id) });
@@ -120,6 +131,25 @@ if (values['expect-error']) {
       }
     });
     codex.on('request', recordProtocolEvent.bind(null, 'request'));
+    const rpcClient = codex as unknown as { call<T = unknown>(method: string, params: Record<string, unknown>, timeoutMs?: number, confirmHealth?: boolean): Promise<T> };
+    const call = rpcClient.call.bind(codex);
+    rpcClient.call = async <T = unknown>(method: string, params: Record<string, unknown>, timeoutMs?: number, confirmHealth?: boolean): Promise<T> => {
+      const attempt = ++rpcAttempt, started = Date.now();
+      const safeMethod = /^[A-Za-z0-9._/-]{1,100}$/u.test(method) ? method : 'other';
+      rpcTrace.push({ attempt, method: safeMethod, phase: 'start' });
+      if (rpcTrace.length > 128) rpcTrace.shift();
+      try {
+        const result = await call<T>(method, params, timeoutMs, confirmHealth);
+        rpcTrace.push({ attempt, method: safeMethod, phase: 'done', elapsedMs: Date.now() - started });
+        if (rpcTrace.length > 128) rpcTrace.shift();
+        return result;
+      } catch (error) {
+        rpcTrace.push({ attempt, method: safeMethod, phase: 'error', elapsedMs: Date.now() - started,
+          errorType: error instanceof Error ? error.name : 'UnknownError' });
+        if (rpcTrace.length > 128) rpcTrace.shift();
+        throw error;
+      }
+    };
     await codex.connect();
     // Snapshot polling would evict the dispatch stages from this bounded trace.
     codex.subscribe = observe('subscribe', codex.subscribe.bind(codex));
@@ -174,10 +204,26 @@ if (values['expect-error']) {
     engine = new Engine(store, codex, { config: () => config, temporaryRoot: values.directory!, redact: value => String(value) });
     const engineInternals = engine as unknown as {
       dispatch: (conversationId: string) => Promise<void>;
+      reconcile: (id: string, completionNotification?: boolean, completionTurnId?: string) => Promise<void>;
       initialMessages: { ensure: (conversationId: string) => Promise<boolean> };
       slackSync: { drain: (conversationId: string, cutoff?: string) => Promise<boolean> };
     };
     engineInternals.dispatch = observe('dispatch', engineInternals.dispatch.bind(engine));
+    const reconcile = engineInternals.reconcile.bind(engine);
+    engineInternals.reconcile = async (id, completionNotification = false, completionTurnId) => {
+      const request = store.getRequest(id), started = Date.now();
+      const eventId = fixtureLabel(request?.eventId);
+      const phase = (value: 'start' | 'done' | 'error', error?: unknown) => {
+        reconciliationTrace.push({ eventId, phase: value, status: store.getRequest(id)?.status ?? 'missing',
+          completionNotification, turnProvided: typeof completionTurnId === 'string',
+          ...(value === 'start' ? {} : { elapsedMs: Date.now() - started }),
+          ...(value === 'error' ? { errorType: error instanceof Error ? error.name : 'UnknownError' } : {}) });
+        if (reconciliationTrace.length > 128) reconciliationTrace.shift();
+      };
+      phase('start');
+      try { await reconcile(id, completionNotification, completionTurnId); phase('done'); }
+      catch (error) { phase('error', error); throw error; }
+    };
     engineInternals.initialMessages.ensure = observe('initialMessage.ensure', engineInternals.initialMessages.ensure.bind(engineInternals.initialMessages));
     engineInternals.slackSync.drain = observe('slackSync.drain', engineInternals.slackSync.drain.bind(engineInternals.slackSync));
     for (const platform of ['slack', 'telegram'] as const) engine.channels[platform] = {
@@ -201,7 +247,8 @@ if (values['expect-error']) {
       droppedQueueAcks, catalogValidated, observedTurns, observedProtocolEvents, cancellationProcessChecks, cancellationInterruptWitnesses,
       ...(processId ? { probeProcessAlive: alive(processId) } : {}),
       requests, cancelCleanups, deliveries: store.listDeliveries(), approvals: store.listApprovals(), diagnostics,
-      driverOperations: driverOperations.slice(-40) };
+      driverOperations: driverOperations.slice(-40), completionObservations: completionObservations.slice(-32),
+      reconciliationTrace: reconciliationTrace.slice(-48), rpcTrace: rpcTrace.slice(-64) };
   }
   const input = createInterface({ input: process.stdin });
   try {

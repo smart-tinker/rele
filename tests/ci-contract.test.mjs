@@ -105,6 +105,9 @@ test('shared wait timeout reports bounded request correlation without message bo
    {kind:'request',method:'private user text',hasThreadId:true,hasTurnId:true,hasRequestId:true,hasItemId:false,hasApprovalId:false},
   ],
   driverOperations:Array.from({length:50},(_,index)=>`operation-${index}`),
+  completionObservations:[{eventId:'after-shell-cancel',status:'running',turnMatches:true,turnId:'private-turn-id'}],
+  reconciliationTrace:[{eventId:'after-shell-cancel',phase:'error',status:'uncertain',completionNotification:true,turnProvided:true,elapsedMs:123,errorType:'CodexTransportError',message:'private'}],
+  rpcTrace:[{attempt:3,method:'thread/items/list',phase:'error',elapsedMs:123,errorType:'CodexTransportError',params:'private'}],
  }),{
   expectedStatus:'waiting_approval',
   requests:[{id:'request-1',eventId:'approval',status:'uncertain',turnId:'turn-1',queuedSubmissionId:'queue-1'}],
@@ -115,6 +118,9 @@ test('shared wait timeout reports bounded request correlation without message bo
    {kind:'notification',method:'serverRequest/resolved',hasThreadId:true,hasTurnId:false,hasRequestId:true,hasItemId:false,hasApprovalId:false},
    {kind:'request',method:'other',hasThreadId:true,hasTurnId:true,hasRequestId:true,hasItemId:false,hasApprovalId:false},
   ],
+  completionObservations:[{eventId:'after-shell-cancel',status:'running',turnMatches:true}],
+  reconciliationTrace:[{eventId:'after-shell-cancel',phase:'error',status:'uncertain',completionNotification:true,turnProvided:true,elapsedMs:123,errorType:'CodexTransportError'}],
+  rpcTrace:[{attempt:3,method:'thread/items/list',phase:'error',elapsedMs:123,errorType:'CodexTransportError'}],
   driverOperations:Array.from({length:40},(_,index)=>`operation-${index+10}`),
  });
  assert.doesNotMatch(JSON.stringify(summarize('waiting_approval',{
@@ -262,8 +268,14 @@ test('shared native gate records bounded request state without payloads on timeo
  assert.match(evidence,/native_snapshot = await asyncio\.wait_for\(peer\.call\('thread\/read'[\s\S]*?evidence\['nativeTurnStatus'\] = native_snapshot/u,'keep native thread state separate from the engine snapshot');
  const driver=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');
  for(const field of ['dispatch','initialMessage.ensure','slackSync.drain','subscribe','backgroundTerminals','enqueue','driverOperations']) assert.ok(driver.includes(field),`shared driver must trace ${field}`);
+ for(const field of ['completionObservations','reconciliationTrace','rpcTrace']) assert.ok(driver.includes(field),`shared driver must trace ${field}`);
+ const diagnostics=await readFile(new URL('../scripts/shared-probe-diagnostics.mjs',import.meta.url),'utf8');
+ for(const field of ['completionObservations','reconciliationTrace','rpcTrace']) assert.ok(diagnostics.includes(field),`timeout evidence must include ${field}`);
  assert.doesNotMatch(driver,/codex\.diagnostics\s*=\s*observe\('diagnostics'/u,'snapshot polling must not evict useful driver operations from the bounded trace');
  assert.match(driver,/driverOperations:\s*driverOperations\.slice\(-\d+\)/u,'bound the operation trace in snapshots');
+ assert.match(driver,/completionObservations:\s*completionObservations\.slice\(-\d+\)/u,'bound completion matching observations');
+ assert.match(driver,/reconciliationTrace:\s*reconciliationTrace\.slice\(-\d+\)/u,'bound Engine reconciliation observations');
+ assert.match(driver,/rpcTrace:\s*rpcTrace\.slice\(-\d+\)/u,'bound app-server RPC observations');
  assert.match(probe,/except \(TimeoutError, RuntimeError\):\s*report\['heldRequestTimeout'\] = await held_request_evidence\(engine, peer, thread\)/u,'capture the safe snapshot when the native wait or provider wait fails');
  const cancel=probe.indexOf("await engine.command('ingest', platform='telegram', eventId='cancel'");
  const afterCancel=probe.indexOf('await asyncio.wait_for(wait_records(before + 2), 25)',cancel);
