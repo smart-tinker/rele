@@ -423,6 +423,22 @@ test('Windows owner probe avoids an immediate duplicate Task Scheduler COM query
  assert.ok(probe.includes('assert.equal(scheduledTaskExists(`${task}-Codex`), false);'),
   'retain the independent check that stopping Codex removes its Task');
 });
+test('Windows owner status proves the listener PID without a second PowerShell TCP query',async()=>{
+ const probe=await readFile(new URL('../scripts/smoke-windows-codex-control.mjs',import.meta.url),'utf8');
+ const native=await readFile(new URL('../scripts/windows/Rele.cs',import.meta.url),'utf8');
+ const live=probe.slice(probe.indexOf("phase = 'status-live';"),probe.indexOf("phase = 'native-initialize';"));
+ assert.ok(live.includes("assert.equal(liveControl.status, 'alreadyRunning')") && live.includes("for (const key of ['endpoint', 'processId'"),
+  'reuse the status response already bound to the started Codex PID');
+ assert.doesNotMatch(live,/Get-NetTCPConnection/u,'avoid a second PowerShell TCP table query after codex-status');
+ const statusStart=native.indexOf('private static Dictionary<string, object> CodexWebSocketStatus(');
+ const statusEnd=native.indexOf('\n    private static Dictionary<string, object> StartCodexWebSocket',statusStart);
+ const status=native.slice(statusStart,statusEnd);
+ assert.match(status,/CodexWebSocketReceipt\(owner,[\s\S]*?"alreadyRunning"\)/u,'codex-status must use the validated runtime receipt');
+ const receiptStart=native.indexOf('private static Dictionary<string, object> ReadCodexWebSocketReceipt(');
+ const receiptEnd=native.indexOf('\n    private static Dictionary<string, object> CodexWebSocketStatus',receiptStart);
+ assert.match(native.slice(receiptStart,receiptEnd),/OwnCodexListener\(owner\.Endpoint, native\.Id\)/u,
+  'the validated runtime receipt must bind the listener to the native PID');
+});
 test('fixture cleanup skips a reused host PID and still drains its exact Task', async()=>{
  const cleanup=await readFile(new URL('../scripts/installer-codex-fixture.mjs',import.meta.url),'utf8');
  const hostStart=cleanup.indexOf('$hostProcess = Get-Process -Id $receipt.hostPid');

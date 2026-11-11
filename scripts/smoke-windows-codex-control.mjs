@@ -197,11 +197,6 @@ try {
   assert.deepEqual(await Promise.all([readFile(target.installSettingsPath), readFile(currentPointer)]), beforeStatus);
   assert.equal(taskSnapshot().split('|')[0], beforeTask.split('|')[0], 'Read-only status must not change the Task definition.');
   process.kill(control.processId, 0);
-  const listeners = JSON.parse(powershell(`$rows=@(Get-NetTCPConnection -State Listen -LocalAddress '127.0.0.1' -LocalPort $env:RELE_CONTROL_PORT);
-    if ($rows.Count -ne 1) { throw 'Native listener is not unique.' }
-    [pscustomobject]@{ pid=[int]$rows[0].OwningProcess } | ConvertTo-Json -Compress`,
-    { env: { ...env, RELE_CONTROL_PORT: new URL(control.endpoint).port } }));
-  assert.equal(listeners.pid, control.processId, 'The kernel listener must belong to the receipt PID.');
   phase = 'native-initialize';
   const call = await connect(control.endpoint);
   const initialized = await call('initialize', { clientInfo: { name: 'rele_control_fixture', version: '1' }, capabilities: { experimentalApi: true } });
