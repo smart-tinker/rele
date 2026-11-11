@@ -317,7 +317,7 @@ try {
     $credential = New-Object System.Management.Automation.PSCredential ($env:COMPUTERNAME + '\' + $account), $password
     $resultPath = Join-Path $FixtureRoot 'windows-standard-user-results.json'
     # Eight versions plus Desktop need 13.5 minutes of 90-second marker observation; desktop-first skips cancellation.
-    if ($RunGates) { $gatesDeadline = [DateTime]::UtcNow.AddMinutes($(if ($Phase -eq 'Shared') { 60 } else { 80 })) }
+    if ($RunGates) { $gatesDeadline = [DateTime]::UtcNow.AddMinutes($(if ($Phase -eq 'Shared') { 60 } else { 100 })) }
     if ($RunGates) {
         $parentStage = 'shared'
         $marker.phase = 'Shared'; $marker | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8
@@ -666,6 +666,7 @@ try {
                         foreach ($status in @('pending', 'sent', 'disconnected')) { $providerResults[$status] = @($evidence.providerTrace | Where-Object { $_.result -eq $status }).Count }
                         $summary.providerResults = $providerResults
                     }
+                    if ($result.installerProgress) { $summary.installerProgress = @($result.installerProgress | Select-Object -Last 8) }
                 } catch { $summary.reportAvailable = $false }
             }
             Write-Output ('Windows canary bounded diagnostic: ' + ($summary | ConvertTo-Json -Compress -Depth 4))

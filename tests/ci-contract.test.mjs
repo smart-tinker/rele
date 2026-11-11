@@ -181,8 +181,21 @@ test('Windows job timeout leaves room for its bounded standard-user native gate'
  const gateTimeout=canary.match(/AddMinutes\(\$\(if \(\$Phase -eq 'Shared'\) \{ (\d+) \} else \{ (\d+) \}\)\)/u);
  assert.ok(jobTimeout,'give Windows its own timeout without extending Ubuntu');
  assert.ok(gateTimeout,'read the native gate deadline from the canary');
+ assert.ok(Number(gateTimeout[2])>=100,'leave enough time after the observed 80-minute full-gate timeout');
  assert.ok(Number(jobTimeout[1])>=Number(gateTimeout[2])+20,'leave twenty minutes for runner setup, later checks, and cleanup');
  assert.equal(Number(jobTimeout[2]),60,'keep the Ubuntu timeout unchanged');
+});
+test('Windows canary timeout reports only bounded installer progress', async()=>{
+ const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ const start=canary.indexOf('$summary = [ordered]@{ stage =');
+ const end=canary.indexOf("Write-Output ('Windows canary bounded diagnostic:",start);
+ assert.ok(start>=0 && end>start,'Windows canary must emit a bounded timeout summary');
+ const summary=canary.slice(start,end);
+ assert.match(canary,/Get-Content -LiteralPath \$stdout -Tail 64 \| Where-Object \{ \$_ -in \$allowed \} \| Select-Object -Last 32/u,
+  'retain only allowlisted installer progress labels');
+ assert.match(summary,/\$summary\.installerProgress = @\(\$result\.installerProgress \| Select-Object -Last 8\)/u,
+  'include the latest bounded installer progress labels in the timeout summary');
+ assert.doesNotMatch(summary,/stdout\.log|stderr\.log/u,'never print raw installer logs');
 });
 test('browser setup installs the pinned Playwright browser without apt dependencies', async()=>{
  const workflow=await readFile(new URL('../.github/workflows/ci.yml',import.meta.url),'utf8');
