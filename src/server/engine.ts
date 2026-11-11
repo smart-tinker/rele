@@ -84,7 +84,7 @@ export class Engine extends EventEmitter {
       if (typeof p.turn?.id === 'string') for (const request of this.store.activeRequests()) {
         if (request.turnId === p.turn.id || request.status === 'starting'
           && this.store.getConversation(request.conversationId)?.threadId === p.threadId) {
-          this.track((async () => { if (!this.stopped && epoch === this.epoch) await this.reconcile(request.id, true); })());
+          this.track((async () => { if (!this.stopped && epoch === this.epoch) await this.reconcile(request.id, true, p.turn.id); })());
         }
       }
     }
@@ -732,20 +732,21 @@ export class Engine extends EventEmitter {
     this.changed();
   }
 
-  async reconcile(id: string, completionNotification = false): Promise<void> {
+  async reconcile(id: string, completionNotification = false, completionTurnId?: string): Promise<void> {
     // Do not block the notification queue behind cleanup; later canonical command items must flow.
     if (this.cancelling.has(id)) return;
     if (this.reconciling.has(id)) {
       this.reconcileAgain.add(id);
       const request = this.store.getRequest(id);
       const threadId = request && this.store.getConversation(request.conversationId)?.threadId;
-      if (!(completionNotification || this.startingQueued.has(id)) || !request?.turnId || !threadId || terminal(request.status)
+      const turnId = request?.turnId ?? completionTurnId;
+      if (!(completionNotification || this.startingQueued.has(id)) || !turnId || !threadId || terminal(request.status)
         || this.store.getMeta(`cancel-requested:${id}`)) return;
       const client = this.codex, epoch = this.epoch;
       try {
         const found = await this.findCompletionHistory(client, threadId, id), current = this.store.getRequest(id);
         if (client !== this.codex || epoch !== this.epoch || !current || terminal(current.status)
-          || current.turnId !== request.turnId || found.turnId !== request.turnId
+          || current.turnId && current.turnId !== turnId || found.turnId !== turnId
           || !['completed', 'failed', 'interrupted'].includes(found.state)) return;
         this.finishFromHistory(current, found);
         this.changed(); this.track(this.deliver());
