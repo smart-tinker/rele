@@ -167,7 +167,7 @@ jobs:
         run: |
           python scripts/transcribe.py --input "$RUNNER_TEMP/voice-fixture/jfk.flac" --model "$RUNNER_TEMP/voice-fixture/tiny" --language en --device cpu > voice-results.json
           python -c 'import json; text=json.load(open("voice-results.json"))["text"]; assert "what your country can do for you" in text.lower()'
-      - run: npx playwright install --with-deps chromium
+      - run: npx playwright install chromium
         id: browser_install
       - run: npm run test:e2e
         id: browser

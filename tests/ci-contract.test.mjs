@@ -184,6 +184,11 @@ test('Windows job timeout leaves room for its bounded standard-user native gate'
  assert.ok(Number(jobTimeout[1])>=Number(gateTimeout[2])+20,'leave twenty minutes for runner setup, later checks, and cleanup');
  assert.equal(Number(jobTimeout[2]),60,'keep the Ubuntu timeout unchanged');
 });
+test('browser setup installs the pinned Playwright browser without apt dependencies', async()=>{
+ const workflow=await readFile(new URL('../.github/workflows/ci.yml',import.meta.url),'utf8');
+ assert.ok(workflow.includes('- run: npx playwright install chromium\n        id: browser_install'));
+ assert.ok(!workflow.includes('npx playwright install --with-deps'));
+});
 test('shared protocol gate only allows unlisted versions for the exact measured Desktop backend', async()=>{
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
  assert.ok(probe.includes("parser.add_argument('--expected-version', required=True)"));
