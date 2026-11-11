@@ -47,6 +47,7 @@ export class Engine extends EventEmitter {
   private reconciling = new Set<string>();
   private reconcileAgain = new Set<string>();
   private completionRechecks = new Map<string, string>();
+  private completionHistoryReads = new Set<string>();
   private provisioning = new Set<string>();
   private ownedThreads = new Set<string>();
   private releasing = new Map<string, Promise<void>>();
@@ -746,6 +747,9 @@ export class Engine extends EventEmitter {
       if (completionNotification && completionTurnId) this.completionRechecks.set(id, completionTurnId);
       if (!(completionNotification || this.startingQueued.has(id)) || !turnId || !threadId || terminal(request.status)
         || this.store.getMeta(`cancel-requested:${id}`)) return;
+      const readKey = `${id}\0${turnId}`;
+      if (this.completionHistoryReads.has(readKey)) return;
+      this.completionHistoryReads.add(readKey);
       const client = this.codex, epoch = this.epoch;
       try {
         const found = await this.findCompletionHistory(client, threadId, id), current = this.store.getRequest(id);
@@ -755,6 +759,7 @@ export class Engine extends EventEmitter {
         this.finishFromHistory(current, found);
         this.changed(); this.track(this.deliver());
       } catch (error) { this.emit('diagnostic', this.options.redact(error)); }
+      finally { this.completionHistoryReads.delete(readKey); }
       return;
     }
     const request = this.store.getRequest(id);

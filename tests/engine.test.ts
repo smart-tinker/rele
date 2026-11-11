@@ -3446,6 +3446,38 @@ describe('multiple origins and terminal reconciliation', () => {
     expect(f.codex.interrupt).not.toHaveBeenCalled();
   });
 
+  it('deduplicates concurrent completion-history reads for one request', async () => {
+    const f = fixture({ start: false }), request = await acceptRequest(f, 'telegram'); await running(f, request);
+    const initialRead = deferred<RequestLocation>(), completionRead = deferred<RequestLocation>();
+    f.codex.findRequest.mockClear();
+    f.codex.findRequest.mockImplementation((_thread, _id) => {
+      const read = f.codex.findRequest.mock.calls.length;
+      if (read === 1) return initialRead.promise;
+      if (read === 2) return completionRead.promise;
+      return Promise.resolve({ state: 'completed', turnId: 'turn-1', text: 'Final answer' });
+    });
+    const reconciliation = f.engine.reconcile(request.id);
+    try {
+      await vi.waitFor(() => expect(f.codex.findRequest).toHaveBeenCalledTimes(1));
+      const completed = { method: 'turn/completed', params: { threadId: THREAD,
+        turn: { id: 'turn-1', status: 'completed' } } } as const;
+      f.codex.notification(completed);
+      await vi.waitFor(() => expect(f.codex.findRequest).toHaveBeenCalledTimes(2));
+      f.codex.notification(completed);
+      await Promise.resolve(); await Promise.resolve();
+      expect(f.codex.findRequest).toHaveBeenCalledTimes(2);
+      completionRead.resolve({ state: 'completed', turnId: 'turn-1', text: 'Final answer' });
+      await vi.waitFor(() => expect(f.store.getRequest(request.id)?.status).toBe('completed'));
+      initialRead.resolve({ state: 'running', turnId: 'turn-1' });
+      await reconciliation; await f.engine.settled();
+      expect(f.store.listDeliveries().filter(row => row.requestId === request.id && row.body === 'Final answer')).toHaveLength(1);
+    } finally {
+      initialRead.resolve({ state: 'running', turnId: 'turn-1' });
+      completionRead.resolve({ state: 'completed', turnId: 'turn-1', text: 'Final answer' });
+      await reconciliation; await f.engine.settled();
+    }
+  });
+
   it('preserves terminal reconciliation when an earlier history read returns stale running state', async () => {
     const f = fixture({ start: false }), request = await acceptRequest(f, 'telegram'); await running(f, request);
     const gate = deferred<RequestLocation>();
