@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { assertStorageApproval, assertSteps, writeBundle, verifyBundles } from '../scripts/ci-contract.mjs';
+import { summarizeSharedNativeRequest } from '../scripts/shared-probe-diagnostics.mjs';
 const sha = 'a'.repeat(40), run = '123', attempt = '1', version = '0.1.2-rc.1';
 const now = Date.parse('2026-11-09T10:00:00Z');
 const approval = { checkedAt: new Date(now).toISOString(), freeBytes: 250 * 1024 ** 2, paidUsageBlocked: true };
@@ -41,6 +42,15 @@ test('tampering, unexpected files, and symlinks fail before publication',()=>fix
  const file=path.join(root,'linux',`rele-${version}-linux-x64.deb`);
  await writeFile(file,'tampered');await assert.rejects(verifyBundles(root,version,sha,run,attempt));
 }));
+test('native request diagnostics expose state without IDs or response text',()=>{
+ const summary=summarizeSharedNativeRequest({state:'completed',turnId:'synthetic-turn-id',text:'synthetic response body'});
+ assert.deepEqual(summary,{state:'completed',turnAssigned:true,queuedSubmissionFound:false,mixed:false,finalAnswerPresent:true});
+ assert.doesNotMatch(JSON.stringify(summary),/synthetic-turn-id|synthetic response body/u);
+ assert.equal(summarizeSharedNativeRequest({state:'running',queuedSubmissionId:'synthetic-queue-id',text:'NOREPLY'}).state,'running');
+ assert.equal(summarizeSharedNativeRequest({state:'running',queuedSubmissionId:'synthetic-queue-id',text:'NOREPLY'}).queuedSubmissionFound,true);
+ assert.equal(summarizeSharedNativeRequest({state:'running',queuedSubmissionId:'synthetic-queue-id',text:'NOREPLY'}).finalAnswerPresent,false);
+ assert.equal(summarizeSharedNativeRequest({state:'unexpected',failureReason:'private detail'}).state,'unknown');
+});
 test('unlisted file is rejected',()=>fixture(async root=>{
  await writeFile(path.join(root,'linux','extra'),'extra');await assert.rejects(verifyBundles(root,version,sha,run,attempt));
 }));
@@ -296,7 +306,9 @@ test('Windows parent failure prints only bounded shared-gate counts and states',
  assert.match(summary,/\[string\]\$result\.stage -match '\^shared-\(\\d\+\\\.\\d\+\\\.\\d\+\(\?:-\[0-9A-Za-z\.\]\+\)\?\)\$'/u,'select version reports only from a validated shared-gate stage');
  assert.match(summary,/\$sharedDiagnosticName = 'shared-results-' \+ \$Matches\[1\] \+ '\.json'/u,'read the report for the failed Codex version');
  assert.match(summary,/Join-Path \$sourceRoot \$sharedDiagnosticName/u,'resolve the selected report under the known source directory');
- for(const field of ['providerRequestCount','engineRequestStatuses','approvalStatuses','nativeTurnStatus','observedTurnStarts','observedTurnCompletions','Write-Output']) {
+ for(const field of ['providerRequestCount','engineRequestStatuses','approvalStatuses','nativeTurnStatus','nativeRequestLookup','nativeRequestErrorType','nativeRequestState',
+  'nativeRequestTurnAssigned','nativeRequestQueuedSubmissionFound','nativeRequestMixed','nativeRequestFinalAnswerPresent',
+  'observedTurnStarts','observedTurnCompletions','Write-Output']) {
   assert.ok(summary.includes(field),`print the bounded timeout field ${field}`);
  }
  assert.doesNotMatch(summary,/stderrTail|exception|payload|requestId|turnId|sharedReport/u,'never print raw errors, payloads, IDs, or the complete report');
@@ -325,6 +337,10 @@ test('shared cancellation failure records bounded provider and native completion
  assert.match(probe,/providerTrace/u,'failure evidence must include mock-provider action/response stages');
  assert.match(probe,/provider_trace\[-8:\]/u,'limit the diagnostic to the latest provider events');
  assert.doesNotMatch(probe,/provider_trace.*body|providerTrace.*body/u,'never include synthetic request bodies in the report');
+ const driver=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');
+ assert.match(driver,/codex\.findRequest\(threadId, target\.id, \[target\.id\], true\)/u,'read the native receipt for the unresolved synthetic request');
+ assert.match(driver,/summarizeSharedNativeRequest\(native\.location\)/u,'publish only bounded native request state');
+ assert.match(driver,/delay\(5000\)\.then\(\(\) => \(\{ timeout: true as const \}\)\)/u,'bound the additional read-only history query');
 });
 test('shared Windows cancellation probe waits for bounded native generation proofs', async()=>{
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');

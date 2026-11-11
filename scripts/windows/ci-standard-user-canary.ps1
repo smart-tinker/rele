@@ -649,6 +649,14 @@ try {
                         foreach ($status in @('pending', 'answered', 'expired')) { $approvalStatuses[$status] = @($evidence.engineApprovals | Where-Object { $_.status -eq $status }).Count }
                         $summary.approvalStatuses = $approvalStatuses
                         $summary.nativeTurnStatus = if ($evidence.nativeTurnStatus -in @('idle', 'active', 'systemError')) { [string]$evidence.nativeTurnStatus } else { 'unknown' }
+                        $nativeRequest = $evidence.nativeRequest
+                        $summary.nativeRequestLookup = if ($nativeRequest) { 'read' } elseif ($evidence.nativeRequestErrorType) { 'error' } elseif ($evidence.nativeRequestTimedOut -eq $true) { 'timeout' } else { 'unavailable' }
+                        if ($evidence.nativeRequestErrorType) { $summary.nativeRequestErrorType = if ($evidence.nativeRequestErrorType -in @('ConnectionResetError', 'CodexTransportError', 'CodexRpcError', 'Error', 'UnknownError')) { [string]$evidence.nativeRequestErrorType } else { 'other' } }
+                        $summary.nativeRequestState = if ($nativeRequest.state -in @('queued', 'running', 'completed', 'failed', 'interrupted', 'not_found')) { [string]$nativeRequest.state } else { 'unknown' }
+                        $summary.nativeRequestTurnAssigned = $nativeRequest.turnAssigned -eq $true
+                        $summary.nativeRequestQueuedSubmissionFound = $nativeRequest.queuedSubmissionFound -eq $true
+                        $summary.nativeRequestMixed = $nativeRequest.mixed -eq $true
+                        $summary.nativeRequestFinalAnswerPresent = $nativeRequest.finalAnswerPresent -eq $true
                         $summary.observedTurnStarts = @($evidence.observedTurns | Where-Object { $_.method -eq 'turn/started' }).Count
                         $summary.observedTurnCompletions = @($evidence.observedTurns | Where-Object { $_.method -eq 'turn/completed' }).Count
                         $providerActions = [ordered]@{}

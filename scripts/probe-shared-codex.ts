@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { summarizeSharedWaitFailure } from './shared-probe-diagnostics.mjs';
+import { summarizeSharedNativeRequest, summarizeSharedWaitFailure } from './shared-probe-diagnostics.mjs';
 import { ConfigStore, defaultConfig, defaultDataDirectory } from '../src/server/config.js';
 import { CodexClient as SourceCodexClient } from '../src/server/codex.js';
 import { Engine as SourceEngine } from '../src/server/engine.js';
@@ -226,9 +226,21 @@ if (values['expect-error']) {
           (!command.requestId || request.id === command.requestId) && request.status === command.status) : store.activeRequests().length > 0;
         while (pending() && Date.now() < until) { await engine!.pump(); await engine!.settled(); await delay(50); }
         if (pending()) {
-          let evidence;
+          let evidence: Record<string, unknown>;
           try { evidence = summarizeSharedWaitFailure(command.status ?? 'active', await snapshot()); }
           catch (error) { evidence = { snapshotErrorType: error instanceof Error ? error.name : 'UnknownError' }; }
+          const target = store.activeRequests().at(-1);
+          if (codex && threadId && target) {
+            const lookup = codex.findRequest(threadId, target.id, [target.id], true).then(
+              location => ({ location }), error => ({ error }));
+            const native = await Promise.race([lookup, delay(5000).then(() => ({ timeout: true as const }))]);
+            if ('location' in native) evidence.nativeRequest = summarizeSharedNativeRequest(native.location);
+            else if ('error' in native) {
+              const errorType = native.error instanceof Error ? native.error.name : 'UnknownError';
+              evidence.nativeRequestErrorType = ['ConnectionResetError', 'CodexTransportError', 'CodexRpcError', 'Error', 'UnknownError'].includes(errorType) ? errorType : 'other';
+            }
+            else evidence.nativeRequestTimedOut = true;
+          }
           throw new Error(`Shared requests did not reach expected state: ${JSON.stringify(evidence)}`);
         }
         await engine!.pump(); await engine!.settled();
