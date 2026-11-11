@@ -86,6 +86,15 @@ if (values['expect-error']) {
     }
   };
   const observedTurns: Array<{ method: string; threadId: string; turnId: string }> = [];
+  const observedProtocolEvents: Array<{ kind: 'request' | 'notification'; method: string; hasThreadId: boolean; hasTurnId: boolean; hasRequestId: boolean; hasItemId: boolean; hasApprovalId: boolean }> = [];
+  const recordProtocolEvent = (kind: 'request' | 'notification', event: { method: string; params?: Record<string, unknown> }) => {
+    const params = event.params ?? {};
+    observedProtocolEvents.push({ kind, method: /^[A-Za-z0-9._/-]{1,100}$/u.test(event.method) ? event.method : 'other',
+      hasThreadId: typeof params.threadId === 'string', hasTurnId: typeof params.turnId === 'string',
+      hasRequestId: typeof params.requestId === 'string' || typeof params.requestId === 'number',
+      hasItemId: typeof params.itemId === 'string', hasApprovalId: typeof params.approvalId === 'string' });
+    if (observedProtocolEvents.length > 64) observedProtocolEvents.shift();
+  };
   const cancellationProcessChecks: Array<{ turnId: string; processAlive: boolean }> = [];
   const cancellationInterruptWitnesses: Array<{ threadId: string; turnId: string; processId: number; processAlive: boolean; markerExists: boolean }> = [];
   let cancellationProcess: { id: number; threadId: string; turnId: string } | undefined;
@@ -99,6 +108,7 @@ if (values['expect-error']) {
   async function start() {
     codex = new CodexClient(config.codex, options);
     codex.on('notification', (event: { method: string; params: { threadId?: unknown; turn?: { id?: unknown } } }) => {
+      recordProtocolEvent('notification', event);
       if (['turn/started', 'turn/completed'].includes(event.method) && typeof event.params.threadId === 'string' && typeof event.params.turn?.id === 'string') {
         observedTurns.push({ method: event.method, threadId: event.params.threadId, turnId: event.params.turn.id });
         if (observedTurns.length > 100) observedTurns.shift();
@@ -109,6 +119,7 @@ if (values['expect-error']) {
         }
       }
     });
+    codex.on('request', recordProtocolEvent.bind(null, 'request'));
     await codex.connect();
     // Snapshot polling would evict the dispatch stages from this bounded trace.
     codex.subscribe = observe('subscribe', codex.subscribe.bind(codex));
@@ -187,7 +198,7 @@ if (values['expect-error']) {
       return raw ? [[request.id, JSON.parse(raw)]] : [];
     }));
     return { threadId, configuredExecutable: config.codex.executable, status: codex.status(), runtime: codex.runtimeInfo(), runtimeProcessId,
-      droppedQueueAcks, catalogValidated, observedTurns, cancellationProcessChecks, cancellationInterruptWitnesses,
+      droppedQueueAcks, catalogValidated, observedTurns, observedProtocolEvents, cancellationProcessChecks, cancellationInterruptWitnesses,
       ...(processId ? { probeProcessAlive: alive(processId) } : {}),
       requests, cancelCleanups, deliveries: store.listDeliveries(), approvals: store.listApprovals(), diagnostics,
       driverOperations: driverOperations.slice(-40) };

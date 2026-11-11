@@ -558,6 +558,7 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
                 {key: row.get(key) for key in ('id', 'requestId', 'method', 'status', 'turnId')}
                 for row in engine_snapshot.get('approvals', [])[-8:]
             ]
+            evidence['engineProtocolEvents'] = engine_snapshot.get('observedProtocolEvents', [])[-24:]
             evidence['driverOperations'] = engine_snapshot.get('driverOperations', [])
         except Exception as error:
             evidence['engineSnapshotError'] = type(error).__name__
@@ -867,7 +868,11 @@ enabled=false
             # An origin-owned approval is resolved by the real Engine; Desktop sees it.
             actions.append(('approval', None))
             await engine.command('ingest', platform='telegram', eventId='approval', text='shared-approval-request')
-            pending = await engine.command('wait', status='waiting_approval')
+            try:
+                pending = await engine.command('wait', status='waiting_approval')
+            except (TimeoutError, RuntimeError):
+                report['approvalWaitFailure'] = await held_request_evidence(engine, peer, thread)
+                raise
             approval = next(item for item in pending['approvals'] if item['status'] == 'pending')
             wire = await peer.wait(lambda event: event.get('method') == 'item/commandExecution/requestApproval'
                                    and event['params'].get('turnId') == approval['turnId'])

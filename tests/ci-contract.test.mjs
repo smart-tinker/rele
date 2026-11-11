@@ -99,14 +99,29 @@ test('shared wait timeout reports bounded request correlation without message bo
   requests:[{id:'request-1',eventId:'approval',status:'uncertain',turnId:'turn-1',queuedSubmissionId:'queue-1',text:'private message'}],
   approvals:[{id:'approval-1',requestId:'request-1',method:'item/commandExecution/requestApproval',status:'pending',turnId:'turn-1',details:'private approval'}],
   observedTurns:[{method:'turn/started',threadId:'thread-1',turnId:'turn-1'}],
+  observedProtocolEvents:[
+   {kind:'request',method:'item/commandExecution/requestApproval',hasThreadId:true,hasTurnId:true,hasRequestId:true,hasItemId:true,hasApprovalId:false,id:'private-rpc-id',command:'private command'},
+   {kind:'notification',method:'serverRequest/resolved',hasThreadId:true,hasTurnId:false,hasRequestId:true,hasItemId:false,hasApprovalId:false,requestId:'private-request-id'},
+   {kind:'request',method:'private user text',hasThreadId:true,hasTurnId:true,hasRequestId:true,hasItemId:false,hasApprovalId:false},
+  ],
   driverOperations:Array.from({length:50},(_,index)=>`operation-${index}`),
  }),{
   expectedStatus:'waiting_approval',
   requests:[{id:'request-1',eventId:'approval',status:'uncertain',turnId:'turn-1',queuedSubmissionId:'queue-1'}],
   approvals:[{id:'approval-1',requestId:'request-1',method:'item/commandExecution/requestApproval',status:'pending',turnId:'turn-1'}],
   observedTurns:[{method:'turn/started',turnId:'turn-1'}],
+  protocolEvents:[
+   {kind:'request',method:'item/commandExecution/requestApproval',hasThreadId:true,hasTurnId:true,hasRequestId:true,hasItemId:true,hasApprovalId:false},
+   {kind:'notification',method:'serverRequest/resolved',hasThreadId:true,hasTurnId:false,hasRequestId:true,hasItemId:false,hasApprovalId:false},
+   {kind:'request',method:'other',hasThreadId:true,hasTurnId:true,hasRequestId:true,hasItemId:false,hasApprovalId:false},
+  ],
   driverOperations:Array.from({length:40},(_,index)=>`operation-${index+10}`),
  });
+ assert.doesNotMatch(JSON.stringify(summarize('waiting_approval',{
+  requests:[],approvals:[],observedTurns:[],driverOperations:[],observedProtocolEvents:[
+   {kind:'request',method:'item/commandExecution/requestApproval',hasThreadId:true,hasTurnId:true,hasRequestId:true,id:'private-rpc-id',command:'private command'}
+  ]
+ })),/private-rpc-id|private command/u);
 });
 test('unconfirmed upload leaves transfers intact for reconciliation',()=>fixture(async root=>{
  const {publishCandidate}=await import('../scripts/ci-publish.mjs');
@@ -243,7 +258,7 @@ test('shared native gate records bounded request state without payloads on timeo
  for(const field of ['providerRequestCount','engineRequests','nativeTurnStatus','observedTurns','eventId','status','turnId']) assert.ok(evidence.includes(field),`timeout evidence must include ${field}`);
  for(const field of ['engineApprovals','queuedProviderActionTypes','driverOperations']) assert.ok(evidence.includes(field),`timeout evidence must include ${field}`);
  for(const field of ['text','payload','input','content','prompt']) assert.ok(!evidence.includes(field),`timeout evidence must exclude ${field}`);
- assert.match(evidence,/engine_snapshot = await asyncio\.wait_for\(engine\.command\('snapshot'\), 5\)[\s\S]*?evidence\['driverOperations'\] = engine_snapshot\.get\('driverOperations', \[\]\)/u,'preserve driver operations from the Rele engine snapshot');
+ assert.match(evidence,/engine_snapshot = await asyncio\.wait_for\(engine\.command\('snapshot'\), 5\)[\s\S]*?evidence\['engineProtocolEvents'\] = engine_snapshot\.get\('observedProtocolEvents', \[\]\)\[-24:\][\s\S]*?evidence\['driverOperations'\] = engine_snapshot\.get\('driverOperations', \[\]\)/u,'preserve bounded protocol event metadata from the Rele engine snapshot');
  assert.match(evidence,/native_snapshot = await asyncio\.wait_for\(peer\.call\('thread\/read'[\s\S]*?evidence\['nativeTurnStatus'\] = native_snapshot/u,'keep native thread state separate from the engine snapshot');
  const driver=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');
  for(const field of ['dispatch','initialMessage.ensure','slackSync.drain','subscribe','backgroundTerminals','enqueue','driverOperations']) assert.ok(driver.includes(field),`shared driver must trace ${field}`);
@@ -336,6 +351,7 @@ test('shared cancellation failure records bounded provider and native completion
   'reuse the bounded native snapshot and observed turn evidence');
  assert.match(probe,/providerTrace/u,'failure evidence must include mock-provider action/response stages');
  assert.match(probe,/provider_trace\[-8:\]/u,'limit the diagnostic to the latest provider events');
+ assert.match(probe,/except \(TimeoutError, RuntimeError\):\s*report\['approvalWaitFailure'\] = await held_request_evidence\(engine, peer, thread\)/u,'capture approval protocol evidence if the Windows driver exits or times out');
  assert.doesNotMatch(probe,/provider_trace.*body|providerTrace.*body/u,'never include synthetic request bodies in the report');
  const driver=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');
  assert.match(driver,/codex\.findRequest\(threadId, target\.id, \[target\.id\], true\)/u,'read the native receipt for the unresolved synthetic request');
