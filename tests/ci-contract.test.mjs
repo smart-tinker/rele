@@ -137,6 +137,25 @@ test('partial or uncertain platform upload stays in its draft and cannot be repl
   assert.equal(f.state.calls.filter(call=>call.method).length,writes);assert.ok(f.state.calls.every(call=>call.method!=='DELETE'));
  }
 }));
+test('platform upload revalidates its draft and main after every upload ACK',()=>fixture(async root=>{
+ const {uploadPlatform}=await import('../scripts/ci-publish.mjs');
+ for(const changedAfter of [1,5])for(const mutation of ['draft published','main advanced','run/attempt changed']) {
+  const f=await releaseBackend(root);await f.prepared();let uploads=0;
+  const api=async(route,options={})=>{
+   const result=await f.api(route,options);
+   if(options.upload && ++uploads===changedAfter) {
+    if(mutation==='draft published')f.state.release.draft=false;
+    else if(mutation==='main advanced')f.state.main='b'.repeat(40);
+    else f.state.release.body=`Rele candidate ${sha}; run 999; attempt 2. Verification pending.`;
+   }
+   return result;
+  };
+  await assert.rejects(uploadPlatform(api,candidate,77,path.join(root,'linux'),'linux'),undefined,`${mutation} after ACK ${changedAfter}`);
+  assert.equal(uploads,changedAfter,'No upload may follow a changed target');
+  assert.equal(f.state.assets.length,changedAfter);
+  assert.equal(f.state.calls.filter(call=>call.method==='PATCH' || call.method==='DELETE').length,0);
+ }
+}));
 test('download rejects missing, extra and tampered draft assets',()=>fixture(async root=>{
  const {downloadCandidate}=await import('../scripts/ci-publish.mjs');
  for(const failure of ['missing','extra','tampered']) {
