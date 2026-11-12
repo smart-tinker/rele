@@ -31,6 +31,7 @@ NODE = shutil.which('node')
 DRIVER = REPO / 'scripts/probe-shared-codex.ts'
 SHIM = REPO / 'dist/server/codex-cli.js'
 ENGINE_READ_TIMEOUT_SECONDS = 70
+ENGINE_WAIT_READ_TIMEOUT_SECONDS = 120
 ENGINE_CANCEL_READ_TIMEOUT_SECONDS = 720
 # backgroundTerminals performs two Windows native identity proofs, each bounded at 30s.
 ENGINE_SHARED_SHELL_START_TIMEOUT_SECONDS = 65
@@ -202,7 +203,7 @@ class EngineDriver:
         self.process.stdin.write((json.dumps({'action': action, **fields}) + '\n').encode())
         await self.process.stdin.drain()
         # Cancellation may repeat Windows generation proofs, each with 30-second subprocess limits.
-        timeout = ENGINE_CANCEL_READ_TIMEOUT_SECONDS if action == 'cancel' else ENGINE_READ_TIMEOUT_SECONDS
+        timeout = ENGINE_CANCEL_READ_TIMEOUT_SECONDS if action == 'cancel' else ENGINE_WAIT_READ_TIMEOUT_SECONDS if action == 'wait' else ENGINE_READ_TIMEOUT_SECONDS
         return await self.read(timeout)
 
     async def close(self):

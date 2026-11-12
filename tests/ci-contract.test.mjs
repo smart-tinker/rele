@@ -195,6 +195,14 @@ test('Windows job timeout leaves room for its bounded standard-user native gate'
  assert.ok(Number(jobTimeout[1])>=Number(gateTimeout[2])+20,'leave twenty minutes for runner setup, later checks, and cleanup');
  assert.equal(Number(jobTimeout[2]),60,'keep the Ubuntu timeout unchanged');
 });
+test('shared protocol completion wait fits within its driver response budget', async()=>{
+ const probe=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');
+ const harness=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ assert.ok(/const ENGINE_WAIT_TIMEOUT_MS = 90_000/u.test(probe),'allow cold shared Desktop completion to settle');
+ assert.ok(/const until = Date\.now\(\) \+ ENGINE_WAIT_TIMEOUT_MS/u.test(probe));
+ assert.ok(/ENGINE_WAIT_READ_TIMEOUT_SECONDS = 120/u.test(harness),'keep the harness listening beyond its turn wait');
+ assert.ok(/timeout = ENGINE_CANCEL_READ_TIMEOUT_SECONDS if action == 'cancel' else ENGINE_WAIT_READ_TIMEOUT_SECONDS if action == 'wait' else ENGINE_READ_TIMEOUT_SECONDS/u.test(harness));
+});
 test('Windows canary timeout reports only bounded installer progress', async()=>{
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
  const start=canary.indexOf('$summary = [ordered]@{ stage =');
@@ -409,8 +417,8 @@ test('shared Windows cancellation probe waits for bounded native generation proo
  const driver=probe.slice(driverStart,driverEnd);
  assert.match(probe,/ENGINE_CANCEL_READ_TIMEOUT_SECONDS\s*=\s*720/u,
   'allow the finite sequence of 30-second Windows process proofs in the cancellation path');
- assert.match(driver,/timeout = ENGINE_CANCEL_READ_TIMEOUT_SECONDS if action == 'cancel' else ENGINE_READ_TIMEOUT_SECONDS/u,
-  'apply the longer read deadline only to the cancellation diagnostic path');
+ assert.match(driver,/timeout = ENGINE_CANCEL_READ_TIMEOUT_SECONDS if action == 'cancel' else ENGINE_WAIT_READ_TIMEOUT_SECONDS if action == 'wait' else ENGINE_READ_TIMEOUT_SECONDS/u,
+  'use action-specific deadlines for cancellation diagnostics and normal completion waits');
  assert.match(driver,/return await self\.read\(timeout\)/u,'use the action-specific response deadline');
 });
 test('shared Windows cancellation fixture outlives the bounded native proof window without sleeping it out', async()=>{

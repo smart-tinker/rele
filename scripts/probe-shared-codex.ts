@@ -19,6 +19,7 @@ const { values } = parseArgs({ options: {
   thread: { type: 'string' }, prepare: { type: 'boolean' }, 'profile-socket': { type: 'string' }, 'expect-error': { type: 'string' },
   'windows-install-dir': { type: 'string' }, 'runtime-directory': { type: 'string' },
 } });
+const ENGINE_WAIT_TIMEOUT_MS = 90_000;
 if (!values.executable || !values.home || !values.directory || !process.env.RELE_DATA_DIR) throw new Error('Missing isolated fixture paths');
 if ((values['windows-install-dir'] || values['runtime-directory']) && process.platform !== 'win32') throw new Error('Windows fixture options require Windows');
 if (values['windows-install-dir'] && values['runtime-directory']) throw new Error('Choose source installation seam or packaged default location');
@@ -359,7 +360,7 @@ if (values['expect-error']) {
           messageId, text: command.text!, ...(slack ? { slack } : {}) });
         if (command.loseAck !== true) await engine!.settled();
       } else if (command.action === 'wait') {
-        const until = Date.now() + 40_000;
+        const until = Date.now() + ENGINE_WAIT_TIMEOUT_MS;
         const pending = () => command.turnId ? !observedTurns.some(event =>
           event.method === 'turn/completed' && event.threadId === threadId && event.turnId === command.turnId) : command.status ? !store.listRequests().some(request =>
           (!command.requestId || request.id === command.requestId) && request.status === command.status) : store.activeRequests().length > 0;
