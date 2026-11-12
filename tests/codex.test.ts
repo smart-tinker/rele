@@ -177,6 +177,65 @@ async function until(predicate: () => boolean): Promise<void> {
   }
 }
 
+describe('native source controls', () => {
+  it('recovers an exact recorded Goal turn beyond the latest page without mixing newer turns', async () => {
+    const f = await fixture({ 'thread/turns/list': message => message.params.cursor === 'older'
+      ? { data: [{ id: 'old-goal-turn', status: 'completed', items: [{ type: 'agentMessage', id: 'old-result', phase: 'final_answer', text: 'Owned old result' }] }], nextCursor: null }
+      : { data: [{ id: 'newer-foreign-turn', status: 'completed', items: [{ type: 'userMessage', clientId: 'other' }] }], nextCursor: 'older' } });
+    await f.client.connect();
+    expect(await f.client.controlTurns(threadId, ['old-goal-turn'])).toMatchObject([{ id: 'old-goal-turn', items: [{ text: 'Owned old result' }] }]);
+  });
+  it('reads configuration and Goal capability without resuming or starting work', async () => {
+    const f = await fixture({
+      'thread/read': () => ({ thread: { ...rawThread, model: 'fixture-model', reasoningEffort: 'high' } }),
+      'experimentalFeature/list': () => ({ data: [{ name: 'goals', enabled: true }], nextCursor: null }),
+      'thread/goal/get': () => ({ goal: null }),
+    });
+    await f.client.connect();
+    const before = f.calls.length;
+    expect(await f.client.controlSnapshot(threadId)).toMatchObject({ model: 'fixture-model', effort: 'high', runtimeStatus: 'idle', goalSupported: true, goal: null, queued: 0 });
+    expect(f.calls.slice(before).map(call => call.method)).not.toContain('thread/resume');
+    expect(f.calls.slice(before).some(call => ['turn/start', 'thread/queue/add', 'thread/goal/set'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it('checks each model effort and changes only future thread defaults, without an inference probe', async () => {
+    const f = await fixture({
+      'model/list': () => ({ data: [{ id: 'fixture-model', model: 'fixture-model', displayName: 'Fixture', supportedReasoningEfforts: [{ reasoningEffort: 'high' }], defaultReasoningEffort: 'high' }], nextCursor: null }),
+      'thread/settings/update': () => ({}),
+    });
+    await f.client.connect();
+    await expect(f.client.updateControlModel(threadId, 'fixture-model', 'low')).rejects.toThrow();
+    expect(f.calls.some(call => call.method === 'thread/settings/update')).toBe(false);
+    await f.client.updateControlModel(threadId, 'fixture-model', 'high');
+    expect(f.calls.filter(call => call.method === 'thread/settings/update').map(call => call.params)).toEqual([{ threadId, model: 'fixture-model', effort: 'high' }]);
+    expect(f.calls.some(call => ['turn/start', 'turn/settings/update', 'thread/resume'].includes(call.method ?? ''))).toBe(false);
+  });
+  it('revalidates admission after the model catalog await and before settings/update', async () => {
+    let admitted = true;
+    const f = await fixture({ 'model/list': () => {
+      admitted = false;
+      return { data: [{ model: 'fixture-model', displayName: 'Fixture', supportedReasoningEfforts: [{ reasoningEffort: 'high' }], defaultReasoningEffort: 'high' }], nextCursor: null };
+    }, 'thread/settings/update': () => ({}) });
+    await f.client.connect();
+    await expect(f.client.updateControlModel(threadId, 'fixture-model', 'high', () => { if (!admitted) throw new Error('Source revoked'); })).rejects.toThrow('Source revoked');
+    expect(f.calls.some(call => call.method === 'thread/settings/update')).toBe(false);
+  });
+
+  it('uses native user-origin Goal mutations, preserves zero accounting, and rejects malformed snapshots', async () => {
+    const goal = { threadId, objective: 'Ship\nDone: tests pass', status: 'active', tokenBudget: 5000, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 100, updatedAt: 100 };
+    const f = await fixture({ 'thread/goal/set': message => ({ goal: { ...goal, status: message.params.status ?? 'active' } }) });
+    await f.client.connect();
+    expect(await f.client.updateControlGoal(threadId, { objective: goal.objective, tokenBudget: 5000 })).toEqual(goal);
+    expect(await f.client.updateControlGoal(threadId, { status: 'paused' })).toMatchObject({ status: 'paused' });
+    expect(f.calls.filter(call => call.method === 'thread/goal/set').map(call => call.params)).toEqual([
+      { threadId, origin: 'user', objective: goal.objective, tokenBudget: 5000 }, { threadId, origin: 'user', status: 'paused' },
+    ]);
+    await expect(f.client.updateControlGoal(threadId, { objective: ' ' })).rejects.toThrow();
+    f.handlers['thread/goal/set'] = () => ({ goal: { ...goal, threadId: 'other' } });
+    await expect(f.client.updateControlGoal(threadId, { status: 'paused' })).rejects.toThrow();
+  });
+});
+
 describe('Codex socket health', () => {
   it('invalidates a socket without matching pongs, preserves another client and permits a fresh connection', async () => {
     const f = await fixture({}, undefined, { heartbeatIntervalMs: 20, heartbeatTimeoutMs: 60 }, false);

@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import type { Approval, AudioAttachment, CatalogChat, CatalogPage, ConnectionState, Delivery, Endpoint, InboundMessage, Origin, Person, Platform, SlackImageAttachment, SlackTranscriptMessage } from '../../shared/types.js';
+import type { ControlContext, ControlView } from '../source-control.js';
+import type { ControlCommand } from './slack-control.js';
 
 export type SlackSessionStatus = 'processing' | 'active' | 'suspended';
 
@@ -46,6 +48,7 @@ export interface ChannelCallbacks {
   endpoint(endpoint: Endpoint): void;
   action(action: ApprovalAction): Promise<void>;
   question?(context: ApprovalContext): Approval | Promise<Approval>;
+  control?(context: ControlContext, command: ControlCommand): Promise<ControlView>;
   status(): void;
 }
 

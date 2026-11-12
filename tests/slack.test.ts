@@ -47,6 +47,7 @@ async function makeChannel(
     message?: ChannelCallbacks['message'];
     action?: ChannelCallbacks['action'];
     question?: ChannelCallbacks['question'];
+    control?: ChannelCallbacks['control'];
     postMessage?: () => Promise<Response>;
     api?: (method: string, body: Record<string, unknown>) => Response | undefined | Promise<Response | undefined>;
     knownEndpoints?: Endpoint[];
@@ -113,7 +114,7 @@ async function makeChannel(
   const channel = new SlackChannel(
     syntheticSlackBotToken,
     syntheticSlackAppToken,
-    { message, endpoint: endpoints, action, question: options.question, status },
+    { message, endpoint: endpoints, action, question: options.question, control: options.control, status },
     {
       fetch: fetcher,
       knownEndpoints: options.knownEndpoints,
@@ -217,6 +218,59 @@ function questionInteraction(id: string, action: Record<string, unknown>) {
   return { envelope_id: id, type: 'interactive', payload: { type: 'block_actions', team: { id: 'TEXAMPLE' }, user: { id: 'UANNA' },
     channel: { id: 'CEXAMPLE' }, message: { ts: '1000.2000', thread_ts: '1000.1000' }, trigger_id: 'synthetic-trigger', actions: [action] } };
 }
+
+describe('Slack message shortcut controls', () => {
+  const view = { id: '12345678-1234-1234-1234-123456789abc', sourceTitle: 'Synthetic thread', conversationTitle: 'Synthetic Codex', nativeThreadId: 'native-id', action: 'status' as const,
+    connected: true, boundSources: 2, ownQueued: 0, ownRunning: 0,
+    snapshot: { model: 'fixture-model', effort: 'high', runtimeStatus: 'idle', goalSupported: true, goal: null, queued: 0 } };
+  const shortcut = (id: string, thread?: string) => ({ envelope_id: id, type: 'interactive', payload: { type: 'message_action', callback_id: 'rele_manage', team: { id: 'TEXAMPLE' },
+    user: { id: 'UANNA' }, channel: { id: 'CEXAMPLE' }, message: { ts: thread ? '1000.2000' : '1000.1000', ...(thread ? { thread_ts: thread } : {}), text: 'selected address, never a prompt' }, trigger_id: 'fixture-trigger' } });
+  const api = (method: string) => method === 'views.open' || method === 'views.update' ? Response.json({ ok: true, view: { id: 'VMODAL' } })
+    : method === 'conversations.members' ? Response.json({ ok: true, members: ['UANNA'], response_metadata: { next_cursor: '' } })
+      : method === 'chat.postEphemeral' ? Response.json({ ok: true }) : undefined;
+
+  it('ACKs promptly and maps root/reply shortcuts to the same exact thread without ordinary inbound work', async () => {
+    const targets: unknown[] = [];
+    const f = await makeChannel({ control: async (context, command) => { targets.push({ context, command }); return view; }, api });
+    f.socket.receive(shortcut('root')); f.socket.receive(shortcut('reply', '1000.1000'));
+    await vi.waitFor(() => expect(f.calls.filter(call => call.url.endsWith('/views.open'))).toHaveLength(2));
+    expect(targets).toMatchObject([{ context: { accountId: 'TEXAMPLE:UBOT', chatId: 'CEXAMPLE', threadId: '1000.1000', messageId: '1000.1000', senderIsBot: false }, command: { kind: 'open' } },
+      { context: { threadId: '1000.1000', messageId: '1000.2000' } }]);
+    expect(f.socket.sent.map(value => JSON.parse(value).envelope_id)).toEqual(['root', 'reply']);
+    expect(f.message).not.toHaveBeenCalled();
+    const modal = JSON.parse(String(f.calls.find(call => call.url.endsWith('/views.open'))!.init!.body)).view;
+    expect(modal.callback_id).toBe('rele_source_control');
+    expect(JSON.stringify(modal)).not.toContain('selected address, never a prompt');
+  });
+
+  it('keeps a submitted modal visible after ACK, and displays a late native failure without a second prompt', async () => {
+    let metadata = '';
+    const f = await makeChannel({ control: async (_context, command) => {
+      if (command.kind === 'submit') { await new Promise(resolve => setTimeout(resolve, 10)); throw new Error('Synthetic native failure'); }
+      return view;
+    }, api });
+    f.socket.receive(shortcut('open'));
+    await vi.waitFor(() => expect(f.calls.some(call => call.url.endsWith('/views.open'))).toBe(true));
+    metadata = JSON.parse(String(f.calls.find(call => call.url.endsWith('/views.open'))!.init!.body)).view.private_metadata;
+    f.socket.receive({ envelope_id: 'submit', type: 'interactive', payload: { type: 'view_submission', team: { id: 'TEXAMPLE' }, user: { id: 'UANNA' }, view: {
+      id: 'VMODAL', callback_id: 'rele_source_control', private_metadata: metadata, state: { values: { operation: { action: { selected_option: { value: 'status' } } } } } }, } });
+    await vi.waitFor(() => expect(f.calls.some(call => call.url.endsWith('/views.update'))).toBe(true));
+    expect(JSON.parse(f.socket.sent.find(value => JSON.parse(value).envelope_id === 'submit')!).payload.response_action).toBe('update');
+    expect(String(f.calls.find(call => call.url.endsWith('/views.update'))!.init!.body)).toContain('Synthetic native failure');
+    expect(f.message).not.toHaveBeenCalled();
+  });
+
+  it('rejects a foreign workspace and nonmember before control, and closing the modal does nothing', async () => {
+    const control = vi.fn().mockResolvedValue(view);
+    const f = await makeChannel({ control, api: method => method === 'conversations.members' ? Response.json({ ok: true, members: [] }) : api(method) });
+    const foreign = shortcut('foreign'); foreign.payload.team.id = 'TOTHER'; f.socket.receive(foreign);
+    f.socket.receive(shortcut('nonmember'));
+    f.socket.receive({ envelope_id: 'closed', type: 'interactive', payload: { type: 'view_closed', view: { callback_id: 'rele_source_control' } } });
+    await vi.waitFor(() => expect(f.socket.sent).toHaveLength(3));
+    await new Promise(resolve => setTimeout(resolve, 15));
+    expect(control).not.toHaveBeenCalled(); expect(f.message).not.toHaveBeenCalled();
+  });
+});
 const questionApi = (method: string, body: Record<string, unknown>) => method === 'views.open' ? Response.json({ ok: true, view: { id: 'VMODAL' } })
   : method === 'chat.postEphemeral' ? Response.json({ ok: true, message_ts: '1000.3000' })
     : method === 'chat.update' ? Response.json({ ok: true, channel: body.channel, ts: body.ts }) : undefined;

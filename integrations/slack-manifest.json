@@ -1,7 +1,7 @@
 {
   "display_information": {"name": "Rele", "description": "Local gateway to shared Codex conversations", "background_color": "#152825"},
-  "features": {"bot_user": {"display_name": "Rele", "always_online": false}, "agent_view": {"agent_description": "Rele connects selected Codex threads to Slack."}},
-  "oauth_config": {"scopes": {"bot": ["app_mentions:read", "channels:history", "channels:read", "groups:history", "groups:read", "im:history", "im:read", "mpim:history", "mpim:read", "users:read", "chat:write", "files:read", "assistant:write"]}},
+  "features": {"bot_user": {"display_name": "Rele", "always_online": false}, "agent_view": {"agent_description": "Rele connects selected Codex threads to Slack."}, "shortcuts": [{"name": "Управление Rele", "type": "message", "callback_id": "rele_manage", "description": "Статус, цель и модель связанного Codex-чата"}]},
+  "oauth_config": {"scopes": {"bot": ["commands", "app_mentions:read", "channels:history", "channels:read", "groups:history", "groups:read", "im:history", "im:read", "mpim:history", "mpim:read", "users:read", "chat:write", "files:read", "assistant:write"]}},
   "settings": {
     "event_subscriptions": {"bot_events": ["app_mention", "message.channels", "message.groups", "message.im", "message.mpim", "agent_session_stopped"]},
     "interactivity": {"is_enabled": true},

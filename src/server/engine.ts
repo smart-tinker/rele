@@ -14,8 +14,10 @@ import { effectiveSharedCodexHome } from './codex-shared.js';
 import { requestInput } from './inbound-context.js';
 import { MessageToolValidationError } from '../shared/message-tool.js';
 import { ASYNC_QUESTION_METHOD, asyncQuestions, encodeAsyncAnswers, matchAsyncAnswer, parseAsyncAnswers } from './async-questions.js';
+import { SourceControls, type ControlContext, type ControlView } from './source-control.js';
+import type { ControlCommand } from './channels/slack-control.js';
 
-export type CodexGateway = Pick<CodexClient, 'status' | 'isVerifiedVersion' | 'createThread' | 'setThreadName' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'steer' | 'findSteerReceipt' | 'interrupt' | 'backgroundTerminals' | 'terminateBackgroundTerminal' | 'findRequest' | 'retryOverloaded' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Partial<Pick<CodexClient, 'hasPendingRequest' | 'asyncQuestionState'>> & Pick<EventEmitter, 'on' | 'off'>;
+export type CodexGateway = Pick<CodexClient, 'status' | 'isVerifiedVersion' | 'createThread' | 'setThreadName' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'steer' | 'findSteerReceipt' | 'interrupt' | 'backgroundTerminals' | 'terminateBackgroundTerminal' | 'findRequest' | 'retryOverloaded' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Partial<Pick<CodexClient, 'hasPendingRequest' | 'asyncQuestionState' | 'controlSnapshot' | 'controlModels' | 'readControlGoal' | 'updateControlGoal' | 'updateControlModel' | 'controlTurns' | 'controlTurnLocation' | 'controlTurnIndex'>> & Pick<EventEmitter, 'on' | 'off'>;
 export interface EngineOptions {
   config: () => AppConfig;
   temporaryRoot: string;
@@ -67,6 +69,7 @@ export class Engine extends EventEmitter {
   private changingSelection = false;
   private readonly slackSync: SlackSync;
   private readonly initialMessages: InitialMessages;
+  private readonly sourceControls: SourceControls;
   private steering = new Set<string>();
   private progressSending = false;
   private progressReads = new Map<string, Promise<RequestLocation>>();
@@ -80,6 +83,7 @@ export class Engine extends EventEmitter {
   private retryingOverloads = new Map<string, Promise<{ turnId: string } | undefined>>();
   private slackConnection?: string;
   private readonly notification = (event: CodexNotification) => {
+    this.sourceControls.notification(event);
     const epoch = this.epoch;
     if (event.method === 'turn/completed' || event.method === 'item/completed') {
       const p = event.params as Record<string, any>;
@@ -101,12 +105,26 @@ export class Engine extends EventEmitter {
     super();
     this.slackSync = new SlackSync(store, platform => this.channels[platform ?? 'slack'], () => this.codex);
     this.initialMessages = new InitialMessages(store, () => this.codex, () => !this.stopped && !this.suspended, options.redact);
+    this.sourceControls = new SourceControls(store, {
+      native: () => this.codex.controlSnapshot && this.codex.controlModels && this.codex.readControlGoal && this.codex.updateControlGoal
+        && this.codex.updateControlModel && this.codex.controlTurns && this.codex.controlTurnLocation && this.codex.controlTurnIndex ? this.codex as CodexClient : undefined,
+      target: () => this.targetFingerprint(), generation: () => `${this.targetFingerprint()}:${this.epoch}`,
+      available: () => !this.stopped && !this.suspended && this.options.config().slack.enabled,
+      channel: () => this.channels.slack, redact: options.redact,
+    });
     codex.on('notification', this.notification);
     codex.on('request', this.serverRequest);
     codex.on('status', this.connection);
   }
 
   suspend(value: boolean): void { this.suspended = value; }
+  control(context: ControlContext, command: ControlCommand): Promise<ControlView> {
+    const task = command.kind === 'open' ? this.sourceControls.open(context)
+      : command.kind === 'preview' && command.id && command.action ? this.sourceControls.preview(context, command.id, command.action)
+        : command.kind === 'submit' && command.id && command.input ? this.sourceControls.submit(context, command.id, command.input)
+          : Promise.reject(new Error('Некорректное действие управления.'));
+    this.track(task); return task;
+  }
   assertCodexSelectionChange(): void {
     // A new executable changes target fingerprints; preserve every unresolved native receipt.
     if (this.store.activeRequests().some(request => request.status !== 'queued' || request.queuedSubmissionId || request.turnId)
@@ -860,7 +878,7 @@ export class Engine extends EventEmitter {
   /** Exposed to deterministic integration tests; the timer uses this same path. */
   async pump(): Promise<void> {
     if (this.stopped) return;
-    const work: Promise<unknown>[] = [this.deliver(), this.flushProgress(), this.flushApprovalUpdates(), this.retryPendingQuestions(), this.refreshAsyncQuestions()];
+    const work: Promise<unknown>[] = [this.deliver(), this.flushProgress(), this.flushApprovalUpdates(), this.retryPendingQuestions(), this.refreshAsyncQuestions(), this.sourceControls.recover()];
     if (!this.suspended) {
       await Promise.allSettled(this.store.listAutoLinkIntents().filter(intent => intent.status !== 'completed').map(intent => this.provision(intent)));
       await this.slackSync.backfill();
@@ -968,6 +986,7 @@ export class Engine extends EventEmitter {
   }
 
   private findOwnRequest(client: CodexGateway, threadId: string, requestId: string): Promise<RequestLocation> {
+    if (this.store.getMeta(`control-goal-request:${requestId}`)) return this.sourceControls.requestLocation(requestId);
     return this.readOwnHistory(requestId, inputs => client.findRequest(threadId, requestId, inputs, true));
   }
 
@@ -1030,6 +1049,7 @@ export class Engine extends EventEmitter {
   }
 
   private async steerPending(parent: ReleRequest): Promise<void> {
+    if (this.store.getMeta(`control-goal-request:${parent.id}`)) return;
     const conversation = this.store.getConversation(parent.conversationId)!;
     const client = this.codex, epoch = this.epoch;
     if (this.steering.has(parent.id) || parent.status !== 'running' || !parent.turnId || this.isMixed(parent.id)
@@ -1269,9 +1289,13 @@ export class Engine extends EventEmitter {
     const conversation = this.store.getConversation(conversationId);
     if (!conversation) return;
     const client = this.codex;
-    const release = client.releaseThread(conversation.threadId).then(() => {
+    const release = (async () => {
+      if (client.status().transport === 'managed' && !await this.sourceControls.canReleaseNative(conversationId)) return;
+      if (client !== this.codex || this.dispatching.has(conversationId)
+        || this.store.activeRequests().some(row => row.conversationId === conversationId && row.status !== 'queued')) return;
+      await client.releaseThread(conversation.threadId);
       if (this.codex === client) this.ownedThreads.delete(conversationId);
-    }).catch(error => {
+    })().catch(error => {
       this.emit('diagnostic', this.options.redact(error));
     }).finally(() => { if (this.releasing.get(conversationId) === release) this.releasing.delete(conversationId); });
     this.releasing.set(conversationId, release);
@@ -1439,6 +1463,7 @@ export class Engine extends EventEmitter {
 
   private async onNotification({ method, params }: CodexNotification): Promise<void> {
     const p = params as Record<string, any>;
+    if (method === 'thread/goal/updated' && typeof p.threadId === 'string' && typeof p.turnId === 'string') await this.sourceControls.ensureRequest(p.threadId, p.turnId);
     const nativeQuestions = ['item/started', 'item/completed'].includes(method) ? asyncQuestions(p.item) : [];
     if (nativeQuestions.length) {
       const client = this.codex, epoch = this.epoch;
@@ -1466,7 +1491,7 @@ export class Engine extends EventEmitter {
     if (method === 'turn/started') for (const active of this.store.activeRequests()) {
       if (!active.steeredInto && this.store.getMeta(`overload-retry:${active.id}`) && this.store.getConversation(active.conversationId)?.threadId === p.threadId) await this.reconcile(active.id);
     }
-    const progressRequest = this.store.activeRequests().find(request => !request.steeredInto && request.turnId === p.turnId
+    const progressRequest = this.store.activeRequests().find(request => !request.steeredInto && !this.store.getMeta(`control-goal-request:${request.id}`) && request.turnId === p.turnId
       && this.store.getConversation(request.conversationId)?.threadId === p.threadId);
     if (progressRequest && !this.isMixed(progressRequest.id)) {
       if (method === 'error' && p.willRetry === true && p.error?.codexErrorInfo === 'serverOverloaded') {
@@ -1567,6 +1592,7 @@ export class Engine extends EventEmitter {
   }
 
   private recoverProgress(id: string, found: RequestLocation): void {
+    if (this.store.getMeta(`control-goal-request:${id}`)) return;
     if (!found.publicHistory) {
       const progress = JSON.parse(this.store.getMeta(`request-progress:${id}`) ?? '{}') as RequestProgress;
       if (!progress.segments && found.commentary?.length) this.recordProgress(id, { steps: found.commentary }, true);
@@ -1732,6 +1758,7 @@ export class Engine extends EventEmitter {
     const rejectUnowned = async () => { if (managed) await client.rejectRequest(event.id, 'Rele cannot authorize this request without its original message.'); };
     const reviewHint = managed ? 'Действие отклонено. Сверьте запрос в панели Rele.' : 'Продолжите в Codex.';
     const p = event.params as Record<string, any>;
+    if (typeof p.threadId === 'string' && typeof p.turnId === 'string') await this.sourceControls.ensureRequest(p.threadId, p.turnId);
     for (const active of this.store.activeRequests()) if (!active.steeredInto && this.store.getConversation(active.conversationId)?.threadId === p.threadId
       && this.retryingOverloads.has(active.id)) await this.retryingOverloads.get(active.id)!.catch(() => {});
     if (!current()) return;
@@ -1814,6 +1841,7 @@ export class Engine extends EventEmitter {
   }
 
   private async retryOverload(request: ReleRequest, found: RequestLocation): Promise<boolean> {
+    if (this.store.getMeta(`control-goal-request:${request.id}`)) return false;
     if (found.state !== 'failed' || found.failureReason !== 'serverOverloaded' || !found.turnId || found.mixed || this.isMixed(request.id)) return false;
     if (this.store.getMeta(`cancel-requested:${request.id}`)) { this.track(this.cancel(request.id)); return true; }
     if (this.retryingOverloads.has(request.id)) return true;
@@ -1870,6 +1898,11 @@ export class Engine extends EventEmitter {
   }
 
   private finishFromHistory(request: ReleRequest, found: RequestLocation): void {
+    if (this.store.getMeta(`control-goal-request:${request.id}`) && ['completed', 'failed', 'interrupted'].includes(found.state)) {
+      this.store.finishRequest(request.id, { status: found.state as 'completed' | 'failed' | 'interrupted', turnId: found.turnId,
+        ...(found.mixed ? { error: mixedMessage } : {}) }, [], true);
+      return;
+    }
     const cleanup = this.cancelCleanup(request.id);
     if (this.cancelling.has(request.id) && !cleanup?.done || cleanup && !cleanup.done) {
       this.store.updateRequest(request.id, { status: 'uncertain', error: 'Ожидается подтверждение остановки фоновых команд.' });

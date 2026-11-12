@@ -17,6 +17,7 @@ import { CodexStdioError, CodexStdioTransport } from './codex-stdio.js';
 import { codexNativeGeneration, type CodexNativePeer } from './codex-native-generation.js';
 import { effectiveSharedCodexHome, ensureSharedCodex, SharedCodexError } from './codex-shared.js';
 import { asyncQuestions, matchAsyncAnswer, parseAsyncAnswers, type AsyncAnswer, type AsyncQuestion } from './async-questions.js';
+import { nativeGoal, type NativeGoal, type NativeControlSnapshot, type ControlModel, type ControlTurn } from './native-controls.js';
 
 export { SUPPORTED_CODEX_VERSION } from '../shared/codex-runtime.js';
 // Keep user conversations from every normal client; technical subagents are not binding targets.
@@ -260,6 +261,99 @@ export class CodexClient extends EventEmitter {
   /** Metadata only: reading does not load a thread or wake its persisted queue. */
   async readThread(threadId: string): Promise<unknown> {
     return this.call('thread/read', { threadId });
+  }
+
+  async controlSnapshot(threadId: string): Promise<NativeControlSnapshot> {
+    this.requireControls();
+    const result = await this.call<{ thread: RawThread & { model?: unknown; reasoningEffort?: unknown } }>('thread/read', { threadId });
+    if (result.thread?.id !== threadId) throw new CodexTransportError('Codex вернул другой разговор.', 'thread-identity-mismatch');
+    const queued = await this.pages<QueueEntry>('thread/queue/list', { threadId, limit: 100 });
+    let goalSupported = false, goal: NativeGoal | null = null;
+    try {
+      const features = await this.pages<{ name: string; enabled: boolean }>('experimentalFeature/list', { limit: 100 });
+      goalSupported = features.some(feature => feature.name === 'goals' && feature.enabled === true);
+      if (goalSupported) goal = await this.readControlGoal(threadId);
+    } catch (error) {
+      if (!(error instanceof CodexRpcError && [-32601, -32600].includes(error.code))) throw error;
+      goalSupported = false;
+    }
+    return { model: typeof result.thread.model === 'string' ? result.thread.model : null,
+      effort: typeof result.thread.reasoningEffort === 'string' ? result.thread.reasoningEffort : null,
+      runtimeStatus: result.thread.status?.type ?? 'unknown', queued: queued.length, goalSupported, goal };
+  }
+
+  async readControlGoal(threadId: string): Promise<NativeGoal | null> {
+    this.requireControls();
+    const result = await this.call<{ goal: unknown }>('thread/goal/get', { threadId });
+    return result.goal === null ? null : nativeGoal(result.goal, threadId);
+  }
+
+  async controlModels(): Promise<ControlModel[]> {
+    this.requireControls();
+    const models = await this.pages<{ model: string; displayName: string; supportedReasoningEfforts: { reasoningEffort: string }[]; defaultReasoningEffort: string }>('model/list', { limit: 100, includeHidden: false });
+    if (models.length > 1000 || models.some(model => typeof model.model !== 'string' || !model.model || model.model.length > 200
+      || typeof model.displayName !== 'string' || !Array.isArray(model.supportedReasoningEfforts)
+      || model.supportedReasoningEfforts.some(option => typeof option.reasoningEffort !== 'string') || typeof model.defaultReasoningEffort !== 'string')) throw new Error('Codex вернул некорректный каталог моделей.');
+    return models.map(model => ({ model: model.model, displayName: model.displayName,
+      efforts: model.supportedReasoningEfforts.map(option => option.reasoningEffort), defaultEffort: model.defaultReasoningEffort }));
+  }
+
+  async updateControlModel(threadId: string, model: string, effort: string, beforeSend?: () => void): Promise<void> {
+    const available = (await this.controlModels()).find(row => row.model === model);
+    if (!available?.efforts.includes(effort)) throw new Error('Пара модели и глубины рассуждения недоступна в каталоге Codex.');
+    beforeSend?.();
+    await this.call('thread/settings/update', { threadId, model, effort });
+  }
+
+  async updateControlGoal(threadId: string, patch: { objective?: string; tokenBudget?: number; status?: 'paused' }, beforeSend?: () => void): Promise<NativeGoal> {
+    this.requireControls();
+    if (patch.objective !== undefined && (!patch.objective.trim() || [...patch.objective].length > 4000)
+      || patch.tokenBudget !== undefined && (!Number.isSafeInteger(patch.tokenBudget) || patch.tokenBudget <= 0)
+      || patch.status !== undefined && patch.status !== 'paused') throw new Error('Проверьте цель и положительный бюджет токенов.');
+    beforeSend?.();
+    const result = await this.call<{ goal: unknown }>('thread/goal/set', { threadId, origin: 'user', ...patch });
+    return nativeGoal(result.goal, threadId);
+  }
+
+  async controlTurns(threadId: string, turnIds?: readonly string[]): Promise<ControlTurn[]> {
+    this.requireControls();
+    if (turnIds) {
+      const pending = new Set(turnIds), rows: ControlTurn[] = [], seen = new Set<string>();
+      let cursor: string | undefined;
+      while (pending.size) {
+        const page = await this.receiptPage(threadId, cursor);
+        for (const turn of page.data) if (pending.delete(turn.id)) rows.push(turn as ControlTurn);
+        cursor = nextPage(page.nextCursor, seen);
+        if (!cursor) break;
+      }
+      return rows;
+    }
+    const page = await this.call<Page<ControlTurn>>('thread/turns/list', { threadId, limit: 100, itemsView: 'full', sortDirection: 'desc' });
+    if (!Array.isArray(page.data)) throw new Error('Codex не подтвердил историю цели.');
+    return page.data;
+  }
+  async controlTurnIndex(threadId: string): Promise<Pick<ControlTurn, 'id' | 'status' | 'startedAt'>[]> {
+    this.requireControls();
+    const page = await this.call<Page<ControlTurn>>('thread/turns/list', { threadId, limit: 100, itemsView: 'notLoaded', sortDirection: 'desc' });
+    if (!Array.isArray(page.data) || page.data.some(turn => typeof turn.id !== 'string' || !turn.id || typeof turn.status !== 'string')) throw new Error('Codex не подтвердил список ходов.');
+    return page.data.map(({ id, status, startedAt }) => ({ id, status, startedAt }));
+  }
+
+  async controlTurnLocation(threadId: string, turnId: string, ownInputIds: readonly string[] = []): Promise<RequestLocation> {
+    this.requireControls();
+    let cursor: string | undefined;
+    const seen = new Set<string>();
+    do {
+      const page = await this.receiptPage(threadId, cursor);
+      const turn = page.data.find(turn => turn.id === turnId);
+      if (turn) return this.historyLocation(turn, new Set(ownInputIds));
+      cursor = nextPage(page.nextCursor, seen);
+    } while (cursor);
+    return { state: 'not_found' };
+  }
+
+  private requireControls(): void {
+    if (!this.state.connected || !this.isVerifiedVersion()) throw new Error('Для управления нужен подключённый проверенный Codex.');
   }
 
   /** Rejoin the existing runtime without overriding its model, sandbox, or instructions. */
