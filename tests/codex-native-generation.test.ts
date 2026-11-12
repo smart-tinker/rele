@@ -334,6 +334,7 @@ it.each([
   ['status command failure', 'status-error', { stage:'status-probe', category:'command-error', failureType:'execution-error' }],
   ['malformed status JSON', 'status-json', { stage:'status-probe', category:'invalid-json', failureType:'parse-error' }],
   ['malformed proof JSON', 'proof-json', { stage:'proof-output', category:'invalid-json', failureType:'parse-error' }],
+  ['PowerShell execution timeout', 'powershell-timeout', { stage:'powershell', category:'timeout', failureType:'execution-timeout' }],
   ['PowerShell failure without a marker', 'powershell-error', { stage:'powershell', category:'unclassified-error', failureType:'execution-error' }],
 ] as const)('reports bounded diagnostics for %s', async (_label, failureMode, expected) => {
   const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
@@ -346,6 +347,7 @@ it.each([
       return { stdout:failureMode === 'status-json' ? '{"private":"path"' : JSON.stringify(receipt), code:0 };
     }
     if (failureMode === 'proof-json') return { stdout:'{"private":"path"', code:0 };
+    if (failureMode === 'powershell-timeout') throw Object.assign(new Error('private command details'), { code:null, killed:true, signal:'SIGTERM', path:'C:\\private\\fixture' });
     if (failureMode === 'powershell-error') throw new Error('C:\\private\\fixture');
     return { stdout:'', code:1 };
   };

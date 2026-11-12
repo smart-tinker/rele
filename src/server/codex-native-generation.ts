@@ -345,6 +345,9 @@ async function windowsGeneration(peer: Exclude<CodexNativePeer, { kind: 'proxy' 
       try { options.onProofFailure?.({ stage:failure[1], category:failure[2], failureType:failure[3] }); } catch {}
       return;
     }
+    const childError = error as { code?: unknown; killed?: unknown; signal?: unknown };
+    if (childError?.code === 'ETIMEDOUT' || (childError?.killed === true && childError.signal === 'SIGTERM'))
+      return fail('powershell', 'timeout', 'execution-timeout');
     return fail('powershell', 'unclassified-error', 'execution-error');
   }
   if (result.code !== 0) return fail('powershell', 'nonzero-exit', 'execution-error');
