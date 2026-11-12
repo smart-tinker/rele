@@ -30,6 +30,24 @@ const navigation: Array<{ id: View; label: string; icon: IconName }> = [
   { id: 'codex', label: 'Codex', icon: 'terminal' },
 ];
 
+interface NavigationState {
+  view: View;
+  showAll: boolean;
+}
+
+function readNavigation(): NavigationState {
+  const params = new URLSearchParams(window.location.search);
+  const view = navigation.find((item) => item.id === params.get('view'))?.id ?? 'conversations';
+  return { view, showAll: view === 'queue' && params.get('queue') === 'all' };
+}
+
+function navigationUrl({ view, showAll }: NavigationState): string {
+  const params = new URLSearchParams();
+  if (view !== 'conversations') params.set('view', view);
+  if (view === 'queue' && showAll) params.set('queue', 'all');
+  return window.location.pathname + (params.size ? `?${params}` : '');
+}
+
 class ErrorBoundary extends Component<
   { children: ReactNode },
   { error: boolean }
@@ -203,7 +221,27 @@ function Dashboard({
   onUnauthorized: () => void;
   onSignOut: () => void;
 }) {
-  const [view, setView] = useState<View>('conversations');
+  const [route, setRoute] = useState(readNavigation);
+  const { view } = route;
+  useEffect(() => {
+    const restore = () => {
+      const next = readNavigation();
+      const url = navigationUrl(next);
+      if (url !== window.location.pathname + window.location.search)
+        window.history.replaceState(null, '', url + window.location.hash);
+      setRoute(next);
+    };
+    restore();
+    window.addEventListener('popstate', restore);
+    return () => window.removeEventListener('popstate', restore);
+  }, []);
+  const navigate = (view: View, showAll = false) => {
+    const next = { view, showAll };
+    const url = navigationUrl(next);
+    if (url !== window.location.pathname + window.location.search)
+      window.history.pushState(null, '', url);
+    setRoute(next);
+  };
   const api = useMemo(
     () => new ReleApi(token, onUnauthorized),
     [token, onUnauthorized],
@@ -225,7 +263,7 @@ function Dashboard({
               key={item.id}
               className={`nav-item ${view === item.id ? 'active' : ''}`}
               aria-current={view === item.id ? 'page' : undefined}
-              onClick={() => setView(item.id)}
+              onClick={() => navigate(item.id)}
             >
               <Icon name={item.icon} />
               <span>{item.label}</span>
@@ -283,11 +321,17 @@ function Dashboard({
                 state={state}
                 api={api}
                 refresh={refresh}
-                onNavigate={setView}
+                onNavigate={navigate}
               />
             )}{' '}
             {view === 'queue' && (
-              <Queue state={state} api={api} refresh={refresh} />
+              <Queue
+                state={state}
+                api={api}
+                refresh={refresh}
+                showAll={route.showAll}
+                setShowAll={(showAll) => navigate('queue', showAll)}
+              />
             )}{' '}
             {view === 'deliveries' && (
               <Deliveries state={state} api={api} refresh={refresh} />
@@ -297,7 +341,7 @@ function Dashboard({
                 state={state}
                 api={api}
                 refresh={refresh}
-                onCodex={() => setView('codex')}
+                onCodex={() => navigate('codex')}
               />
             )}{' '}
             {view === 'codex' && (

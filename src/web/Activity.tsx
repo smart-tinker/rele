@@ -73,12 +73,15 @@ export function Queue({
   state,
   api,
   refresh,
+  showAll,
+  setShowAll,
 }: {
   state: DashboardState;
   api: ReleApi;
   refresh: () => Promise<void>;
+  showAll: boolean;
+  setShowAll: (showAll: boolean) => void;
 }) {
-  const [showAll, setShowAll] = useState(false);
   const [working, setWorking] = useState('');
   const action = useAction();
   const requests = [...state.requests]
