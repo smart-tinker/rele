@@ -2,12 +2,16 @@
 
 Разработка ведётся через GitHub issues и PR. [Схема CI](CI.md) использует два
 параллельных GitHub-hosted runner-а: `ubuntu-24.04` и `windows-2025`, затем один
-короткий Ubuntu `CI gate`. Draft PR получает быстрые проверки; ready PR и `main`
+короткий Ubuntu `CI gate`. Независимо работают CodeQL (один Ubuntu runner)
+и dependency review для PR (ещё один): на событие PR возможно до четырёх runner-ов
+одновременно. Draft PR получает быстрые проверки; ready PR и `main`
 полный набор, включая сборку пакетов. В workflow есть public guard: jobs
 выполняются только для публичного репозитория. Кэш отключён; обычные PR/main
 runs не загружают artifacts. Только ручной release dispatch из `main` проходит
 quota guard, временно передаёт пакеты publisher-у (retention transfer artifacts —
-до одного дня) и создаёт draft RC.
+до одного дня), подписывает проверенные файлы в build job и проверяет attestations
+в publisher перед созданием draft RC. Матрица вынесена в reusable `verify.yml`;
+обычный caller имеет только read-права, права подписи выдаются release caller-у.
 GitHub Actions не заменяет приёмку готового пакета.
 Переходы draft → RC → stable, разрешение публикации и сверка байтов определены
 в [каноническом регламенте выпуска](RELEASING.md).
@@ -17,8 +21,9 @@ GitHub Actions не заменяет приёмку готового пакет�
 acceptance host — Linux**. Она проверяет только готовый установленный пакет,
 без исходников и dev-suite. CI gate объединяет результаты обеих ОС и обязателен
 для merge в `main`: активный ruleset требует успешный check от GitHub Actions
-и актуальность ветки относительно main (проверено 2026-11-12). Остальные настройки
-безопасности и provenance ведутся в issue #8.
+и актуальность ветки относительно main (проверено 2026-11-12). CodeQL и dependency
+review — отдельные checks; включение их в required checks после интеграции
+ведётся в issue #8. Состав проверок и attestations описан в [CI](CI.md).
 
 В этапе acceptance не запускаются `npm ci`, typecheck, Vitest, компиляция или
 build/package scripts. На Windows и Linux acceptance hosts передаются только

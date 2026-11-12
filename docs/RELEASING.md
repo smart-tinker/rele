@@ -92,6 +92,10 @@ RC получает новый `N`; исправление stable — новую
 - Полный inventory имён, размеров и SHA256: Linux `.deb` и `.tar.gz`, Windows
   `-setup.exe` и `.zip`, четыре `.sha256`, provenance `verification.json`.
   Проверить контрольные файлы, provenance и фактически загруженные assets.
+  До создания draft publisher обязан подтвердить attestations каждого входного
+  файла от build job в `verify.yml` для этого repository, source SHA и main ref.
+  `verification.json` объединяет проверенные отчёты обеих ОС, но сам не является
+  подписанным build artifact.
   Автоматические source archives GitHub не являются installer/portable.
 - Отдельные результаты source/CI, package, installed runtime и real delivery;
   native acceptance, принятые критерии issues, известные ограничения и открытые DoD.
@@ -112,18 +116,19 @@ evidence автоматически. CI run и его `verification.json` под
 
 ## Что уже делает tooling
 
-Контракт сверён с [workflow](../.github/workflows/ci.yml),
+Контракт сверён с [оркестрацией CI](../.github/workflows/ci.yml),
+[общей матрицей](../.github/workflows/verify.yml),
 [package](../scripts/package.mjs), [Windows installer](../scripts/build-windows-installer.mjs),
 [Linux installer](../scripts/build-linux-installer.mjs),
 [CI contract](../scripts/ci-contract.mjs) и [publisher](../scripts/ci-publish.mjs).
-Отдельно проверен текущий CI PR [#2](https://github.com/smart-tinker/rele/pull/2)
-на [4077dd6](https://github.com/smart-tinker/rele/commit/4077dd615d510836b43aa5bf302701e522a7b723):
-релизные scripts имеют тот же контракт; развитие Windows gates
-остаётся в этом PR и не меняется этой документацией.
 
 - Package builders принимают финальную версию или `X.Y.Z-rc.N`; Windows
   ограничивает числовые компоненты 65535, Debian преобразует `-rc.` в `~rc.`.
   Поддержку финальной версии builder-ом нельзя выдавать за готовый stable flow.
+- Release build job создаёт GitHub artifact attestations для точных пакетов,
+  контрольных файлов и `evidence.json` до временной передачи. Обычные PR/main
+  runs не подписывают и не загружают пакеты. Publisher сначала проверяет repository,
+  signer workflow `verify.yml`, source SHA/main ref и GitHub-hosted runner origin.
 - CI bundle/publisher принимают только RC, связывают обе ОС с одним SHA/run/attempt,
   проверяют файлы и SHA256, отклоняют занятые tag/release и изменившийся `main`.
   Ручной `release: true` из `main` создаёт только `draft=true, prerelease=true`.
