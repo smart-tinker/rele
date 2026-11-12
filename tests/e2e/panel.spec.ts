@@ -21,6 +21,7 @@ test('fragment authentication is cleaned, survives reload, and is removed at sig
   expect(
     await page.evaluate(() => sessionStorage.getItem('rele.panelToken')),
   ).toBeNull();
+  await page.getByRole('button', { name: 'Ввести токен вручную', exact: true }).click();
   await page.getByLabel('Токен панели').fill('invalid-synthetic-token');
   await page.getByRole('button', { name: 'Открыть Rele' }).click();
   await expect(page.getByRole('alert')).toContainText('Токен панели не принят');
