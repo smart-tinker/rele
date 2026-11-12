@@ -152,21 +152,86 @@ test('unconfirmed upload leaves transfers intact for reconciliation',()=>fixture
  await assert.rejects(publishCandidate(api,bundle,'owner/repo',version,sha,[11,12]));
  assert.equal(calls.includes('DELETE'),false);
 }));
-test('the aggregate gate fails unless the matrix result is success', async()=>{
+test('the aggregate gate accepts only the selected successful verification and skipped alternative', async()=>{
  const workflow=await readFile(new URL('../.github/workflows/ci.yml',import.meta.url),'utf8');
  const start=workflow.indexOf('\n  gate:\n');
  const end=workflow.indexOf('\n  publish:\n',start);
  const gate=workflow.slice(start,end);
  const command=gate.match(/^\s+run: (.+)$/mu)?.[1];
  assert.ok(command,'aggregate gate must have a one-line shell command');
+ const expectation=gate.match(/EXPECTED_RESULTS: \$\{\{ (.+) \}\}/u)?.[1];
+ assert.ok(expectation,'select the expected job results from the release input');
+ const expectedResults=new Function('inputs',`return (${expectation});`);
  const {spawnSync}=await import('node:child_process');
- for(const [verifyResult,status] of [['success',0],['failure',1],['cancelled',1],['skipped',1]]) {
+ for(const release of [false,true]) for(const verifyResult of ['success','failure','cancelled','skipped']) for(const releaseResult of ['success','failure','cancelled','skipped']) {
+  const expected=release?'skipped:success':'success:skipped';
+  assert.equal(expectedResults({release}),expected);
+  const status=`${verifyResult}:${releaseResult}`===expected?0:1;
   const result=spawnSync('bash',['-e','-o','pipefail','-c',command],{
-   env:{...process.env,VERIFY_RESULT:verifyResult},encoding:'utf8',
+   env:{...process.env,VERIFY_RESULT:verifyResult,RELEASE_RESULT:releaseResult,EXPECTED_RESULTS:expected},encoding:'utf8',
   });
   assert.ifError(result.error);
-  assert.equal(result.status,status,`VERIFY_RESULT=${verifyResult}`);
+  assert.equal(result.status,status,`release=${release}, verify=${verifyResult}, release_verify=${releaseResult}`);
  }
+});
+test('ordinary events cannot select the write-scoped reusable build job', async()=>{
+ const workflow=await readFile(new URL('../.github/workflows/ci.yml',import.meta.url),'utf8');
+ const start=workflow.indexOf('\n  verify:\n'),releaseStart=workflow.indexOf('\n  verify_release:\n'),end=workflow.indexOf('\n  gate:\n');
+ assert.ok(start>=0 && releaseStart>start && end>releaseStart,'separate ordinary verification from release verification');
+ const jobs=[workflow.slice(start,releaseStart),workflow.slice(releaseStart,end)];
+ const select=jobs.map(job=>new Function('github','inputs',`return (${job.match(/^    if: (.+)$/mu)?.[1]});`));
+ const build=await readFile(new URL('../.github/workflows/verify.yml',import.meta.url),'utf8');
+ const buildAllowed=new Function('github','inputs',`return (${build.match(/^    if: (.+)$/mu)?.[1]});`);
+ const releaseConditions=['Check account storage approval before uploading','Bind packages to this verified commit and run','Attest the exact verified build bytes','Transfer verified packages for one day'].map(name=>{
+  const start=build.indexOf(`name: ${name}\n`),end=build.indexOf('\n      - ',start+1);
+  const step=build.slice(start,end<0?undefined:end);
+  const condition=step.match(/^        if: (.+)$/mu)?.[1];
+  assert.ok(condition,`${name} must be conditional`);
+  return new Function('github','inputs',`return (${condition});`);
+ });
+ for(const [event,release,ref,isPrivate,want] of [
+  ['pull_request',false,'refs/pull/1/merge',false,[true,false]],
+  ['push',false,'refs/heads/main',false,[true,false]],
+  ['workflow_dispatch',false,'refs/heads/main',false,[true,false]],
+  ['workflow_dispatch',false,'refs/heads/topic',false,[true,false]],
+  ['workflow_dispatch',true,'refs/heads/main',false,[false,true]],
+  ['workflow_dispatch',true,'refs/heads/topic',false,[false,false]],
+  ['workflow_dispatch',true,'refs/heads/main',true,[false,false]],
+  ['pull_request',false,'refs/pull/1/merge',true,[false,false]],
+  ['push',true,'refs/heads/main',false,[false,false]],
+ ]) {
+  const github={event_name:event,ref,event:{repository:{private:isPrivate}}};
+  assert.deepEqual(select.map(condition=>Boolean(condition(github,{release}))),want,`${event}, release=${release}, ref=${ref}, private=${isPrivate}`);
+  for(const condition of releaseConditions) assert.equal(Boolean(buildAllowed(github,{release}) && condition(github,{release})),want[1],`release side effect on ${event}, release=${release}, ref=${ref}, private=${isPrivate}`);
+ }
+ const permissions=job=>Object.fromEntries(job.match(/^    permissions:\n((?:      [\w-]+: \w+\n)+)/mu)[1].trim().split('\n').map(line=>line.trim().split(': ')));
+ assert.deepEqual(permissions(jobs[0]),{contents:'read',actions:'read'});
+ assert.deepEqual(permissions(jobs[1]),{contents:'read',actions:'read','id-token':'write',attestations:'write'});
+ for(const job of jobs) assert.match(job,/uses: \.\/\.github\/workflows\/verify\.yml/u,'run one shared original build job');
+ assert.match(jobs[0],/release: false/u);assert.match(jobs[1],/release: true/u);
+});
+test('publisher verifies every incoming file against the reusable build identity and stops on rejection', async()=>{
+ const workflow=await readFile(new URL('../.github/workflows/ci.yml',import.meta.url),'utf8');
+ const publisher=workflow.slice(workflow.indexOf('\n  publish:\n'));
+ const command=publisher.match(/name: Verify build attestations before creating a draft[\s\S]*?        run: \|\n([\s\S]*?)(?=\n      - name:)/u)?.[1];
+ assert.ok(command,'verify attestations before the publisher writes a release');
+ const root=await mkdtemp(path.join(tmpdir(),'rele-attest-'));
+ try {
+  await mkdir(path.join(root,'bin'));
+  await writeFile(path.join(root,'bin','gh'),'#!/bin/sh\nprintf \'%s\\n\' "$*" >> calls.txt\nexit "$ATTESTATION_STATUS"\n',{mode:0o755});
+  const files=['incoming/linux/evidence.json','incoming/linux/package.deb','incoming/windows/evidence.json','incoming/windows/package.zip'];
+  for(const file of files) {await mkdir(path.dirname(path.join(root,file)),{recursive:true});await writeFile(path.join(root,file),'verified bytes');}
+  const {spawnSync}=await import('node:child_process');
+  const env={...process.env,PATH:path.join(root,'bin')+path.delimiter+process.env.PATH,GITHUB_REPOSITORY:'owner/repo',GITHUB_SHA:sha};
+  for(const status of [0,1]) {
+   await rm(path.join(root,'calls.txt'),{force:true});
+   const result=spawnSync('bash',['-e','-o','pipefail','-c',command],{cwd:root,env:{...env,ATTESTATION_STATUS:String(status)},encoding:'utf8'});
+   assert.ifError(result.error);assert.equal(result.status,status,result.stderr);
+   const calls=(await readFile(path.join(root,'calls.txt'),'utf8')).trim().split('\n');
+   assert.deepEqual(calls,(status===0?files:files.slice(0,1)).map(file=>
+    `attestation verify ${file} --repo owner/repo --signer-workflow owner/repo/.github/workflows/verify.yml --source-digest ${sha} --source-ref refs/heads/main --deny-self-hosted-runners`));
+  }
+ } finally {await rm(root,{recursive:true,force:true});}
 });
 test('one required CI gate waits for every OS matrix job', async()=>{
  const workflow=await readFile(new URL('../.github/workflows/ci.yml',import.meta.url),'utf8');
@@ -176,17 +241,31 @@ test('one required CI gate waits for every OS matrix job', async()=>{
  assert.notEqual(end,-1,'gate must precede the publisher');
  const gate=workflow.slice(start,end);
  assert.match(gate,/name: CI gate/u);
- assert.match(gate,/needs: verify/u);
+ assert.match(gate,/needs: \[verify, verify_release\]/u);
  assert.match(gate,/always\(\)/u);
  assert.match(gate,/github\.event\.repository\.private == false/u);
  assert.match(gate,/needs\.verify\.result/u);
+ assert.match(gate,/needs\.verify_release\.result/u);
  const publisher=workflow.slice(workflow.indexOf('\n  publish:\n'));
- assert.match(publisher,/needs: \[verify, gate\]/u);
+ assert.match(publisher,/needs: \[verify_release, gate\]/u);
+ const condition=publisher.match(/^    if: \$\{\{ (.+) \}\}$/mu)?.[1];
+ assert.ok(condition,'explicitly guard publication after the unselected job skips');
+ const publish=new Function('github','inputs','needs','cancelled',`return (${condition});`);
+ const github={event_name:'workflow_dispatch',ref:'refs/heads/main',event:{repository:{private:false}}};
+ for(const releaseResult of ['success','failure','cancelled','skipped']) for(const gateResult of ['success','failure','cancelled','skipped']) for(const cancelled of [false,true]) {
+  assert.equal(publish(github,{release:true},{verify_release:{result:releaseResult},gate:{result:gateResult}},()=>cancelled),
+   !cancelled && releaseResult==='success' && gateResult==='success');
+ }
+ for(const event of ['pull_request','push','workflow_dispatch']) for(const release of [false,true]) for(const ref of ['refs/heads/main','refs/heads/topic']) for(const isPrivate of [false,true]) {
+  const context={event_name:event,ref,event:{repository:{private:isPrivate}}};
+  assert.equal(publish(context,{release},{verify_release:{result:'success'},gate:{result:'success'}},()=>false),
+   !isPrivate && event==='workflow_dispatch' && release && ref==='refs/heads/main');
+ }
 });
 test('Windows job timeout leaves room for its bounded standard-user native gate', async()=>{
- const workflow=await readFile(new URL('../.github/workflows/ci.yml',import.meta.url),'utf8');
+ const workflow=await readFile(new URL('../.github/workflows/verify.yml',import.meta.url),'utf8');
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
- const verify=workflow.slice(workflow.indexOf('\n  verify:\n'),workflow.indexOf('\n  gate:\n'));
+ const verify=workflow.slice(workflow.indexOf('\n  verify:\n'));
  const jobTimeout=verify.match(/^\s+timeout-minutes:\s*\$\{\{\s*matrix\.os\s*==\s*'windows-2025'\s*&&\s*(\d+)\s*\|\|\s*(\d+)\s*\}\}\s*$/mu);
  const gateTimeout=canary.match(/AddMinutes\(\$\(if \(\$Phase -eq 'Shared'\) \{ (\d+) \} else \{ (\d+) \}\)\)/u);
  assert.ok(jobTimeout,'give Windows its own timeout without extending Ubuntu');
@@ -216,7 +295,7 @@ test('Windows canary timeout reports only bounded installer progress', async()=>
  assert.doesNotMatch(summary,/stdout\.log|stderr\.log/u,'never print raw installer logs');
 });
 test('browser setup installs the pinned Playwright browser without apt dependencies', async()=>{
- const workflow=await readFile(new URL('../.github/workflows/ci.yml',import.meta.url),'utf8');
+ const workflow=await readFile(new URL('../.github/workflows/verify.yml',import.meta.url),'utf8');
  assert.ok(workflow.includes('- run: npx playwright install chromium\n        id: browser_install'));
  assert.ok(!workflow.includes('npx playwright install --with-deps'));
 });
@@ -264,7 +343,7 @@ test('signed Desktop fixture defines complete inert MCP transports for its enabl
 });
 test('actual Desktop CI provisions the verified MSIX before standard-user discovery', async()=>{
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
- const workflow=await readFile(new URL('../.github/workflows/ci.yml',import.meta.url),'utf8');
+ const workflow=await readFile(new URL('../.github/workflows/verify.yml',import.meta.url),'utf8');
  const provision=workflow.indexOf('name: Provision the signed Desktop package for disposable users');
  const standardUser=workflow.indexOf('name: Verify Windows installer and native shared gates as a standard user');
  const discover=canary.indexOf('shared-actual-desktop');
