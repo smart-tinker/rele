@@ -67,7 +67,7 @@ export function messageTrace(input: {
       if (request.turnId) Object.assign(execution, { status: 'uncertain', detail: 'Исход выполнения неизвестен.', at: request.updatedAt });
       nextAction = 'Проверьте очередь и историю Codex; не повторяйте запрос до подтверждения исхода. Защищённая сверка доступна отдельно в очереди.';
     }
-    if (input.enqueueRejectedAt) {
+    if (request.status === 'failed' && input.enqueueRejectedAt === request.updatedAt) {
       Object.assign(native, { status: 'rejected', detail: 'Сохранён явный RPC-отказ при enqueue. Это не потеря подтверждения.', at: input.enqueueRejectedAt });
       latest = { stage: 'native', status: 'rejected', at: input.enqueueRejectedAt };
       nextAction = 'Просмотрите причину отказа в очереди. Карточка не отправляет запрос заново.';

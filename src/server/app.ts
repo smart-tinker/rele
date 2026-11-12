@@ -160,11 +160,12 @@ export function createApp(services: AppServices) {
     if (item && delivery && !sameTraceOrigin(item.origin, delivery.origin)) item = undefined;
     const origin = delivery?.origin ?? item?.origin;
     if (!origin) throw new ApiError(404, 'Нет сохранённой записи; это не доказывает отсутствие сообщения.');
+    const source = engine.channels[origin.platform]?.state;
     return messageTrace({ origin, request: item, deliveries: item ? store.listRequestDeliveries(item.id) : delivery ? [delivery] : [],
       receivedAt: item ? store.requestReceivedAt(item.id) : undefined,
       enqueueRejectedAt: item ? store.getMeta(`enqueue-rejected:${item.id}`) : undefined,
       nativeThreadId: (item ? store.getConversation(item.conversationId)?.threadId : undefined) ?? delivery?.nativeThreadId,
-      startedAt, capturedAt: new Date().toISOString(), connected: { codex: services.codex().status().connected, source: engine.channels[origin.platform]?.state.connected ?? false } });
+      startedAt, capturedAt: new Date().toISOString(), connected: { codex: services.codex().status().connected, source: !!source?.connected && source.accountId === origin.accountId } });
   });
   app.get('/api/threads', async request => {
     const query = object(request.query); fields(query, ['archived', 'refresh']);
