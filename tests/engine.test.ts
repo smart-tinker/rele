@@ -1994,6 +1994,36 @@ describe('Engine scoped shell cancellation', () => {
       expect(f.store.listDeliveries().some(row => row.requestId === request.id && row.key === 'terminal:error')).toBe(false);
     });
 
+  type BaselineCase = { failure: string; after: (f: ReturnType<typeof fixture>, request: ReleRequest) => void };
+  it.each([
+    { failure: 'missing', after: (f, request) => {
+      const key = `request-terminal-baseline:${request.id}`, getMeta = f.store.getMeta.bind(f.store);
+      vi.spyOn(f.store, 'getMeta').mockImplementation(name => name === key ? undefined : getMeta(name));
+    } },
+    { failure: 'target-changed', after: (f, request) => {
+      const key = `request-terminal-baseline:${request.id}`, baseline = JSON.parse(f.store.getMeta(key)!);
+      f.store.setMeta(key, JSON.stringify({ ...baseline, target: 'changed-target' }));
+    } },
+    { failure: 'generation-missing', after: (f, request) => {
+      const key = `request-terminal-baseline:${request.id}`, baseline = JSON.parse(f.store.getMeta(key)!);
+      delete baseline.serverGeneration; f.store.setMeta(key, JSON.stringify(baseline));
+    } },
+    { failure: 'generation-invalid', after: (f, request) => {
+      const key = `request-terminal-baseline:${request.id}`, baseline = JSON.parse(f.store.getMeta(key)!);
+      f.store.setMeta(key, JSON.stringify({ ...baseline, serverGeneration: 'A'.repeat(64) }));
+    } },
+    { failure: 'terminals-invalid', after: (f, request) => {
+      const key = `request-terminal-baseline:${request.id}`, baseline = JSON.parse(f.store.getMeta(key)!);
+      f.store.setMeta(key, JSON.stringify({ ...baseline, terminals: [{ itemId: 'invalid-command', processId: 'bad' }] }));
+    } },
+  ] satisfies BaselineCase[])('reports a fixed code when the original terminal baseline is $failure', async ({ failure, after }) => {
+    const f = fixture(), request = await shell(f); after(f, request);
+
+    await expect(f.engine.cancel(request.id)).rejects.toMatchObject({ code: `terminal-baseline-${failure}` });
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+    expect(f.codex.terminals.some(item => item.itemId === 'own-command' && item.processId === '1234')).toBe(true);
+  });
+
   it('keeps cancellation uncertain when the generation changes after interrupt before terminal cleanup', async () => {
     const f = fixture(), request = await shell(f);
     f.codex.interrupt.mockImplementationOnce(async () => {

@@ -593,11 +593,14 @@ export class Engine extends EventEmitter {
     this.rememberCommandItems(id, found.commandItems ?? []);
     const rawBaseline = this.store.getMeta(`request-terminal-baseline:${id}`);
     const baseline = rawBaseline ? JSON.parse(rawBaseline) as TerminalBaseline : undefined;
-    if (!baseline || baseline.target !== state.target || typeof baseline.serverGeneration !== 'string'
-      || !/^[a-f0-9]{64}$/u.test(baseline.serverGeneration) || !Array.isArray(baseline.terminals)
-      || baseline.terminals.some(entry => !terminalPair(entry))) {
-      throw new Error('Исходный сервер или снимок команд не подтверждён. Отсутствие терминалов не доказывает завершение прежних процессов.');
-    }
+    const baselineFailure = !baseline ? 'missing'
+      : baseline.target !== state.target ? 'target-changed'
+        : typeof baseline.serverGeneration !== 'string' ? 'generation-missing'
+          : !/^[a-f0-9]{64}$/u.test(baseline.serverGeneration) ? 'generation-invalid'
+            : !Array.isArray(baseline.terminals) || baseline.terminals.some(entry => !terminalPair(entry)) ? 'terminals-invalid' : undefined;
+    if (!baseline || baselineFailure) throw Object.assign(new Error('Исходный сервер или снимок команд не подтверждён. Отсутствие терминалов не доказывает завершение прежних процессов.'), {
+      code: `terminal-baseline-${baselineFailure ?? 'missing'}`,
+    });
     const verifyServer = (snapshot: CodexTerminalSnapshot) => {
       current();
       if (this.isMixed(id)) throw new Error('В ход добавлено сообщение другого клиента Codex. Автоматическая отмена смешанного хода недоступна.');
