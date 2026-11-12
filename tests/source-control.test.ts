@@ -165,6 +165,20 @@ describe('personal Slack source controls', () => {
     await expect(f.controls.open(context)).rejects.toThrow();
   });
 
+  it('does not show a settled Goal from the previous conversation after a source rebind', async () => {
+    const f = fixture(), form = await f.controls.open(context);
+    await f.controls.submit(context, form.id, { action: 'goal', objective: 'Finish old work', criterion: 'Done' });
+    f.goal = { ...f.goal!, status: 'complete' };
+    await f.controls.recover();
+    expect((await f.controls.open(context)).goalDeliveryState).toBe('complete');
+
+    const next = f.store.createConversation({ name: 'Next Codex', cwd: '/fixture', threadId: 'next-native-thread' });
+    f.store.routeSource(f.endpoint.id, next.id);
+    f.native.controlSnapshot = async () => ({ model: 'model-one', effort: 'high', runtimeStatus: 'idle', queued: 0, goalSupported: true, goal: null });
+
+    expect(await f.controls.open(context)).not.toHaveProperty('goalDeliveryState');
+  });
+
   it('revalidates actor, binding, runtime generation and expiry before any mutation', async () => {
     for (const change of ['actor', 'binding', 'generation', 'expired'] as const) {
       const f = fixture(); const view = await f.controls.open(context);

@@ -115,11 +115,11 @@ export class SourceControls {
   private async view(receipt: Receipt, action: ControlSelection = 'status'): Promise<ControlView> {
     const source = this.source(receipt.context), native = this.options.native();
     const connected = !!native?.status().connected && native.isVerifiedVersion();
-    const requests = this.store.listRequests(1000).filter(request => request.origin.endpointId === source.endpoint.id);
+    const requests = this.store.listRequests(1000).filter(request => request.origin.endpointId === source.endpoint.id && request.conversationId === source.conversation.id);
     const records = this.ids().map(id => this.read(id));
-    const pending = records.find(row => row.origin.endpointId === source.endpoint.id
+    const pending = records.find(row => row.origin.endpointId === source.endpoint.id && row.conversationId === source.conversation.id && row.threadId === source.conversation.threadId
       && (['sending', 'uncertain'].includes(row.state) || row.warning || row.outbox?.some(delivery => ['sending', 'uncertain'].includes(delivery.status))));
-    const owner = [...records].reverse().find(row => row.origin.endpointId === source.endpoint.id && row.goal);
+    const owner = [...records].reverse().find(row => row.origin.endpointId === source.endpoint.id && row.conversationId === source.conversation.id && row.threadId === source.conversation.threadId && row.goal);
     return { id: receipt.id, sourceTitle: source.endpoint.title, conversationTitle: source.conversation.name,
       nativeThreadId: receipt.threadId, action, connected, boundSources: source.conversation.bindings.length,
       accessMode: this.store.getSourceAccess(source.endpoint.id).mode,
