@@ -238,6 +238,12 @@ test('Windows native process proof reuses hashes for matching expected image pat
  assert.ok(source.includes('MatchesExpectedImage $exe $expectedExecutable $hash'));
  assert.ok(source.includes('MatchesExpectedImage $helper.MainModule.FileName $p.helperExecutable $helperHash'));
 });
+test('Windows native proof failure details use only the existing bounded CI diagnostic flag',async()=>{
+ const source=await readFile(new URL('../src/server/codex.ts',import.meta.url),'utf8');
+ assert.match(source,/process\.env\.RELE_CI_SHARED_DIAGNOSTICS\s*===\s*'1'/u);
+ assert.match(source,/onProofFailure/u);
+ assert.match(source,/event:\s*'codex-native-proof-failure'/u);
+});
 test('the current signed Desktop backend is covered by every supported Codex probe', async()=>{
  const version='0.167.0-alpha.4.1';
  for(const file of ['../scripts/protocol-probe.py','../scripts/managed-protocol-probe.py','../scripts/shared-protocol-probe.py','../scripts/windows/ci-standard-user-canary.ps1']) {

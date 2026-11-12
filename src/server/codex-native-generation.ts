@@ -282,6 +282,7 @@ export interface CodexNativeGenerationOptions {
   platform?: NodeJS.Platform;
   run?: (command: string, args: string[]) => Promise<CommandResult>;
   installationDirectory?: string;
+  onProofFailure?: (failure: { stage: string; category: string; failureType: string }) => void;
 }
 
 const execute = promisify(execFile);
@@ -320,7 +321,16 @@ async function windowsGeneration(peer: Exclude<CodexNativePeer, { kind: 'proxy' 
   const input = Buffer.from(JSON.stringify({ receipt, peer, serverId, gatewayId: process.pid })).toString('base64');
   const source = WINDOWS_PROOF.replace('__INPUT__', input);
   const systemRoot = process.env.SystemRoot || 'C:\\Windows';
-  const result = await run(path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(source, 'utf16le').toString('base64')]);
+  let result: CommandResult;
+  try { result = await run(path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(source, 'utf16le').toString('base64')]); }
+  catch (error) {
+    const stderr = (error as { stderr?: unknown })?.stderr;
+    const failure = typeof stderr === 'string' && /^rele-native-proof:([a-z-]{1,64}):[^:\r\n]{1,96}:([A-Za-z]{1,64}):([A-Za-z0-9-]{1,64})$/mu.exec(stderr);
+    if (failure) {
+      try { options.onProofFailure?.({ stage:failure[1], category:failure[2], failureType:failure[3] }); } catch {}
+    }
+    throw error;
+  }
   const proof = JSON.parse(result.stdout);
   if (result.code !== 0 || proof?.peerVerified !== true || proof.pid !== serverId || proof.gatewayId !== process.pid
     || typeof proof.birth !== 'string' || !WINDOWS_TIME.test(proof.birth) || !Number.isFinite(Date.parse(proof.birth))

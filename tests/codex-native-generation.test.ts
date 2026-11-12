@@ -300,6 +300,20 @@ it('limits Windows proof diagnostics to a fixed stage, exception type and catego
   expect(proof).toContain("$script:stage='tcp-query'");
 });
 
+it('reports only bounded Windows proof failure details when requested', async () => {
+  const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
+  const home = 'C:\\Users\\Owner\\fixture', executable = 'C:\\native\\codex.exe';
+  const receipt = { status:'alreadyRunning', endpoint:'ws://127.0.0.1:62662', codexHome:home, executable, executableSha256:'a'.repeat(64), ownerSid:'S-1-5-21-1001', processId:10944, processStartTime:'2026-11-03T10:00:00.1234567Z' };
+  let failure: unknown;
+  const run = async (command: string) => {
+    if (command.endsWith('Rele.exe')) return { stdout:JSON.stringify(receipt), code:0 };
+    throw Object.assign(new Error('private path and command details'), { stderr:'rele-native-proof:tcp-query:RuntimeException:OperationStopped:CommandNotFoundException\r\nC:\\private\\fixture' });
+  };
+  await Reflect.apply(codexNativeGeneration, undefined, [{ kind:'windows-shared', endpoint:receipt.endpoint, localPort:55001, remotePort:62662 }, 10944, home,
+    { platform:'win32', run, installationDirectory:'C:\\Rele', onProofFailure:(value: unknown) => { failure = value; } }]);
+  expect(failure).toEqual({ stage:'tcp-query', category:'OperationStopped', failureType:'CommandNotFoundException' });
+});
+
 it.each([
   { peerVerified:false }, { pid:10945 }, { owner:'S-1-5-21-1002' }, { sha256:'b'.repeat(64) },
   { codexHome:'C:\\Users\\Other\\fixture' }, { birth:'2026-11-03T10:00:00.1234568Z' },
