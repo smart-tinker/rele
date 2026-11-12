@@ -59,6 +59,30 @@ test('symlink cannot substitute a package',()=>fixture(async root=>{
  await symlink(path.join(root,'windows'),file,process.platform==='win32'?'junction':undefined);
  await assert.rejects(verifyBundles(root,version,sha,run,attempt));
 }));
+test('publisher finalizes a prepared draft without replacing packages or deleting transfers',()=>fixture(async root=>{
+ const {publishCandidate}=await import('../scripts/ci-publish.mjs');
+ const bundle=await verifyBundles(root,version,sha,run,attempt), writes=[];
+ const draft={id:77,tag_name:`v${version}`,target_commitish:sha,draft:true,prerelease:true,
+  body:`Rele candidate ${sha}; run ${run}; attempt ${attempt}. Verification pending.`};
+ const api=async(route,options={})=>{
+  if(options.method){writes.push({route,...options});return options.upload?{name:'verification.json',size:options.body.length,digest:'sha256:'+createHash('sha256').update(options.body).digest('hex')}:{...draft,body:options.body.body};}
+  if(route.endsWith('/git/ref/heads/main'))return {object:{sha}};
+  if(route.endsWith('/git/ref/tags/'+draft.tag_name))return null;
+  if(route.endsWith('/releases/77'))return draft;
+  if(route.endsWith('/releases/tags/'+draft.tag_name))return draft;
+  if(route.includes('/assets?'))return [
+   ...bundle.files.map((file,index)=>({id:index+1,name:file.name,size:file.bytes,digest:'sha256:'+file.sha256})),
+   ...bundle.evidence.map((evidence,index)=>{const body=Buffer.from(JSON.stringify(evidence,null,2)+'\n');return {id:9+index,name:evidence.platform+'-evidence.json',size:body.length,digest:'sha256:'+createHash('sha256').update(body).digest('hex')};}),
+  ];
+  throw new Error('Unexpected API read '+route);
+ };
+ const result=await publishCandidate(api,bundle,'owner/repo',version,sha,77);
+ assert.equal(result.id,77);
+ assert.deepEqual(writes.map(item=>[item.method,item.upload?new URL('https://uploads.github.com'+item.route).searchParams.get('name'):item.route]),[
+  ['POST','verification.json'],['PATCH','/repos/owner/repo/releases/77'],
+ ]);
+ assert.equal(result.draft,true);
+}));
 test('publisher refuses an advanced main or existing tag before any write', ()=>fixture(async root=>{
  const {publishCandidate}=await import('../scripts/ci-publish.mjs');
  for(const advanced of [true,false]) {
