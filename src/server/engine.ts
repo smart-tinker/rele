@@ -775,7 +775,7 @@ export class Engine extends EventEmitter {
         if (client !== this.codex || epoch !== this.epoch || !current || terminal(current.status)
           || current.turnId && current.turnId !== turnId || found.turnId !== turnId
           || !['completed', 'failed', 'interrupted'].includes(found.state)) return;
-        this.finishFromHistory(current, found);
+        if (!await this.retryOverload(current, found)) this.finishFromHistory(current, found);
         this.changed(); this.track(this.deliver());
       } catch (error) { this.emit('diagnostic', this.options.redact(error)); }
       finally { this.completionHistoryReads.delete(readKey); }
@@ -1811,6 +1811,7 @@ export class Engine extends EventEmitter {
   private async retryOverload(request: ReleRequest, found: RequestLocation): Promise<boolean> {
     if (found.state !== 'failed' || found.failureReason !== 'serverOverloaded' || !found.turnId || found.mixed || this.isMixed(request.id)) return false;
     if (this.store.getMeta(`cancel-requested:${request.id}`)) { this.track(this.cancel(request.id)); return true; }
+    if (this.retryingOverloads.has(request.id)) return true;
     if (found.retryBlocked) return false;
     const key = `overload-retry:${request.id}`, raw = this.store.getMeta(key);
     let retry = raw ? JSON.parse(raw) as OverloadRetry : undefined;
