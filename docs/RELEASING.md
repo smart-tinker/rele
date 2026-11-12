@@ -92,7 +92,7 @@ RC получает новый `N`; исправление stable — новую
 - Полный inventory имён, размеров и SHA256: Linux `.deb` и `.tar.gz`, Windows
   `-setup.exe` и `.zip`, четыре `.sha256`, provenance `verification.json`.
   Проверить контрольные файлы, provenance и фактически загруженные assets.
-  До создания draft publisher обязан подтвердить attestations каждого входного
+  До признания draft проверенным финализатор обязан подтвердить attestations каждого входного
   файла от build job в `verify.yml` для этого repository, source SHA и main ref.
   `verification.json` объединяет проверенные отчёты обеих ОС, но сам не является
   подписанным build artifact. В assets также сохраняются два attested отчёта

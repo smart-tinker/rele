@@ -7,6 +7,9 @@ provider send. Refresh repeats only this GET. Existing protected actions remain
 on their original pages. The card omits request/answer/error bodies, participants,
 credentials, configuration, approval details and unrelated conversation content.
 
+[Synthetic desktop/mobile evidence](qa/message-trace-20261112/README.md) records
+the stale, disconnected and uncertain-delivery fixture without private messages.
+
 ## Identity and limits
 
 A request is selected by its durable Rele ID, never by native thread, event ID or
@@ -18,6 +21,10 @@ card keeps the request/ingress stages unknown rather than borrowing another
 request from the same native thread. Repeated delivery IDs are shown once.
 The direct request lookup is not limited by the dashboard's recent-250 window;
 all existing delivery rows for that request are considered.
+
+Native Goal stages use a separate durable outbox. Their synthetic request records
+can prove execution here, but this card does not join that outbox. Missing ordinary
+delivery rows remain unknown; they do not prove non-delivery or NOREPLY.
 
 ## Data map
 
