@@ -13,9 +13,10 @@ GitHub Actions не заменяет приёмку готового пакет�
 Текущая сборка и автоматические проверки выполняются на hosted runners. Приёмка
 остаётся отдельным этапом: **Windows acceptance host — Windows**, **Linux
 acceptance host — Linux**. Она проверяет только готовый установленный пакет,
-без исходников и dev-suite. CI gate объединяет результаты обеих ОС, но текущий
-ruleset репозитория (проверено 2026-11-12) пока не требует его как условие merge; настройки защиты main
-ведутся отдельно в issue #8.
+без исходников и dev-suite. CI gate объединяет результаты обеих ОС и обязателен
+для merge в `main`: активный ruleset требует успешный check от GitHub Actions
+и актуальность ветки относительно main (проверено 2026-11-12). Остальные настройки
+безопасности и provenance ведутся в issue #8.
 
 В этапе acceptance не запускаются `npm ci`, typecheck, Vitest, компиляция или
 build/package scripts. На Windows и Linux acceptance hosts передаются только

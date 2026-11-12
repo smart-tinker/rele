@@ -26,8 +26,9 @@ flowchart TD
 
 `CI gate` — единый check workflow после matrix; он завершается ошибкой, если
 хотя бы одна ОС не прошла. Сейчас активный ruleset защищает `main` от удаления и
-force-push и требует разрешения review threads, но не требует CI status check для
-merge. Это отдельный пробел настроек, отслеживаемый в issue #8. Gate выполняется
+force-push, требует разрешения review threads и успешный `CI gate` от GitHub
+Actions на актуальной ветке. Остальные security checks и provenance отслеживаются
+в issue #8. Gate выполняется
 последовательно, поэтому одновременно работают максимум два runner-а.
 
 Версии Codex берутся из `SUPPORTED_CODEX_VERSIONS`, отдельного списка в YAML нет.
