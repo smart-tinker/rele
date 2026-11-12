@@ -77,8 +77,10 @@ export async function uploadPlatform(api, candidate, releaseId, directory, platf
  for(const file of files) {
   const data=await readFile(file.path);
   if(file.sha256) {assert.equal(data.length,file.bytes);assert.equal(createHash('sha256').update(data).digest('hex'),file.sha256);}
+  await checkedDraft(api,candidate,releaseId);
   await upload(api,base,releaseId,file.name,data);
  }
+ await checkedDraft(api,candidate,releaseId);
 }
 export async function downloadCandidate(api, candidate, releaseId, directory) {
  const base=context(candidate);await checkedDraft(api,candidate,releaseId);
