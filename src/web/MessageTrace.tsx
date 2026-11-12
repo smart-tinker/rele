@@ -3,7 +3,7 @@ import type { MessageTrace, TraceStage } from '../shared/message-trace';
 import { ReleApi, errorText } from './client';
 import { Button, Drawer, Notice, Status, formatDate } from './ui';
 
-const stages: Record<TraceStage, string> = { ingress: 'Приём', admission: 'Разрешение / пропуск', native: 'Приём Codex', execution: 'Выполнение', delivery: 'Доставка' };
+const stages: Record<TraceStage, string> = { request: 'Состояние запроса Rele', ingress: 'Приём', admission: 'Разрешение / пропуск', native: 'Приём Codex', execution: 'Выполнение', delivery: 'Доставка' };
 const statuses: Record<string, string> = {
   'no-data': 'Нет данных', recorded: 'Запись сохранена', queued: 'В очереди Rele', transcribing: 'Обработка аудио', starting: 'Подготовка запуска',
   accepted: 'Принято Codex', running: 'Выполняется', waiting_approval: 'Ожидает решения', completed: 'Завершено', failed: 'Ошибка',

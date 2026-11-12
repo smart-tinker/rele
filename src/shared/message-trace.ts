@@ -1,6 +1,6 @@
 import type { Delivery, Origin, ReleRequest } from './types.js';
 
-export type TraceStage = 'ingress' | 'admission' | 'native' | 'execution' | 'delivery';
+export type TraceStage = 'request' | 'ingress' | 'admission' | 'native' | 'execution' | 'delivery';
 export interface TraceStep { stage: TraceStage; status: string; detail: string; at?: string }
 export interface MessageTrace {
   source: Pick<Origin, 'platform' | 'accountId' | 'endpointId' | 'chatId' | 'threadId' | 'messageId'>;
@@ -56,6 +56,10 @@ export function messageTrace(input: {
       nextAction = request.status === 'waiting_approval' ? 'Просмотрите отдельное подтверждение в очереди.'
         : request.status === 'running' ? 'Дождитесь завершения и обновите снимок.'
         : 'Проверьте исходный чат и сохранённое состояние запроса; карточка не запускает новый ход.';
+    }
+    if (!request.turnId && ['completed', 'failed', 'interrupted', 'cancelled'].includes(request.status)) {
+      Object.assign(execution, { status: 'no-data', detail: 'Сохранён итог запроса Rele, но фактическое выполнение Codex не подтверждено.', at: undefined });
+      latest = { stage: 'request', status: request.status, at: request.updatedAt };
     }
     if (request.status === 'uncertain') {
       Object.assign(native, { status: 'uncertain', detail: 'Исход native операции не подтверждён; сохранённые идентификаторы не снимают неопределённость.', at: request.updatedAt });
