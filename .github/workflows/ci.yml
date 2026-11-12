@@ -21,187 +21,28 @@ concurrency:
 
 jobs:
   verify:
-    if: github.event.repository.private == false && (!inputs.release || github.ref == 'refs/heads/main')
-    name: ${{ github.event.pull_request.draft && 'Fast' || 'Verify' }} (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.os == 'windows-2025' && 160 || 60 }}
+    if: github.event.repository.private == false && !inputs.release
+    uses: ./.github/workflows/verify.yml
+    with:
+      release: false
     permissions:
       contents: read
       actions: read
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix:
-        os: [ubuntu-24.04, windows-2025]
-    env:
-      FULL: ${{ !github.event.pull_request.draft }}
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        with:
-          node-version: 24.19.0
-          package-manager-cache: false
-      - if: env.FULL == 'true'
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: '3.13'
-      - run: npm ci
-        id: install
-      - run: npm run typecheck
-        id: types
-      - run: node --test tests/ci-contract.test.mjs
-        id: ci_contract
-      - run: npm test
-        id: unit
-      - run: npm run build
-        id: build
-      - name: Read the supported Codex contract
-        if: env.FULL == 'true'
-        run: |
-          node --input-type=module -e "import { SUPPORTED_CODEX_VERSIONS } from './src/shared/codex-runtime.ts'; console.log('CODEX_VERSIONS='+SUPPORTED_CODEX_VERSIONS.join(' '))" >> "$GITHUB_ENV"
-      - name: Install the isolated protocol fixture
-        id: fixture
-        if: env.FULL == 'true'
-        run: |
-          python -m pip install -r scripts/protocol-requirements.txt
-          for version in $CODEX_VERSIONS; do
-            npm install --prefix "$RUNNER_TEMP/codex-probe-$version" --ignore-scripts --no-audit --no-fund --no-package-lock "@openai/codex@$version"
-          done
-      - name: Build installers and portable runtime, verify the extracted archive
-        id: package
-        if: env.FULL == 'true'
-        run: |
-          npm run package
-          node scripts/smoke-package.mjs
-      - name: Verify bounded Windows fixture cleanup with a real file lock
-        id: cleanup
-        if: env.FULL == 'true' && runner.os == 'Windows'
-        run: node scripts/probe-installer-cleanup.mjs
-      - name: Prepare the signed Desktop backend and verify the noninteractive owner primitive
-        id: desktop
-        if: env.FULL == 'true' && runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $desktopRoot = Join-Path $env:RUNNER_TEMP 'desktop-native-gate'
-          & ./scripts/windows/probe-desktop-package.ps1 -OutputDirectory $desktopRoot -PrepareNativeGate
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          node scripts/smoke-windows-codex-owner.mjs
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          node scripts/smoke-windows-desktop-tools-pipe.mjs
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Provision the signed Desktop package for disposable users
-        id: desktop_provision
-        if: env.FULL == 'true' && runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $desktopRoot = Join-Path $env:RUNNER_TEMP 'desktop-native-gate'
-          $inventory = Get-Content -LiteralPath (Join-Path $desktopRoot 'desktop-package-inventory.json') -Raw | ConvertFrom-Json
-          $package = Join-Path $desktopRoot 'downloads/ChatGPT-x64.msix'
-          $runnerRoot = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
-          if (-not [IO.Path]::GetFullPath($package).StartsWith($runnerRoot, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $package -PathType Leaf)) { throw 'The Desktop package must be a local file under this disposable RUNNER_TEMP.' }
-          $signature = Get-AuthenticodeSignature -LiteralPath $package
-          if ($inventory.result -ne 'passed' -or $inventory.nativeGatePrepared -ne $true -or $inventory.package.signature.status -ne 'Valid' -or $signature.Status -ne 'Valid' -or $inventory.package.identity.name -notin @('OpenAI.Codex', 'OpenAI.ChatGPT') -or $inventory.package.identity.architecture -ne 'x64' -or $inventory.package.identity.version -notmatch '^\d+(?:\.\d+){3}$' -or $inventory.package.sha256 -notmatch '^[a-f0-9]{64}$') { throw 'The Desktop package inventory is not a valid signed x64 package.' }
-          $hash = (Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($hash -ne $inventory.package.sha256) { throw 'The Desktop MSIX bytes do not match the signed package inventory.' }
-          $existing = @(Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq $inventory.package.identity.name })
-          if ($existing.Count -ne 0) { throw 'The disposable runner already has a provisioned Desktop package.' }
-          Add-AppxProvisionedPackage -Online -PackagePath $package -SkipLicense | Out-Null
-          $provisioned = @(Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq $inventory.package.identity.name -and $_.Version.ToString() -eq $inventory.package.identity.version })
-          if ($provisioned.Count -ne 1) { throw 'The signed Desktop package was not provisioned for new users.' }
-          Write-Output ('RELE_DESKTOP_APPX_PROVISIONED=' + $inventory.package.identity.name + ':' + $inventory.package.identity.version)
-      - name: Verify Windows installer and native shared gates as a standard user
-        id: standard_user
-        if: env.FULL == 'true' && runner.os == 'Windows'
-        env:
-          RELE_CI_SHARED_DIAGNOSTICS: '1'
-        shell: pwsh
-        run: |
-          $desktopRoot = Join-Path $env:RUNNER_TEMP 'desktop-native-gate'
-          & ./scripts/windows/ci-standard-user-canary.ps1 -RunGates -DesktopBundle (Join-Path $desktopRoot 'payload') -DesktopInventory (Join-Path $desktopRoot 'desktop-package-inventory.json') -DesktopPackage (Join-Path $desktopRoot 'downloads/ChatGPT-x64.msix')
-      - name: Verify the real Debian package and systemd lifecycle
-        id: debian
-        if: env.FULL == 'true' && runner.os == 'Linux'
-        env:
-          RELE_TEST_CODEX_PREFIX: ${{ runner.temp }}/codex-probe-0.163.0
-          RELE_TEST_CODEX_VERSION: 0.163.0
-        run: node scripts/smoke-linux-installer.mjs
-      - name: Verify the actual Codex protocol without credentials or a real model
-        id: protocol
-        if: env.FULL == 'true'
-        run: |
-          for version in $CODEX_VERSIONS; do
-            python scripts/protocol-probe.py --codex-prefix "$RUNNER_TEMP/codex-probe-$version" --expected-version "$version" --report "protocol-results-$version.json"
-          done
-      - name: Verify managed Rele, shared history, ownership and origin delivery
-        id: managed
-        if: env.FULL == 'true'
-        run: |
-          for version in $CODEX_VERSIONS; do
-            python scripts/managed-protocol-probe.py --codex-prefix "$RUNNER_TEMP/codex-probe-$version" --expected-version "$version" --report "managed-results-$version.json"
-          done
-      - name: Verify the Ubuntu native shared daemon and Rele recovery
-        id: shared
-        if: env.FULL == 'true' && runner.os == 'Linux'
-        run: |
-          for version in $CODEX_VERSIONS; do
-            python scripts/shared-protocol-probe.py --codex-prefix "$RUNNER_TEMP/codex-probe-$version" --expected-version "$version" --report "shared-results-$version.json"
-          done
-      - name: Install the pinned local speech environment and public fixture
-        id: voice_fixture
-        if: env.FULL == 'true'
-        run: |
-          python -m pip install -r scripts/voice-requirements.txt
-          python scripts/fetch-voice-fixture.py --directory "$RUNNER_TEMP/voice-fixture"
-      - name: Verify actual CPU transcription with network syscalls denied
-        id: voice_linux
-        if: env.FULL == 'true' && runner.os == 'Linux'
-        run: python scripts/probe-voice-offline.py --model "$RUNNER_TEMP/voice-fixture/tiny" --input "$RUNNER_TEMP/voice-fixture/jfk.flac" --assert-text 'what your country can do for you' --report voice-results.json
-      - name: Verify actual Windows CPU transcription from local files
-        id: voice_windows
-        if: env.FULL == 'true' && runner.os == 'Windows'
-        run: |
-          python scripts/transcribe.py --input "$RUNNER_TEMP/voice-fixture/jfk.flac" --model "$RUNNER_TEMP/voice-fixture/tiny" --language en --device cpu > voice-results.json
-          python -c 'import json; text=json.load(open("voice-results.json"))["text"]; assert "what your country can do for you" in text.lower()'
-      - run: npx playwright install chromium
-        id: browser_install
-      - run: npm run test:e2e
-        id: browser
-      - name: Verify the real production UI and HTTP API
-        id: ui
-        run: node scripts/smoke-ui.mjs
-      - name: Require every applicable check
-        if: always()
-        env:
-          STEPS: ${{ toJSON(steps) }}
-          REQUIRED: install types ci_contract unit build browser_install browser ui ${{ env.FULL == 'true' && 'fixture package protocol managed voice_fixture' || '' }} ${{ env.FULL == 'true' && runner.os == 'Linux' && 'debian shared voice_linux' || '' }} ${{ env.FULL == 'true' && runner.os == 'Windows' && 'cleanup desktop desktop_provision standard_user voice_windows' || '' }}
-        run: node scripts/ci.mjs steps
-      - name: Check account storage approval before uploading
-        if: github.event_name == 'workflow_dispatch' && inputs.release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          STORAGE_APPROVAL: ${{ vars.CI_STORAGE_APPROVAL }}
-        run: node scripts/ci.mjs quota
-      - name: Bind packages to this verified commit and run
-        if: github.event_name == 'workflow_dispatch' && inputs.release
-        run: node scripts/ci.mjs bundle
-      - name: Transfer verified packages for one day
-        if: github.event_name == 'workflow_dispatch' && inputs.release
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: rele-${{ github.run_id }}-${{ github.run_attempt }}-${{ runner.os }}
-          path: ci-bundle/*
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
+
+  verify_release:
+    if: github.event.repository.private == false && github.event_name == 'workflow_dispatch' && inputs.release && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/verify.yml
+    with:
+      release: true
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
 
   gate:
     name: CI gate
-    needs: verify
+    needs: [verify, verify_release]
     if: ${{ always() && github.event.repository.private == false && (!inputs.release || github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 2
@@ -209,17 +50,20 @@ jobs:
       - name: Require both OS jobs
         env:
           VERIFY_RESULT: ${{ needs.verify.result }}
-        run: test "$VERIFY_RESULT" = success
+          RELEASE_RESULT: ${{ needs.verify_release.result }}
+          EXPECTED_RESULTS: ${{ inputs.release && 'skipped:success' || 'success:skipped' }}
+        run: test "$VERIFY_RESULT:$RELEASE_RESULT" = "$EXPECTED_RESULTS"
 
   publish:
     name: Draft RC from verified packages
-    needs: [verify, gate]
-    if: github.event.repository.private == false && github.event_name == 'workflow_dispatch' && inputs.release && github.ref == 'refs/heads/main'
+    needs: [verify_release, gate]
+    if: ${{ !cancelled() && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && inputs.release && github.ref == 'refs/heads/main' && needs.verify_release.result == 'success' && needs.gate.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
       actions: write
+      attestations: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -236,6 +80,16 @@ jobs:
         with:
           name: rele-${{ github.run_id }}-${{ github.run_attempt }}-Windows
           path: incoming/windows
+      - name: Verify build attestations before creating a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for package in incoming/linux/* incoming/windows/*; do
+            gh attestation verify "$package" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/verify.yml" \
+              --source-digest "$GITHUB_SHA" --source-ref refs/heads/main \
+              --deny-self-hosted-runners
+          done
       - name: Verify provenance, create draft, confirm uploads, remove only these transfers
         env:
           GH_TOKEN: ${{ github.token }}
