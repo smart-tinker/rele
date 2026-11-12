@@ -3487,6 +3487,56 @@ describe('multiple origins and terminal reconciliation', () => {
     expect(f.codex.interrupt).not.toHaveBeenCalled();
   });
 
+  it.each(['history snapshot', 'queued start ACK'] as const)('retries overload after a pending %s without replaying input', async pendingKind => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture(), request = await acceptRequest(f, 'telegram');
+    const turnId = pendingKind === 'history snapshot' ? 'turn-1' : 'queued-turn';
+    const overload: RequestLocation = { state: 'failed', turnId, failureReason: 'serverOverloaded' };
+    let release!: () => void;
+    let reconciliation: Promise<void>;
+    if (pendingKind === 'history snapshot') {
+      await running(f, request, turnId);
+      const snapshot = deferred<RequestLocation>();
+      f.codex.findRequest.mockClear();
+      f.codex.findRequest.mockReturnValueOnce(snapshot.promise);
+      reconciliation = f.engine.reconcile(request.id);
+      release = () => snapshot.resolve(overload);
+      await vi.waitFor(() => expect(f.codex.findRequest).toHaveBeenCalledOnce());
+    } else {
+      f.codex.locations.set(request.id, { state: 'queued', queuedSubmissionId: `queue-${request.id}`, soleQueuedSubmission: true });
+      const ack = deferred<{ turn: { id: string; status: string; items: never[] } }>();
+      f.codex.startQueued.mockImplementationOnce(() => ack.promise);
+      reconciliation = f.engine.reconcile(request.id);
+      release = () => ack.resolve({ turn: { id: turnId, status: 'inProgress', items: [] } });
+      await vi.waitFor(() => expect(f.codex.startQueued).toHaveBeenCalledOnce());
+      f.codex.running(request.id, turnId);
+      await vi.waitFor(() => expect(f.store.getRequest(request.id)).toMatchObject({ turnId, status: 'running' }));
+    }
+    try {
+      f.codex.locations.set(request.id, overload);
+      await f.engine.reconcile(request.id, pendingKind === 'history snapshot', turnId);
+      expect(f.store.getRequest(request.id)).toMatchObject({ status: 'running', turnId, error: expect.stringContaining('Ожидается автоматический повтор 1/4') });
+      expect(JSON.parse(f.store.getMeta(`overload-retry:${request.id}`)!)).toMatchObject({ turnId, attempts: 0, dueAt: Date.now() + 15_000 });
+      expect(f.store.listDeliveries().filter(row => row.kind === 'error')).toEqual([]);
+      release(); await reconciliation; await f.engine.settled();
+      vi.setSystemTime(Date.now() + 14_999); await f.engine.reconcile(request.id);
+      expect(f.codex.retryOverloaded).not.toHaveBeenCalled();
+      vi.setSystemTime(Date.now() + 1); await f.engine.reconcile(request.id); await f.engine.settled();
+      expect(JSON.parse(f.store.getMeta(`overload-retry:${request.id}`)!)).toMatchObject({ turnId, attempts: 1, sending: true });
+      f.codex.complete(request.id, 'Recovered after concurrent overload', `${turnId}-retry`);
+      await f.engine.settled(); await f.engine.pump();
+      expect(f.store.getRequest(request.id)).toMatchObject({ status: 'completed', turnId: `${turnId}-retry` });
+      expect(f.store.listDeliveries().filter(row => row.key.startsWith('answer:'))).toMatchObject([{ body: 'Recovered after concurrent overload', status: 'sent' }]);
+      expect(f.store.listDeliveries().filter(row => row.kind === 'error')).toEqual([]);
+      expect(f.codex.enqueue).toHaveBeenCalledOnce();
+      expect(f.codex.retryOverloaded).toHaveBeenCalledOnce();
+      expect(f.codex.startQueued).toHaveBeenCalledTimes(pendingKind === 'queued start ACK' ? 1 : 0);
+      expect(f.slack.deliver).not.toHaveBeenCalled();
+    } finally {
+      release(); await reconciliation; await f.engine.settled();
+    }
+  });
+
   it('deduplicates concurrent completion-history reads for one request', async () => {
     const f = fixture({ start: false }), request = await acceptRequest(f, 'telegram'); await running(f, request);
     const initialRead = deferred<RequestLocation>(), completionRead = deferred<RequestLocation>();
