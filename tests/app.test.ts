@@ -1802,10 +1802,32 @@ describe('read-only message trace', () => {
 
   it('recognizes a typed explicit enqueue rejection without inferring it from arbitrary error text', async () => {
     const f = traceFixture(); f.store.updateRequest(f.request.id, { status: 'failed', error: 'not exposed' });
-    f.store.setMeta(`enqueue-rejected:${f.request.id}`, '2026-11-12T12:00:00.000Z');
+    const rejectedAt = f.store.getRequest(f.request.id)!.updatedAt;
+    f.store.setMeta(`enqueue-rejected:${f.request.id}`, rejectedAt);
     const response = await f.app.inject({ url: f.url, headers }); expect(response.statusCode).toBe(200);
-    expect(response.json().latest).toEqual({ stage: 'native', status: 'rejected', at: '2026-11-12T12:00:00.000Z' });
+    expect(response.json().latest).toEqual({ stage: 'native', status: 'rejected', at: rejectedAt });
     expect(response.body).not.toContain('not exposed');
+  });
+
+  it.each(['queued', 'running', 'uncertain', 'failed'] as const)('does not let an old enqueue rejection override newer %s evidence', async status => {
+    const f = traceFixture();
+    f.store.setMeta(`enqueue-rejected:${f.request.id}`, '2000-01-01T01:30:00.000Z');
+    f.store.updateRequest(f.request.id, { status, ...(status === 'running' ? { turnId: 'new-turn' } : {}) });
+    const response = await f.app.inject({ url: f.url, headers }); expect(response.statusCode).toBe(200);
+    expect(response.json().latest.status).toBe(status);
+    expect(response.json().steps.find((step: { stage: string }) => step.stage === 'native').status).not.toBe('rejected');
+  });
+
+  it('marks only the immutable source account connected after a platform account switch', async () => {
+    const f = traceFixture();
+    f.engine.channels.telegram = { state: { configured: true, connected: true, accountId: f.request.origin.accountId } } as Channel;
+    expect((await f.app.inject({ url: f.url, headers })).json().connected.source).toBe(true);
+    f.engine.channels.telegram.state.accountId = 'another-telegram-account';
+    const changed = (await f.app.inject({ url: f.url, headers })).json();
+    expect(changed.connected.source).toBe(false);
+    expect(changed.source.accountId).toBe(f.request.origin.accountId);
+    delete f.engine.channels.telegram.state.accountId;
+    expect((await f.app.inject({ url: f.url, headers })).json().connected.source).toBe(false);
   });
 
   it('does not call an error notification or partial multipart answer a delivered final', async () => {
