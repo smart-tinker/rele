@@ -580,6 +580,19 @@ afterEach(async () => {
   vi.useRealTimers();
 });
 
+describe('Engine trace enqueue rejection evidence', () => {
+  it.each(['rejected', 'uncertain', 'before-enqueue'] as const)('records only typed enqueue rejection: %s', async outcome => {
+    const f = fixture();
+    if (outcome === 'rejected') f.codex.enqueue.mockRejectedValueOnce(new CodexRpcError(-32602, 'Queue refused'));
+    else if (outcome === 'uncertain') f.codex.enqueue.mockRejectedValueOnce(new CodexTransportError('ACK lost'));
+    else f.codex.backgroundTerminals.mockRejectedValueOnce(new CodexRpcError(-32602, 'Failure before enqueue'));
+    const request = await acceptRequest(f);
+    const receipt = f.store.getMeta(`enqueue-rejected:${request.id}`);
+    if (outcome === 'rejected') { expect(receipt).toEqual(expect.stringMatching(/^\d{4}-/u)); expect(f.store.getRequest(request.id)?.status).toBe('failed'); }
+    else { expect(receipt).toBeUndefined(); expect(f.store.getRequest(request.id)?.status).toBe(outcome === 'uncertain' ? 'uncertain' : 'queued'); }
+  });
+});
+
 describe('Engine Codex maintenance', () => {
   it('changes a version policy with unsent queue intact, but preserves native and cleanup receipts', async () => {
     const f = fixture({ start: false });
