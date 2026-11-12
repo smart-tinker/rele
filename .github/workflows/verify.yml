@@ -6,6 +6,9 @@ on:
       release:
         type: boolean
         default: false
+      release_id:
+        type: string
+        default: ''
 
 jobs:
   verify:
@@ -48,7 +51,7 @@ jobs:
       - name: Read the supported Codex contract
         if: env.FULL == 'true'
         run: |
-          node --input-type=module -e "import { SUPPORTED_CODEX_VERSIONS } from './src/shared/codex-runtime.ts'; console.log('CODEX_VERSIONS='+SUPPORTED_CODEX_VERSIONS.join(' '))" >> "$GITHUB_ENV"
+          node --input-type=module -e "import { SUPPORTED_CODEX_VERSIONS } from './src/shared/codex-runtime.ts'; console.log('CODEX_VERSIONS='+SUPPORTED_CODEX_VERSIONS.join(' ')); console.log('CODEX_GOALS_VERSION='+SUPPORTED_CODEX_VERSIONS.at(-1))" >> "$GITHUB_ENV"
       - name: Install the isolated protocol fixture
         id: fixture
         if: env.FULL == 'true'
@@ -57,6 +60,12 @@ jobs:
           for version in $CODEX_VERSIONS; do
             npm install --prefix "$RUNNER_TEMP/codex-probe-$version" --ignore-scripts --no-audit --no-fund --no-package-lock "@openai/codex@$version"
           done
+      - name: Verify native Goal lifecycle with a loopback provider
+        id: native_controls
+        if: env.FULL == 'true'
+        run: |
+          native_cli=$(python -c 'import os,pathlib; prefix=pathlib.Path(os.environ["RUNNER_TEMP"])/("codex-probe-"+os.environ["CODEX_GOALS_VERSION"]); name="codex.exe" if os.name=="nt" else "codex"; candidates=list(prefix.glob("node_modules/@openai/codex-*/vendor/*/bin/"+name)); assert len(candidates)==1, "Expected one native Goal fixture binary"; print(candidates[0].resolve().as_posix())')
+          RELE_NATIVE_GOALS_CLI="$native_cli" RELE_NATIVE_GOALS_VERSION="$CODEX_GOALS_VERSION" npm test -- tests/native-source-controls.test.ts
       - name: Build installers and portable runtime, verify the extracted archive
         id: package
         if: env.FULL == 'true'
@@ -163,14 +172,8 @@ jobs:
         if: always()
         env:
           STEPS: ${{ toJSON(steps) }}
-          REQUIRED: install types ci_contract unit build browser_install browser ui ${{ env.FULL == 'true' && 'fixture package protocol managed voice_fixture' || '' }} ${{ env.FULL == 'true' && runner.os == 'Linux' && 'debian shared voice_linux' || '' }} ${{ env.FULL == 'true' && runner.os == 'Windows' && 'cleanup desktop desktop_provision standard_user voice_windows' || '' }}
+          REQUIRED: install types ci_contract unit build browser_install browser ui ${{ env.FULL == 'true' && 'fixture native_controls package protocol managed voice_fixture' || '' }} ${{ env.FULL == 'true' && runner.os == 'Linux' && 'debian shared voice_linux' || '' }} ${{ env.FULL == 'true' && runner.os == 'Windows' && 'cleanup desktop desktop_provision standard_user voice_windows' || '' }}
         run: node scripts/ci.mjs steps
-      - name: Check account storage approval before uploading
-        if: github.event_name == 'workflow_dispatch' && inputs.release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          STORAGE_APPROVAL: ${{ vars.CI_STORAGE_APPROVAL }}
-        run: node scripts/ci.mjs quota
       - name: Bind packages to this verified commit and run
         if: github.event_name == 'workflow_dispatch' && inputs.release
         run: node scripts/ci.mjs bundle
@@ -180,12 +183,9 @@ jobs:
         with:
           subject-path: ci-bundle/*
           create-storage-record: false
-      - name: Transfer verified packages for one day
+      - name: Upload verified packages directly to the prepared draft
         if: github.event_name == 'workflow_dispatch' && inputs.release
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: rele-${{ github.run_id }}-${{ github.run_attempt }}-${{ runner.os }}
-          path: ci-bundle/*
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ inputs.release_id }}
+        run: node scripts/ci.mjs upload

@@ -1,7 +1,7 @@
 # Выпуск Rele: draft → RC → stable
 
 Это канонический контракт переходов и разрешения выпуска. Рабочий цикл —
-[DEVELOPMENT](DEVELOPMENT.md), автоматические проверки и квота — [CI](CI.md),
+[DEVELOPMENT](DEVELOPMENT.md), автоматические проверки и передача пакетов — [CI](CI.md),
 native-приёмка — [ACCEPTANCE](ACCEPTANCE.md). Этот документ не разрешает dispatch,
 публикацию, изменение настроек или установку вне согласованного scope.
 
@@ -51,8 +51,8 @@ git ls-remote --tags https://github.com/smart-tinker/rele.git 'refs/tags/v0.1.1-
 
 | Этап | Что требуется | Что этап доказывает |
 |---|---|---|
-| Подготовка draft RC | Согласованный scope/issues, review, frozen source/build SHA; полный Windows/Linux набор [CI](CI.md#tdd-через-pr), штатные пакеты и provenance; release/quota guards [CI](CI.md#выпуск-и-бесплатные-лимиты) | Проверенные исходники и точные пакеты; draft ещё не распространён |
-| Публикация RC | Draft прошёл сверку ниже; принятое соответствие `main`, свободное имя, полный комплект файлов, разрешение Эльдара на распространение RC | `draft=false`, `prerelease=true`, не Latest; native-результаты и ограничения явно указаны |
+| Подготовка draft RC | Согласованный scope/issues, review, frozen source/build SHA; полный Windows/Linux набор [CI](CI.md#tdd-через-pr), штатные пакеты и provenance; release/identity guards [CI](CI.md#выпуск-и-бесплатные-лимиты) | Проверенные исходники и точные пакеты; draft ещё не распространён |
+| Публикация RC | Draft прошёл сверку ниже; принятое соответствие `main`, свободное имя, полный комплект файлов, разрешение владельца проекта на распространение RC | `draft=false`, `prerelease=true`, не Latest; native-результаты и ограничения явно указаны |
 | Приёмка RC | Готовые пакеты на согласованных Windows/Linux acceptance hosts по [DEVELOPMENT](DEVELOPMENT.md#рабочий-цикл) и [ACCEPTANCE](ACCEPTANCE.md) | Работа установленного приложения и выполнение критериев issues |
 | Подготовка и публикация stable | RC принят; отдельное разрешение; финальная версия/тег, полные автоматические gates и native-приёмка финальных байтов, весь [ACCEPTANCE](ACCEPTANCE.md) без открытых обязательных критериев | `draft=false`, `prerelease=false`; Latest только для отдельно рекомендованной версии |
 
@@ -95,7 +95,8 @@ RC получает новый `N`; исправление stable — новую
   До создания draft publisher обязан подтвердить attestations каждого входного
   файла от build job в `verify.yml` для этого repository, source SHA и main ref.
   `verification.json` объединяет проверенные отчёты обеих ОС, но сам не является
-  подписанным build artifact.
+  подписанным build artifact. В assets также сохраняются два attested отчёта
+  `linux-evidence.json` и `windows-evidence.json`; итоговый inventory — 11 файлов.
   Автоматические source archives GitHub не являются installer/portable.
 - Отдельные результаты source/CI, package, installed runtime и real delivery;
   native acceptance, принятые критерии issues, известные ограничения и открытые DoD.
@@ -125,17 +126,24 @@ evidence автоматически. CI run и его `verification.json` под
 - Package builders принимают финальную версию или `X.Y.Z-rc.N`; Windows
   ограничивает числовые компоненты 65535, Debian преобразует `-rc.` в `~rc.`.
   Поддержку финальной версии builder-ом нельзя выдавать за готовый stable flow.
+- Подготовительный job создаёт новый непроверенный draft с pinned source/run/attempt.
+  Это незавершённая подготовка, не готовый кандидат для распространения.
 - Release build job создаёт GitHub artifact attestations для точных пакетов,
-  контрольных файлов и `evidence.json` до временной передачи. Обычные PR/main
+  контрольных файлов и `evidence.json`, затем загружает их прямо в тот же draft. Обычные PR/main
   runs не подписывают и не загружают пакеты. Publisher сначала проверяет repository,
   signer workflow `verify.yml`, source SHA/main ref и GitHub-hosted runner origin.
+  Уникальные remote имена OS-отчётов при скачивании возвращаются в локальное
+  `evidence.json` без изменения подписанных байтов.
 - CI bundle/publisher принимают только RC, связывают обе ОС с одним SHA/run/attempt,
   проверяют файлы и SHA256, отклоняют занятые tag/release и изменившийся `main`.
-  Ручной `release: true` из `main` создаёт только `draft=true, prerelease=true`.
-- После подтверждения digest загруженных файлов publisher удаляет только два
-  transfer-artifact этого run/attempt. Действующие разрешение storage, резерв,
-  retention и остановка при API-ошибке описаны в [CI](CI.md#выпуск-и-бесплатные-лимиты).
-  Временные Actions artifacts разрешены этим контрактом; старые данные не удаляются.
+  Ручной `release: true` из `main` оставляет `draft=true, prerelease=true`.
+  После скачивания и проверки десяти исходных assets финализатор добавляет
+  сводный `verification.json`, отмечает draft проверенным и делает readback.
+  Пакеты повторно не загружаются и не пересобираются.
+- Actions artifacts, их квота, retention и удаление transfers в выпуске не используются.
+  Старые данные, теги и Releases не меняются. Неопределённый ACK, частичный upload
+  или ошибка проверки оставляют draft для сверки; существующие assets не
+  перезаписываются, шаги автоматически не повторяются.
 - Автоматическая публикация RC/stable, назначение Latest и проверка native-приёмки
   не реализованы. Publisher задаёт `target_commitish`, но не делает независимый
   readback реального tag commit после публикации. Это обязательные операторские
@@ -144,14 +152,14 @@ evidence автоматически. CI run и его `verification.json` под
 
 ## Полномочия и остановка
 
-Эльдар как владелец проекта разрешает публичный RC и отдельно stable/rollout
+Владелец проекта разрешает публичный RC и отдельно stable/rollout
 в согласованном scope; оператор выполняет переход и фиксирует evidence.
 Право записи GitHub, green CI, merge и наличие этого документа разрешение
 не заменяют. Не менять permissions, billing или release-настройки ради прохождения.
 
 Остановить следующий переход при занятом имени, неподтверждённом tag/SHA,
 неполном комплекте или неверных хешах/provenance, незавершённом обязательном gate,
-смене `main`, неизвестной квоте, отсутствии разрешения или реальном отказе контроля.
+смене `main`, неподтверждённой идентичности draft, отсутствии разрешения или реальном отказе контроля.
 Перед stable останавливает также открытая обязательная native-приёмка. Спорное
 снижение требований выносится на отдельное решение, без ослабления текущих gates.
 

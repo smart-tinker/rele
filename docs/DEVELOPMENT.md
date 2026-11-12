@@ -8,10 +8,14 @@
 полный набор, включая сборку пакетов. В workflow есть public guard: jobs
 выполняются только для публичного репозитория. Кэш отключён; обычные PR/main
 runs не загружают artifacts. Только ручной release dispatch из `main` проходит
-quota guard, временно передаёт пакеты publisher-у (retention transfer artifacts —
-до одного дня), подписывает проверенные файлы в build job и проверяет attestations
-в publisher перед созданием draft RC. Матрица вынесена в reusable `verify.yml`;
-обычный caller имеет только read-права, права подписи выдаются release caller-у.
+подготовку непроверенного draft, подписывает проверенные файлы в build jobs и
+загружает их прямо в этот draft. Финальный Ubuntu job скачивает assets, проверяет
+attestations и хеши, затем отмечает draft проверенным. Actions artifacts и кэш
+не используются; пакеты повторно не загружаются. Матрица вынесена в reusable `verify.yml`;
+обычный caller имеет только read-права; release caller получает права подписи
+и записи Release assets. Дополнительный короткий Ubuntu job создаёт draft до
+матрицы. Полный набор также включает env-gated native Goal lifecycle через
+изолированный loopback provider, без платной модели.
 GitHub Actions не заменяет приёмку готового пакета.
 Переходы draft → RC → stable, разрешение публикации и сверка байтов определены
 в [каноническом регламенте выпуска](RELEASING.md).
@@ -53,8 +57,9 @@ build/package scripts. На Windows и Linux acceptance hosts передаютс
    версии инструментов и SHA256 пакетов. Новый diff, сбой или изменение среды
    требуют соответствующей перепроверки; узкий probe не заменяет итоговые gates.
 4. Провести PR через review и `main`. Отдельный ручной release dispatch после
-   quota guard передаёт проверенные байты publisher-у и создаёт draft RC без
-   пересборки. Дальнейшие переходы и неизменяемость опубликованных файлов —
+   создаёт непроверенный draft, а OS jobs после gates прямо загружают проверенные
+   байты. Финализатор проверяет полный комплект и отмечает тот же draft готовым
+   без пересборки; временного Actions storage нет. Дальнейшие переходы и неизменяемость опубликованных файлов —
    по [RELEASING](RELEASING.md).
 5. После публикации RC в этапе приёмки на Windows и Linux acceptance hosts
    проверить SHA256 полученных installers/portable, установить готовое приложение

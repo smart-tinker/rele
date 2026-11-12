@@ -20,6 +20,28 @@ concurrency:
   cancel-in-progress: ${{ !inputs.release }}
 
 jobs:
+  prepare_release:
+    name: Prepare unverified draft RC
+    if: github.event.repository.private == false && github.event_name == 'workflow_dispatch' && inputs.release && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.prepare.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24.19.0
+          package-manager-cache: false
+      - id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/ci.mjs prepare
+
   verify:
     if: github.event.repository.private == false && !inputs.release
     uses: ./.github/workflows/verify.yml
@@ -30,12 +52,14 @@ jobs:
       actions: read
 
   verify_release:
+    needs: [prepare_release]
     if: github.event.repository.private == false && github.event_name == 'workflow_dispatch' && inputs.release && github.ref == 'refs/heads/main'
     uses: ./.github/workflows/verify.yml
     with:
       release: true
+      release_id: ${{ needs.prepare_release.outputs.release_id }}
     permissions:
-      contents: read
+      contents: write
       actions: read
       id-token: write
       attestations: write
@@ -55,15 +79,16 @@ jobs:
         run: test "$VERIFY_RESULT:$RELEASE_RESULT" = "$EXPECTED_RESULTS"
 
   publish:
-    name: Draft RC from verified packages
-    needs: [verify_release, gate]
+    name: Verify draft RC packages
+    needs: [prepare_release, verify_release, gate]
     if: ${{ !cancelled() && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && inputs.release && github.ref == 'refs/heads/main' && needs.verify_release.result == 'success' && needs.gate.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
-      actions: write
       attestations: read
+    env:
+      RELEASE_ID: ${{ needs.prepare_release.outputs.release_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -72,15 +97,11 @@ jobs:
         with:
           node-version: 24.19.0
           package-manager-cache: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: rele-${{ github.run_id }}-${{ github.run_attempt }}-Linux
-          path: incoming/linux
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: rele-${{ github.run_id }}-${{ github.run_attempt }}-Windows
-          path: incoming/windows
-      - name: Verify build attestations before creating a draft
+      - name: Download the exact draft assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/ci.mjs download
+      - name: Verify draft build attestations
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -90,7 +111,7 @@ jobs:
               --source-digest "$GITHUB_SHA" --source-ref refs/heads/main \
               --deny-self-hosted-runners
           done
-      - name: Verify provenance, create draft, confirm uploads, remove only these transfers
+      - name: Verify provenance and finalize the same draft without replacing packages
         env:
           GH_TOKEN: ${{ github.token }}
         run: node scripts/ci.mjs publish

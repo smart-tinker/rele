@@ -4,17 +4,39 @@ import { mkdtemp, writeFile, rm, mkdir, symlink, readFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { assertStorageApproval, assertSteps, writeBundle, verifyBundles } from '../scripts/ci-contract.mjs';
+import { assertSteps, writeBundle, verifyBundles } from '../scripts/ci-contract.mjs';
 import { summarizeSharedNativeRequest } from '../scripts/shared-probe-diagnostics.mjs';
 const sha = 'a'.repeat(40), run = '123', attempt = '1', version = '0.1.2-rc.1';
-const now = Date.parse('2026-11-09T10:00:00Z');
-const approval = { checkedAt: new Date(now).toISOString(), freeBytes: 250 * 1024 ** 2, paidUsageBlocked: true };
-test('storage fails closed for absent, stale, paid or insufficient allowance', () => {
- assert.doesNotThrow(() => assertStorageApproval(approval, 0, now));
- for (const value of [null, {...approval, paidUsageBlocked:false}, {...approval, freeBytes:0}, {...approval, checkedAt:'invalid'}, {...approval, checkedAt:'2026-11-08T10:00:00Z'}, {...approval, checkedAt:'2026-11-10T10:00:00Z'}]) assert.throws(() => assertStorageApproval(value, 0, now));
- assert.throws(() => assertStorageApproval(approval, 400 * 1024 ** 2, now));
- assert.throws(() => assertStorageApproval(approval, NaN, now));
-});
+const candidate={repository:'owner/repo',version,commit:sha,runId:run,attempt};
+async function releaseBackend(root) {
+ const {prepareCandidate,uploadPlatform}=await import('../scripts/ci-publish.mjs');
+ const state={main:sha,tag:null,release:null,assets:[],bodies:new Map(),calls:[]};
+ const api=async(route,options={})=>{
+  state.calls.push({route,...options});
+  if(options.upload) {
+   const name=new URL('https://uploads.github.com'+route).searchParams.get('name');
+   assert.ok(!state.assets.some(asset=>asset.name===name),'Duplicate asset upload');
+   const asset={id:state.assets.length+101,name,size:options.body.length,digest:'sha256:'+createHash('sha256').update(options.body).digest('hex')};
+   state.assets.push(asset);state.bodies.set(asset.id,Buffer.from(options.body));return {...asset};
+  }
+  if(options.method==='POST') {
+   assert.ok(!state.release,'Cannot replace an existing draft');
+   state.release={id:77,html_url:'https://github.com/owner/repo/releases/77',...options.body};return {...state.release};
+  }
+  if(options.method==='PATCH') {state.release={...state.release,...options.body};return {...state.release};}
+  assert.ok(!options.method || options.method==='GET','Deletion is forbidden');
+  if(route.endsWith('/git/ref/heads/main'))return {object:{sha:state.main}};
+  if(route.includes('/git/ref/tags/'))return state.tag;
+  if(route.includes('/releases?'))return state.release?[{...state.release}]:[];
+  if(route.endsWith('/releases/77'))return state.release?{...state.release}:null;
+  if(route.endsWith('/releases/77/assets?per_page=100'))return state.assets.map(asset=>({...asset}));
+  if(options.download)return state.bodies.get(Number(route.split('/').at(-1)));
+  throw new Error('Unexpected API read '+route);
+ };
+ const prepared=async()=>prepareCandidate(api,candidate);
+ const uploaded=async()=>{await prepared();await Promise.all(['linux','windows'].map(platform=>uploadPlatform(api,candidate,77,path.join(root,platform),platform)));};
+ return {state,api,prepared,uploaded};
+}
 test('missing, skipped and failed required steps cannot pass', () => {
  assert.doesNotThrow(() => assertSteps({a:{outcome:'success',conclusion:'success'}}, ['a']));
  for (const outcome of ['skipped','failure','cancelled']) assert.throws(() => assertSteps({a:{outcome,conclusion:'success'}}, ['a']));
@@ -59,53 +81,98 @@ test('symlink cannot substitute a package',()=>fixture(async root=>{
  await symlink(path.join(root,'windows'),file,process.platform==='win32'?'junction':undefined);
  await assert.rejects(verifyBundles(root,version,sha,run,attempt));
 }));
+test('preparation refuses advanced main, occupied tags and existing drafts before any write',()=>fixture(async root=>{
+ for(const mutation of ['main','tag','release']) {
+  const f=await releaseBackend(root);
+  if(mutation==='main')f.state.main='b'.repeat(40);
+  if(mutation==='tag')f.state.tag={object:{type:'commit',sha}};
+  if(mutation==='release')f.state.release={tag_name:`v${version}`,draft:true};
+  await assert.rejects(f.prepared());assert.ok(f.state.calls.every(call=>!call.method));
+ }
+}));
 test('publisher finalizes a prepared draft without replacing packages or deleting transfers',()=>fixture(async root=>{
- const {publishCandidate}=await import('../scripts/ci-publish.mjs');
- const bundle=await verifyBundles(root,version,sha,run,attempt), writes=[];
- const draft={id:77,tag_name:`v${version}`,target_commitish:sha,draft:true,prerelease:true,
-  body:`Rele candidate ${sha}; run ${run}; attempt ${attempt}. Verification pending.`};
- const api=async(route,options={})=>{
-  if(options.method){writes.push({route,...options});return options.upload?{name:'verification.json',size:options.body.length,digest:'sha256:'+createHash('sha256').update(options.body).digest('hex')}:{...draft,body:options.body.body};}
-  if(route.endsWith('/git/ref/heads/main'))return {object:{sha}};
-  if(route.endsWith('/git/ref/tags/'+draft.tag_name))return null;
-  if(route.endsWith('/releases/77'))return draft;
-  if(route.endsWith('/releases/tags/'+draft.tag_name))return draft;
-  if(route.includes('/assets?'))return [
-   ...bundle.files.map((file,index)=>({id:index+1,name:file.name,size:file.bytes,digest:'sha256:'+file.sha256})),
-   ...bundle.evidence.map((evidence,index)=>{const body=Buffer.from(JSON.stringify(evidence,null,2)+'\n');return {id:9+index,name:evidence.platform+'-evidence.json',size:body.length,digest:'sha256:'+createHash('sha256').update(body).digest('hex')};}),
-  ];
-  throw new Error('Unexpected API read '+route);
- };
- const result=await publishCandidate(api,bundle,'owner/repo',version,sha,77);
- assert.equal(result.id,77);
+ const {downloadCandidate,publishCandidate}=await import('../scripts/ci-publish.mjs');
+ const f=await releaseBackend(root);await f.uploaded();
+ const incoming=path.join(root,'incoming');await downloadCandidate(f.api,candidate,77,incoming);
+ for(const platform of ['linux','windows']) {
+  const metadata=f.state.assets.find(asset=>asset.name===`${platform}-evidence.json`);
+  assert.deepEqual(await readFile(path.join(incoming,platform,'evidence.json')),f.state.bodies.get(metadata.id),'Remote evidence renaming must preserve the attested bytes');
+ }
+ const before=f.state.calls.length;
+ const result=await publishCandidate(f.api,await verifyBundles(incoming,version,sha,run,attempt),candidate,77);
+ assert.equal(result.id,77);assert.equal(result.draft,true);assert.equal(result.prerelease,true);
+ assert.match(result.body,/Verification passed/u);
+ const writes=f.state.calls.slice(before).filter(call=>call.method);
  assert.deepEqual(writes.map(item=>[item.method,item.upload?new URL('https://uploads.github.com'+item.route).searchParams.get('name'):item.route]),[
   ['POST','verification.json'],['PATCH','/repos/owner/repo/releases/77'],
  ]);
- assert.equal(result.draft,true);
+ assert.equal(f.state.assets.length,11);assert.equal(f.state.calls.filter(call=>call.upload).length,11);
+ assert.ok(f.state.calls.every(call=>call.method!=='DELETE' && !call.route.includes('/actions/')));
 }));
-test('publisher refuses an advanced main or existing tag before any write', ()=>fixture(async root=>{
- const {publishCandidate}=await import('../scripts/ci-publish.mjs');
- for(const advanced of [true,false]) {
-  const calls=[];
-  const api=async(route,options={})=>{calls.push(options.method??'GET');if(route.endsWith('/git/ref/heads/main'))return {object:{sha:advanced?'b'.repeat(40):sha}};return {exists:true};};
-  await assert.rejects(publishCandidate(api,await verifyBundles(root,version,sha,run,attempt),'owner/repo',version,sha,[11,12]));
-  assert.ok(calls.length > 0 && calls.every(x=>x==='GET')); 
+test('draft identity and source/run/attempt changes stop uploads before any asset write',()=>fixture(async root=>{
+ const {uploadPlatform}=await import('../scripts/ci-publish.mjs');
+ for(const patch of [{id:78},{draft:false},{prerelease:false},{target_commitish:'b'.repeat(40)},{tag_name:'v0.1.2-rc.99'},
+  {body:`Rele candidate ${sha}; run 999; attempt ${attempt}. Verification pending.`},
+  {body:`Rele candidate ${sha}; run ${run}; attempt 2. Verification pending.`}]) {
+  const f=await releaseBackend(root);await f.prepared();Object.assign(f.state.release,patch);
+  await assert.rejects(uploadPlatform(f.api,candidate,77,path.join(root,'linux'),'linux'));assert.equal(f.state.assets.length,0);
  }
 }));
-test('publisher uploads verified bytes to a new draft, then removes only this run artifacts',()=>fixture(async root=>{
- const {publishCandidate}=await import('../scripts/ci-publish.mjs');
- const bundle=await verifyBundles(root,version,sha,run,attempt), calls=[];
- const api=async(route,options={})=>{
-  calls.push({route,...options});
-  if(route.endsWith('/git/ref/heads/main'))return {object:{sha}};
-  if(!options.method)return null;
-  if(options.upload){const name=new URL('https://uploads.github.com'+route).searchParams.get('name');return {name,size:options.body.length,digest:'sha256:'+createHash('sha256').update(options.body).digest('hex')};}
-  if(options.method==='POST'){assert.equal(options.body.draft,true);return {id:77,html_url:'https://github.com/owner/repo/releases/77'};}
-  return null;
- };
- const result=await publishCandidate(api,bundle,'owner/repo',version,sha,[11,12]);
- assert.equal(result.id,77);assert.equal(calls.filter(x=>x.upload).length,9);
- assert.deepEqual(calls.slice(-2).map(x=>[x.method,x.route]),[['DELETE','/repos/owner/repo/actions/artifacts/11'],['DELETE','/repos/owner/repo/actions/artifacts/12']]);
+test('lost preparation ACK leaves its draft without a second creation attempt',()=>fixture(async root=>{
+ const {prepareCandidate}=await import('../scripts/ci-publish.mjs');const f=await releaseBackend(root);
+ const api=async(route,options={})=>{const result=await f.api(route,options);if(options.method==='POST')throw new Error('ACK lost');return result;};
+ await assert.rejects(prepareCandidate(api,candidate),/ACK lost/u);
+ assert.ok(f.state.release);await assert.rejects(prepareCandidate(api,candidate),/Release already exists/u);
+ assert.equal(f.state.calls.filter(call=>call.method==='POST').length,1);
+}));
+test('partial or uncertain platform upload stays in its draft and cannot be replayed',()=>fixture(async root=>{
+ const {uploadPlatform}=await import('../scripts/ci-publish.mjs');
+ for(const failure of ['lost ACK','wrong digest']) {
+  const f=await releaseBackend(root);await f.prepared();let uploaded=0;
+  const api=async(route,options={})=>{const result=await f.api(route,options);if(options.upload && ++uploaded===2){if(failure==='lost ACK')throw new Error('ACK lost');return {...result,digest:'sha256:'+'0'.repeat(64)};}return result;};
+  await assert.rejects(uploadPlatform(api,candidate,77,path.join(root,'linux'),'linux'));
+  assert.equal(f.state.assets.length,2);assert.equal(f.state.release.draft,true);assert.match(f.state.release.body,/pending/u);
+  const writes=f.state.calls.filter(call=>call.method).length;
+  await assert.rejects(uploadPlatform(api,candidate,77,path.join(root,'linux'),'linux'),/reconcile before retry/u);
+  assert.equal(f.state.calls.filter(call=>call.method).length,writes);assert.ok(f.state.calls.every(call=>call.method!=='DELETE'));
+ }
+}));
+test('download rejects missing, extra and tampered draft assets',()=>fixture(async root=>{
+ const {downloadCandidate}=await import('../scripts/ci-publish.mjs');
+ for(const failure of ['missing','extra','tampered']) {
+  const f=await releaseBackend(root);await f.uploaded();
+  if(failure==='missing')f.state.assets.pop();
+  if(failure==='extra')f.state.assets.push({...f.state.assets[0],id:999,name:'unexpected.exe'});
+  if(failure==='tampered')f.state.bodies.set(f.state.assets[0].id,Buffer.from('changed after upload'));
+  await assert.rejects(downloadCandidate(f.api,candidate,77,path.join(root,failure)));
+  assert.equal(f.state.release.draft,true);assert.match(f.state.release.body,/pending/u);
+ }
+}));
+test('finalizer refuses wrong assets, hashes or build identity before any final write',()=>fixture(async root=>{
+ const {publishCandidate}=await import('../scripts/ci-publish.mjs');const bundle=await verifyBundles(root,version,sha,run,attempt);
+ for(const failure of ['missing','extra','hash','main','run','attempt']) {
+  const f=await releaseBackend(root);await f.uploaded();
+  if(failure==='missing')f.state.assets.pop();
+  if(failure==='extra')f.state.assets.push({...f.state.assets[0],id:999,name:'unexpected.exe'});
+  if(failure==='hash')f.state.assets[0].digest='sha256:'+'0'.repeat(64);
+  if(failure==='main')f.state.main='b'.repeat(40);
+  const changed=failure==='run'?{...candidate,runId:'999'}:failure==='attempt'?{...candidate,attempt:'2'}:candidate;
+  const writes=f.state.calls.filter(call=>call.method).length;
+  await assert.rejects(publishCandidate(f.api,bundle,changed,77));
+  assert.equal(f.state.calls.filter(call=>call.method).length,writes);
+ }
+}));
+test('uncertain final upload and advanced main leave an unverified draft without replay',()=>fixture(async root=>{
+ const {publishCandidate}=await import('../scripts/ci-publish.mjs');const bundle=await verifyBundles(root,version,sha,run,attempt);
+ for(const failure of ['lost ACK','main advanced','draft published']) {
+  const f=await releaseBackend(root);await f.uploaded();
+  const api=async(route,options={})=>{const result=await f.api(route,options);if(options.upload){if(failure==='lost ACK')throw new Error('ACK lost');if(failure==='draft published')f.state.release.draft=false;else f.state.main='b'.repeat(40);}return result;};
+  await assert.rejects(publishCandidate(api,bundle,candidate,77));
+  assert.equal(f.state.assets.length,11);assert.equal(f.state.release.draft,failure!=='draft published');assert.match(f.state.release.body,/pending/u);
+  assert.equal(f.state.calls.filter(call=>call.method==='PATCH').length,0);
+  const uploads=f.state.calls.filter(call=>call.upload).length;
+  await assert.rejects(publishCandidate(api,bundle,candidate,77));assert.equal(f.state.calls.filter(call=>call.upload).length,uploads);
+ }
 }));
 test('workflow requirement lists tolerate empty conditional groups', async()=>{
  const {spawnSync}=await import('node:child_process');
@@ -163,19 +230,6 @@ test('shared wait timeout reports bounded request correlation without message bo
   ]
  })),/private-rpc-id|private command/u);
 });
-test('unconfirmed upload leaves transfers intact for reconciliation',()=>fixture(async root=>{
- const {publishCandidate}=await import('../scripts/ci-publish.mjs');
- const bundle=await verifyBundles(root,version,sha,run,attempt),calls=[];
- const api=async(route,options={})=>{
-  calls.push(options.method??'GET');
-  if(route.endsWith('/git/ref/heads/main'))return {object:{sha}};
-  if(!options.method)return null;
-  if(options.upload)return {name:'wrong',size:0,digest:'wrong'};
-  return {id:77};
- };
- await assert.rejects(publishCandidate(api,bundle,'owner/repo',version,sha,[11,12]));
- assert.equal(calls.includes('DELETE'),false);
-}));
 test('the aggregate gate accepts only the selected successful verification and skipped alternative', async()=>{
  const workflow=await readFile(new URL('../.github/workflows/ci.yml',import.meta.url),'utf8');
  const start=workflow.indexOf('\n  gate:\n');
@@ -206,7 +260,7 @@ test('ordinary events cannot select the write-scoped reusable build job', async(
  const select=jobs.map(job=>new Function('github','inputs',`return (${job.match(/^    if: (.+)$/mu)?.[1]});`));
  const build=await readFile(new URL('../.github/workflows/verify.yml',import.meta.url),'utf8');
  const buildAllowed=new Function('github','inputs',`return (${build.match(/^    if: (.+)$/mu)?.[1]});`);
- const releaseConditions=['Check account storage approval before uploading','Bind packages to this verified commit and run','Attest the exact verified build bytes','Transfer verified packages for one day'].map(name=>{
+ const releaseConditions=['Bind packages to this verified commit and run','Attest the exact verified build bytes','Upload verified packages directly to the prepared draft'].map(name=>{
   const start=build.indexOf(`name: ${name}\n`),end=build.indexOf('\n      - ',start+1);
   const step=build.slice(start,end<0?undefined:end);
   const condition=step.match(/^        if: (.+)$/mu)?.[1];
@@ -228,17 +282,23 @@ test('ordinary events cannot select the write-scoped reusable build job', async(
   assert.deepEqual(select.map(condition=>Boolean(condition(github,{release}))),want,`${event}, release=${release}, ref=${ref}, private=${isPrivate}`);
   for(const condition of releaseConditions) assert.equal(Boolean(buildAllowed(github,{release}) && condition(github,{release})),want[1],`release side effect on ${event}, release=${release}, ref=${ref}, private=${isPrivate}`);
  }
+ const preparation=workflow.slice(workflow.indexOf('\n  prepare_release:\n'),workflow.indexOf('\n  verify:\n'));
+ const prepare=new Function('github','inputs',`return (${preparation.match(/^    if: (.+)$/mu)?.[1]});`);
+ for(const event of ['pull_request','push','workflow_dispatch']) for(const release of [false,true]) for(const ref of ['refs/heads/main','refs/heads/topic']) for(const isPrivate of [false,true]) {
+  const github={event_name:event,ref,event:{repository:{private:isPrivate}}};
+  assert.equal(Boolean(prepare(github,{release})),event==='workflow_dispatch' && release && ref==='refs/heads/main' && !isPrivate);
+ }
  const permissions=job=>Object.fromEntries(job.match(/^    permissions:\n((?:      [\w-]+: \w+\n)+)/mu)[1].trim().split('\n').map(line=>line.trim().split(': ')));
  assert.deepEqual(permissions(jobs[0]),{contents:'read',actions:'read'});
- assert.deepEqual(permissions(jobs[1]),{contents:'read',actions:'read','id-token':'write',attestations:'write'});
+ assert.deepEqual(permissions(jobs[1]),{contents:'write',actions:'read','id-token':'write',attestations:'write'});
  for(const job of jobs) assert.match(job,/uses: \.\/\.github\/workflows\/verify\.yml/u,'run one shared original build job');
  assert.match(jobs[0],/release: false/u);assert.match(jobs[1],/release: true/u);
 });
 test('publisher verifies every incoming file against the reusable build identity and stops on rejection', async()=>{
  const workflow=await readFile(new URL('../.github/workflows/ci.yml',import.meta.url),'utf8');
  const publisher=workflow.slice(workflow.indexOf('\n  publish:\n'));
- const command=publisher.match(/name: Verify build attestations before creating a draft[\s\S]*?        run: \|\n([\s\S]*?)(?=\n      - name:)/u)?.[1];
- assert.ok(command,'verify attestations before the publisher writes a release');
+ const command=publisher.match(/name: Verify draft build attestations[\s\S]*?        run: \|\n([\s\S]*?)(?=\n      - name:)/u)?.[1];
+ assert.ok(command,'verify attestations before the publisher finalizes a draft');
  const root=await mkdtemp(path.join(tmpdir(),'rele-attest-'));
  try {
   await mkdir(path.join(root,'bin'));
@@ -271,7 +331,7 @@ test('one required CI gate waits for every OS matrix job', async()=>{
  assert.match(gate,/needs\.verify\.result/u);
  assert.match(gate,/needs\.verify_release\.result/u);
  const publisher=workflow.slice(workflow.indexOf('\n  publish:\n'));
- assert.match(publisher,/needs: \[verify_release, gate\]/u);
+ assert.match(publisher,/needs: \[prepare_release, verify_release, gate\]/u);
  const condition=publisher.match(/^    if: \$\{\{ (.+) \}\}$/mu)?.[1];
  assert.ok(condition,'explicitly guard publication after the unselected job skips');
  const publish=new Function('github','inputs','needs','cancelled',`return (${condition});`);
