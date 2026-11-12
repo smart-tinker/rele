@@ -314,6 +314,47 @@ it('reports only bounded Windows proof failure details when requested', async ()
   expect(failure).toEqual({ stage:'tcp-query', category:'OperationStopped', failureType:'CommandNotFoundException' });
 });
 
+it('reports when a Windows proof is valid JSON but fails the native-peer contract', async () => {
+  const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
+  const home = 'C:\\Users\\Owner\\fixture', executable = 'C:\\native\\codex.exe';
+  const receipt = { status:'alreadyRunning', endpoint:'ws://127.0.0.1:62662', codexHome:home, executable, executableSha256:'a'.repeat(64), ownerSid:'S-1-5-21-1001', processId:10944, processStartTime:'2026-11-03T10:00:00.1234567Z' };
+  const proof = { pid:10944, birth:receipt.processStartTime, boot:'2026-11-01T01:02:03.0000000Z', executable, sha256:'a'.repeat(64), owner:receipt.ownerSid,
+    codexHome:home, peerVerified:false, parentPid:process.pid, gatewayId:process.pid, gatewayOwner:receipt.ownerSid, localPort:55001, remotePort:62662 };
+  let failure: unknown;
+  const run = async (command: string) => command.endsWith('Rele.exe')
+    ? { stdout:JSON.stringify(receipt), code:0 }
+    : { stdout:JSON.stringify(proof), code:0 };
+  const generation = await codexNativeGeneration({ kind:'windows-shared', endpoint:receipt.endpoint, localPort:55001, remotePort:62662 }, 10944, home,
+    { platform:'win32', run, installationDirectory:'C:\\Rele', onProofFailure:value => { failure = value; } });
+  expect(generation).toBeUndefined();
+  expect(failure).toEqual({ stage:'proof-contract', category:'peer-identity', failureType:'contract-mismatch' });
+});
+
+it.each([
+  ['status command failure', 'status-error', { stage:'status-probe', category:'command-error', failureType:'execution-error' }],
+  ['malformed status JSON', 'status-json', { stage:'status-probe', category:'invalid-json', failureType:'parse-error' }],
+  ['malformed proof JSON', 'proof-json', { stage:'proof-output', category:'invalid-json', failureType:'parse-error' }],
+  ['PowerShell failure without a marker', 'powershell-error', { stage:'powershell', category:'unclassified-error', failureType:'execution-error' }],
+] as const)('reports bounded diagnostics for %s', async (_label, failureMode, expected) => {
+  const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
+  const home = 'C:\\Users\\Owner\\fixture', executable = 'C:\\native\\codex.exe';
+  const receipt = { status:'alreadyRunning', endpoint:'ws://127.0.0.1:62662', codexHome:home, executable, executableSha256:'a'.repeat(64), ownerSid:'S-1-5-21-1001', processId:10944, processStartTime:'2026-11-03T10:00:00.1234567Z' };
+  let failure: unknown;
+  const run = async (command: string) => {
+    if (command.endsWith('Rele.exe')) {
+      if (failureMode === 'status-error') throw new Error('C:\\private\\fixture');
+      return { stdout:failureMode === 'status-json' ? '{"private":"path"' : JSON.stringify(receipt), code:0 };
+    }
+    if (failureMode === 'proof-json') return { stdout:'{"private":"path"', code:0 };
+    if (failureMode === 'powershell-error') throw new Error('C:\\private\\fixture');
+    return { stdout:'', code:1 };
+  };
+  const generation = await codexNativeGeneration({ kind:'windows-shared', endpoint:receipt.endpoint, localPort:55001, remotePort:62662 }, 10944, home,
+    { platform:'win32', run, installationDirectory:'C:\\Rele', onProofFailure:value => { failure = value; } });
+  expect(generation).toBeUndefined();
+  expect(failure).toEqual(expected);
+});
+
 it.each([
   { peerVerified:false }, { pid:10945 }, { owner:'S-1-5-21-1002' }, { sha256:'b'.repeat(64) },
   { codexHome:'C:\\Users\\Other\\fixture' }, { birth:'2026-11-03T10:00:00.1234568Z' },

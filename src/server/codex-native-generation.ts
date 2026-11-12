@@ -298,25 +298,40 @@ function sameWindowsPath(left: string, right: string): boolean {
   } catch { return false; }
 }
 async function windowsGeneration(peer: Exclude<CodexNativePeer, { kind: 'proxy' }>, serverId: number, home: string, options: CodexNativeGenerationOptions): Promise<string | undefined> {
-  if (!windowsPath(home)) return;
+  const fail = (stage: string, category: string, failureType: string): undefined => {
+    try { options.onProofFailure?.({ stage, category, failureType }); } catch {}
+    return undefined;
+  };
+  if (!windowsPath(home)) return fail('input', 'codex-home', 'invalid-contract');
   const run = options.run ?? (async (command: string, args: string[]) => ({ ...(await execute(command, args, { timeout: 30_000, maxBuffer: 128 * 1024, windowsHide: true })), code: 0 }));
   const directory = options.installationDirectory ?? fileURLToPath(new URL('../../', import.meta.url));
   let receipt: any;
   if (peer.kind === 'stdio') {
-    if (!Number.isSafeInteger(peer.pid) || peer.pid <= 1 || !windowsPath(peer.executable) || !windowsPath(peer.codexHome) || !sameWindowsPath(peer.codexHome, home)) return;
+    if (!Number.isSafeInteger(peer.pid) || peer.pid <= 1 || !windowsPath(peer.executable) || !windowsPath(peer.codexHome) || !sameWindowsPath(peer.codexHome, home)) {
+      return fail('peer-input', 'stdio-peer', 'invalid-contract');
+    }
     if (peer.helperExecutable) {
-      if (peer.pid === serverId || !sameWindowsPath(peer.helperExecutable, path.win32.join(directory, 'dist', 'native', 'Rele.Process.exe'))) return;
-    } else if (peer.pid !== serverId) return;
+      if (peer.pid === serverId || !sameWindowsPath(peer.helperExecutable, path.win32.join(directory, 'dist', 'native', 'Rele.Process.exe')))
+        return fail('peer-input', 'stdio-helper', 'invalid-contract');
+    } else if (peer.pid !== serverId) return fail('peer-input', 'stdio-pid', 'invalid-contract');
   } else {
     if (!Number.isInteger(peer.localPort) || peer.localPort <= 0 || peer.localPort > 65535
       || !Number.isInteger(peer.remotePort) || peer.remotePort <= 0 || peer.remotePort > 65535
-      || peer.localPort === peer.remotePort || peer.endpoint !== `ws://127.0.0.1:${peer.remotePort}`) return;
-    const status = await run(path.win32.join(directory, 'Rele.exe'), ['codex-status', '--quiet', '--codex-home', home]);
-    receipt = JSON.parse(status.stdout);
-    if (status.code !== 0 || receipt?.status !== 'alreadyRunning' || receipt.endpoint !== peer.endpoint || receipt.processId !== serverId
+      || peer.localPort === peer.remotePort || peer.endpoint !== `ws://127.0.0.1:${peer.remotePort}`) {
+      return fail('peer-input', 'shared-peer', 'invalid-contract');
+    }
+    let status: CommandResult;
+    try { status = await run(path.win32.join(directory, 'Rele.exe'), ['codex-status', '--quiet', '--codex-home', home]); }
+    catch { return fail('status-probe', 'command-error', 'execution-error'); }
+    if (status.code !== 0) return fail('status-probe', 'nonzero-exit', 'execution-error');
+    try { receipt = JSON.parse(status.stdout); }
+    catch { return fail('status-probe', 'invalid-json', 'parse-error'); }
+    if (receipt?.status !== 'alreadyRunning' || receipt.endpoint !== peer.endpoint || receipt.processId !== serverId
       || !windowsPath(receipt.codexHome) || !sameWindowsPath(receipt.codexHome, home) || !windowsPath(receipt.executable)
       || !SHA.test(receipt.executableSha256) || typeof receipt.ownerSid !== 'string' || !/^S-1-\d+(?:-\d+)+$/u.test(receipt.ownerSid)
-      || typeof receipt.processStartTime !== 'string' || !WINDOWS_TIME.test(receipt.processStartTime) || !Number.isFinite(Date.parse(receipt.processStartTime))) return;
+      || typeof receipt.processStartTime !== 'string' || !WINDOWS_TIME.test(receipt.processStartTime) || !Number.isFinite(Date.parse(receipt.processStartTime))) {
+      return fail('status-contract', 'shared-peer', 'contract-mismatch');
+    }
   }
   const input = Buffer.from(JSON.stringify({ receipt, peer, serverId, gatewayId: process.pid })).toString('base64');
   const source = WINDOWS_PROOF.replace('__INPUT__', input);
@@ -328,24 +343,40 @@ async function windowsGeneration(peer: Exclude<CodexNativePeer, { kind: 'proxy' 
     const failure = typeof stderr === 'string' && /^rele-native-proof:([a-z-]{1,64}):[^:\r\n]{1,96}:([A-Za-z]{1,64}):([A-Za-z0-9-]{1,64})$/mu.exec(stderr);
     if (failure) {
       try { options.onProofFailure?.({ stage:failure[1], category:failure[2], failureType:failure[3] }); } catch {}
+      return;
     }
-    throw error;
+    return fail('powershell', 'unclassified-error', 'execution-error');
   }
-  const proof = JSON.parse(result.stdout);
-  if (result.code !== 0 || proof?.peerVerified !== true || proof.pid !== serverId || proof.gatewayId !== process.pid
-    || typeof proof.birth !== 'string' || !WINDOWS_TIME.test(proof.birth) || !Number.isFinite(Date.parse(proof.birth))
-    || typeof proof.owner !== 'string' || !/^S-1-\d+(?:-\d+)+$/u.test(proof.owner) || !SHA.test(proof.sha256)
-    || !windowsPath(proof.executable) || !windowsPath(proof.codexHome) || !sameWindowsPath(proof.codexHome, home)
-    || typeof proof.boot !== 'string' || !WINDOWS_TIME.test(proof.boot) || !Number.isFinite(Date.parse(proof.boot))) return;
+  if (result.code !== 0) return fail('powershell', 'nonzero-exit', 'execution-error');
+  let proof: any;
+  try { proof = JSON.parse(result.stdout); }
+  catch { return fail('proof-output', 'invalid-json', 'parse-error'); }
+  if (proof?.peerVerified !== true || proof.pid !== serverId || proof.gatewayId !== process.pid)
+    return fail('proof-contract', 'peer-identity', 'contract-mismatch');
+  if (typeof proof.birth !== 'string' || !WINDOWS_TIME.test(proof.birth) || !Number.isFinite(Date.parse(proof.birth))
+    || typeof proof.boot !== 'string' || !WINDOWS_TIME.test(proof.boot) || !Number.isFinite(Date.parse(proof.boot)))
+    return fail('proof-contract', 'process-lifecycle', 'contract-mismatch');
+  if (typeof proof.owner !== 'string' || !/^S-1-\d+(?:-\d+)+$/u.test(proof.owner))
+    return fail('proof-contract', 'process-owner', 'contract-mismatch');
+  if (!SHA.test(proof.sha256)) return fail('proof-contract', 'executable-hash', 'contract-mismatch');
+  if (!windowsPath(proof.executable)) return fail('proof-contract', 'executable-path', 'contract-mismatch');
+  if (!windowsPath(proof.codexHome) || !sameWindowsPath(proof.codexHome, home))
+    return fail('proof-contract', 'codex-home', 'contract-mismatch');
   if (peer.kind === 'stdio') {
     if (proof.parentPid !== (peer.helperExecutable ? peer.pid : process.pid) || proof.gatewayOwner !== proof.owner
-      || (proof.executableContentMatchesExpected !== true && !sameWindowsPath(proof.executable, peer.executable!))) return;
+      || (proof.executableContentMatchesExpected !== true && !sameWindowsPath(proof.executable, peer.executable!)))
+      return fail('peer-binding', 'stdio-peer', 'contract-mismatch');
     if (peer.helperExecutable && (proof.helperPid !== peer.pid || proof.helperParentPid !== process.pid || proof.helperOwner !== proof.owner
       || !windowsPath(proof.helperExecutable) || (proof.helperExecutableContentMatchesExpected !== true && !sameWindowsPath(proof.helperExecutable, peer.helperExecutable))
-      || typeof proof.helperBirth !== 'string' || !WINDOWS_TIME.test(proof.helperBirth) || !Number.isFinite(Date.parse(proof.helperBirth)) || !SHA.test(proof.helperSha256))) return;
-  } else if (proof.birth !== receipt.processStartTime || proof.localPort !== peer.localPort || proof.remotePort !== peer.remotePort
-    || proof.owner !== receipt.ownerSid || proof.sha256 !== receipt.executableSha256
-    || (proof.executableContentMatchesExpected !== true && !sameWindowsPath(proof.executable, receipt.executable))) return;
+      || typeof proof.helperBirth !== 'string' || !WINDOWS_TIME.test(proof.helperBirth) || !Number.isFinite(Date.parse(proof.helperBirth)) || !SHA.test(proof.helperSha256)))
+      return fail('peer-binding', 'stdio-helper', 'contract-mismatch');
+  } else {
+    if (proof.birth !== receipt.processStartTime || proof.localPort !== peer.localPort || proof.remotePort !== peer.remotePort)
+      return fail('peer-binding', 'shared-generation', 'contract-mismatch');
+    if (proof.owner !== receipt.ownerSid) return fail('peer-binding', 'shared-owner', 'contract-mismatch');
+    if (proof.sha256 !== receipt.executableSha256 || (proof.executableContentMatchesExpected !== true && !sameWindowsPath(proof.executable, receipt.executable)))
+      return fail('peer-binding', 'shared-executable', 'contract-mismatch');
+  }
   return createHash('sha256').update(JSON.stringify({ platform: 'win32', pid: proof.pid, birth: proof.birth, boot: proof.boot, executable: path.win32.normalize(proof.executable).toLowerCase(), sha256: proof.sha256, owner: proof.owner, codexHome: path.win32.normalize(proof.codexHome).toLowerCase() })).digest('hex');
 }
 
