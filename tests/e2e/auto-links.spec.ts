@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test';
 import type { CatalogChat, CatalogPage, Person } from '../../src/shared/types';
 import { fixtureEndpoint, fixtureState, installApi, openPanel } from './fixtures';
 
-test('automatic conversation creation is explicit, named, editable, and leaves existing bindings intact', async ({ page }) => {
+test('automatic conversation creation is explicit, named, editable, and leaves existing bindings intact', async ({ page }, testInfo) => {
   const state = fixtureState();
   const api = await installApi(page, state);
   const originals = structuredClone(state.conversations);
@@ -37,12 +37,12 @@ test('automatic conversation creation is explicit, named, editable, and leaves e
   expect(state.conversations).toEqual(originals);
   expect(consoleErrors).toEqual([]);
   await page.getByRole('heading', { name: 'Новые разговоры из мессенджера' }).scrollIntoViewIfNeeded();
-  await page.screenshot({ path: '/tmp/rele-auto-links-desktop.png', fullPage: false });
+  await page.screenshot({ path: testInfo.outputPath('rele-auto-links-desktop.png'), fullPage: false });
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(page.getByRole('button', { name: 'Добавить правило', exact: true })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.getByRole('heading', { name: 'Новые разговоры из мессенджера' }).scrollIntoViewIfNeeded();
-  await page.screenshot({ path: '/tmp/rele-auto-links-mobile.png', fullPage: false });
+  await page.screenshot({ path: testInfo.outputPath('rele-auto-links-mobile.png'), fullPage: false });
 });
 
 
