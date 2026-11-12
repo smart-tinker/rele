@@ -243,10 +243,69 @@ describe('Slack message shortcut controls', () => {
     expect(JSON.stringify(modal)).not.toContain('selected address, never a prompt');
   });
 
+  it('preserves the current effort when the model changes again', async () => {
+    const modelView = { ...view, action: 'model' as const, models: [
+      { model: 'model-one', displayName: 'Model one', efforts: ['high'], defaultEffort: 'high' },
+      { model: 'model-two', displayName: 'Model two', efforts: ['low', 'xhigh'], defaultEffort: 'low' },
+      { model: 'model-three', displayName: 'Model three', efforts: ['medium', 'xhigh'], defaultEffort: 'medium' },
+    ] };
+    const f = await makeChannel({ control: async () => modelView, api });
+    f.socket.receive(shortcut('open'));
+    await vi.waitFor(() => expect(f.calls.some(call => call.url.endsWith('/views.open'))).toBe(true));
+    const opened = JSON.parse(String(f.calls.find(call => call.url.endsWith('/views.open'))!.init!.body)).view;
+    const metadata = opened.private_metadata;
+    const interaction = (id: string, hash: string, model: string, action: Record<string, unknown>, effort: string) => ({ envelope_id: id, type: 'interactive', payload: {
+      type: 'block_actions', team: { id: 'TEXAMPLE' }, user: { id: 'UANNA' }, channel: { id: 'CEXAMPLE' }, message: { ts: '1000.1000' },
+      view: { id: 'VMODAL', callback_id: 'rele_source_control', hash, private_metadata: metadata, state: { values: {
+        model: { model: { selected_option: { text: { type: 'plain_text', text: model }, value: model } } },
+        effort: { effort: { selected_option: { text: { type: 'plain_text', text: effort }, value: effort } } },
+      } } }, actions: [action],
+    } });
+    f.socket.receive(interaction('model-two', 'hash-one', 'model-two', { action_id: 'model', selected_option: { value: 'model-two' } }, 'high'));
+    await vi.waitFor(() => expect(f.calls.filter(call => call.url.endsWith('/views.update'))).toHaveLength(1));
+    // Selecting effort does not dispatch a Slack block action. It is included in the next model action's current view state.
+    f.socket.receive(interaction('model-three', 'hash-two', 'model-three', { action_id: 'model', selected_option: { value: 'model-three' } }, 'xhigh'));
+    await vi.waitFor(() => expect(f.calls.filter(call => call.url.endsWith('/views.update'))).toHaveLength(2));
+
+    const updated = JSON.parse(String(f.calls.filter(call => call.url.endsWith('/views.update'))[1]!.init!.body)).view;
+    expect(updated.blocks.find((block: { block_id?: string }) => block.block_id === 'model')?.element?.initial_option?.value).toBe('model-three');
+    expect(updated.blocks.find((block: { block_id?: string }) => block.block_id === 'effort')?.element?.initial_option?.value).toBe('xhigh');
+  });
+
+  it('does not replace a newer control modal after Slack rejects a stale view hash', async () => {
+    let currentHash = 'newer-hash', currentView: unknown = { newerSelection: true };
+    const f = await makeChannel({ control: async () => view, api: (method, body) => {
+      if (method === 'views.open') return Response.json({ ok: true, view: { id: 'VMODAL' } });
+      if (method === 'views.update') {
+        if (body.hash && body.hash !== currentHash) return Response.json({ ok: false, error: 'hash_conflict' });
+        currentView = body.view; currentHash = 'next-hash'; return Response.json({ ok: true, view: { id: 'VMODAL' } });
+      }
+      return api(method);
+    } });
+    f.socket.receive(shortcut('open'));
+    await vi.waitFor(() => expect(f.calls.some(call => call.url.endsWith('/views.open'))).toBe(true));
+    const modal = JSON.parse(String(f.calls.find(call => call.url.endsWith('/views.open'))!.init!.body)).view;
+    f.socket.receive({ envelope_id: 'stale-action', type: 'interactive', payload: { type: 'block_actions', team: { id: 'TEXAMPLE' }, user: { id: 'UANNA' },
+      channel: { id: 'CEXAMPLE' }, message: { ts: '1000.1000' }, view: { id: 'VMODAL', callback_id: 'rele_source_control', hash: 'stale-hash',
+        private_metadata: modal.private_metadata, state: { values: {} } }, actions: [{ action_id: 'action', selected_option: { value: 'status' } }] } });
+    await vi.waitFor(() => expect(f.calls.filter(call => call.url.endsWith('/views.update'))).toHaveLength(2));
+
+    expect(currentView).toEqual({ newerSelection: true });
+  });
+
+  it('does not expose raw diagnostics in a control error modal', async () => {
+    const f = await makeChannel({ control: async () => { throw new Error('failed at /home/dadgo/.config/codex/token.json'); }, api });
+    f.socket.receive(shortcut('raw-error'));
+    await vi.waitFor(() => expect(f.calls.some(call => call.url.endsWith('/views.open'))).toBe(true));
+    const modal = JSON.parse(String(f.calls.find(call => call.url.endsWith('/views.open'))!.init!.body)).view;
+    expect(JSON.stringify(modal)).not.toContain('/home/dadgo');
+    expect(JSON.stringify(modal)).toContain('Не удалось открыть управление Rele.');
+  });
+
   it('keeps a submitted modal visible after ACK, and displays a late native failure without a second prompt', async () => {
     let metadata = '';
     const f = await makeChannel({ control: async (_context, command) => {
-      if (command.kind === 'submit') { await new Promise(resolve => setTimeout(resolve, 10)); throw new Error('Synthetic native failure'); }
+      if (command.kind === 'submit') { await new Promise(resolve => setTimeout(resolve, 10)); throw new Error('Synthetic native failure at /home/dadgo/.config/codex/token.json'); }
       return view;
     }, api });
     f.socket.receive(shortcut('open'));
@@ -256,7 +315,9 @@ describe('Slack message shortcut controls', () => {
       id: 'VMODAL', callback_id: 'rele_source_control', private_metadata: metadata, state: { values: { operation: { action: { selected_option: { value: 'status' } } } } } }, } });
     await vi.waitFor(() => expect(f.calls.some(call => call.url.endsWith('/views.update'))).toBe(true));
     expect(JSON.parse(f.socket.sent.find(value => JSON.parse(value).envelope_id === 'submit')!).payload.response_action).toBe('update');
-    expect(String(f.calls.find(call => call.url.endsWith('/views.update'))!.init!.body)).toContain('Synthetic native failure');
+    const update = String(f.calls.find(call => call.url.endsWith('/views.update'))!.init!.body);
+    expect(update).toContain('Операция не подтверждена. Проверьте Статус');
+    expect(update).not.toContain('/home/dadgo');
     expect(f.message).not.toHaveBeenCalled();
   });
 

@@ -21,6 +21,7 @@ const CONVERSATION_TYPES = [
   ['public_channel', 'channels:read'], ['private_channel', 'groups:read'], ['im', 'im:read'], ['mpim', 'mpim:read'],
 ] as const;
 const PAYLOAD_NOISE = new Set(['token', 'access_token', 'refresh_token', 'authorization', 'response_url', 'bot_profile', 'user_profile', 'event_ts', 'client_msg_id', 'team', 'channel', 'reply_count', 'reply_users', 'reply_users_count', 'latest_reply', 'last_read', 'subscribed', 'reactions']);
+const controlErrorMessage = (error: unknown, fallback: string) => error instanceof ChannelError || error instanceof Error && error.message === 'Управление Rele недоступно.' ? error.message : fallback;
 
 export function slackImageAttachments(files: unknown): SlackImageAttachment[] {
   const images: SlackImageAttachment[] = [];
@@ -700,12 +701,13 @@ export class SlackChannel implements Channel {
       const selected = action?.action_id === 'action' ? action.selected_option?.value : 'model';
       const view = await this.callbacks.control(context, saved ? { kind: 'preview', id: saved.id, action: selected } : { kind: 'open' });
       this.requireAccount(context.accountId);
-      const selectedModel = action?.action_id === 'model' ? action.selected_option?.value : undefined;
-      if (saved) await this.api('views.update', { view_id: payload.view.id, hash: payload.view.hash, view: controlModal(view, context, selectedModel) });
+      const selectedModel = action?.action_id === 'model' ? action.selected_option?.value : payload.view?.state?.values?.model?.model?.selected_option?.value;
+      const selectedEffort = payload.view?.state?.values?.effort?.effort?.selected_option?.value;
+      if (saved) await this.api('views.update', { view_id: payload.view.id, hash: payload.view.hash, view: controlModal(view, context, selectedModel, selectedEffort) });
       else await this.api('views.open', { trigger_id: payload.trigger_id, view: controlModal(view, context) });
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Не удалось открыть управление Rele.';
-      if (payload.view?.id) await this.api('views.update', { view_id: payload.view.id, view: controlMessage(message) }).catch(() => {});
+      const message = controlErrorMessage(error, 'Не удалось открыть управление Rele. Проверьте подключение и актуальность связи; затем откройте меню сообщения снова.');
+      if (payload.view?.id) await this.api('views.update', { view_id: payload.view.id, hash: payload.view.hash, view: controlMessage(message) }).catch(() => {});
       else if (payload.trigger_id && payload.team?.id === this.teamId) {
         try { await this.api('views.open', { trigger_id: payload.trigger_id, view: controlMessage(message) }); }
         catch { await this.questionFeedback(payload, context ? { ...context, platform: 'slack', approvalId: '' } : undefined); }
@@ -723,7 +725,7 @@ export class SlackChannel implements Channel {
       await this.api('views.update', { view_id: payload.view.id, view: controlModal(view, context) });
     } catch (error) {
       if (payload.team?.id !== this.teamId) return;
-      await this.api('views.update', { view_id: payload.view.id, view: controlMessage(error instanceof Error ? error.message : 'Операция не подтверждена. Проверьте Статус.') }).catch(() => {});
+      await this.api('views.update', { view_id: payload.view.id, view: controlMessage(controlErrorMessage(error, 'Операция не подтверждена. Проверьте Статус и откройте меню сообщения снова.')) }).catch(() => {});
     }
   }
 

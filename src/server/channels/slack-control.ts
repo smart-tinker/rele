@@ -31,7 +31,7 @@ export function controlInput(values: Record<string, any>): ControlInput {
   }
   return { action };
 }
-export function controlModal(view: ControlView, context: ControlContext, selectedModel?: string): Record<string, unknown> {
+export function controlModal(view: ControlView, context: ControlContext, selectedModel?: string, selectedEffort?: string): Record<string, unknown> {
   const snapshot = view.snapshot;
   const blocks: Record<string, unknown>[] = [section(`${view.sourceTitle}\nCodex: ${view.conversationTitle}\nID: ${view.nativeThreadId}\nДоступ источника: ${view.accessMode ?? 'неизвестен'}.`)];
   if (view.message) blocks.push(section(view.message));
@@ -40,16 +40,18 @@ export function controlModal(view: ControlView, context: ControlContext, selecte
   blocks.push({ type: 'input', block_id: 'operation', dispatch_action: true, label: plain('Действие'), element: { type: 'static_select', action_id: 'action',
     options: actions.map(([label, value]) => option(label, value)), initial_option: option(selected[0], selected[1]) } });
   blocks.push(section(!view.connected || !snapshot ? 'Codex отключён. Текущее состояние неизвестно; сохранённые данные не считаются свежими.'
-    : `Подключение Codex: доступно; разговор: ${snapshot.runtimeStatus}.\n${snapshot.runtimeStatus === 'notLoaded' ? 'Сохранённая' : 'Настроенная'} модель: ${snapshot.model ?? 'унаследована или неизвестна'}; глубина: ${snapshot.effort ?? 'по умолчанию или неизвестна'}.\nФактическая модель и глубина текущего хода не подтверждены.\nЗапросы этого Slack-треда: в очереди ${view.ownQueued}, активны ${view.ownRunning}.\nЦель: ${snapshot.goal?.status ?? (snapshot.goalSupported ? 'не задана' : 'поддержка не подтверждена')}.\nДоставка этапов по квитанциям Rele: ${view.goalDeliveryState ?? 'не отслеживается этим источником'}.`));
+    : `Подключение Codex: доступно; разговор: ${snapshot.runtimeStatus}.\n${snapshot.runtimeStatus === 'notLoaded' ? 'Сохранённая' : 'Настроенная'} модель: ${snapshot.model ?? 'неизвестна'}; глубина: ${snapshot.effort ?? 'неизвестна'}.\nФактическая модель и глубина текущего хода не подтверждены.\nЗапросы этого Slack-треда: в очереди ${view.ownQueued}, активны ${view.ownRunning}.\nЦель: ${snapshot.goal?.status ?? (snapshot.goalSupported ? 'не задана' : 'поддержка не подтверждена')}.\nДоставка этапов по квитанциям Rele: ${view.goalDeliveryState ?? 'не отслеживается этим источником'}.`));
   let submit: string | undefined = 'Обновить';
   if (view.action === 'model') {
     blocks.push(section(`Изменится общий Codex-чат для последующих запросов всех связанных источников (${view.boundSources}). Текущий ход сохранит свои настройки. Каталог не подтверждает доступ провайдера; платный проверочный запрос не запускается.`));
     const models = view.models?.slice(0, 100) ?? [], model = models.find(row => row.model === (selectedModel ?? snapshot?.model));
     if (models.length) blocks.push({ type: 'input', block_id: 'model', dispatch_action: true, label: plain('Модель'), element: { type: 'static_select', action_id: 'model', placeholder: plain('Выберите модель'),
       options: models.map(row => option(row.displayName, row.model)), ...(model ? { initial_option: option(model.displayName, model.model) } : {}) } });
-    if (model) blocks.push({ type: 'input', block_id: 'effort', label: plain('Глубина рассуждения'), element: { type: 'static_select', action_id: 'effort',
-      options: model.efforts.map(effort => option(effort, effort)), initial_option: option(model.efforts.includes(snapshot?.effort ?? '') ? snapshot!.effort! : model.defaultEffort,
-        model.efforts.includes(snapshot?.effort ?? '') ? snapshot!.effort! : model.defaultEffort) } });
+    if (model) {
+      const effort = model.efforts.includes(selectedEffort ?? '') ? selectedEffort! : model.efforts.includes(snapshot?.effort ?? '') ? snapshot!.effort! : model.defaultEffort;
+      blocks.push({ type: 'input', block_id: 'effort', label: plain('Глубина рассуждения'), element: { type: 'static_select', action_id: 'effort',
+        options: model.efforts.map(effort => option(effort, effort)), initial_option: option(effort, effort) } });
+    }
     if (!view.connected || !models.length || !model) submit = undefined; else submit = 'Сохранить';
   } else if (view.action === 'goal') {
     if (snapshot?.goal && snapshot.goal.status !== 'complete') {
