@@ -80,8 +80,8 @@ artifacts. Ручной `release: true` разрешён только из `main
 бюджет аккаунта остаётся обязательной защитой от платы. Накопленное ранее usage
 не обнуляется удалением файлов. Старый backup/Actions retention не меняется этим PR.
 
-Hosted runs исполняют Windows Desktop fixture, standard-user canary и ограничены
-timeout 60 минут. Каждый конкретный результат относится только к своему SHA; run
+Hosted runs исполняют Windows Desktop fixture и standard-user canary; ограничения
+времени для каждой ОС задаются в `timeout-minutes` workflow. Каждый результат относится только к своему SHA; run
 в статусе `in_progress`, `skipped` или с failure не доказывает успешный gate.
 CI не заменяет acceptance установленного пакета, а release dispatch не является
 разрешением на stable или раскатку.
