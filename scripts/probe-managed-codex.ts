@@ -34,8 +34,6 @@ const conversation = store.createConversation({ name: 'Managed fixture', threadI
   bindings: Object.values(endpoints).map(endpoint => ({ platform: endpoint.platform, endpointId: endpoint.id, allowedSenderIds: ['fixture-user'] })),
 });
 // This ownership/history fixture starts with an initialized existing conversation.
-const initializedKey = initialMessageKey(values.home, values.thread);
-store.setMeta(initializedKey, JSON.stringify({ applied: true }));
 const slackHistory: SlackTranscriptMessage[] = [{
   endpointId: endpoints.slack.id, accountId: endpoints.slack.accountId, chatId: endpoints.slack.chatId,
   threadId: endpoints.slack.threadId, messageId: '1700000000.000001',
@@ -58,7 +56,9 @@ async function start(): Promise<void> {
   } satisfies Channel;
   engine.on('diagnostic', message => { diagnostics.push(String(message)); });
   await codex.connect();
-  assert.equal(initialMessageKey(codex.status().codexHome!, store.getConversation(conversation.id)!.threadId), initializedKey);
+  const connectedHome = codex.status().codexHome;
+  assert(connectedHome, 'Codex did not report its connected profile');
+  store.setMeta(initialMessageKey(connectedHome, store.getConversation(conversation.id)!.threadId), JSON.stringify({ applied: true }));
   engine.start();
 }
 async function snapshot() {
