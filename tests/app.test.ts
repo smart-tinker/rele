@@ -1844,6 +1844,39 @@ describe('read-only message trace', () => {
     expect(response.json().nextAction).toMatch(/не повтор/u);
   });
 
+  it.each(['sent', 'uncertain'] as const)('keeps running guidance when only an overload notice is %s', async status => {
+    const f = traceFixture();
+    f.store.updateRequest(f.request.id, { status: 'running', turnId: 'overloaded-turn' });
+    f.store.addDeliveries(f.request.id, [{ key: 'retry:overloaded-turn', ordinal: 0, kind: 'answer', body: 'Retry notice' }]);
+    const notice = f.store.listDeliveries()[0];
+    f.store.updateDelivery(notice.id, { status, remoteMessageId: status === 'sent' ? 'notice-receipt' : undefined });
+    const response = await f.app.inject({ url: f.url, headers }); expect(response.statusCode).toBe(200);
+    const trace = response.json();
+    expect(trace.latest).toMatchObject({ stage: 'execution', status: 'running' });
+    expect(trace.steps.find((step: { stage: string }) => step.stage === 'delivery').status).toBe('no-data');
+    expect(trace.nextAction).toContain('Дождитесь завершения');
+    expect(trace.deliveries).toEqual([expect.objectContaining({ id: notice.id, status })]);
+  });
+
+  it.each(['sent', 'uncertain'] as const)('keeps final delivery independent of a %s overload notice', async status => {
+    const f = traceFixture();
+    f.store.addDeliveries(f.request.id, [{ key: 'retry:overloaded-turn', ordinal: 0, kind: 'answer', body: 'Retry notice' }]);
+    const notice = f.store.listDeliveries()[0];
+    f.store.updateDelivery(notice.id, { status, remoteMessageId: status === 'sent' ? 'notice-receipt' : undefined });
+    f.store.finishRequest(f.request.id, { status: 'completed', turnId: 'retried-turn' }, [
+      { key: 'answer:0', ordinal: 0, kind: 'answer', body: 'Final answer' },
+    ]);
+    const answer = f.store.listDeliveries().find(item => item.key === 'answer:0')!;
+    f.store.updateDelivery(answer.id, { status: 'sent', remoteMessageId: 'answer-receipt' });
+    const response = await f.app.inject({ url: f.url, headers }); expect(response.statusCode).toBe(200);
+    const trace = response.json();
+    expect(trace.latest).toMatchObject({ stage: 'delivery', status: 'sent' });
+    expect(trace.deliveries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: notice.id, status }),
+      expect.objectContaining({ id: answer.id, status: 'sent', receipt: true }),
+    ]));
+  });
+
   it('distinguishes a suppressed final from missing delivery evidence', async () => {
     const f = traceFixture();
     f.store.finishRequest(f.request.id, { status: 'completed', turnId: 'turn-1' }, [], true);
