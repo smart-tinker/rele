@@ -27,6 +27,7 @@ Git-теги и исторические заметки не являются п
 - [Установка и проверка пакета](docs/INSTALLATION.md)
 - [Исторические заметки RC](docs/RELEASE-HISTORY.md)
 - [Разработка и проверки](docs/DEVELOPMENT.md)
+- [Регламент draft → RC → stable](docs/RELEASING.md)
 
 ## Установка
 

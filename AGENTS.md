@@ -3,6 +3,7 @@
 Перед изменением прочитайте [DEVELOPMENT](docs/DEVELOPMENT.md), а для проверок —
 [CI](docs/CI.md). Архитектура: [ARCHITECTURE](docs/ARCHITECTURE.md);
 приёмка готового пакета: [ACCEPTANCE](docs/ACCEPTANCE.md).
+Публикация draft/RC/stable: [RELEASING](docs/RELEASING.md).
 Это точка входа, не замена этим документам.
 
 ## Небольшой проверяемый шаг

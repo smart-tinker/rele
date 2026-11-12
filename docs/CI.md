@@ -3,6 +3,8 @@
 Конфигурация реализована в `.github/workflows/ci.yml`. Репозиторий `rele` публичный;
 GitHub Actions запускает автоматические проверки для PR и `main`. Public guard
 оставляет jobs выключенными, если visibility репозитория изменится на private.
+Релизные переходы, разрешение публикации и отдельные RC/stable gates —
+[RELEASING](RELEASING.md); ниже описана реализованная автоматизация.
 
 ```mermaid
 flowchart TD

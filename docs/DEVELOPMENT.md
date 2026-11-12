@@ -9,6 +9,8 @@ runs не загружают artifacts. Только ручной release dispat
 quota guard, временно передаёт пакеты publisher-у (retention transfer artifacts —
 до одного дня) и создаёт draft RC.
 GitHub Actions не заменяет приёмку готового пакета.
+Переходы draft → RC → stable, разрешение публикации и сверка байтов определены
+в [каноническом регламенте выпуска](RELEASING.md).
 
 Текущая сборка и автоматические проверки выполняются на hosted runners. Приёмка
 остаётся отдельным этапом: **Windows acceptance host — Windows**, **Linux
@@ -46,8 +48,8 @@ build/package scripts. На Windows и Linux acceptance hosts передаютс
    требуют соответствующей перепроверки; узкий probe не заменяет итоговые gates.
 4. Провести PR через review и `main`. Отдельный ручной release dispatch после
    quota guard передаёт проверенные байты publisher-у и создаёт draft RC без
-   пересборки. Опубликованные assets/tag RC неизменяемы: последующие исправления
-   выпускаются следующим RC, а не заменяют прежний пакет.
+   пересборки. Дальнейшие переходы и неизменяемость опубликованных файлов —
+   по [RELEASING](RELEASING.md).
 5. После публикации RC в этапе приёмки на Windows и Linux acceptance hosts
    проверить SHA256 полученных installers/portable, установить готовое приложение
    и выполнить приёмку его работы, обновления и восстановления. Windows
