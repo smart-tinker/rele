@@ -1,8 +1,8 @@
 # CI Rele
 
-Целевая конфигурация реализована в `.github/workflows/ci.yml`. Пока репозиторий
-приватный, Actions выключены и каждый job имеет дополнительный public guard.
-Ни dispatch, ни rerun до public не выполняются.
+Конфигурация реализована в `.github/workflows/ci.yml`. Репозиторий `rele` публичный;
+GitHub Actions запускает автоматические проверки для PR и `main`. Public guard
+оставляет jobs выключенными, если visibility репозитория изменится на private.
 
 ```mermaid
 flowchart TD
@@ -18,14 +18,17 @@ flowchart TD
 
 | Режим | Runner-ы | Что выполняется |
 |---|---|---|
-| Draft PR | 2 одновременно, затем CI gate | npm ci, типы, контракт CI, unit, build, Chromium E2E, production UI/API smoke |
-| Ready PR, main, ручная проверка | те же 2, затем CI gate | Всё выше + сборка пакетов, установка/удаление, protocol и managed для всех поддерживаемых версий Codex, CPU voice |
+| Draft PR | 2 одновременно, затем CI gate на Ubuntu | npm ci, типы, контракт CI, unit, build, Chromium E2E, production UI/API smoke |
+| Ready PR, `main`, ручной dispatch с `release: false` | те же 2, затем CI gate на Ubuntu | Всё выше + сборка пакетов, установка/удаление, protocol и managed для всех поддерживаемых версий Codex, CPU voice |
 | Windows, полный режим | Windows job | Заблокированные файлы при cleanup, Desktop backend, owner/pipe, installer/native shared под обычным пользователем |
 | Linux, полный режим | Ubuntu job | Debian/systemd lifecycle, native shared/recovery, voice с запрещёнными network syscalls |
 | Ручной release из main | 2, затем CI gate и publisher на Ubuntu | Проверки → временные пакеты → сверка SHA/commit/run → draft release без пересборки |
 
-`CI gate` — единый required check для branch protection. Он запускается после
-matrix и завершается ошибкой, если хотя бы одна ОС не прошла. Gate выполняется
+`CI gate` — единый check workflow после matrix; он завершается ошибкой, если
+хотя бы одна ОС не прошла. Сейчас активный ruleset защищает `main` от удаления и
+force-push, требует разрешения review threads и успешный `CI gate` от GitHub
+Actions на актуальной ветке. Остальные security checks и provenance отслеживаются
+в issue #8. Gate выполняется
 последовательно, поэтому одновременно работают максимум два runner-а.
 
 Версии Codex берутся из `SUPPORTED_CODEX_VERSIONS`, отдельного списка в YAML нет.
@@ -39,19 +42,19 @@ GUI/DPAPI в сессии владельца: эти проверки остаю
 1. Описать наблюдаемый дефект и критерий приёмки в issue.
 2. Открыть draft PR с регрессионным тестом, получить RED на обеих ОС. В PR указать
    ссылки на run и assertion: ошибка установки или импорта не считается RED.
-3. Добавить исправление, получить GREEN того же теста и остальных проверок.
-4. Перевести PR в ready: это запускает полный набор на тех же двух ОС.
-5. После public настроить единственный required check `CI gate`. Draft `Fast (...)`
-   не заменяет этот gate.
+3. Добавить исправление, получить GREEN того же теста и остальных быстрых проверок.
+4. После GREEN перевести PR в ready: полный набор запускается на обеих ОС.
+   Draft `Fast (...)` не заменяет полный набор.
 
-RED и GREEN — отдельные push/run, поэтому не нужен отдельный постоянный runner или
-небезопасный автоматический перенос тестов в старую рабочую копию. До public
-этот цикл выполняется локально; ссылок на hosted RED/GREEN пока нет.
+RED и GREEN — отдельные push/run на двух матричных runner-ах; постоянно работающий
+runner не нужен. Для диагностики можно запускать тот же тест локально, но hosted
+результаты привязаны к точному SHA PR.
 
 ## Выпуск и бесплатные лимиты
 
-Обычные PR/main не загружают artifacts. Ручной `release: true` разрешён только
-из main. Перед выпуском версия package.json должна быть новым `X.Y.Z-rc.N`:
+Обычные PR/main и ручной dispatch с `release: false` не загружают workflow
+artifacts. Ручной `release: true` разрешён только из `main`; он запускает полный
+набор проверок и publisher. Перед выпуском версия package.json должна быть новым `X.Y.Z-rc.N`:
 существующий tag/release никогда не перезаписывается. Publisher перепроверяет,
 что main не изменился, и принимает ровно два комплекта текущего run/attempt.
 
@@ -76,6 +79,8 @@ RED и GREEN — отдельные push/run, поэтому не нужен о�
 бюджет аккаунта остаётся обязательной защитой от платы. Накопленное ранее usage
 не обнуляется удалением файлов. Старый backup/Actions retention не меняется этим PR.
 
-Первые hosted прогоны после public должны подтвердить доступность Windows Desktop
-fixture, права standard-user canary и достаточность timeout 60 минут. До этого
-конфигурация проверена локально, но работа на GitHub runner-ах не доказана.
+Hosted runs исполняют Windows Desktop fixture, standard-user canary и ограничены
+timeout 60 минут. Каждый конкретный результат относится только к своему SHA; run
+в статусе `in_progress`, `skipped` или с failure не доказывает успешный gate.
+CI не заменяет acceptance установленного пакета, а release dispatch не является
+разрешением на stable или раскатку.
