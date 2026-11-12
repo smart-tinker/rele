@@ -1785,7 +1785,9 @@ describe('read-only message trace', () => {
     ['starting', { queuedSubmissionId: 'queue-1' }, 'native', 'accepted'],
     ['running', { turnId: 'turn-1' }, 'execution', 'running'],
     ['uncertain', {}, 'native', 'uncertain'],
-    ['failed', { error: 'Queue refused (untyped old error)' }, 'execution', 'failed'],
+    ['failed', { error: 'Queue refused (untyped old error)' }, 'request', 'failed'],
+    ['completed', {}, 'request', 'completed'],
+    ['cancelled', {}, 'request', 'cancelled'],
   ] as const)('reports %s only at its evidenced stage', async (status, patch, stage, expected) => {
     const f = traceFixture(); f.store.updateRequest(f.request.id, { status, ...patch });
     const response = await f.app.inject({ url: f.url, headers }); expect(response.statusCode).toBe(200);
@@ -1795,6 +1797,7 @@ describe('read-only message trace', () => {
     expect(trace.steps.find((s: { stage: string }) => s.stage === 'delivery').status).toBe('no-data');
     expect(trace.nextAction).not.toMatch(/Повторить|повторите отправку/u);
     if (status === 'failed') expect(trace.latest.status).not.toBe('rejected');
+    if (stage === 'request') expect(trace.steps.find((s: { stage: string }) => s.stage === 'execution').status).toBe('no-data');
   });
 
   it('recognizes a typed explicit enqueue rejection without inferring it from arbitrary error text', async () => {
