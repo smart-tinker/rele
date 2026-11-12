@@ -1811,6 +1811,7 @@ export class Engine extends EventEmitter {
   private async retryOverload(request: ReleRequest, found: RequestLocation): Promise<boolean> {
     if (found.state !== 'failed' || found.failureReason !== 'serverOverloaded' || !found.turnId || found.mixed || this.isMixed(request.id)) return false;
     if (this.store.getMeta(`cancel-requested:${request.id}`)) { this.track(this.cancel(request.id)); return true; }
+    if (this.retryingOverloads.has(request.id)) return true;
     if (found.retryBlocked) return false;
     const key = `overload-retry:${request.id}`, raw = this.store.getMeta(key);
     let retry = raw ? JSON.parse(raw) as OverloadRetry : undefined;
