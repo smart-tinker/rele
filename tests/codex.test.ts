@@ -1429,10 +1429,34 @@ describe('Codex managed runtime', () => {
     let proofFailure = 'preflight';
     if (process.platform === 'win32' && !first.serverGeneration) {
       const peer = Reflect.get(f.client, 'nativePeer') as CodexNativePeer | undefined;
+      const stdioPeer = peer?.kind === 'stdio' ? peer : undefined;
+      const expectedPeerPid = stdioPeer?.pid;
+      const expectedExecutable = stdioPeer?.executable;
+      const helperExecutable = stdioPeer?.helperExecutable;
       const run = async (command: string, args: string[]) => {
         try {
           const result = await execute(command, args, { timeout:30_000, maxBuffer:128*1024, windowsHide:true });
-          proofFailure = 'proof-validation';
+          let proof: Record<string, unknown>;
+          try { proof = JSON.parse(result.stdout) as Record<string, unknown>; }
+          catch { proofFailure = result.stdout.trim() ? 'proof-output-invalid-json' : 'proof-output-empty'; return { ...result, code:0 }; }
+          const validTime = (value: unknown) => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$/u.test(value) && Number.isFinite(Date.parse(value));
+          const validPath = (value: unknown) => typeof value === 'string' && /^[A-Za-z]:\\/u.test(value) && path.win32.isAbsolute(value);
+          const samePath = (left: unknown, right: string | undefined) => typeof left === 'string' && right !== undefined && path.win32.normalize(left).toLowerCase() === path.win32.normalize(right).toLowerCase();
+          const checks: [string, boolean][] = [
+            ['peer', proof.peerVerified === true], ['pid', proof.pid === first.serverId], ['gateway', proof.gatewayId === process.pid],
+            ['birth', validTime(proof.birth)], ['boot', validTime(proof.boot)], ['owner', typeof proof.owner === 'string' && /^S-1-\d+(?:-\d+)+$/u.test(proof.owner)],
+            ['sha', typeof proof.sha256 === 'string' && /^[a-f0-9]{64}$/u.test(proof.sha256)], ['executable-path', validPath(proof.executable)],
+            ['home', validPath(proof.codexHome) && samePath(proof.codexHome, home)], ['parent', proof.parentPid === (helperExecutable ? expectedPeerPid : process.pid)],
+            ['gateway-owner', proof.gatewayOwner === proof.owner], ['image', proof.executableContentMatchesExpected === true || samePath(proof.executable, expectedExecutable)],
+            ['helper-pid', helperExecutable === undefined || proof.helperPid === expectedPeerPid],
+            ['helper-parent', helperExecutable === undefined || proof.helperParentPid === process.pid],
+            ['helper-owner', helperExecutable === undefined || proof.helperOwner === proof.owner],
+            ['helper-path', helperExecutable === undefined || validPath(proof.helperExecutable)],
+            ['helper-image', helperExecutable === undefined || proof.helperExecutableContentMatchesExpected === true || samePath(proof.helperExecutable, helperExecutable)],
+            ['helper-birth', helperExecutable === undefined || validTime(proof.helperBirth)],
+            ['helper-sha', helperExecutable === undefined || typeof proof.helperSha256 === 'string' && /^[a-f0-9]{64}$/u.test(proof.helperSha256)],
+          ];
+          proofFailure = `proof-validation:${checks.filter(([, ok]) => !ok).map(([name]) => name).join(',') || 'unclassified'}`;
           return { ...result, code:0 };
         } catch (error) {
           const stderr = String((error as { stderr?:string }).stderr ?? '');
