@@ -1223,6 +1223,7 @@ export class Engine extends EventEmitter {
         this.store.setMeta(`async-answer-submitting:${request.id}`, this.targetFingerprint());
         this.asyncAnswerDelivery(request.id, 'sending');
       }
+      if (this.store.getMeta(`enqueue-rejected:${request.id}`)) this.store.setMeta(`enqueue-rejected:${request.id}`, '');
       attempted = true;
       const input = answerApproval ? request.text : requestInput(request);
       const result = await (images ? client.enqueue(conversation.threadId, input, request.id, images) : client.enqueue(conversation.threadId, input, request.id));
@@ -1243,7 +1244,11 @@ export class Engine extends EventEmitter {
           this.asyncAnswerDelivery(request.id, 'uncertain');
         } else if (this.stopped) {
           this.store.updateRequest(request.id, { status: 'queued' }); this.asyncAnswerDelivery(request.id, 'queued');
-        } else { this.fail(request.id, this.options.redact(error)); this.asyncAnswerDelivery(request.id, undefined); }
+        } else {
+          this.fail(request.id, this.options.redact(error));
+          if (attempted && error instanceof CodexRpcError) this.store.setMeta(`enqueue-rejected:${request.id}`, this.store.getRequest(request.id)!.updatedAt);
+          this.asyncAnswerDelivery(request.id, undefined);
+        }
       } else if (!request) {
         if (waiting && this.store.getRequest(waiting.id)?.status === 'queued') this.store.updateRequest(waiting.id, { error: this.options.redact(error) });
         this.retryThreadAfter.set(conversationId, Date.now() + 5_000);

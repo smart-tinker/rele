@@ -580,6 +580,44 @@ afterEach(async () => {
   vi.useRealTimers();
 });
 
+describe('Engine trace enqueue rejection evidence', () => {
+  it.each(['rejected', 'uncertain', 'before-enqueue'] as const)('records only typed enqueue rejection: %s', async outcome => {
+    const f = fixture();
+    if (outcome === 'rejected') f.codex.enqueue.mockRejectedValueOnce(new CodexRpcError(-32602, 'Queue refused'));
+    else if (outcome === 'uncertain') f.codex.enqueue.mockRejectedValueOnce(new CodexTransportError('ACK lost'));
+    else f.codex.backgroundTerminals.mockRejectedValueOnce(new CodexRpcError(-32602, 'Failure before enqueue'));
+    const request = await acceptRequest(f);
+    const receipt = f.store.getMeta(`enqueue-rejected:${request.id}`);
+    if (outcome === 'rejected') { expect(receipt).toEqual(expect.stringMatching(/^\d{4}-/u)); expect(f.store.getRequest(request.id)?.status).toBe('failed'); }
+    else { expect(receipt).toBeUndefined(); expect(f.store.getRequest(request.id)?.status).toBe(outcome === 'uncertain' ? 'uncertain' : 'queued'); }
+  });
+});
+
+describe('Engine trace rejection attempt lifecycle', () => {
+  it.each(['success', 'generic-failure'] as const)('does not carry a stopped enqueue rejection into a restarted %s attempt', async outcome => {
+    const f = fixture();
+    const wire = deferred<{ queuedSubmissionId: string }>();
+    f.codex.enqueue.mockImplementationOnce(() => wire.promise);
+    await f.engine.receive(f.message('slack', 'stop-rejection'));
+    await vi.waitFor(() => expect(f.codex.enqueue).toHaveBeenCalledOnce());
+    const request = f.store.listRequests()[0];
+    const stopped = f.engine.stop();
+    wire.reject(new CodexRpcError(-32602, 'Rejected while stopping'));
+    await stopped;
+    expect(f.store.getRequest(request.id)?.status).toBe('queued');
+    expect(f.store.getMeta(`enqueue-rejected:${request.id}`)).toBeFalsy();
+    // A previous version may already have left a rejection receipt on the same queued ID.
+    f.store.setMeta(`enqueue-rejected:${request.id}`, '2000-01-01T01:30:00.000Z');
+    const restarted = fixture({ path: f.path, start: false });
+    if (outcome === 'generic-failure') restarted.codex.enqueue.mockRejectedValueOnce(new CodexTransportError('New attempt ACK lost'));
+    restarted.engine.start(); await restarted.engine.settled(); await restarted.engine.pump(); await restarted.engine.settled();
+    if (outcome === 'success') await running(restarted, request, 'new-attempt-turn');
+    expect(restarted.store.getRequest(request.id)).toMatchObject({ status: outcome === 'success' ? 'running' : 'uncertain', origin: request.origin });
+    expect(restarted.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, requestInput(request), request.id);
+    expect(restarted.store.getMeta(`enqueue-rejected:${request.id}`)).toBeFalsy();
+  });
+});
+
 describe('Engine Codex maintenance', () => {
   it('changes a version policy with unsent queue intact, but preserves native and cleanup receipts', async () => {
     const f = fixture({ start: false });

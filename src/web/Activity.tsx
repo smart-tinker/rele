@@ -2,6 +2,7 @@ import { useState, type FormEvent } from 'react';
 import type { Approval, DashboardState, ReleRequest } from '../shared/types';
 import { ReleApi } from './client';
 import { useAction } from './hooks';
+import { TraceLink } from './MessageTrace';
 import {
   ActionMessages,
   Button,
@@ -166,6 +167,7 @@ export function Queue({
                     <td data-label="Запрос / связка">
                       <div className="cell-copy">
                         <strong>{conversationName(state, request)}</strong>
+                        <TraceLink kind="requests" id={request.id} api={api} />
                         <details className="message-details">
                           <summary>
                             {request.text ||
@@ -548,6 +550,7 @@ export function Deliveries({
                               ? 'Сообщение об ошибке'
                               : `Ответ · часть ${delivery.ordinal + 1}`}
                         </small>
+                        <TraceLink kind="deliveries" id={delivery.id} api={api} />
                         <details className="message-details">
                           <summary>{delivery.body}</summary>
                           <p>{delivery.body}</p>
