@@ -24,7 +24,7 @@ jobs:
     if: github.event.repository.private == false && (!inputs.release || github.ref == 'refs/heads/main')
     name: ${{ github.event.pull_request.draft && 'Fast' || 'Verify' }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.os == 'windows-2025' && 130 || 60 }}
+    timeout-minutes: ${{ matrix.os == 'windows-2025' && 160 || 60 }}
     permissions:
       contents: read
       actions: read
