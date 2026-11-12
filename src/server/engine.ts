@@ -1238,6 +1238,7 @@ export class Engine extends EventEmitter {
         if (current) this.asyncAnswerDelivery(current.id, 'queued');
         this.retryThreadAfter.set(conversationId, Date.now() + 5_000);
       } else if (request && !terminal(this.store.getRequest(request.id)!.status)) {
+        if (attempted && error instanceof CodexRpcError) this.store.setMeta(`enqueue-rejected:${request.id}`, new Date().toISOString());
         if (attempted && !(error instanceof CodexRpcError)) {
           this.store.updateRequest(request.id, { status: 'uncertain', error: this.options.redact(error) });
           this.asyncAnswerDelivery(request.id, 'uncertain');
