@@ -775,7 +775,7 @@ export class Engine extends EventEmitter {
         if (client !== this.codex || epoch !== this.epoch || !current || terminal(current.status)
           || current.turnId && current.turnId !== turnId || found.turnId !== turnId
           || !['completed', 'failed', 'interrupted'].includes(found.state)) return;
-        this.finishFromHistory(current, found);
+        if (!await this.retryOverload(current, found)) this.finishFromHistory(current, found);
         this.changed(); this.track(this.deliver());
       } catch (error) { this.emit('diagnostic', this.options.redact(error)); }
       finally { this.completionHistoryReads.delete(readKey); }
