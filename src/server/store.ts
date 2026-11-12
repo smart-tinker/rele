@@ -1100,6 +1100,12 @@ export class Store {
     return input?.requestId === request.id && input.state !== 'refused' ? { ...request, steeredInto: input.parentRequestId,
       turnId: input.turnId, status: input.state === 'applied' ? 'completed' : 'uncertain', error: input.error } : request;
   }
+  requestReceivedAt(id: string): string | undefined {
+    return optional(this.db.prepare('SELECT created_at FROM inbound_events WHERE request_id=?').get(id)?.created_at ?? null);
+  }
+  listRequestDeliveries(id: string): Delivery[] {
+    return this.db.prepare('SELECT * FROM deliveries WHERE request_id=? ORDER BY ordinal,rowid').all(id).map(toDelivery);
+  }
   listRequests(limit = 100): ReleRequest[] { return this.db.prepare('SELECT * FROM requests ORDER BY rowid DESC LIMIT ?').all(limitValue(limit)).map(row => this.requestFromRow(row)); }
   listPendingRequests(): ReleRequest[] { return this.db.prepare("SELECT * FROM requests WHERE status='queued' ORDER BY rowid").all().map(row => this.requestFromRow(row)).filter(request => !request.steeredInto); }
   activeRequests(): ReleRequest[] {

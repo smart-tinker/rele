@@ -8,7 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CodexConnectionTarget, CodexDiscoveryResult } from '../src/shared/types.js';
-import { ensureSharedCodex, ensureWindowsSharedCodex, isSharedCodexWebSocket, completeCodexPackage, prepareDesktopCodexPackage, resolveSharedCodexExecutable, type SharedCodexOptions } from '../src/server/codex-shared.js';
+import { ensureSharedCodex, ensureWindowsSharedCodex, isSharedCodexWebSocket, completeCodexPackage, prepareDesktopCodexPackage, readPreparedDesktopCodexPackage, resolveSharedCodexExecutable, type SharedCodexOptions } from '../src/server/codex-shared.js';
 import { runCodexProbe } from '../src/server/codex-discovery.js';
 
 const directories: string[] = [];
@@ -97,6 +97,29 @@ async function windowsFixture() {
 }
 
 describe('Windows direct shared Codex', () => {
+  it('prints bounded Desktop discovery codes on a CI bootstrap failure without publishing paths or messages', async () => {
+    const f = await windowsFixture(), privateMarker = 'private-codex-ci-diagnostic';
+    Object.assign(f.env, { RELE_CI_SHARED_DIAGNOSTICS: '1' });
+    const executable = path.join(f.home, privateMarker, 'codex.exe');
+    f.discover.mockResolvedValue({
+      installations: [{ executable, name: 'Desktop', source: 'desktop-install', version: '0.166.0-alpha.6', running: false }],
+      issues: [{ code: 'cli-probe-failed', message: privateMarker, executable }],
+    });
+    const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).rejects.toMatchObject({ code: 'shared-cli-unavailable' });
+      expect(diagnostic).toHaveBeenCalledTimes(1);
+      const line = String(diagnostic.mock.calls[0][0]);
+      expect(line).toMatch(/^RELE_CI_WINDOWS_DESKTOP_DISCOVERY=/u);
+      expect(JSON.parse(line.slice(line.indexOf('=') + 1))).toEqual({
+        installations: [{ source: 'desktop-install', version: '0.166.0-alpha.6', running: false }],
+        issues: ['cli-probe-failed'],
+        candidates: [{ source: 'desktop-install', version: '0.166.0-alpha.6', result: 'candidate-resolution-failed' }],
+      });
+      expect(line).not.toContain(privateMarker);
+    } finally { diagnostic.mockRestore(); }
+  });
+
   it('cold-starts a complete Rele-owned Desktop snapshot that survives source removal', async () => {
     const f = await windowsFixture(), source = f.executable, original = f.run.getMockImplementation()!;
     f.run.mockImplementation(async (command, args, ...rest) => {
@@ -454,6 +477,17 @@ describe('local Desktop native package preparation', () => {
     expect(await readdir(path.dirname(root))).toEqual([path.basename(root)]);
     expect(f.run.mock.calls.every(([, args]) => args.join(' ') === '--version')).toBe(true);
     expect(await readdir(f.home)).not.toContain('packages');
+  });
+
+  it('reads a prepared package when RELE_DATA_DIR reaches the same directory through a junction', async () => {
+    const f = await fixture(), desktop = await desktopFixture(path.join(f.home, 'desktop'));
+    const prepared = (await prepareDesktopCodexPackage(desktop, f.options))!;
+    const alias = path.join(f.home, 'rele-data-alias');
+    await symlink(f.env.RELE_DATA_DIR, alias, process.platform === 'win32' ? 'junction' : 'dir');
+
+    await expect(readPreparedDesktopCodexPackage(prepared, {
+      ...f.options, env: { ...f.env, RELE_DATA_DIR: alias },
+    }, true)).resolves.toMatchObject({ version: '0.163.0' });
   });
 
   it.each(['helper', 'asar', 'gui'])('does not stage a partial or unrecognized Desktop missing %s', async missing => {

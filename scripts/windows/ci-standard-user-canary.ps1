@@ -1,9 +1,9 @@
-param([ValidateSet('Parent', 'Child')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce, [switch]$RunGates, [ValidateSet('Shared', 'Installer')][string]$Phase = 'Installer', [string]$DesktopBundle, [string]$DesktopInventory, [Alias('Standalone')][switch]$StandaloneShared, [string]$PowerShell7Path, [string]$AcceptanceComputerName)
+param([ValidateSet('Parent', 'Child')][string]$Mode = 'Parent', [string]$FixtureRoot, [string]$Nonce, [switch]$RunGates, [ValidateSet('Shared', 'Installer')][string]$Phase = 'Installer', [string]$DesktopBundle, [string]$DesktopInventory, [string]$DesktopPackage, [Alias('Standalone')][switch]$StandaloneShared, [string]$PowerShell7Path, [string]$AcceptanceComputerName)
 $ErrorActionPreference = 'Stop'
 if ($StandaloneShared -and ($Mode -ne 'Parent' -or -not $RunGates)) { throw 'Standalone mode requires Parent -RunGates.' }
 if ($StandaloneShared -and $Phase -eq 'Installer' -and ([string]::IsNullOrWhiteSpace($AcceptanceComputerName) -or [Environment]::MachineName -ine $AcceptanceComputerName)) { throw 'Standalone installer acceptance requires an explicit matching -AcceptanceComputerName.' }
 if ($Phase -eq 'Shared' -and -not $RunGates) { throw 'Shared-only mode requires -RunGates.' }
-if (($DesktopBundle -or $DesktopInventory) -and ($Mode -ne 'Parent' -or -not $RunGates -or -not $DesktopBundle -or -not $DesktopInventory)) { throw 'Actual Desktop inputs require Parent -RunGates and both payload and inventory paths.' }
+if (($DesktopBundle -or $DesktopInventory -or $DesktopPackage) -and ($Mode -ne 'Parent' -or -not $RunGates -or -not $DesktopBundle -or -not $DesktopInventory -or -not $DesktopPackage)) { throw 'Actual Desktop inputs require Parent -RunGates and payload, inventory, and signed MSIX paths.' }
 $sourceRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $shell = if ($PowerShell7Path) { $PowerShell7Path } else { Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'PowerShell\7\pwsh.exe' }
 if (-not [IO.Path]::IsPathFullyQualified($shell) -or [IO.Path]::GetFileName($shell) -ine 'pwsh.exe' -or -not (Test-Path -LiteralPath $shell -PathType Leaf) -or [Diagnostics.FileVersionInfo]::GetVersionInfo($shell).FileMajorPart -ne 7) { throw 'A fully qualified PowerShell 7 executable is required for this canary.' }
@@ -91,6 +91,7 @@ if ($Mode -eq 'Child') {
     $env:SystemRoot = $windows; $env:WINDIR = $windows; $env:ComSpec = Join-Path $system 'cmd.exe'; $env:PATH = $system
     $env:USERPROFILE = $profile; $env:LOCALAPPDATA = Join-Path $profile 'AppData\Local'; $env:APPDATA = Join-Path $profile 'AppData\Roaming'
     $env:TEMP = Join-Path $FixtureRoot 'tmp'; $env:TMP = $env:TEMP
+    if ([bool]$marker.sharedDiagnostics) { $env:RELE_CI_SHARED_DIAGNOSTICS = '1' }
     New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
     $evidence = @{ nonce = $Nonce; sid = $sid; phase = $Phase; result = 'failed'; selfElevated = $null; taskElevated = $null; stage = 'token'; selfSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId }
     $task = $null; $running = $null
@@ -116,13 +117,36 @@ if ($Mode -eq 'Child') {
         }
         function Invoke-SharedGates {
             if ($marker.desktopBundle) {
+                $evidence.stage = 'desktop-appx-registration'
+                $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+                $env:RELE_CI_DESKTOP_APPX_NAME = [string]$marker.desktopIdentityName
+                $env:RELE_CI_DESKTOP_APPX_VERSION = [string]$marker.desktopIdentityVersion
+                $registrationScript = @'
+$ErrorActionPreference = 'Stop'
+$name = $env:RELE_CI_DESKTOP_APPX_NAME
+if ($name -notin @('OpenAI.Codex', 'OpenAI.ChatGPT')) { throw 'Unexpected Desktop package identity.' }
+$packages = @(Get-AppxPackage -Name $name)
+if ($packages.Count -ne 1 -or $packages[0].Version.ToString() -ne $env:RELE_CI_DESKTOP_APPX_VERSION -or -not $packages[0].InstallLocation) { throw 'The signed Desktop package was not registered for this user.' }
+[Console]::Out.WriteLine('RELE_DESKTOP_APPX_REGISTERED=' + $packages[0].Name + ':' + $packages[0].Version)
+'@
+                try {
+                    $registration = @(& $windowsPowerShell -NoProfile -NonInteractive -Command $registrationScript 2>&1)
+                    $registrationExit = $LASTEXITCODE
+                    if ($registrationExit -ne 0 -or -not ($registration -match ('^RELE_DESKTOP_APPX_REGISTERED=' + [regex]::Escape($marker.desktopIdentityName) + ':' + [regex]::Escape($marker.desktopIdentityVersion) + '$'))) {
+                        $registration | ForEach-Object { Write-Output $_ }
+                        throw 'The verified Desktop MSIX could not be registered for the standard user.'
+                    }
+                    $evidence.gates += 'desktop-appx-registration'
+                } finally {
+                    Remove-Item Env:\RELE_CI_DESKTOP_APPX_NAME, Env:\RELE_CI_DESKTOP_APPX_VERSION -ErrorAction SilentlyContinue
+                }
                 $evidence.stage = 'shared-actual-desktop'
                 & $marker.python (Join-Path $sourceRoot 'scripts\shared-protocol-probe.py') --desktop-bundle $marker.desktopBundle --desktop-inventory $marker.desktopInventory --expected-version $marker.desktopVersion --windows-app-template $applicationTemplate --windows-runtime packaged --report (Join-Path $env:RELE_TEST_REPORT_DIR 'shared-results-actual-desktop.json')
                 if ($LASTEXITCODE -ne 0) { throw 'The standard-user actual Desktop bootstrap gate failed.' }
                 $evidence.gates += 'shared-actual-desktop'
                 $evidence.actualDesktopGui = $false
             }
-            $versions = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6')
+            $versions = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1')
             for ($index = 0; $index -lt $versions.Count; $index++) {
                 $version = $versions[$index]; $evidence.stage = 'shared-' + $version
                 & $marker.python (Join-Path $sourceRoot 'scripts\shared-protocol-probe.py') --codex-prefix $marker.prefixes[$index] --expected-version $version --windows-app-template $applicationTemplate --windows-runtime packaged --report (Join-Path $env:RELE_TEST_REPORT_DIR ('shared-results-' + $version + '.json'))
@@ -257,26 +281,30 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant fixture source read access.' }
     & icacls.exe $FixtureRoot /grant ('*' + $sid + ':(OI)(CI)(M)') /T /C | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Cannot grant fixture write access.' }
-    $marker = @{ nonce = $Nonce; sid = $sid; phase = 'Installer'; runGates = $RunGates.IsPresent; desktopBundle = $null; desktopInventory = $null }
+    $marker = @{ nonce = $Nonce; sid = $sid; phase = 'Installer'; runGates = $RunGates.IsPresent; sharedDiagnostics = [bool]($RunGates.IsPresent -and $DesktopBundle -and $env:RELE_CI_SHARED_DIAGNOSTICS -eq '1'); desktopBundle = $null; desktopInventory = $null; desktopPackage = $null }
     if ($RunGates) {
         $marker.node = (Get-Command node.exe -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
         $marker.python = (Get-Command python.exe -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
         foreach ($executable in @($marker.node, $marker.python)) {
             if ($executable -isnot [string] -or -not [IO.Path]::IsPathFullyQualified($executable) -or [IO.Path]::GetExtension($executable) -ne '.exe' -or -not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw 'An isolated gate runtime must resolve to one fully qualified executable.' }
         }
-        $marker.prefixes = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6') | ForEach-Object { Join-Path $env:RUNNER_TEMP ('codex-probe-' + $_) }
+        $marker.prefixes = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1') | ForEach-Object { Join-Path $env:RUNNER_TEMP ('codex-probe-' + $_) }
         $desktopReadPaths = @()
         if ($DesktopBundle) {
             $marker.desktopBundle = [IO.Path]::GetFullPath($DesktopBundle)
             $marker.desktopInventory = [IO.Path]::GetFullPath($DesktopInventory)
+            $marker.desktopPackage = [IO.Path]::GetFullPath($DesktopPackage)
             $runnerRoot = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
-            foreach ($path in @($marker.desktopBundle, $marker.desktopInventory)) {
+            foreach ($path in @($marker.desktopBundle, $marker.desktopInventory, $marker.desktopPackage)) {
                 if (-not $path.StartsWith($runnerRoot, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $path)) { throw 'Desktop gate inputs must be existing paths under this disposable RUNNER_TEMP.' }
             }
             $inventory = Get-Content -LiteralPath $marker.desktopInventory -Raw | ConvertFrom-Json
-            if ($inventory.result -ne 'passed' -or $inventory.nativeGatePrepared -ne $true -or $inventory.package.signature.status -ne 'Valid' -or $inventory.backendVersion -notin @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6')) { throw 'The actual Desktop inventory is not a successful signed and versioned preparation.' }
+            if ($inventory.result -ne 'passed' -or $inventory.nativeGatePrepared -ne $true -or $inventory.package.signature.status -ne 'Valid' -or $inventory.backendVersion -isnot [string] -or $inventory.backendVersion -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?$') { throw 'The actual Desktop inventory is not a successful signed and versioned preparation.' }
+            if ([IO.Path]::GetFileName($marker.desktopPackage) -ine 'ChatGPT-x64.msix' -or [IO.Path]::GetExtension($marker.desktopPackage) -ine '.msix' -or $inventory.package.identity.name -notin @('OpenAI.Codex', 'OpenAI.ChatGPT') -or $inventory.package.identity.version -notmatch '^\d+(?:\.\d+){3}$' -or $inventory.package.sha256 -notmatch '^[a-f0-9]{64}$' -or (Get-FileHash -LiteralPath $marker.desktopPackage -Algorithm SHA256).Hash.ToLowerInvariant() -ne $inventory.package.sha256) { throw 'The Desktop MSIX does not match the verified signed package inventory.' }
             $marker.desktopVersion = $inventory.backendVersion
-            $desktopReadPaths = @($marker.desktopBundle, (Split-Path $marker.desktopInventory))
+            $marker.desktopIdentityName = $inventory.package.identity.name
+            $marker.desktopIdentityVersion = $inventory.package.identity.version
+            $desktopReadPaths = @($marker.desktopBundle, (Split-Path $marker.desktopInventory), (Split-Path $marker.desktopPackage))
         }
         $portableShellPaths = if ($StandaloneShared) { @((Split-Path $shell)) } else { @() }
         foreach ($path in (@((Split-Path $marker.node), (Split-Path $marker.python)) + $marker.prefixes + $desktopReadPaths + $portableShellPaths)) {
@@ -289,7 +317,7 @@ try {
     $credential = New-Object System.Management.Automation.PSCredential ($env:COMPUTERNAME + '\' + $account), $password
     $resultPath = Join-Path $FixtureRoot 'windows-standard-user-results.json'
     # Eight versions plus Desktop need 13.5 minutes of 90-second marker observation; desktop-first skips cancellation.
-    if ($RunGates) { $gatesDeadline = [DateTime]::UtcNow.AddMinutes($(if ($Phase -eq 'Shared') { 60 } else { 80 })) }
+    if ($RunGates) { $gatesDeadline = [DateTime]::UtcNow.AddMinutes($(if ($Phase -eq 'Shared') { 60 } else { 130 })) }
     if ($RunGates) {
         $parentStage = 'shared'
         $marker.phase = 'Shared'; $marker | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8
@@ -406,11 +434,31 @@ try {
                 $result | Add-Member -NotePropertyName event332Template -NotePropertyValue $template.Substring(0, [Math]::Min(1024, $template.Length))
             } catch { $result | Add-Member -NotePropertyName event332TemplateErrorHResult -NotePropertyValue ('0x{0:X8}' -f $_.Exception.HResult) }
         }
+        $timeoutReportPath = Join-Path $FixtureRoot 'reports\shared-results-actual-desktop.json'
+        if ($RunGates -and $Phase -eq 'Installer' -and $child.ExitCode -ne 0 -and (Test-Path -LiteralPath $timeoutReportPath -PathType Leaf)) {
+            try {
+                $timeoutReport = Get-Content -LiteralPath $timeoutReportPath -Raw | ConvertFrom-Json
+                if ($null -ne $timeoutReport.heldRequestTimeout) {
+                    $result | Add-Member -Force -NotePropertyName heldRequestTimeout -NotePropertyValue $timeoutReport.heldRequestTimeout
+                }
+                if ($null -ne $timeoutReport.afterShellCancelWaitFailure) {
+                    $result | Add-Member -Force -NotePropertyName afterShellCancelWaitFailure -NotePropertyValue $timeoutReport.afterShellCancelWaitFailure
+                }
+                if ($null -ne $timeoutReport.cancellationRequestTimeout) {
+                    $result | Add-Member -Force -NotePropertyName cancellationRequestTimeout -NotePropertyValue $timeoutReport.cancellationRequestTimeout
+                }
+            } catch {
+                $result | Add-Member -Force -NotePropertyName timeoutEvidenceReadHResult -NotePropertyValue ('0x{0:X8}' -f $_.Exception.HResult)
+            }
+        }
         $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $resultPath -Encoding UTF8
         Get-Content -LiteralPath $resultPath -Raw | Write-Output
         Copy-Item -LiteralPath $resultPath -Destination (Join-Path $sourceRoot 'windows-standard-user-results.json')
     } else { throw 'The standard-user installer phase did not produce a receipt.' }
-    if ($result.result -ne 'passed') { foreach ($log in @('stdout.log', 'stderr.log')) { Get-Content -LiteralPath (Join-Path $FixtureRoot $log) -Tail 30 | Write-Output }; throw 'The standard-user canary or native gate failed; see the bounded fixture reports.' }
+    if ($result.result -ne 'passed') {
+        foreach ($log in @('stdout.log', 'stderr.log')) { Get-Content -LiteralPath (Join-Path $FixtureRoot $log) -Tail 30 | Write-Output }
+        throw 'The standard-user canary or native gate failed; see the bounded fixture reports.'
+    }
 } catch {
     $publishedResult = Join-Path $sourceRoot 'windows-standard-user-results.json'
     if (-not (Test-Path -LiteralPath $publishedResult)) {
@@ -500,7 +548,7 @@ try {
     # A timeout can end Python before its retainedFixture JSON is written. The
     # matching successful child receipt is the only destructive-cleanup permit.
     if ($installerChildStarted -and -not $installerCleanupConfirmed) { $retainedSharedFixtures += $FixtureRoot }
-    foreach ($name in @('shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json', 'shared-results-0.163.0-alpha.11.2.json', 'shared-results-0.164.0-alpha.11.1.json', 'shared-results-0.165.0-alpha.1.2.json', 'shared-results-0.166.0-alpha.5.1.json', 'shared-results-0.166.0-alpha.6.json', 'shared-results-actual-desktop.json')) {
+    foreach ($name in @('shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json', 'shared-results-0.163.0-alpha.11.2.json', 'shared-results-0.164.0-alpha.11.1.json', 'shared-results-0.165.0-alpha.1.2.json', 'shared-results-0.166.0-alpha.5.1.json', 'shared-results-0.166.0-alpha.6.json', 'shared-results-0.167.0-alpha.3.2.json', 'shared-results-0.167.0-alpha.4.1.json', 'shared-results-actual-desktop.json')) {
         $reportPath = Join-Path $FixtureRoot ('reports\' + $name)
         if (Test-Path -LiteralPath $reportPath -PathType Leaf) {
             try {
@@ -539,7 +587,7 @@ try {
         { if ($user -and $retainedSharedFixtures.Count -eq 0) { Remove-FixtureProfile $user.SID.Value $profileCleanupFacts } },
         { if ($user -and $retainedSharedFixtures.Count -eq 0) { Remove-LocalUser -SID $user.SID } },
         { if ($RunGates) {
-            foreach ($name in @('installer-results.json', 'installer-failure-results.json', 'installer-native-cleanup-results.json', 'shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json', 'shared-results-0.163.0-alpha.11.2.json', 'shared-results-0.164.0-alpha.11.1.json', 'shared-results-0.165.0-alpha.1.2.json', 'shared-results-0.166.0-alpha.5.1.json', 'shared-results-0.166.0-alpha.6.json', 'shared-results-actual-desktop.json')) { $report = Join-Path $FixtureRoot ('reports\' + $name); if (Test-Path -LiteralPath $report) { Copy-Item -LiteralPath $report -Destination (Join-Path $sourceRoot $name) } }
+            foreach ($name in @('installer-results.json', 'installer-failure-results.json', 'installer-native-cleanup-results.json', 'shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json', 'shared-results-0.163.0-alpha.11.2.json', 'shared-results-0.164.0-alpha.11.1.json', 'shared-results-0.165.0-alpha.1.2.json', 'shared-results-0.166.0-alpha.5.1.json', 'shared-results-0.166.0-alpha.6.json', 'shared-results-0.167.0-alpha.3.2.json', 'shared-results-0.167.0-alpha.4.1.json', 'shared-results-actual-desktop.json')) { $report = Join-Path $FixtureRoot ('reports\' + $name); if (Test-Path -LiteralPath $report) { Copy-Item -LiteralPath $report -Destination (Join-Path $sourceRoot $name) } }
             $stdout = Join-Path $FixtureRoot 'stdout.log'
             if (Test-Path -LiteralPath $stdout) {
                 $allowed = @('Windows installer smoke: an unknown startup script is preserved', 'Windows installer smoke: a previous portable process is not killed', 'Windows installer smoke: foreign Desktop settings are preserved without blocking installation', 'Windows installer smoke: the Codex wrapper preserves argv, profile, data and raw bytes', 'Windows installer smoke: launcher restart', 'Windows installer smoke: same-version upgrade with backup', 'Windows installer smoke: owned Desktop settings restore and later foreign changes survive uninstall', 'Windows installer smoke: uninstall preserves data', 'Windows installer cleanup: desktop-environment', 'Windows installer cleanup: held-adapter', 'Windows installer cleanup: native-daemon', 'Windows installer cleanup: files', 'Windows installer cleanup: complete')
@@ -573,6 +621,56 @@ try {
         if ($installerProgress.Count -ne 0) { $result | Add-Member -NotePropertyName installerProgress -NotePropertyValue ($installerProgress.ToArray()) }
         if ($cleanupFailures.Count -ne 0) { $result.result = 'failed'; $result | Add-Member -NotePropertyName cleanupErrors -NotePropertyValue $cleanupFailures }
         $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $publishedResult -Encoding UTF8
+        if ($RunGates -and $result.result -ne 'passed') {
+            $sharedDiagnosticName = 'shared-results-actual-desktop.json'
+            if ([string]$result.stage -match '^shared-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)$') { $sharedDiagnosticName = 'shared-results-' + $Matches[1] + '.json' }
+            $sharedDiagnosticPath = Join-Path $sourceRoot $sharedDiagnosticName
+            $summary = [ordered]@{ stage = if ($parentStage -in @('shared', 'rdp-session', 'installer')) { $parentStage } else { 'unknown' }; reportAvailable = $false }
+            if (Test-Path -LiteralPath $sharedDiagnosticPath -PathType Leaf) {
+                try {
+                    $sharedDiagnostic = Get-Content -LiteralPath $sharedDiagnosticPath -Raw | ConvertFrom-Json
+                    $summary.reportAvailable = $true
+                    $summary.result = if ($sharedDiagnostic.result -in @('passed', 'failed')) { $sharedDiagnostic.result } else { 'unknown' }
+                    $summary.codexVersion = if ([string]$sharedDiagnostic.codexVersion -match '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$') { [string]$sharedDiagnostic.codexVersion } else { 'unknown' }
+                    $checks = @($sharedDiagnostic.checks.PSObject.Properties)
+                    $summary.checksPassed = @($checks | Where-Object { $_.Value -eq $true }).Count
+                    $summary.checksFailed = @($checks | Where-Object { $_.Value -eq $false }).Count
+                    $evidence = $sharedDiagnostic.heldRequestTimeout
+                    if (-not $evidence) { $evidence = $sharedDiagnostic.afterShellCancelWaitFailure }
+                    if (-not $evidence) { $evidence = $sharedDiagnostic.cancellationRequestTimeout }
+                    if ($evidence) {
+                        $summary.providerRequestCount = if ($evidence.providerRequestCount -is [int] -or $evidence.providerRequestCount -is [long]) { [Math]::Max(0, [int]$evidence.providerRequestCount) } else { 0 }
+                        $requestStatuses = [ordered]@{}
+                        foreach ($status in @('queued', 'transcribing', 'starting', 'running', 'waiting_approval', 'completed', 'failed', 'interrupted', 'cancelled', 'uncertain')) {
+                            $requestStatuses[$status] = @($evidence.engineRequests | Where-Object { $_.status -eq $status }).Count
+                        }
+                        $summary.engineRequestStatuses = $requestStatuses
+                        $approvalStatuses = [ordered]@{}
+                        foreach ($status in @('pending', 'answered', 'expired')) { $approvalStatuses[$status] = @($evidence.engineApprovals | Where-Object { $_.status -eq $status }).Count }
+                        $summary.approvalStatuses = $approvalStatuses
+                        $summary.nativeTurnStatus = if ($evidence.nativeTurnStatus -in @('idle', 'active', 'systemError')) { [string]$evidence.nativeTurnStatus } else { 'unknown' }
+                        $nativeRequest = $evidence.nativeRequest
+                        $summary.nativeRequestLookup = if ($nativeRequest) { 'read' } elseif ($evidence.nativeRequestErrorType) { 'error' } elseif ($evidence.nativeRequestTimedOut -eq $true) { 'timeout' } else { 'unavailable' }
+                        if ($evidence.nativeRequestErrorType) { $summary.nativeRequestErrorType = if ($evidence.nativeRequestErrorType -in @('ConnectionResetError', 'CodexTransportError', 'CodexRpcError', 'Error', 'UnknownError')) { [string]$evidence.nativeRequestErrorType } else { 'other' } }
+                        $summary.nativeRequestState = if ($nativeRequest.state -in @('queued', 'running', 'completed', 'failed', 'interrupted', 'not_found')) { [string]$nativeRequest.state } else { 'unknown' }
+                        $summary.nativeRequestTurnAssigned = $nativeRequest.turnAssigned -eq $true
+                        $summary.nativeRequestQueuedSubmissionFound = $nativeRequest.queuedSubmissionFound -eq $true
+                        $summary.nativeRequestMixed = $nativeRequest.mixed -eq $true
+                        $summary.nativeRequestFinalAnswerPresent = $nativeRequest.finalAnswerPresent -eq $true
+                        $summary.observedTurnStarts = @($evidence.observedTurns | Where-Object { $_.method -eq 'turn/started' }).Count
+                        $summary.observedTurnCompletions = @($evidence.observedTurns | Where-Object { $_.method -eq 'turn/completed' }).Count
+                        $providerActions = [ordered]@{}
+                        foreach ($action in @('initial', 'final', 'hold', 'shell', 'approval', 'question')) { $providerActions[$action] = @($evidence.providerTrace | Where-Object { $_.action -eq $action }).Count }
+                        $summary.providerActions = $providerActions
+                        $providerResults = [ordered]@{}
+                        foreach ($status in @('pending', 'sent', 'disconnected')) { $providerResults[$status] = @($evidence.providerTrace | Where-Object { $_.result -eq $status }).Count }
+                        $summary.providerResults = $providerResults
+                    }
+                    if ($result.installerProgress) { $summary.installerProgress = @($result.installerProgress | Select-Object -Last 8) }
+                } catch { $summary.reportAvailable = $false }
+            }
+            Write-Output ('Windows canary bounded diagnostic: ' + ($summary | ConvertTo-Json -Compress -Depth 4))
+        }
     }
     if ($cleanupFailures.Count -ne 0) { throw 'The isolated Windows canary cleanup did not complete.' }
 }

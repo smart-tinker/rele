@@ -76,12 +76,14 @@ test('expired launch links offer manual sign-in and are never retried on reload'
   await expect(page.getByRole('alert')).toContainText(
     'Ссылка для входа истекла или уже использована',
   );
+  await page.getByRole('button', { name: 'Ввести токен вручную', exact: true }).click();
   await expect(page.getByLabel('Токен панели')).toBeEnabled();
   await page.reload();
   await expect(
     page.getByRole('heading', { name: 'Вход в панель', exact: true }),
   ).toBeVisible();
   expect(exchanges).toBe(1);
+  await page.getByRole('button', { name: 'Ввести токен вручную', exact: true }).click();
   await page.getByLabel('Токен панели').fill(panelToken);
   await page.getByRole('button', { name: 'Открыть Rele', exact: true }).click();
   await expect(

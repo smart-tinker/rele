@@ -1,0 +1,19 @@
+name: Dependency review
+on:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: dependency-review-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  dependency-review:
+    name: Dependency review
+    if: github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/dependency-review-action@907a6e9569212033966bc0b69d32473b046dd66b # inspected upstream commit, 2026-10-16
+        with:
+          fail-on-severity: moderate
+          comment-summary-in-pr: never

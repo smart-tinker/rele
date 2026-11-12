@@ -1740,3 +1740,143 @@ it('returns only fixed message tool validation errors and hides unexpected engin
   expect(failed.statusCode).toBe(500);
   expect(failed.body).not.toContain('synthetic-private-engine-detail');
 });
+
+
+describe('read-only message trace', () => {
+  function traceFixture() {
+    const f = makeApp();
+    const conversation = f.store.createConversation({ name: 'Trace fixture', threadId: 'native-trace-thread', cwd: '/fixture',
+      bindings: [{ platform: f.endpoint.platform, endpointId: f.endpoint.id, allowedSenderIds: ['sender-anna'] }] });
+    const message = { eventId: 'trace-event', endpoint: f.endpoint, sender: f.endpoint.people[0], messageId: 'trace-message', text: 'private request body' };
+    const request = f.store.ingest(message).request!;
+    return { ...f, conversation, message, request, url: `/api/traces/requests/${request.id}` };
+  }
+
+  it('joins by request and immutable origin, excludes bodies, and keeps inspection read-only', async () => {
+    const f = traceFixture();
+    const other = { ...f.endpoint, id: 'other-source', platform: 'slack' as const, chatId: 'other-chat' };
+    f.store.upsertEndpoint(other);
+    f.store.addBinding(f.conversation.id, other.platform, other.id, ['sender-anna']);
+    const second = f.store.ingest({ ...f.message, endpoint: other }).request!;
+    f.store.finishRequest(f.request.id, { status: 'completed', turnId: 'own-turn' }, [{ key: 'final', ordinal: 0, kind: 'answer', body: 'private answer body' }]);
+    f.store.finishRequest(second.id, { status: 'completed', turnId: 'other-turn' }, [{ key: 'final', ordinal: 0, kind: 'answer', body: 'other private conversation' }]);
+    const own = f.store.listDeliveries().find(d => d.requestId === f.request.id)!;
+    f.store.updateDelivery(own.id, { status: 'sent', remoteMessageId: 'provider-receipt' });
+    const baseline = { requests: f.store.listRequests(), deliveries: f.store.listDeliveries() };
+    expect((await f.app.inject({ url: f.url })).statusCode).toBe(401);
+    const response = await f.app.inject({ url: f.url, headers });
+    expect(response.statusCode).toBe(200);
+    const trace = response.json();
+    expect(trace).toMatchObject({ requestId: f.request.id, eventId: 'trace-event', nativeThreadId: 'native-trace-thread',
+      source: { endpointId: f.endpoint.id, messageId: 'trace-message' }, latest: { stage: 'delivery', status: 'sent' } });
+    expect(trace.deliveries).toEqual([{ id: own.id, kind: 'answer', status: 'sent', at: f.store.getDelivery(own.id)!.updatedAt, receipt: true }]);
+    for (const secret of ['private request body', 'private answer body', 'other private conversation', telegramToken, 'synthetic-codex-secret']) expect(response.body).not.toContain(secret);
+    const fromDelivery = await f.app.inject({ url: `/api/traces/deliveries/${own.id}`, headers });
+    expect(fromDelivery.json()).toMatchObject({ requestId: f.request.id, source: trace.source, latest: trace.latest });
+    await f.app.inject({ url: f.url, headers });
+    expect({ requests: f.store.listRequests(), deliveries: f.store.listDeliveries() }).toEqual(baseline);
+    expect(f.codex.connect).not.toHaveBeenCalled(); expect(f.engine.resume).not.toHaveBeenCalled();
+    expect(f.engine.reconcile).not.toHaveBeenCalled(); expect(f.engine.cancel).not.toHaveBeenCalled(); expect(f.engine.retryDelivery).not.toHaveBeenCalled();
+    expect((await f.app.inject({ url: f.url, headers, method: 'POST', payload: {} })).statusCode).toBe(404);
+  });
+
+  it.each([
+    ['queued', {}, 'admission', 'queued'],
+    ['starting', { queuedSubmissionId: 'queue-1' }, 'native', 'accepted'],
+    ['running', { turnId: 'turn-1' }, 'execution', 'running'],
+    ['uncertain', {}, 'native', 'uncertain'],
+    ['failed', { error: 'Queue refused (untyped old error)' }, 'request', 'failed'],
+    ['completed', {}, 'request', 'completed'],
+    ['cancelled', {}, 'request', 'cancelled'],
+  ] as const)('reports %s only at its evidenced stage', async (status, patch, stage, expected) => {
+    const f = traceFixture(); f.store.updateRequest(f.request.id, { status, ...patch });
+    const response = await f.app.inject({ url: f.url, headers }); expect(response.statusCode).toBe(200);
+    const trace = response.json();
+    expect(trace.latest).toMatchObject({ stage, status: expected });
+    expect(trace.steps.find((s: { stage: string }) => s.stage === 'admission').detail).toContain('не сохраня');
+    expect(trace.steps.find((s: { stage: string }) => s.stage === 'delivery').status).toBe('no-data');
+    expect(trace.nextAction).not.toMatch(/Повторить|повторите отправку/u);
+    if (status === 'failed') expect(trace.latest.status).not.toBe('rejected');
+    if (stage === 'request') expect(trace.steps.find((s: { stage: string }) => s.stage === 'execution').status).toBe('no-data');
+  });
+
+  it('recognizes a typed explicit enqueue rejection without inferring it from arbitrary error text', async () => {
+    const f = traceFixture(); f.store.updateRequest(f.request.id, { status: 'failed', error: 'not exposed' });
+    const rejectedAt = f.store.getRequest(f.request.id)!.updatedAt;
+    f.store.setMeta(`enqueue-rejected:${f.request.id}`, rejectedAt);
+    const response = await f.app.inject({ url: f.url, headers }); expect(response.statusCode).toBe(200);
+    expect(response.json().latest).toEqual({ stage: 'native', status: 'rejected', at: rejectedAt });
+    expect(response.body).not.toContain('not exposed');
+  });
+
+  it.each(['queued', 'running', 'uncertain', 'failed'] as const)('does not let an old enqueue rejection override newer %s evidence', async status => {
+    const f = traceFixture();
+    f.store.setMeta(`enqueue-rejected:${f.request.id}`, '2000-01-01T01:30:00.000Z');
+    f.store.updateRequest(f.request.id, { status, ...(status === 'running' ? { turnId: 'new-turn' } : {}) });
+    const response = await f.app.inject({ url: f.url, headers }); expect(response.statusCode).toBe(200);
+    expect(response.json().latest.status).toBe(status);
+    expect(response.json().steps.find((step: { stage: string }) => step.stage === 'native').status).not.toBe('rejected');
+  });
+
+  it('marks only the immutable source account connected after a platform account switch', async () => {
+    const f = traceFixture();
+    f.engine.channels.telegram = { state: { configured: true, connected: true, accountId: f.request.origin.accountId } } as Channel;
+    expect((await f.app.inject({ url: f.url, headers })).json().connected.source).toBe(true);
+    f.engine.channels.telegram.state.accountId = 'another-telegram-account';
+    const changed = (await f.app.inject({ url: f.url, headers })).json();
+    expect(changed.connected.source).toBe(false);
+    expect(changed.source.accountId).toBe(f.request.origin.accountId);
+    delete f.engine.channels.telegram.state.accountId;
+    expect((await f.app.inject({ url: f.url, headers })).json().connected.source).toBe(false);
+  });
+
+  it('does not call an error notification or partial multipart answer a delivered final', async () => {
+    const f = traceFixture();
+    f.store.finishRequest(f.request.id, { status: 'completed', turnId: 'turn-1' }, [
+      { key: 'final:0', ordinal: 0, kind: 'answer', body: 'private first' },
+      { key: 'final:1', ordinal: 1, kind: 'answer', body: 'private second' },
+      { key: 'error', ordinal: 0, kind: 'error', body: 'private error' },
+    ]);
+    for (const d of f.store.listDeliveries()) f.store.updateDelivery(d.id, { status: d.key === 'final:1' ? 'uncertain' : 'sent', remoteMessageId: d.key === 'final:1' ? undefined : `remote-${d.id}` });
+    const response = await f.app.inject({ url: f.url, headers }); expect(response.statusCode).toBe(200);
+    expect(response.json().latest).toMatchObject({ stage: 'delivery', status: 'uncertain' });
+    expect(response.json().nextAction).toMatch(/исходн.*чат/u);
+    expect(response.json().nextAction).toMatch(/не повтор/u);
+  });
+
+  it('distinguishes a suppressed final from missing delivery evidence', async () => {
+    const f = traceFixture();
+    f.store.finishRequest(f.request.id, { status: 'completed', turnId: 'turn-1' }, [], true);
+    const response = await f.app.inject({ url: f.url, headers }); expect(response.statusCode).toBe(200);
+    expect(response.json().latest).toMatchObject({ stage: 'execution', status: 'suppressed' });
+    expect(response.json().steps.find((s: { stage: string }) => s.stage === 'delivery').status).toBe('suppressed');
+  });
+
+  it('keeps duplicate requests identical and labels pre-start records after restart', async () => {
+    const f = traceFixture();
+    expect(f.store.ingest(f.message).request!.id).toBe(f.request.id);
+    await f.app.close();
+    const restarted = createApp({ store: f.store, config: f.config, engine: f.engine as unknown as Engine, codex: () => f.codex, configure: f.configure, version: 'fixture-restart' });
+    opened.push({ app: restarted, store: new Store(':memory:') });
+    const response = await restarted.inject({ url: f.url, headers }); expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ requestId: f.request.id, provenance: 'saved' });
+    expect(response.json().capturedAt).toBeTruthy(); expect(response.json().startedAt).toBeTruthy();
+  });
+
+  it('keeps disconnect separate from the saved delivery receipt', async () => {
+    const f = traceFixture(); f.codex.status = () => ({ configured: true, connected: false, queueSupported: true, desktopVerified: false });
+    const response = await f.app.inject({ url: f.url, headers }); expect(response.statusCode).toBe(200);
+    expect(response.json().connected).toEqual({ codex: false, source: false });
+    expect(response.json().latest).toMatchObject({ status: 'queued' });
+    expect(response.json().warnings.join(' ')).toMatch(/отключ/u);
+  });
+
+  it('returns no-data for an independent agent delivery rather than linking a shared native thread', async () => {
+    const f = traceFixture();
+    const d = f.store.addToolMessage({ threadId: f.conversation.threadId, callId: 'independent', conversationId: f.conversation.id, origin: f.request.origin, arguments: {}, text: 'private tool body', mentions: [] });
+    const response = await f.app.inject({ url: `/api/traces/deliveries/${d.id}`, headers }); expect(response.statusCode).toBe(200);
+    expect(response.json().requestId).toBeUndefined();
+    expect(response.json().steps.find((s: { stage: string }) => s.stage === 'ingress').status).toBe('no-data');
+    expect(response.body).not.toContain('private tool body');
+  });
+});

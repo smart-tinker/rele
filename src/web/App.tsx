@@ -30,6 +30,24 @@ const navigation: Array<{ id: View; label: string; icon: IconName }> = [
   { id: 'codex', label: 'Codex', icon: 'terminal' },
 ];
 
+interface NavigationState {
+  view: View;
+  showAll: boolean;
+}
+
+function readNavigation(): NavigationState {
+  const params = new URLSearchParams(window.location.search);
+  const view = navigation.find((item) => item.id === params.get('view'))?.id ?? 'conversations';
+  return { view, showAll: view === 'queue' && params.get('queue') === 'all' };
+}
+
+function navigationUrl({ view, showAll }: NavigationState): string {
+  const params = new URLSearchParams();
+  if (view !== 'conversations') params.set('view', view);
+  if (view === 'queue' && showAll) params.set('queue', 'all');
+  return window.location.pathname + (params.size ? `?${params}` : '');
+}
+
 class ErrorBoundary extends Component<
   { children: ReactNode },
   { error: boolean }
@@ -129,9 +147,10 @@ function SignIn({
   launching: boolean;
 }) {
   const [token, setToken] = useState('');
+  const [manual, setManual] = useState(false);
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    if (token.trim()) onSignIn(token.trim());
+    if (!launching && token.trim()) onSignIn(token.trim());
   };
   return (
     <main className="auth-page">
@@ -143,34 +162,46 @@ function SignIn({
           выполните <code>rele open --print-url</code> и откройте выданную ссылку
           в браузере. Вводить токен не нужно.
         </p>
-        <form className="form-stack" onSubmit={submit}>
-          <Field label="Токен панели">
-            <input
-              type="password"
-              autoFocus
-              autoComplete="off"
-              required
-              disabled={launching}
-              value={token}
-              onChange={(event) => setToken(event.target.value)}
-              placeholder="Токен доступа"
-            />
-          </Field>
-          {error && <Notice>{error}</Notice>}
-          {launching && (
-            <p className="field-hint" role="status">
-              Проверяем одноразовую ссылку…
-            </p>
-          )}
-          <Button
-            type="submit"
-            variant="primary"
-            disabled={!token.trim()}
-            busy={launching}
-          >
-            Открыть Rele
-          </Button>
-        </form>
+        {error && <Notice>{error}</Notice>}
+        {launching && (
+          <p className="field-hint" role="status">
+            Проверяем одноразовую ссылку…
+          </p>
+        )}
+        <Button
+          variant="quiet"
+          aria-expanded={manual}
+          aria-controls="manual-sign-in"
+          disabled={launching}
+          onClick={() => setManual(!manual)}
+        >
+          Ввести токен вручную
+        </Button>
+        {manual && (
+          <form id="manual-sign-in" className="form-stack" onSubmit={submit}>
+            <p className="field-hint">Резервный способ, если у вас уже есть токен панели.</p>
+            <Field label="Токен панели">
+              <input
+                type="password"
+                autoFocus
+                autoComplete="off"
+                required
+                disabled={launching}
+                value={token}
+                onChange={(event) => setToken(event.target.value)}
+                placeholder="Токен доступа"
+              />
+            </Field>
+            <Button
+              type="submit"
+              variant="primary"
+              disabled={!token.trim()}
+              busy={launching}
+            >
+              Открыть Rele
+            </Button>
+          </form>
+        )}
         <p className="auth-note">
           После перезапуска браузера вход в этой вкладке может не сохраниться.
           Откройте Rele заново указанным выше способом или введите токен панели,
@@ -190,7 +221,27 @@ function Dashboard({
   onUnauthorized: () => void;
   onSignOut: () => void;
 }) {
-  const [view, setView] = useState<View>('conversations');
+  const [route, setRoute] = useState(readNavigation);
+  const { view } = route;
+  useEffect(() => {
+    const restore = () => {
+      const next = readNavigation();
+      const url = navigationUrl(next);
+      if (url !== window.location.pathname + window.location.search)
+        window.history.replaceState(null, '', url + window.location.hash);
+      setRoute(next);
+    };
+    restore();
+    window.addEventListener('popstate', restore);
+    return () => window.removeEventListener('popstate', restore);
+  }, []);
+  const navigate = (view: View, showAll = false) => {
+    const next = { view, showAll };
+    const url = navigationUrl(next);
+    if (url !== window.location.pathname + window.location.search)
+      window.history.pushState(null, '', url);
+    setRoute(next);
+  };
   const api = useMemo(
     () => new ReleApi(token, onUnauthorized),
     [token, onUnauthorized],
@@ -212,7 +263,7 @@ function Dashboard({
               key={item.id}
               className={`nav-item ${view === item.id ? 'active' : ''}`}
               aria-current={view === item.id ? 'page' : undefined}
-              onClick={() => setView(item.id)}
+              onClick={() => navigate(item.id)}
             >
               <Icon name={item.icon} />
               <span>{item.label}</span>
@@ -270,11 +321,17 @@ function Dashboard({
                 state={state}
                 api={api}
                 refresh={refresh}
-                onNavigate={setView}
+                onNavigate={navigate}
               />
             )}{' '}
             {view === 'queue' && (
-              <Queue state={state} api={api} refresh={refresh} />
+              <Queue
+                state={state}
+                api={api}
+                refresh={refresh}
+                showAll={route.showAll}
+                setShowAll={(showAll) => navigate('queue', showAll)}
+              />
             )}{' '}
             {view === 'deliveries' && (
               <Deliveries state={state} api={api} refresh={refresh} />
@@ -284,7 +341,7 @@ function Dashboard({
                 state={state}
                 api={api}
                 refresh={refresh}
-                onCodex={() => setView('codex')}
+                onCodex={() => navigate('codex')}
               />
             )}{' '}
             {view === 'codex' && (

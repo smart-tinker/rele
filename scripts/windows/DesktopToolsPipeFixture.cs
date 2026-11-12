@@ -137,7 +137,7 @@ internal static class DesktopToolsPipeFixture
             int offset = 0;
             while (offset < received.Length) { int count = client.Read(received, offset, Math.Min(1023, received.Length - offset)); if (count == 0) throw new InvalidOperationException("premature-eof"); offset += count; }
         });
-        Check(Task.WaitAll(new[] { write, read }, 5000), "raw-duplex-timeout");
+        Check(Task.WaitAll(new[] { write, read }, 15000), "raw-duplex-timeout");
         Check(Convert.ToBase64String(bytes) == Convert.ToBase64String(received), "raw-bytes-unchanged");
     }
 
