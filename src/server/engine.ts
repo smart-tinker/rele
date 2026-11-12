@@ -536,6 +536,7 @@ export class Engine extends EventEmitter {
     if (pending) return pending;
     const request = this.store.getRequest(id);
     if (!request || terminal(request.status)) throw new Error('Запрос уже завершён.');
+    if (this.store.getMeta(`control-goal-request:${id}`)) throw new Error('Остановите цель через меню «Управление Rele» исходного сообщения Slack. Общая отмена очереди для хода цели недоступна.');
     if (request.steeredInto) throw new Error('Дополнение относится к уже выполняющемуся запросу. Остановить можно исходный запрос.');
     // A lost cancellation ACK must never let reconciliation restart the original request.
     this.store.setMeta(`cancel-requested:${id}`, '1');
@@ -1900,7 +1901,7 @@ export class Engine extends EventEmitter {
   private finishFromHistory(request: ReleRequest, found: RequestLocation): void {
     if (this.store.getMeta(`control-goal-request:${request.id}`) && ['completed', 'failed', 'interrupted'].includes(found.state)) {
       this.store.finishRequest(request.id, { status: found.state as 'completed' | 'failed' | 'interrupted', turnId: found.turnId,
-        ...(found.mixed ? { error: mixedMessage } : {}) }, [], true);
+        ...(found.mixed ? { error: mixedMessage } : {}) }, []);
       return;
     }
     const cleanup = this.cancelCleanup(request.id);

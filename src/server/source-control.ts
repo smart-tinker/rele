@@ -306,7 +306,7 @@ export class SourceControls {
       if (this.store.getMeta(`control-goal-request:${active.id}`) !== receipt.id || !active.turnId) return;
       const previous = await native.controlTurnLocation(threadId, active.turnId, this.knownInputs(active.id));
       if (!['completed', 'failed', 'interrupted'].includes(previous.state)) return;
-      this.store.finishRequest(active.id, { status: previous.state as 'completed' | 'failed' | 'interrupted', turnId: active.turnId }, [], true);
+      this.store.finishRequest(active.id, { status: previous.state as 'completed' | 'failed' | 'interrupted', turnId: active.turnId }, []);
       for (const approval of this.store.listApprovals(1000).filter(row => row.requestId === active.id && row.status === 'pending')) {
         this.store.updateApproval(approval.id, { status: 'expired' }); this.store.cancelApprovalDeliveries(approval.id);
       }
