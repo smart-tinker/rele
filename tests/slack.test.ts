@@ -129,6 +129,20 @@ async function makeChannel(
   return { channel, socket, calls, fetcher, endpoints, message, action, status };
 }
 
+it('ACKs a message shortcut and shows an honest unavailable control instead of silently ignoring it', async () => {
+  const { socket, calls, message } = await makeChannel({
+    api: method => method === 'views.open' ? Response.json({ ok: true, view: { id: 'VFIXTURE' } }) : undefined,
+  });
+  socket.receive({ envelope_id: 'control-unavailable', type: 'interactive', payload: {
+    type: 'message_action', callback_id: 'rele_manage', team: { id: 'TEXAMPLE' }, user: { id: 'UANNA' },
+    channel: { id: 'CEXAMPLE' }, message: { ts: '1000.1000' }, trigger_id: 'synthetic-trigger',
+  } });
+  await vi.waitFor(() => expect(calls.filter(call => call.url.endsWith('/views.open'))).toHaveLength(1));
+  expect(JSON.parse(socket.sent[0]!)).toMatchObject({ envelope_id: 'control-unavailable' });
+  expect(String(calls.find(call => call.url.endsWith('/views.open'))!.init!.body)).toContain('Управление Rele недоступно.');
+  expect(message).not.toHaveBeenCalled();
+});
+
 function envelope(
   id: string,
   type: 'message' | 'app_mention' = 'message',
