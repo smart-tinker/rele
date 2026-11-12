@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { realpathSync, statSync } from 'node:fs';
 import { realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -162,33 +163,65 @@ except Exception:
 // spawned child (or the exact installed Job Object helper and its direct child).
 const WINDOWS_PROOF = String.raw`
 $ErrorActionPreference='Stop'
+$script:stage='input'
 try {
   $inputProof=ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__INPUT__')))
   $r=$inputProof.receipt; $p=$inputProof.peer; $stdio=$p.kind -eq 'stdio'
   function Require($ok) { if (-not $ok) { throw 'unproven' } }
+  function FileSha256($path) {
+    $pathStage=$script:stage
+    $script:stage=$pathStage+'-hash-open'
+    $algorithm=[Security.Cryptography.SHA256]::Create()
+    try {
+      $stream=[IO.File]::OpenRead($path)
+      try { $script:stage=$pathStage+'-hash-compute'; return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
+      finally { $stream.Dispose() }
+    } finally { $algorithm.Dispose() }
+  }
+  function MatchesExpectedImage($actualPath,$expectedPath,$actualHash) {
+    if ([IO.Path]::GetFullPath($actualPath) -ieq [IO.Path]::GetFullPath($expectedPath)) { return $true }
+    try { $expectedHash=FileSha256 $expectedPath; return $expectedHash -ceq $actualHash }
+    catch [System.ArgumentException] { return $false }
+  }
   function Identity {
+    $script:stage='process-query'
     $native=[Diagnostics.Process]::GetProcessById([int]$inputProof.serverId); $helper=$null
     try {
+      $script:stage='process-handle'
       Require ($native.Handle -ne [IntPtr]::Zero)
+      $script:stage='owner-query'
       $record=Get-CimInstance Win32_Process -Filter ("ProcessId="+$native.Id) -ErrorAction Stop
       $owner=Invoke-CimMethod -InputObject $record -MethodName GetOwnerSid -ErrorAction Stop
       Require ($owner.ReturnValue -eq 0)
+      $script:stage='image-query'
       $exe=$native.MainModule.FileName; $birth=$native.StartTime.ToUniversalTime().ToString('o')
-      $hash=(Get-FileHash -LiteralPath $exe -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+      $script:stage='process-image-hash'
+      $hash=FileSha256 $exe
+      $script:stage='process-identity'
       if ($stdio) {
         $gatewayOwner=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-        Require ($owner.Sid -eq $gatewayOwner -and [IO.Path]::GetFullPath($exe) -ieq [IO.Path]::GetFullPath($p.executable))
+        $expectedExecutable=$p.executable
+        $script:stage='stdio-owner-check'
+        Require ($owner.Sid -eq $gatewayOwner)
         $expectedParent=$inputProof.gatewayId
-        if ($p.helperExecutable) { $expectedParent=$p.pid } else { Require ($native.Id -eq $p.pid) }
+        if ($p.helperExecutable) { $expectedParent=$p.pid } else { $script:stage='stdio-process-id-check'; Require ($native.Id -eq $p.pid) }
+        $script:stage='stdio-parent-check'
         Require ($record.ParentProcessId -eq $expectedParent)
+        $script:stage='stdio-home-path'
         $nativeHome=[IO.Path]::GetFullPath($p.codexHome)
+        $script:stage='stdio-home-check'
         Require ([IO.Directory]::Exists($nativeHome))
       } else {
-        Require ($owner.Sid -eq $r.ownerSid -and $birth -ceq $r.processStartTime -and $hash -ceq $r.executableSha256 -and [IO.Path]::GetFullPath($exe) -ieq [IO.Path]::GetFullPath($r.executable))
+        $expectedExecutable=$r.executable
+        Require ($owner.Sid -eq $r.ownerSid -and $birth -ceq $r.processStartTime -and $hash -ceq $r.executableSha256)
         $nativeHome=[IO.Path]::GetFullPath($r.codexHome)
       }
+      $script:stage='expected-image-hash'
+      $executableContentMatchesExpected=MatchesExpectedImage $exe $expectedExecutable $hash
+      $script:stage='boot-query'
       $boot=(Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime().ToString('o')
       $result=[ordered]@{pid=$native.Id;birth=$birth;boot=$boot;executable=[IO.Path]::GetFullPath($exe).ToLowerInvariant();sha256=$hash;owner=$owner.Sid;codexHome=$nativeHome.ToLowerInvariant()}
+      $result.executableContentMatchesExpected=$executableContentMatchesExpected
       if ($stdio) {
         $result.parentPid=[int]$record.ParentProcessId; $result.gatewayOwner=$gatewayOwner
         if ($p.helperExecutable) {
@@ -196,10 +229,15 @@ try {
           Require ($helper.Handle -ne [IntPtr]::Zero)
           $helperRecord=Get-CimInstance Win32_Process -Filter ("ProcessId="+$helper.Id) -ErrorAction Stop
           $helperOwner=Invoke-CimMethod -InputObject $helperRecord -MethodName GetOwnerSid -ErrorAction Stop
-          Require ($helperRecord.ParentProcessId -eq $inputProof.gatewayId -and $helperOwner.ReturnValue -eq 0 -and $helperOwner.Sid -eq $gatewayOwner -and [IO.Path]::GetFullPath($helper.MainModule.FileName) -ieq [IO.Path]::GetFullPath($p.helperExecutable))
+          $script:stage='helper-image-hash'
+          $helperHash=FileSha256 $helper.MainModule.FileName
+          $script:stage='expected-helper-image-hash'
+          $helperExecutableContentMatchesExpected=MatchesExpectedImage $helper.MainModule.FileName $p.helperExecutable $helperHash
+          Require ($helperRecord.ParentProcessId -eq $inputProof.gatewayId -and $helperOwner.ReturnValue -eq 0 -and $helperOwner.Sid -eq $gatewayOwner)
           $result.helperPid=$helper.Id; $result.helperParentPid=[int]$helperRecord.ParentProcessId; $result.helperExecutable=[IO.Path]::GetFullPath($helper.MainModule.FileName).ToLowerInvariant()
+          $result.helperExecutableContentMatchesExpected=$helperExecutableContentMatchesExpected
           $result.helperBirth=$helper.StartTime.ToUniversalTime().ToString('o'); $result.helperOwner=$helperOwner.Sid
-          $result.helperSha256=(Get-FileHash -LiteralPath $helper.MainModule.FileName -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+          $result.helperSha256=$helperHash
         }
       }
       return $result
@@ -207,20 +245,36 @@ try {
   }
   function Peer {
     if ($stdio) { return }
+    $script:stage='tcp-query'
     $rows=@(Get-NetTCPConnection -State Established -ErrorAction Stop)
+    $script:stage='tcp-match'
     $server=@($rows | Where-Object { $_.LocalAddress -eq '127.0.0.1' -and $_.LocalPort -eq $p.remotePort -and $_.RemoteAddress -eq '127.0.0.1' -and $_.RemotePort -eq $p.localPort })
     $client=@($rows | Where-Object { $_.LocalAddress -eq '127.0.0.1' -and $_.LocalPort -eq $p.localPort -and $_.RemoteAddress -eq '127.0.0.1' -and $_.RemotePort -eq $p.remotePort })
     Require ($server.Count -eq 1 -and $server[0].OwningProcess -eq $r.processId -and $client.Count -eq 1 -and $client[0].OwningProcess -eq $inputProof.gatewayId)
   }
+  $script:stage='peer-before'
   Peer
+  $script:stage='identity-before'
   $before=Identity
+  $script:stage='peer-after'
   Peer
+  $script:stage='identity-after'
   $after=Identity
+  $script:stage='identity-compare'
   Require (($before | ConvertTo-Json -Compress) -ceq ($after | ConvertTo-Json -Compress))
   $before.peerVerified=$true; $before.gatewayId=$inputProof.gatewayId
   if (-not $stdio) { $before.localPort=$p.localPort; $before.remotePort=$p.remotePort }
+  $script:stage='proof-output'
   $before | ConvertTo-Json -Compress
-} catch { exit 1 }
+  $script:stage='complete'
+} catch {
+  $detail=$_.Exception
+  while ($detail.InnerException) { $detail=$detail.InnerException }
+  $failureType=$detail.GetType().Name
+  if ($detail -is [System.ComponentModel.Win32Exception]) { $failureType += '-' + $detail.NativeErrorCode }
+  [Console]::Error.WriteLine('rele-native-proof:' + $script:stage + ':' + $_.Exception.GetType().Name + ':' + $_.CategoryInfo.Category + ':' + $failureType)
+  exit 1
+}
 `;
 
 interface CommandResult { stdout: string; code: number | null }
@@ -228,51 +282,101 @@ export interface CodexNativeGenerationOptions {
   platform?: NodeJS.Platform;
   run?: (command: string, args: string[]) => Promise<CommandResult>;
   installationDirectory?: string;
+  onProofFailure?: (failure: { stage: string; category: string; failureType: string }) => void;
 }
 
 const execute = promisify(execFile);
 const SHA = /^[a-f0-9]{64}$/u;
 const WINDOWS_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$/u;
 function windowsPath(value: unknown): value is string { return typeof value === 'string' && /^[A-Za-z]:\\/u.test(value) && path.win32.isAbsolute(value); }
-function sameWindowsPath(left: string, right: string): boolean { return path.win32.normalize(left).toLowerCase() === path.win32.normalize(right).toLowerCase(); }
+function sameWindowsPath(left: string, right: string): boolean {
+  if (path.win32.normalize(left).toLowerCase() === path.win32.normalize(right).toLowerCase()) return true;
+  try {
+    const a = statSync(left, { bigint:true }), b = statSync(right, { bigint:true });
+    if (a.dev !== 0n && b.dev !== 0n && a.ino !== 0n && b.ino !== 0n) return a.dev === b.dev && a.ino === b.ino;
+    return path.win32.normalize(realpathSync.native(left)).toLowerCase() === path.win32.normalize(realpathSync.native(right)).toLowerCase();
+  } catch { return false; }
+}
 async function windowsGeneration(peer: Exclude<CodexNativePeer, { kind: 'proxy' }>, serverId: number, home: string, options: CodexNativeGenerationOptions): Promise<string | undefined> {
-  if (!windowsPath(home)) return;
-  const run = options.run ?? (async (command: string, args: string[]) => ({ ...(await execute(command, args, { timeout: 5_000, maxBuffer: 128 * 1024, windowsHide: true })), code: 0 }));
+  const fail = (stage: string, category: string, failureType: string): undefined => {
+    try { options.onProofFailure?.({ stage, category, failureType }); } catch {}
+    return undefined;
+  };
+  if (!windowsPath(home)) return fail('input', 'codex-home', 'invalid-contract');
+  const run = options.run ?? (async (command: string, args: string[]) => ({ ...(await execute(command, args, { timeout: 30_000, maxBuffer: 128 * 1024, windowsHide: true })), code: 0 }));
   const directory = options.installationDirectory ?? fileURLToPath(new URL('../../', import.meta.url));
   let receipt: any;
   if (peer.kind === 'stdio') {
-    if (!Number.isSafeInteger(peer.pid) || peer.pid <= 1 || !windowsPath(peer.executable) || !windowsPath(peer.codexHome) || !sameWindowsPath(peer.codexHome, home)) return;
+    if (!Number.isSafeInteger(peer.pid) || peer.pid <= 1 || !windowsPath(peer.executable) || !windowsPath(peer.codexHome) || !sameWindowsPath(peer.codexHome, home)) {
+      return fail('peer-input', 'stdio-peer', 'invalid-contract');
+    }
     if (peer.helperExecutable) {
-      if (peer.pid === serverId || !sameWindowsPath(peer.helperExecutable, path.win32.join(directory, 'dist', 'native', 'Rele.Process.exe'))) return;
-    } else if (peer.pid !== serverId) return;
+      if (peer.pid === serverId || !sameWindowsPath(peer.helperExecutable, path.win32.join(directory, 'dist', 'native', 'Rele.Process.exe')))
+        return fail('peer-input', 'stdio-helper', 'invalid-contract');
+    } else if (peer.pid !== serverId) return fail('peer-input', 'stdio-pid', 'invalid-contract');
   } else {
     if (!Number.isInteger(peer.localPort) || peer.localPort <= 0 || peer.localPort > 65535
       || !Number.isInteger(peer.remotePort) || peer.remotePort <= 0 || peer.remotePort > 65535
-      || peer.localPort === peer.remotePort || peer.endpoint !== `ws://127.0.0.1:${peer.remotePort}`) return;
-    const status = await run(path.win32.join(directory, 'Rele.exe'), ['codex-status', '--quiet', '--codex-home', home]);
-    receipt = JSON.parse(status.stdout);
-    if (status.code !== 0 || receipt?.status !== 'alreadyRunning' || receipt.endpoint !== peer.endpoint || receipt.processId !== serverId
+      || peer.localPort === peer.remotePort || peer.endpoint !== `ws://127.0.0.1:${peer.remotePort}`) {
+      return fail('peer-input', 'shared-peer', 'invalid-contract');
+    }
+    let status: CommandResult;
+    try { status = await run(path.win32.join(directory, 'Rele.exe'), ['codex-status', '--quiet', '--codex-home', home]); }
+    catch { return fail('status-probe', 'command-error', 'execution-error'); }
+    if (status.code !== 0) return fail('status-probe', 'nonzero-exit', 'execution-error');
+    try { receipt = JSON.parse(status.stdout); }
+    catch { return fail('status-probe', 'invalid-json', 'parse-error'); }
+    if (receipt?.status !== 'alreadyRunning' || receipt.endpoint !== peer.endpoint || receipt.processId !== serverId
       || !windowsPath(receipt.codexHome) || !sameWindowsPath(receipt.codexHome, home) || !windowsPath(receipt.executable)
       || !SHA.test(receipt.executableSha256) || typeof receipt.ownerSid !== 'string' || !/^S-1-\d+(?:-\d+)+$/u.test(receipt.ownerSid)
-      || typeof receipt.processStartTime !== 'string' || !WINDOWS_TIME.test(receipt.processStartTime) || !Number.isFinite(Date.parse(receipt.processStartTime))) return;
+      || typeof receipt.processStartTime !== 'string' || !WINDOWS_TIME.test(receipt.processStartTime) || !Number.isFinite(Date.parse(receipt.processStartTime))) {
+      return fail('status-contract', 'shared-peer', 'contract-mismatch');
+    }
   }
   const input = Buffer.from(JSON.stringify({ receipt, peer, serverId, gatewayId: process.pid })).toString('base64');
   const source = WINDOWS_PROOF.replace('__INPUT__', input);
   const systemRoot = process.env.SystemRoot || 'C:\\Windows';
-  const result = await run(path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(source, 'utf16le').toString('base64')]);
-  const proof = JSON.parse(result.stdout);
-  if (result.code !== 0 || proof?.peerVerified !== true || proof.pid !== serverId || proof.gatewayId !== process.pid
-    || typeof proof.birth !== 'string' || !WINDOWS_TIME.test(proof.birth) || !Number.isFinite(Date.parse(proof.birth))
-    || typeof proof.owner !== 'string' || !/^S-1-\d+(?:-\d+)+$/u.test(proof.owner) || !SHA.test(proof.sha256)
-    || !windowsPath(proof.executable) || !windowsPath(proof.codexHome) || !sameWindowsPath(proof.codexHome, home)
-    || typeof proof.boot !== 'string' || !WINDOWS_TIME.test(proof.boot) || !Number.isFinite(Date.parse(proof.boot))) return;
+  let result: CommandResult;
+  try { result = await run(path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(source, 'utf16le').toString('base64')]); }
+  catch (error) {
+    const stderr = (error as { stderr?: unknown })?.stderr;
+    const failure = typeof stderr === 'string' && /^rele-native-proof:([a-z-]{1,64}):[^:\r\n]{1,96}:([A-Za-z]{1,64}):([A-Za-z0-9-]{1,64})$/mu.exec(stderr);
+    if (failure) {
+      try { options.onProofFailure?.({ stage:failure[1], category:failure[2], failureType:failure[3] }); } catch {}
+      return;
+    }
+    return fail('powershell', 'unclassified-error', 'execution-error');
+  }
+  if (result.code !== 0) return fail('powershell', 'nonzero-exit', 'execution-error');
+  let proof: any;
+  try { proof = JSON.parse(result.stdout); }
+  catch { return fail('proof-output', 'invalid-json', 'parse-error'); }
+  if (proof?.peerVerified !== true || proof.pid !== serverId || proof.gatewayId !== process.pid)
+    return fail('proof-contract', 'peer-identity', 'contract-mismatch');
+  if (typeof proof.birth !== 'string' || !WINDOWS_TIME.test(proof.birth) || !Number.isFinite(Date.parse(proof.birth))
+    || typeof proof.boot !== 'string' || !WINDOWS_TIME.test(proof.boot) || !Number.isFinite(Date.parse(proof.boot)))
+    return fail('proof-contract', 'process-lifecycle', 'contract-mismatch');
+  if (typeof proof.owner !== 'string' || !/^S-1-\d+(?:-\d+)+$/u.test(proof.owner))
+    return fail('proof-contract', 'process-owner', 'contract-mismatch');
+  if (!SHA.test(proof.sha256)) return fail('proof-contract', 'executable-hash', 'contract-mismatch');
+  if (!windowsPath(proof.executable)) return fail('proof-contract', 'executable-path', 'contract-mismatch');
+  if (!windowsPath(proof.codexHome) || !sameWindowsPath(proof.codexHome, home))
+    return fail('proof-contract', 'codex-home', 'contract-mismatch');
   if (peer.kind === 'stdio') {
-    if (proof.parentPid !== (peer.helperExecutable ? peer.pid : process.pid) || proof.gatewayOwner !== proof.owner || !sameWindowsPath(proof.executable, peer.executable!)) return;
+    if (proof.parentPid !== (peer.helperExecutable ? peer.pid : process.pid) || proof.gatewayOwner !== proof.owner
+      || (proof.executableContentMatchesExpected !== true && !sameWindowsPath(proof.executable, peer.executable!)))
+      return fail('peer-binding', 'stdio-peer', 'contract-mismatch');
     if (peer.helperExecutable && (proof.helperPid !== peer.pid || proof.helperParentPid !== process.pid || proof.helperOwner !== proof.owner
-      || !windowsPath(proof.helperExecutable) || !sameWindowsPath(proof.helperExecutable, peer.helperExecutable)
-      || typeof proof.helperBirth !== 'string' || !WINDOWS_TIME.test(proof.helperBirth) || !Number.isFinite(Date.parse(proof.helperBirth)) || !SHA.test(proof.helperSha256))) return;
-  } else if (proof.birth !== receipt.processStartTime || proof.localPort !== peer.localPort || proof.remotePort !== peer.remotePort
-    || proof.owner !== receipt.ownerSid || proof.sha256 !== receipt.executableSha256 || !sameWindowsPath(proof.executable, receipt.executable)) return;
+      || !windowsPath(proof.helperExecutable) || (proof.helperExecutableContentMatchesExpected !== true && !sameWindowsPath(proof.helperExecutable, peer.helperExecutable))
+      || typeof proof.helperBirth !== 'string' || !WINDOWS_TIME.test(proof.helperBirth) || !Number.isFinite(Date.parse(proof.helperBirth)) || !SHA.test(proof.helperSha256)))
+      return fail('peer-binding', 'stdio-helper', 'contract-mismatch');
+  } else {
+    if (proof.birth !== receipt.processStartTime || proof.localPort !== peer.localPort || proof.remotePort !== peer.remotePort)
+      return fail('peer-binding', 'shared-generation', 'contract-mismatch');
+    if (proof.owner !== receipt.ownerSid) return fail('peer-binding', 'shared-owner', 'contract-mismatch');
+    if (proof.sha256 !== receipt.executableSha256 || (proof.executableContentMatchesExpected !== true && !sameWindowsPath(proof.executable, receipt.executable)))
+      return fail('peer-binding', 'shared-executable', 'contract-mismatch');
+  }
   return createHash('sha256').update(JSON.stringify({ platform: 'win32', pid: proof.pid, birth: proof.birth, boot: proof.boot, executable: path.win32.normalize(proof.executable).toLowerCase(), sha256: proof.sha256, owner: proof.owner, codexHome: path.win32.normalize(proof.codexHome).toLowerCase() })).digest('hex');
 }
 

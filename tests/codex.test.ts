@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { execFile } from 'node:child_process';
 import { once } from 'node:events';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -11,9 +12,13 @@ import { SharedCodexError } from '../src/server/codex-shared.js';
 import { Engine } from '../src/server/engine.js';
 import { Store } from '../src/server/store.js';
 import { defaultConfig } from '../src/server/config.js';
+import { codexNativeGeneration, type CodexNativePeer } from '../src/server/codex-native-generation.js';
 import { initialMessageKey } from '../src/server/initial-message.js';
 import { asyncQuestions, encodeAsyncAnswers } from '../src/server/async-questions.js';
 import type { Endpoint } from '../src/shared/types.js';
+import { promisify } from 'node:util';
+
+const execute = promisify(execFile);
 
 interface Rpc { id?: string | number; method?: string; params: Record<string, unknown>; result?: unknown; error?: { code: number; message: string } }
 type Handler = (message: Rpc, socket: WebSocket) => unknown | Promise<unknown>;
@@ -977,8 +982,28 @@ describe('Codex shared-runtime adapter', () => {
     expect(f.calls.filter(call => call.method === 'thread/backgroundTerminals/terminate').map(call => call.params))
       .toEqual([{ threadId, processId: '1234' }]);
     terminals[0].processId = '9999';
-    await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, itemId: 'own-command', processId: '1234' })).rejects.toThrow();
+    await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, itemId: 'own-command', processId: '1234' }))
+      .rejects.toMatchObject({ identityFailure: 'terminal-process-changed' });
+    terminals.push({ itemId: 'own-command', processId: '1111', command: 'duplicate-command-body' });
+    await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, itemId: 'own-command', processId: '1234' }))
+      .rejects.toMatchObject({ identityFailure: 'terminal-ambiguous' });
     expect(f.calls.filter(call => call.method === 'thread/backgroundTerminals/terminate')).toHaveLength(1);
+  });
+
+  it('does not terminate a process when the exact background terminal already disappeared', async () => {
+    const generation = 'a'.repeat(64);
+    const f = await fixture({
+      'server/diagnostics': () => ({ process: { id: 42 }, gauges: [] }),
+      'thread/backgroundTerminals/terminate': () => ({ terminated: true }),
+    });
+    await f.client.connect();
+    const terminateCalls = f.calls.filter(call => call.method === 'thread/backgroundTerminals/terminate').length;
+    vi.spyOn(f.client, 'backgroundTerminals')
+      .mockResolvedValueOnce({ serverId: 42, serverGeneration: generation, terminals: [{ itemId: 'own-command', processId: '1234' }] })
+      .mockResolvedValueOnce({ serverId: 42, serverGeneration: generation, terminals: [] });
+    const snapshot = await f.client.backgroundTerminals(threadId);
+    await expect(f.client.terminateBackgroundTerminal(threadId, { ...snapshot.terminals[0], serverId:snapshot.serverId, serverGeneration:generation })).resolves.toBeUndefined();
+    expect(f.calls.filter(call => call.method === 'thread/backgroundTerminals/terminate')).toHaveLength(terminateCalls);
   });
 
   it('forwards approval requests and rejects responses after another client resolves them', async () => {
@@ -1358,11 +1383,40 @@ describe('Codex managed runtime', () => {
       'thread/backgroundTerminals/terminate': () => ({ terminated: true }),
     });
     await f.client.connect();
-    for (const serverGeneration of ['a'.repeat(64), 'A'.repeat(64), 'a'.repeat(63), '']) {
-      await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, serverGeneration, itemId: 'own-command', processId: '1234' })).rejects.toMatchObject({ code: 'terminal-identity-changed' });
+    await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, serverGeneration: 'a'.repeat(64), itemId: 'own-command', processId: '1234' }))
+      .rejects.toMatchObject({ code: 'terminal-identity-changed', identityFailure: 'server-generation-unconfirmed' });
+    for (const serverGeneration of ['A'.repeat(64), 'a'.repeat(63), '']) {
+      await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, serverGeneration, itemId: 'own-command', processId: '1234' }))
+        .rejects.toMatchObject({ code: 'terminal-identity-changed', identityFailure: 'target-generation-invalid' });
     }
     expect(f.calls.some(call => call.method === 'thread/backgroundTerminals/terminate')).toBe(false);
     expect(await f.client.backgroundTerminals(threadId)).not.toHaveProperty('serverGeneration');
+  });
+
+  it('classifies a server identity change without sending native termination', async () => {
+    let serverId = 42;
+    const f = await fixture({
+      'server/diagnostics': () => ({ process: { id: serverId }, gauges: [] }),
+      'thread/backgroundTerminals/list': () => ({ data: [{ itemId: 'own-command', processId: '1234' }], nextCursor: null }),
+      'thread/backgroundTerminals/terminate': () => ({ terminated: true }),
+    });
+    await f.client.connect();
+    const snapshot = await f.client.backgroundTerminals(threadId);
+    serverId++;
+
+    await expect(f.client.terminateBackgroundTerminal(threadId, { ...snapshot.terminals[0], serverId: snapshot.serverId }))
+      .rejects.toMatchObject({ code: 'terminal-identity-changed', identityFailure: 'server-id-changed' });
+    expect(f.calls.some(call => call.method === 'thread/backgroundTerminals/terminate')).toBe(false);
+  });
+
+  it('classifies a confirmed server generation change without sending native termination', async () => {
+    const f = await fixture();
+    await f.client.connect();
+    vi.spyOn(f.client, 'backgroundTerminals').mockResolvedValue({ serverId: 42, serverGeneration: 'b'.repeat(64), terminals: [{ itemId: 'own-command', processId: '1234' }] });
+
+    await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, serverGeneration: 'a'.repeat(64), itemId: 'own-command', processId: '1234' }))
+      .rejects.toMatchObject({ code: 'terminal-identity-changed', identityFailure: 'server-generation-changed' });
+    expect(f.calls.some(call => call.method === 'thread/backgroundTerminals/terminate')).toBe(false);
   });
 
   it.skipIf(!['linux', 'win32'].includes(process.platform))('proves a stable generation for the actual owned stdio peer and changes it for a replacement process', async () => {
@@ -1372,7 +1426,47 @@ describe('Codex managed runtime', () => {
     await f.client.connect();
     const first = await f.client.backgroundTerminals(threadId);
     expect(first.serverId).toBe((await f.records())[0].pid);
-    expect(first).toHaveProperty('serverGeneration', expect.stringMatching(/^[a-f0-9]{64}$/u));
+    let proofFailure = 'preflight';
+    if (process.platform === 'win32' && !first.serverGeneration) {
+      const peer = Reflect.get(f.client, 'nativePeer') as CodexNativePeer | undefined;
+      const stdioPeer = peer?.kind === 'stdio' ? peer : undefined;
+      const expectedPeerPid = stdioPeer?.pid;
+      const expectedExecutable = stdioPeer?.executable;
+      const helperExecutable = stdioPeer?.helperExecutable;
+      const run = async (command: string, args: string[]) => {
+        try {
+          const result = await execute(command, args, { timeout:30_000, maxBuffer:128*1024, windowsHide:true });
+          let proof: Record<string, unknown>;
+          try { proof = JSON.parse(result.stdout) as Record<string, unknown>; }
+          catch { proofFailure = result.stdout.trim() ? 'proof-output-invalid-json' : 'proof-output-empty'; return { ...result, code:0 }; }
+          const validTime = (value: unknown) => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$/u.test(value) && Number.isFinite(Date.parse(value));
+          const validPath = (value: unknown) => typeof value === 'string' && /^[A-Za-z]:\\/u.test(value) && path.win32.isAbsolute(value);
+          const samePath = (left: unknown, right: string | undefined) => typeof left === 'string' && right !== undefined && path.win32.normalize(left).toLowerCase() === path.win32.normalize(right).toLowerCase();
+          const checks: [string, boolean][] = [
+            ['peer', proof.peerVerified === true], ['pid', proof.pid === first.serverId], ['gateway', proof.gatewayId === process.pid],
+            ['birth', validTime(proof.birth)], ['boot', validTime(proof.boot)], ['owner', typeof proof.owner === 'string' && /^S-1-\d+(?:-\d+)+$/u.test(proof.owner)],
+            ['sha', typeof proof.sha256 === 'string' && /^[a-f0-9]{64}$/u.test(proof.sha256)], ['executable-path', validPath(proof.executable)],
+            ['home', validPath(proof.codexHome) && samePath(proof.codexHome, home)], ['parent', proof.parentPid === (helperExecutable ? expectedPeerPid : process.pid)],
+            ['gateway-owner', proof.gatewayOwner === proof.owner], ['image', proof.executableContentMatchesExpected === true || samePath(proof.executable, expectedExecutable)],
+            ['helper-pid', helperExecutable === undefined || proof.helperPid === expectedPeerPid],
+            ['helper-parent', helperExecutable === undefined || proof.helperParentPid === process.pid],
+            ['helper-owner', helperExecutable === undefined || proof.helperOwner === proof.owner],
+            ['helper-path', helperExecutable === undefined || validPath(proof.helperExecutable)],
+            ['helper-image', helperExecutable === undefined || proof.helperExecutableContentMatchesExpected === true || samePath(proof.helperExecutable, helperExecutable)],
+            ['helper-birth', helperExecutable === undefined || validTime(proof.helperBirth)],
+            ['helper-sha', helperExecutable === undefined || typeof proof.helperSha256 === 'string' && /^[a-f0-9]{64}$/u.test(proof.helperSha256)],
+          ];
+          proofFailure = `proof-validation:${checks.filter(([, ok]) => !ok).map(([name]) => name).join(',') || 'unclassified'}`;
+          return { ...result, code:0 };
+        } catch (error) {
+          const stderr = String((error as { stderr?:string }).stderr ?? '');
+          proofFailure = stderr.match(/rele-native-proof:([a-z-]+)/u)?.[1] ?? 'powershell-invocation';
+          return { stdout:'', code:1 };
+        }
+      };
+      await codexNativeGeneration(peer, first.serverId, home, { platform:'win32', run });
+    }
+    expect(first, `Windows native proof returned no generation (${proofFailure})`).toHaveProperty('serverGeneration', expect.stringMatching(/^[a-f0-9]{64}$/u));
     expect(await f.client.backgroundTerminals(threadId)).toEqual(first);
     await expect(f.client.terminateBackgroundTerminal(threadId, { serverId:first.serverId, serverGeneration:'0'.repeat(64), itemId:'fixture-command', processId:'1234' })).rejects.toMatchObject({ code:'terminal-identity-changed' });
     expect((await f.calls()).filter(call => call.method === 'thread/backgroundTerminals/terminate')).toHaveLength(0);

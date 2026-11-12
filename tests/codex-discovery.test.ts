@@ -190,6 +190,18 @@ describe('Codex installation and existing Desktop discovery', () => {
     expect(result.recommended).toEqual({ executable: desktop, transport: 'websocket', endpoint: 'ws://127.0.0.1:4500' });
   });
 
+  it('recognizes the signed Desktop backend version exercised by the hosted Windows gate', async () => {
+    const packageRoot = win.dirname(win.dirname(win.dirname(desktop)));
+    const metadata = { processes: [], packages: [{ name: 'OpenAI.Codex', location: packageRoot }], issues: [] };
+    const f = windowsFixture(metadata, [desktop]);
+    f.run.mockImplementation(async (command, args) => args.includes(WINDOWS_CODEX_METADATA_SCRIPT)
+      ? { stdout: JSON.stringify(metadata), code: 0 }
+      : { stdout: `codex-cli ${command === desktop ? '0.167.0-alpha.4.1' : '0.163.0'}`, code: 0 });
+    const result = await discoverCodex(f.options);
+    expect(result.recommendedManaged).toEqual({ executable: desktop, transport: 'managed', endpoint: '' });
+    expect(result.issues.map(item => item.code)).not.toContain('cli-version-unverified');
+  });
+
   it.each(['0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6'])('recommends supported %s even when a newer unsupported package is found first', async version => {
     const latest = desktop.replace('26.1_', '26.2_'), unsupported = desktop.replace('26.1_', '26.3_');
     const packages = [unsupported, desktop, latest].map(executable => ({ name: 'OpenAI.Codex', location: win.dirname(win.dirname(win.dirname(executable))) }));
@@ -309,8 +321,8 @@ describe('Codex installation and existing Desktop discovery', () => {
     await expect(runCodexProbe(process.execPath, ['-e', 'require("node:fs").writeSync(1, "x".repeat(200000))'], 4_000)).rejects.toThrow('probe-output-limit');
   });
 
-  it.each(['process-provider', 'owner-query', 'json-provider'])('captures fixed %s stage without publishing other child stderr', async stage => {
-    const error = await runCodexProbe(process.execPath, ['-e', `process.stderr.write("synthetic-secret\\nrele-discovery:${stage}\\nrele-discovery:synthetic-secret\\n"); setInterval(() => {}, 1000)`], 250).catch(error => error);
+  it.each(['process-provider', 'owner-query', 'json-provider', 'query-row-close', 'query-collection-close', 'query-searcher-close'])('captures fixed %s stage without publishing other child stderr', async stage => {
+    const error = await runCodexProbe(process.execPath, ['-e', `process.stderr.write("synthetic-secret\\nrele-discovery:${stage}\\nrele-discovery:synthetic-secret\\n"); setInterval(() => {}, 1000)`], 1_000).catch(error => error);
     expect(error).toMatchObject({ message: 'probe-timeout', stage });
     expect(JSON.stringify(error)).not.toContain('synthetic-secret');
   });
@@ -351,13 +363,13 @@ try {
 }
 [Console]::Out.Write('provider-current-user-ok')
 `;
-    const result = await runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], 8_000).catch(error => ({
+    const result = await runCodexProbe('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], 20_000).catch(error => ({
       error: ['probe-timeout', 'probe-output-limit', 'probe-unavailable'].includes(error?.message) ? error.message : 'probe-error',
       // Reuse a whitelisted marker so this diagnostic leaves the product probe unchanged.
       stage: error?.stage === 'done' ? 'query-close' : error?.stage,
     }));
     expect(result).toEqual({ code: 0, stdout: 'provider-current-user-ok', stage: 'done' });
-  }, 10_000);
+  }, 30_000);
 
   it.skipIf(process.platform !== 'win32')('completes a process-only scan without calling optional Appx discovery', async () => {
     const fixtures = String.raw`

@@ -1015,6 +1015,25 @@ describe('Engine public Slack progress', () => {
     expect(f.codex.interrupt).not.toHaveBeenCalled();
   });
 
+  it('reconciles a terminal event while a Slack progress history read is pending', async () => {
+    const f = fixture({ start: false }), request = await acceptRequest(f); await running(f, request);
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1',
+      item: { id: 'pending-comment', type: 'agentMessage', phase: 'commentary', text: 'Pending public step' } } });
+    await f.engine.settled();
+    const proof = deferred<RequestLocation>();
+    f.codex.findRequest.mockClear(); f.codex.findRequest.mockReturnValueOnce(proof.promise);
+    const flush = (f.engine as unknown as { flushProgress(): Promise<void> }).flushProgress();
+    await vi.waitFor(() => expect(f.codex.findRequest).toHaveBeenCalledTimes(1));
+    f.codex.complete(request.id, 'Fresh final');
+    try {
+      await vi.waitFor(() => expect(f.store.getRequest(request.id)?.status).toBe('completed'));
+    } finally {
+      proof.resolve({ state: 'running', turnId: 'turn-1' });
+      await flush; await f.engine.settled();
+    }
+    expect(f.store.listDeliveries().filter(row => row.requestId === request.id && row.body === 'Fresh final')).toHaveLength(1);
+  });
+
   it.each(['stop', 'replace', 'disconnect'] as const)('discards progress proof after %s while reconciliation waits for it', async change => {
     const f = fixture({ start: false }); f.codex.connection(true);
     const request = await acceptRequest(f); await running(f, request);
@@ -1662,6 +1681,65 @@ describe('Engine continuation after native Stop', () => {
     expect(f.store.getRequest(request.id)?.queuedSubmissionId).toBe('accepted-native-entry');
   });
 
+  it('binds a queued turn from its start acknowledgement when Codex omits notifications', async () => {
+    const f = fixture(), request = await acceptRequest(f, 'telegram');
+    await f.engine.settled();
+    ownQueue(f, request);
+    f.codex.startQueued.mockImplementationOnce(async () => ({ turn: { id: 'queued-ack-turn', status: 'inProgress', items: [] } }));
+
+    await f.engine.reconcile(request.id);
+
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'running', turnId: 'queued-ack-turn' });
+  });
+
+  it('rechecks a completed turn when history lags behind its notification during queue start', async () => {
+    const f = fixture(), request = await acceptRequest(f, 'telegram');
+    await f.engine.settled();
+    ownQueue(f, request);
+    const startAck = deferred<{ turn: { id: string; status: string; items: never[] } }>();
+    f.codex.startQueued.mockImplementationOnce(() => startAck.promise);
+    const continuing = f.engine.reconcile(request.id);
+    try {
+      await vi.waitFor(() => expect(f.codex.startQueued).toHaveBeenCalledOnce());
+      f.codex.running(request.id, 'queued-turn');
+      await vi.waitFor(() => expect(f.store.getRequest(request.id)?.status).toBe('running'));
+      const priorReads = f.codex.findRequest.mock.calls.length;
+      f.codex.notification({ method: 'turn/completed', params: { threadId: THREAD,
+        turn: { id: 'queued-turn', status: 'completed' } } });
+      await vi.waitFor(() => expect(f.codex.findRequest.mock.calls.length).toBe(priorReads + 1));
+      f.codex.locations.set(request.id, { state: 'completed', turnId: 'queued-turn', text: 'Queued final' });
+      await vi.waitFor(() => expect(f.store.getRequest(request.id)?.status).toBe('completed'), { timeout: 3000 });
+      expect(f.store.listDeliveries().filter(row => row.requestId === request.id && row.body === 'Queued final')).toHaveLength(1);
+    } finally {
+      startAck.resolve({ turn: { id: 'queued-turn', status: 'inProgress', items: [] } });
+      await continuing;
+      await f.engine.settled();
+    }
+  });
+
+  it('reconciles a completed queued turn before its start acknowledgement assigns the turn id', async () => {
+    const f = fixture(), request = await acceptRequest(f, 'telegram');
+    await f.engine.settled();
+    ownQueue(f, request);
+    const startAck = deferred<{ turn: { id: string; status: string; items: never[] } }>();
+    f.codex.startQueued.mockImplementationOnce(() => startAck.promise);
+    const continuing = f.engine.reconcile(request.id);
+    try {
+      await vi.waitFor(() => expect(f.codex.startQueued).toHaveBeenCalledOnce());
+      expect(f.store.getRequest(request.id)?.status).toBe('starting');
+      expect(f.store.getRequest(request.id)?.turnId).toBeUndefined();
+      f.codex.locations.set(request.id, { state: 'completed', turnId: 'queued-turn', text: 'Queued final' });
+      f.codex.notification({ method: 'turn/completed', params: { threadId: THREAD,
+        turn: { id: 'queued-turn', status: 'completed' } } });
+      await vi.waitFor(() => expect(f.store.getRequest(request.id)?.status).toBe('completed'), { timeout: 3000 });
+      expect(f.store.listDeliveries().filter(row => row.requestId === request.id && row.body === 'Queued final')).toHaveLength(1);
+    } finally {
+      startAck.resolve({ turn: { id: 'queued-turn', status: 'inProgress', items: [] } });
+      await continuing;
+      await f.engine.settled();
+    }
+  });
+
   it('persists a lost queue/start ACK fence across restart and recovers later completion without repeating either mutation', async () => {
     const f = fixture(), request = await acceptRequest(f, 'telegram');
     await f.engine.settled();
@@ -1811,6 +1889,28 @@ describe('Engine scoped shell cancellation', () => {
     expect(f.codex.enqueue).toHaveBeenLastCalledWith(THREAD, requestInput(next), next.id);
   });
 
+  it('interrupts the running turn before terminating its still-live confirmed command', async () => {
+    const f = fixture(), request = await shell(f), order: string[] = [];
+    f.codex.terminateBackgroundTerminal.mockImplementationOnce(async (_threadId, target) => {
+      order.push('terminate');
+      f.codex.terminals = f.codex.terminals.filter(row => row.itemId !== target.itemId || row.processId !== target.processId);
+    });
+    f.codex.interrupt.mockImplementationOnce(async (threadId, turnId) => {
+      order.push(f.codex.terminals.some(row => row.itemId === 'own-command' && row.processId === '1234')
+        ? 'interrupt-while-command-live' : 'interrupt-after-command-terminated');
+      f.codex.locations.set(request.id, { state: 'interrupted', turnId });
+      f.codex.notification({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'interrupted' } } });
+    });
+
+    await expect(f.engine.cancel(request.id)).resolves.toBeUndefined();
+
+    expect(order).toEqual(['interrupt-while-command-live', 'terminate']);
+    expect(f.codex.terminateBackgroundTerminal).toHaveBeenCalledExactlyOnceWith(THREAD, {
+      serverId: 42, serverGeneration: 'a'.repeat(64), itemId: 'own-command', processId: '1234',
+    });
+    expect(f.codex.terminals).toEqual([]);
+  });
+
   it.each(['running', 'interrupted'] as const)('reconciles a lost terminate ACK on the same connection from %s without replaying a persisted PID', async state => {
     const f = fixture(), request = await shell(f);
     if (state === 'interrupted') f.codex.locations.set(request.id, { state, turnId: 'shell-turn' });
@@ -1894,7 +1994,37 @@ describe('Engine scoped shell cancellation', () => {
       expect(f.store.listDeliveries().some(row => row.requestId === request.id && row.key === 'terminal:error')).toBe(false);
     });
 
-  it('refuses terminal cleanup when the generation changes after interrupt', async () => {
+  type BaselineCase = { failure: string; after: (f: ReturnType<typeof fixture>, request: ReleRequest) => void };
+  it.each([
+    { failure: 'missing', after: (f, request) => {
+      const key = `request-terminal-baseline:${request.id}`, getMeta = f.store.getMeta.bind(f.store);
+      vi.spyOn(f.store, 'getMeta').mockImplementation(name => name === key ? undefined : getMeta(name));
+    } },
+    { failure: 'target-changed', after: (f, request) => {
+      const key = `request-terminal-baseline:${request.id}`, baseline = JSON.parse(f.store.getMeta(key)!);
+      f.store.setMeta(key, JSON.stringify({ ...baseline, target: 'changed-target' }));
+    } },
+    { failure: 'generation-missing', after: (f, request) => {
+      const key = `request-terminal-baseline:${request.id}`, baseline = JSON.parse(f.store.getMeta(key)!);
+      delete baseline.serverGeneration; f.store.setMeta(key, JSON.stringify(baseline));
+    } },
+    { failure: 'generation-invalid', after: (f, request) => {
+      const key = `request-terminal-baseline:${request.id}`, baseline = JSON.parse(f.store.getMeta(key)!);
+      f.store.setMeta(key, JSON.stringify({ ...baseline, serverGeneration: 'A'.repeat(64) }));
+    } },
+    { failure: 'terminals-invalid', after: (f, request) => {
+      const key = `request-terminal-baseline:${request.id}`, baseline = JSON.parse(f.store.getMeta(key)!);
+      f.store.setMeta(key, JSON.stringify({ ...baseline, terminals: [{ itemId: 'invalid-command', processId: 'bad' }] }));
+    } },
+  ] satisfies BaselineCase[])('reports a fixed code when the original terminal baseline is $failure', async ({ failure, after }) => {
+    const f = fixture(), request = await shell(f); after(f, request);
+
+    await expect(f.engine.cancel(request.id)).rejects.toMatchObject({ code: `terminal-baseline-${failure}` });
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+    expect(f.codex.terminals.some(item => item.itemId === 'own-command' && item.processId === '1234')).toBe(true);
+  });
+
+  it('keeps cancellation uncertain when the generation changes after interrupt before terminal cleanup', async () => {
     const f = fixture(), request = await shell(f);
     f.codex.interrupt.mockImplementationOnce(async () => {
       f.codex.locations.set(request.id, { state: 'interrupted', turnId: 'shell-turn' });
@@ -1986,6 +2116,21 @@ describe('Engine scoped shell cancellation', () => {
 });
 
 describe('Engine approvals', () => {
+  it('keeps a live approval waiting when native history briefly omits its turn', async () => {
+    const f = fixture();
+    const request = await acceptRequest(f, 'telegram');
+    const approval = await requestApproval(f, request);
+    f.codex.findRequest.mockResolvedValueOnce({ state: 'not_found' });
+
+    await f.engine.reconcile(request.id);
+
+    expect(approval.rpcId).not.toBeNull();
+    expect(f.codex.hasPendingRequest(approval.rpcId!)).toBe(true);
+    expect(f.store.getApproval(approval.id)?.status).toBe('pending');
+    expect(f.store.getRequest(request.id)).toMatchObject({ status: 'waiting_approval', turnId: approval.turnId });
+    expect(f.codex.respond).not.toHaveBeenCalled();
+  });
+
   it.each(['lookup-error', 'mixed', 'wrong-turn', 'already-terminal'] as const)('rejects a managed approval when origin verification is %s', async reason => {
     const f = fixture();
     f.codex.transport = 'managed';
@@ -3315,17 +3460,132 @@ describe('multiple origins and terminal reconciliation', () => {
     for (const delivery of sent) expect(delivery.body).toBe(`answer-${delivery.origin.endpointId}`);
   });
 
+  it('reconciles a final-answer item when Codex omits turn/completed', async () => {
+    const f = fixture(); const request = await acceptRequest(f, 'telegram'); await running(f, request);
+    f.codex.locations.set(request.id, { state: 'completed', turnId: 'turn-1', text: 'Final answer' });
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1',
+      item: { type: 'agentMessage', phase: 'final_answer', text: 'Final answer' } } });
+    await f.engine.settled();
+    expect(f.store.getRequest(request.id)?.status).toBe('completed');
+    expect(f.store.listDeliveries().some(delivery => delivery.requestId === request.id && delivery.body === 'Final answer')).toBe(true);
+  });
+
   it('rechecks a completion notification received during an earlier history read', async () => {
     const f = fixture(); const request = await acceptRequest(f, 'telegram'); await running(f, request);
     const gate = deferred<RequestLocation>(); f.codex.findRequest.mockReturnValueOnce(gate.promise);
     const pendingRead = f.engine.reconcile(request.id);
     await vi.waitFor(() => expect(f.codex.findRequest).toHaveBeenCalled());
     f.codex.complete(request.id, 'OK'); await Promise.resolve(); await Promise.resolve();
-    gate.reject(new Error('Interrupted snapshot has no completion timestamp'));
+    try {
+      await vi.waitFor(() => expect(f.store.getRequest(request.id)?.status).toBe('completed'));
+    } finally {
+      gate.reject(new Error('Interrupted snapshot has no completion timestamp'));
+    }
     await pendingRead; await f.engine.settled(); await f.engine.pump();
     expect(f.store.getRequest(request.id)?.status).toBe('completed');
     expect(f.telegram.deliver.mock.calls.map(([delivery]) => delivery.body)).toContain('OK');
     expect(f.codex.interrupt).not.toHaveBeenCalled();
+  });
+
+  it('deduplicates concurrent completion-history reads for one request', async () => {
+    const f = fixture({ start: false }), request = await acceptRequest(f, 'telegram'); await running(f, request);
+    const initialRead = deferred<RequestLocation>(), completionRead = deferred<RequestLocation>();
+    f.codex.findRequest.mockClear();
+    f.codex.findRequest.mockImplementation((_thread, _id) => {
+      const read = f.codex.findRequest.mock.calls.length;
+      if (read === 1) return initialRead.promise;
+      if (read === 2) return completionRead.promise;
+      return Promise.resolve({ state: 'completed', turnId: 'turn-1', text: 'Final answer' });
+    });
+    const reconciliation = f.engine.reconcile(request.id);
+    try {
+      await vi.waitFor(() => expect(f.codex.findRequest).toHaveBeenCalledTimes(1));
+      const completed = { method: 'turn/completed', params: { threadId: THREAD,
+        turn: { id: 'turn-1', status: 'completed' } } } as const;
+      f.codex.notification(completed);
+      await vi.waitFor(() => expect(f.codex.findRequest).toHaveBeenCalledTimes(2));
+      f.codex.notification(completed);
+      await Promise.resolve(); await Promise.resolve();
+      expect(f.codex.findRequest).toHaveBeenCalledTimes(2);
+      completionRead.resolve({ state: 'completed', turnId: 'turn-1', text: 'Final answer' });
+      await vi.waitFor(() => expect(f.store.getRequest(request.id)?.status).toBe('completed'));
+      initialRead.resolve({ state: 'running', turnId: 'turn-1' });
+      await reconciliation; await f.engine.settled();
+      expect(f.store.listDeliveries().filter(row => row.requestId === request.id && row.body === 'Final answer')).toHaveLength(1);
+    } finally {
+      initialRead.resolve({ state: 'running', turnId: 'turn-1' });
+      completionRead.resolve({ state: 'completed', turnId: 'turn-1', text: 'Final answer' });
+      await reconciliation; await f.engine.settled();
+    }
+  });
+
+  it('preserves terminal reconciliation when an earlier history read returns stale running state', async () => {
+    const f = fixture({ start: false }), request = await acceptRequest(f, 'telegram'); await running(f, request);
+    const gate = deferred<RequestLocation>();
+    f.codex.findRequest.mockClear();
+    f.codex.findRequest.mockImplementation(async (_thread, id) => {
+      const read = f.codex.findRequest.mock.calls.length;
+      if (read === 1) return gate.promise;
+      if (read <= 6) return { state: 'running', turnId: 'turn-1' };
+      if (read === 7) {
+        f.codex.locations.set(id, { state: 'completed', turnId: 'turn-1', text: 'Final answer' });
+        return { state: 'running', turnId: 'turn-1' };
+      }
+      return f.codex.locations.get(id)!;
+    });
+    const pendingRead = f.engine.reconcile(request.id);
+    await vi.waitFor(() => expect(f.codex.findRequest).toHaveBeenCalledTimes(1));
+
+    f.codex.notification({ method: 'turn/completed', params: { threadId: THREAD,
+      turn: { id: 'turn-1', status: 'completed' } } });
+    await vi.waitFor(() => expect(f.codex.findRequest).toHaveBeenCalledTimes(6), { timeout: 5000 });
+
+    gate.resolve({ state: 'running', turnId: 'turn-1' });
+    await pendingRead;
+    await vi.waitFor(() => expect(f.store.getRequest(request.id)?.status).toBe('completed'));
+    await f.engine.settled();
+    expect(f.store.listDeliveries().filter(row => row.requestId === request.id && row.body === 'Final answer')).toHaveLength(1);
+  });
+
+  it('reconciles completion while an earlier native question read is pending', async () => {
+    const f = fixture(); const request = await acceptRequest(f, 'telegram'); await running(f, request);
+    const item = { id: 'blocked-native-question', type: 'agentMessage', delivery: 'async', text: 'Question',
+      questions: [{ title: 'Continue?' }] };
+    const question = asyncQuestions(item)[0].question;
+    const state = deferred<{ turnId: string; question: typeof question }>();
+    f.codex.asyncQuestionState.mockImplementationOnce(() => state.promise);
+    f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1', item } });
+    await vi.waitFor(() => expect(f.codex.asyncQuestionState).toHaveBeenCalledWith(THREAD, question.id));
+    f.codex.complete(request.id, 'OK');
+    try {
+      await vi.waitFor(() => expect(f.store.getRequest(request.id)?.status).toBe('completed'));
+      await vi.waitFor(() => expect(f.telegram.deliver.mock.calls.map(([delivery]) => delivery.body)).toContain('OK'));
+    } finally {
+      state.resolve({ turnId: 'turn-1', question });
+      await f.engine.settled();
+    }
+  });
+
+  it('reconciles a terminal turn when its queue start acknowledgement is pending and Codex omits turn/completed', async () => {
+    const f = fixture(); const request = await acceptRequest(f, 'telegram'); await f.engine.settled();
+    f.codex.locations.set(request.id, { state: 'queued', queuedSubmissionId: `queue-${request.id}`, soleQueuedSubmission: true });
+    const startAck = deferred<{ turn: { id: string; status: string; items: never[] } }>();
+    f.codex.startQueued.mockImplementationOnce(() => startAck.promise);
+    const continuing = f.engine.reconcile(request.id);
+    await vi.waitFor(() => expect(f.codex.startQueued).toHaveBeenCalledOnce());
+    f.codex.running(request.id, 'queued-turn');
+    await f.engine.settled();
+    f.codex.locations.set(request.id, { state: 'completed', turnId: 'queued-turn', text: 'Queued final' });
+    vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(Date.now() + 16_000);
+    try {
+      await f.engine.pump(); await f.engine.settled();
+      await vi.waitFor(() => expect(f.store.getRequest(request.id)?.status).toBe('completed'));
+      expect(f.store.listDeliveries().filter(row => row.requestId === request.id && row.body === 'Queued final')).toHaveLength(1);
+    } finally {
+      startAck.resolve({ turn: { id: 'queued-turn', status: 'inProgress', items: [] } });
+      await continuing;
+      await f.engine.settled();
+    }
   });
 
   it.each(['completion', 'question'] as const)('does not delay another thread %s behind a blocked completion history read', async event => {
@@ -3673,8 +3933,8 @@ describe('Engine chronological Slack dialogue', () => {
     const action = f.engine.action(asyncAction(f, approval));
     await vi.waitFor(() => expect(f.slack.deliver.mock.calls.some(([delivery]) => delivery.key.startsWith('question-answer:'))).toBe(true));
     const pump = f.engine.pump();
-    await vi.waitFor(() => expect(updateApproval).toHaveBeenCalled());
-    expect(updateApproval.mock.calls.at(-1)?.[1].decision).toBe('queued');
+    await vi.waitFor(() => expect(updateApproval.mock.calls.some(([, approval, resolution]) =>
+      approval.decision === 'queued' && resolution?.answerMarkerTs === undefined)).toBe(true));
     expect(updateApproval.mock.calls.at(-1)?.[2]?.answerMarkerTs).toBeUndefined();
     markerPost.resolve('1000.9999'); await action; await pump; await f.engine.settled(); await f.engine.pump();
     expect(updateApproval.mock.calls.some(([, , resolution]) => resolution?.answerMarkerTs === '1000.9999')).toBe(true);
