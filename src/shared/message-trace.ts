@@ -80,7 +80,7 @@ export function messageTrace(input: {
     }
   }
   // Clarification receipts, approvals and error notices do not prove delivery of a final answer.
-  const answers = deliveries.filter(item => request ? item.kind === 'answer' && !item.key.startsWith('question-answer:') : item.kind === 'message');
+  const answers = deliveries.filter(item => request ? item.kind === 'answer' && !item.key.startsWith('question-answer:') && !item.key.startsWith('retry:') : item.kind === 'message');
   if (answers.length) {
     const status = answers.some(item => item.status === 'uncertain') ? 'uncertain'
       : answers.some(item => item.status === 'sending') ? 'sending'
