@@ -1514,6 +1514,47 @@ describe('Engine correlation and queue', () => {
     expect(f.store.getRequest(request.id)?.status).toBe('interrupted');
   });
 
+  it('single-flights overload retries while native preflight is pending', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = fixture(), request = await acceptRequest(f, 'telegram'); await running(f, request);
+    const overload: RequestLocation = { state: 'failed', turnId: 'turn-1', failureReason: 'serverOverloaded' };
+    f.codex.locations.set(request.id, overload);
+    await f.engine.reconcile(request.id); vi.setSystemTime(Date.now() + 15_000);
+    const preflight = deferred<void>(), duplicatePreflight = deferred<void>(), history = deferred<RequestLocation>();
+    f.codex.retryOverloaded.mockImplementation(async (_thread, id, previous, _inputs, beforeSend) => {
+      if (f.codex.retryOverloaded.mock.calls.length > 1) duplicatePreflight.resolve();
+      await preflight.promise;
+      if (!beforeSend()) return;
+      const turnId = `${previous}-retry`;
+      f.codex.locations.set(id, { state: 'running', turnId });
+      return { turnId };
+    });
+    const retrying = f.engine.reconcile(request.id);
+    let competing: Promise<void> | undefined;
+    try {
+      await vi.waitFor(() => expect(f.codex.retryOverloaded).toHaveBeenCalledOnce());
+      f.codex.findRequest.mockReturnValueOnce(history.promise);
+      competing = f.engine.reconcile(request.id, true, 'turn-1');
+      history.resolve(overload);
+      await Promise.race([competing, duplicatePreflight.promise]);
+      expect(f.codex.retryOverloaded).toHaveBeenCalledOnce();
+      expect(JSON.parse(f.store.getMeta(`overload-retry:${request.id}`)!)).toMatchObject({ turnId: 'turn-1', attempts: 0 });
+      preflight.resolve(); await retrying; await competing; await f.engine.settled();
+      expect(JSON.parse(f.store.getMeta(`overload-retry:${request.id}`)!)).toMatchObject({ turnId: 'turn-1', attempts: 1, sending: true });
+      f.codex.complete(request.id, 'Single preflight answer', 'turn-1-retry');
+      await f.engine.settled(); await f.engine.pump();
+      expect(f.store.getRequest(request.id)).toMatchObject({ status: 'completed', turnId: 'turn-1-retry' });
+      expect(f.store.listDeliveries().filter(row => row.key.startsWith('answer:'))).toMatchObject([{ body: 'Single preflight answer', status: 'sent' }]);
+      expect(f.store.listDeliveries().filter(row => row.kind === 'error')).toEqual([]);
+      expect(f.codex.enqueue).toHaveBeenCalledOnce();
+      expect(f.codex.retryOverloaded).toHaveBeenCalledOnce();
+      expect(f.slack.deliver).not.toHaveBeenCalled();
+    } finally {
+      history.resolve(overload); preflight.resolve();
+      await retrying; await competing; await f.engine.settled();
+    }
+  });
+
   it('a native busy rejection defers retry without burning an attempt or looping', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     const f = fixture(); const request = await acceptRequest(f); await running(f, request);
