@@ -505,7 +505,7 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
         if thread:
             command += ['--thread', thread]
         driver_env = env
-        if args.desktop_bundle and not args.installed_desktop and os.environ.get('RELE_CI_SHARED_DIAGNOSTICS') == '1':
+        if os.name == 'nt' and os.environ.get('RELE_CI_SHARED_DIAGNOSTICS') == '1':
             driver_env = {**env, 'RELE_CI_SHARED_DIAGNOSTICS': '1'}
         process = await spawn(command, driver_env, REPO)
         client = EngineDriver(process)

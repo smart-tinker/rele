@@ -464,7 +464,7 @@ test('actual Desktop CI provisions the verified MSIX before standard-user discov
  assert.ok(canary.includes(').Hash.ToLowerInvariant() -ne $inventory.package.sha256'),'bind installation to the verified MSIX bytes');
  assert.match(workflow,/ci-standard-user-canary\.ps1 -RunGates .*?-DesktopPackage/u,'pass the verified MSIX to the canary');
 });
-test('actual Desktop discovery diagnostics reach only the isolated Rele driver', async()=>{
+test('explicit Windows diagnostics reach only the isolated Rele driver', async()=>{
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
  const driverStart=probe.indexOf('    async def driver('),driverEnd=probe.indexOf('\n    async def desktop(',driverStart);
@@ -476,7 +476,10 @@ test('actual Desktop discovery diagnostics reach only the isolated Rele driver',
  assert.match(parent,/sharedDiagnostics = \[bool\]\(\$RunGates\.IsPresent -and \$DesktopBundle -and \$env:RELE_CI_SHARED_DIAGNOSTICS -eq '1'\)/u,'serialize diagnostics only for an explicit signed Desktop gate');
  assert.match(child,/foreach \(\$entry in @\(Get-ChildItem Env:\)\) \{ Remove-Item[^}]+\}\s*\$env:SystemRoot[\s\S]*?if \(\[bool\]\$marker\.sharedDiagnostics\) \{\s*\$env:RELE_CI_SHARED_DIAGNOSTICS = '1'\s*\}/u,'restore only the explicit marker after the clean child environment is built');
  assert.doesNotMatch(baseEnv,/RELE_CI_SHARED_DIAGNOSTICS/u,'do not pass the diagnostic flag to every isolated child');
- assert.match(driver,/args\.desktop_bundle and not args\.installed_desktop/u,'scope diagnostics to automatic discovery of the signed Desktop fixture');
+ assert.match(driver,/if os\.name == 'nt' and os\.environ\.get\('RELE_CI_SHARED_DIAGNOSTICS'\) == '1'/u,
+  'forward the explicit diagnostics flag to all isolated Windows shared-driver probes');
+ assert.doesNotMatch(driver,/if args\.desktop_bundle and not args\.installed_desktop and os\.environ\.get\('RELE_CI_SHARED_DIAGNOSTICS'\)/u,
+  'do not omit diagnostics for packaged Codex version probes');
  assert.match(driver,/os\.environ\.get\('RELE_CI_SHARED_DIAGNOSTICS'\) == '1'/u,'require the explicit CI diagnostic switch');
  assert.match(driver,/spawn\(command, driver_env, REPO\)/u,'forward the switch only to the Rele driver');
 });
