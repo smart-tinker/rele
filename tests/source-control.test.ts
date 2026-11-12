@@ -11,6 +11,7 @@ import { SourceControls, type ControlContext } from '../src/server/source-contro
 import { endpointId } from '../src/server/channels/common.js';
 import type { Delivery, Endpoint } from '../src/shared/types.js';
 import type { NativeControlSnapshot, NativeGoal, ControlTurn } from '../src/server/native-controls.js';
+import { messageTrace } from '../src/shared/message-trace.js';
 
 const paths: string[] = [], stores: Store[] = [];
 afterEach(() => { stores.splice(0).forEach(store => store.close()); paths.splice(0).forEach(path => rmSync(path, { recursive: true, force: true })); vi.useRealTimers(); });
@@ -55,6 +56,73 @@ function fixture() {
   return { controls, store, native, options, endpoint, conversation, turns, sent, mutations, get goal() { return goal; }, set goal(value) { goal = value; },
     disconnect: () => { connected = false; }, changeGeneration: () => { generation = 'generation-2'; } };
 }
+
+async function runningGoalEngine() {
+  const f = fixture(), native = Object.assign(new EventEmitter(), f.native, { releaseThread: vi.fn(async () => {}) });
+  const engine = new Engine(f.store, native as unknown as CodexGateway, { config: () => ({ ...defaultConfig, slack: { enabled: true } }), temporaryRoot: tmpdir(), redact: f.options.redact });
+  engine.channels.slack = f.options.channel() as unknown as Channel;
+  const form = await engine.control(context, { kind: 'open' });
+  await engine.control(context, { kind: 'submit', id: form.id, input: { action: 'goal', objective: 'Finish', criterion: 'Done' } });
+  const turn: ControlTurn = { id: 'goal-turn', status: 'inProgress', items: [] }; f.turns.push(turn);
+  native.emit('notification', { method: 'thread/goal/updated', params: { threadId: 'native-thread', turnId: turn.id, goal: f.goal } }); await engine.settled();
+  return { ...f, native, engine, turn, request: f.store.activeRequests()[0] };
+}
+
+function expectGoalTerminal(store: Store, requestId: string, status: 'completed' | 'failed' | 'interrupted') {
+  const request = store.getRequest(requestId)!;
+  expect(request).toMatchObject({ status });
+  expect(request.suppressedFinal).toBeUndefined();
+  expect(store.getMeta(`suppressed-final:${requestId}`)).toBeUndefined();
+  const deliveries = store.listDeliveries().filter(row => row.requestId === requestId);
+  expect(deliveries).toEqual([]);
+  const trace = messageTrace({ request, origin: request.origin, deliveries, connected: { codex: true, source: true }, startedAt: request.createdAt, capturedAt: request.updatedAt });
+  expect(trace.latest).toMatchObject({ stage: 'execution', status });
+  expect(trace.steps.find(step => step.stage === 'delivery')?.status).toBe('no-data');
+}
+
+describe('native Goal terminal receipts', () => {
+  it.each(['completed', 'failed', 'interrupted'] as const)('reconciles an Engine Goal turn as %s without NOREPLY or duplicate ordinary output', async status => {
+    const f = await runningGoalEngine();
+    try {
+      f.turn.status = status;
+      f.turn.items.push({ type: 'agentMessage', id: 'terminal-output', phase: null, text: 'Actual public Goal output' });
+      await f.engine.reconcile(f.request.id);
+      expectGoalTerminal(f.store, f.request.id, status);
+      await f.engine.pump(); await f.engine.pump(); await f.engine.settled();
+      expectGoalTerminal(f.store, f.request.id, status);
+      expect(f.sent.filter(row => row.key === 'item:goal-turn:terminal-output').map(row => row.body)).toEqual(['Actual public Goal output']);
+    } finally { await f.engine.stop(); }
+  });
+
+  it.each(['completed', 'failed', 'interrupted'] as const)('advances SourceControls after a %s prior turn without NOREPLY or ordinary output', async status => {
+    const f = fixture(), form = await f.controls.open(context);
+    await f.controls.submit(context, form.id, { action: 'goal', objective: 'Finish', criterion: 'Done' });
+    const previous: ControlTurn = { id: 'previous-turn', status: 'inProgress', items: [] }; f.turns.push(previous);
+    f.controls.notification({ method: 'thread/goal/updated', params: { threadId: 'native-thread', turnId: previous.id, goal: f.goal } });
+    await f.controls.ensureRequest('native-thread', previous.id);
+    const request = f.store.activeRequests()[0];
+    previous.status = status; previous.items.push({ type: 'agentMessage', id: 'terminal-output', phase: null, text: 'Actual prior Goal output' });
+    f.turns.push({ id: 'next-turn', status: 'inProgress', items: [] });
+    f.controls.notification({ method: 'thread/goal/updated', params: { threadId: 'native-thread', turnId: 'next-turn', goal: f.goal } });
+    await expect(f.controls.ensureRequest('native-thread', 'next-turn')).resolves.toBeUndefined();
+    expectGoalTerminal(f.store, request.id, status);
+    expect(f.store.activeRequests().map(row => row.turnId)).toEqual(['next-turn']);
+    await f.controls.recover(); await f.controls.recover();
+    expectGoalTerminal(f.store, request.id, status);
+    expect(f.sent.filter(row => row.key === 'item:previous-turn:terminal-output').map(row => row.body)).toEqual(['Actual prior Goal output']);
+  });
+
+  it('refuses generic queue cancellation of a Goal turn before writing ordinary cancellation markers', async () => {
+    const f = await runningGoalEngine(), before = f.store.getRequest(f.request.id);
+    try {
+      await expect(f.engine.cancel(f.request.id)).rejects.toThrow('меню');
+      expect(f.store.getRequest(f.request.id)).toEqual(before);
+      for (const key of ['cancel-requested', 'cancel-cleanup', 'request-terminal-baseline']) expect(f.store.getMeta(`${key}:${f.request.id}`)).toBeUndefined();
+      expect(f.mutations).toEqual(['resume', 'goal']);
+      expect(f.store.listDeliveries()).toEqual([]);
+    } finally { await f.engine.stop(); }
+  });
+});
 
 describe('personal Slack source controls', () => {
   it('connects Engine controls to the current gateway and source without any ordinary request', async () => {
