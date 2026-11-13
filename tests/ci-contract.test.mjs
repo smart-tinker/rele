@@ -408,6 +408,25 @@ test('Windows canary timeout reports only bounded installer progress', async()=>
   'include the latest bounded installer progress labels in the timeout summary');
  assert.doesNotMatch(summary,/stdout\.log|stderr\.log/u,'never print raw installer logs');
 });
+test('shared fixture cleanup identifies the timed out operation without raw error text', async()=>{
+ const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ const start=probe.indexOf('cleanup_errors = []',probe.indexOf('async def scenario(order):'));
+ const end=probe.indexOf('\n\n    try:\n        if args.desktop_bundle:',start);
+ assert.ok(start>=0 && end>start,'capture cleanup failures in the isolated scenario');
+ const cleanup=probe.slice(start,end);
+ assert.match(cleanup,/\('engine\.close', engine\).*\('observer\.close', observer\).*\('peer\.close', peer\)/su,
+  'label each independently closed fixture client');
+ assert.match(cleanup,/'operation':/u,'record the failing operation');
+ assert.match(cleanup,/'elapsedMs':/u,'record bounded monotonic elapsed time');
+ assert.match(cleanup,/'errorType':/u,'record only the exception category');
+ assert.match(cleanup,/'resource':/u,'identify the owned resource');
+ assert.match(cleanup,/'native\.stop'/u,'distinguish native stop from client close');
+ assert.match(cleanup,/'ownerPid':/u,'include the observed native owner PID when known');
+ assert.doesNotMatch(cleanup,/repr\(error\)|str\(error\)/u,'do not print raw exception details');
+ assert.match(cleanup,/if primary_error is None:/u,'keep cleanup diagnostics separate from the primary failure');
+ assert.match(probe,/console_report = dict\(report\)[\s\S]*console_report\['retainedFixture'\] = 'retained'[\s\S]*print\(json\.dumps\(console_report,/u,
+  'redact the retained fixture path from public runner output');
+});
 test('browser setup installs the pinned Playwright browser without apt dependencies', async()=>{
  const workflow=await readFile(new URL('../.github/workflows/verify.yml',import.meta.url),'utf8');
  assert.ok(workflow.includes('- run: npx playwright install chromium\n        id: browser_install'));

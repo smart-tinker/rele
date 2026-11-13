@@ -18,6 +18,7 @@ import shlex
 import shutil
 import sys
 import tempfile
+import time
 import uuid
 
 from aiohttp import web
@@ -1080,23 +1081,37 @@ enabled=false
                 event.set()
             primary_error = sys.exc_info()[1]
             cleanup_errors = []
-            for client in (engine, observer, peer):
+            for operation, client in (('engine.close', engine), ('observer.close', observer), ('peer.close', peer)):
                 if client:
+                    started = time.monotonic()
+                    process = getattr(client, 'process', None)
                     try:
                         await client.close()
                     except Exception as error:
-                        cleanup_errors.append(repr(error))
+                        cleanup_errors.append({'operation': operation,
+                            'elapsedMs': round((time.monotonic() - started) * 1000),
+                            'errorType': type(error).__name__,
+                            'resource': 'engine-driver-process' if isinstance(client, EngineDriver) else
+                                'desktop-shim-process' if process else 'direct-websocket',
+                            'processPid': process.pid if process else None,
+                            'ownerPid': locals().get('pid')})
+            started = time.monotonic()
             try:
                 stopped = await native(env, 'stop')
                 assert stopped['status'] in ('stopped', 'notRunning')
             except Exception as error:
-                cleanup_errors.append(repr(error))
+                cleanup_errors.append({'operation': 'native.stop',
+                    'elapsedMs': round((time.monotonic() - started) * 1000),
+                    'errorType': type(error).__name__,
+                    'resource': 'native-owner' if os.name == 'nt' else 'native-daemon',
+                    'processPid': None, 'ownerPid': locals().get('pid')})
             if cleanup_errors:
                 args.retain_fixture = True
                 report['retainedFixture'] = str(root)
                 report.setdefault('cleanupErrors', []).extend(cleanup_errors)
                 if primary_error is None:
-                    raise RuntimeError(f'Isolated fixture cleanup failed: {cleanup_errors}')
+                    operations = ', '.join(error['operation'] for error in cleanup_errors)
+                    raise RuntimeError(f'Isolated fixture cleanup failed: {operations}')
 
     try:
         if args.desktop_bundle:
@@ -1128,7 +1143,11 @@ enabled=false
         await asyncio.wait_for(asyncio.gather(*drainers, return_exceptions=True), 10)
         await runner.cleanup()
         args.report.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
-        print(json.dumps(report, indent=2))
+        console_report = dict(report)
+        if console_report.get('retainedFixture'):
+            # The parent needs this local path to retain owned files; CI logs do not.
+            console_report['retainedFixture'] = 'retained'
+        print(json.dumps(console_report, indent=2))
 
 
 if __name__ == '__main__':
