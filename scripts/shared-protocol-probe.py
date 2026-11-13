@@ -437,7 +437,8 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
 '''
         process = await spawn([NODE, '--input-type=module', '-e', script,
             str(REPO / 'scripts/installer-codex-fixture.mjs'), json.dumps(fixture['target'])], env, root)
-        output = await output_and_exit(process, 40)
+        # The nested owner shutdown helper has a 45-second Windows deadline.
+        output = await output_and_exit(process, 60)
         assert process.returncode == 0, ('owner-stop', errors[-10:])
         return json.loads(output)
 
