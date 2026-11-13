@@ -379,8 +379,8 @@ test('Windows job timeout leaves room for its bounded standard-user native gate'
  const gateTimeout=canary.match(/AddMinutes\(\$\(if \(\$Phase -eq 'Shared'\) \{ (\d+) \} else \{ (\d+) \}\)\)/u);
  assert.ok(jobTimeout,'give Windows its own timeout without extending Ubuntu');
  assert.ok(gateTimeout,'read the native gate deadline from the canary');
- assert.ok(Number(gateTimeout[2])>=130,'leave room for the observed 100-minute shared suite and the installer lifecycle gate');
- assert.ok(Number(jobTimeout[1])>=Number(gateTimeout[2])+20,'leave twenty minutes for runner setup, later checks, and cleanup');
+ assert.ok(Number(gateTimeout[2])>=145,'leave time for the observed shared suite and the installer lifecycle that exceeded the old deadline');
+ assert.ok(Number(jobTimeout[1])>=Number(gateTimeout[2])+45,'leave time for runner setup, later checks, and cleanup');
  assert.equal(Number(jobTimeout[2]),60,'keep the Ubuntu timeout unchanged');
 });
 test('shared protocol completion wait fits within its driver response budget', async()=>{
