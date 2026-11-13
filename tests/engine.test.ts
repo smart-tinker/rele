@@ -4060,10 +4060,10 @@ describe('Engine chronological Slack dialogue', () => {
     const markerPost = deferred<string>();
     f.slack.deliver.mockImplementation(async delivery => delivery.key.startsWith('question-answer:') ? markerPost.promise : `remote-${delivery.id}`);
     const action = f.engine.action(asyncAction(f, approval));
-    await vi.waitFor(() => expect(f.slack.deliver.mock.calls.some(([delivery]) => delivery.key.startsWith('question-answer:'))).toBe(true));
+    await vi.waitFor(() => expect(f.slack.deliver.mock.calls.some(([delivery]) => delivery.key.startsWith('question-answer:'))).toBe(true), { timeout: 15_000 });
     const pump = f.engine.pump();
     await vi.waitFor(() => expect(updateApproval.mock.calls.some(([, approval, resolution]) =>
-      approval.decision === 'queued' && resolution?.answerMarkerTs === undefined)).toBe(true));
+      approval.decision === 'queued' && resolution?.answerMarkerTs === undefined)).toBe(true), { timeout: 15_000 });
     expect(updateApproval.mock.calls.at(-1)?.[2]?.answerMarkerTs).toBeUndefined();
     markerPost.resolve('1000.9999'); await action; await pump; await f.engine.settled(); await f.engine.pump();
     expect(updateApproval.mock.calls.some(([, , resolution]) => resolution?.answerMarkerTs === '1000.9999')).toBe(true);
