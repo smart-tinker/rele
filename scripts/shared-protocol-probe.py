@@ -564,6 +564,7 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
             evidence['engineProtocolEvents'] = engine_snapshot.get('observedProtocolEvents', [])[-24:]
             evidence['driverOperations'] = engine_snapshot.get('driverOperations', [])
             evidence['reconciliationStageTrace'] = engine_snapshot.get('reconciliationStageTrace', [])[-32:]
+            evidence['rpcTrace'] = engine_snapshot.get('rpcTrace', [])[-16:]
         except Exception as error:
             evidence['engineSnapshotError'] = type(error).__name__
         try:

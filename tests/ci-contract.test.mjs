@@ -408,6 +408,20 @@ test('Windows canary timeout reports only bounded installer progress', async()=>
   'include the latest bounded installer progress labels in the timeout summary');
  assert.doesNotMatch(summary,/stdout\.log|stderr\.log/u,'never print raw installer logs');
 });
+test('Windows canary timeout reports bounded native RPC and driver stages', async()=>{
+ const harness=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ const evidenceStart=harness.indexOf('    async def held_request_evidence(');
+ const evidenceEnd=harness.indexOf('\n    async def wait_records',evidenceStart);
+ const summaryStart=canary.indexOf('$summary = [ordered]@{ stage =');
+ const summaryEnd=canary.indexOf("Write-Output ('Windows canary bounded diagnostic:",summaryStart);
+ assert.ok(evidenceStart>=0&&evidenceEnd>evidenceStart&&summaryStart>=0&&summaryEnd>summaryStart,'Windows timeout path must collect and emit bounded diagnostics');
+ const evidence=harness.slice(evidenceStart,evidenceEnd),summary=canary.slice(summaryStart,summaryEnd);
+ assert.match(evidence,/evidence\['rpcTrace'\] = engine_snapshot\.get\('rpcTrace', \[\]\)\[-16:\]/u,'capture the latest native RPC stages');
+ assert.match(summary,/\$summary\.rpcTrace = @\(\$evidence\.rpcTrace \| Select-Object -Last 16\)/u,'print only the latest bounded RPC trace');
+ assert.match(summary,/\$summary\.driverOperations = @\(\$evidence\.driverOperations \| Select-Object -Last 16\)/u,'print only the latest bounded driver operation stages');
+ assert.doesNotMatch(summary,/payload|\.input\b|\.text\b|stdout\.log|stderr\.log/u,'timeout diagnostics must exclude request content and raw logs');
+});
 test('shared fixture cleanup identifies the timed out operation without raw error text', async()=>{
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
  const start=probe.indexOf('cleanup_errors = []',probe.indexOf('async def scenario(order):'));

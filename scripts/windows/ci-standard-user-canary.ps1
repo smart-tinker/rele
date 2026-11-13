@@ -689,6 +689,8 @@ try {
                         $providerResults = [ordered]@{}
                         foreach ($status in @('pending', 'sent', 'disconnected')) { $providerResults[$status] = @($evidence.providerTrace | Where-Object { $_.result -eq $status }).Count }
                         $summary.providerResults = $providerResults
+                        $summary.driverOperations = @($evidence.driverOperations | Select-Object -Last 16)
+                        $summary.rpcTrace = @($evidence.rpcTrace | Select-Object -Last 16)
                     }
                     if ($result.installerProgress) { $summary.installerProgress = @($result.installerProgress | Select-Object -Last 8) }
                 } catch { $summary.reportAvailable = $false }
