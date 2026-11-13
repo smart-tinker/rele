@@ -588,9 +588,10 @@ test('Windows fixture stop wait exceeds the nested owner shutdown deadline', asy
  const fixture=await readFile(new URL('../scripts/installer-codex-fixture.mjs',import.meta.url),'utf8');
  const ownerStop=probe.slice(probe.indexOf('    async def owner_stop(env):'),probe.indexOf('\n    async def native(env, operation):'));
  const outerTimeout=Number(ownerStop.match(/output_and_exit\(process,\s*(\d+)\)/u)?.[1])*1000;
- const innerTimeout=Number(fixture.match(/timeout:\s*scheduledDirectory\s*\?\s*75_000\s*:\s*(\d+)_000/u)?.[1])*1000;
+ const innerTimeout=Number(fixture.match(/timeout:\s*(?:scheduledDirectory\s*\?\s*75_000\s*:\s*)?(\d+)_000,\s*windowsHide: true/u)?.[1])*1000;
  assert.match(ownerStop,/stopInstallerCodex\(target\)/u,'owner-stop uses the standard fixture shutdown deadline');
- assert.ok(outerTimeout >= innerTimeout+10_000,'allow 10 seconds for the nested Windows shutdown helper to exit');
+ assert.ok(innerTimeout >= 75_000,'allow the bounded Windows owner shutdown to finish under a loaded shared gate');
+ assert.ok(outerTimeout >= innerTimeout+15_000,'allow 15 seconds for the nested Windows shutdown helper to exit');
 });
 test('Windows canary forwards only bounded timeout evidence from the failed Desktop probe', async()=>{
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');

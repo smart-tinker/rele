@@ -195,7 +195,7 @@ export function stopInstallerCodex(target, scheduledDirectory) {
         $folder.DeleteTask($owner.taskName, 0);
       }
       '{"status":"stopped"}'`], { env: { ...process.env, RELE_FIXTURE_OWNER: JSON.stringify({ ...target.desktopOwner, ...(scheduledDirectory ? { scheduledDirectory } : {}) }) },
-      encoding: 'utf8', timeout: scheduledDirectory ? 75_000 : 45_000, windowsHide: true });
+      encoding: 'utf8', timeout: 75_000, windowsHide: true });
     assert.equal(result.status, 0, result.stderr || 'The isolated WebSocket owner must stop before its profile is removed.');
     return JSON.parse(result.stdout);
   }
