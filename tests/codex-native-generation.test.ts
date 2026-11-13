@@ -314,6 +314,27 @@ it('reports only bounded Windows proof failure details when requested', async ()
   expect(failure).toEqual({ stage:'tcp-query', category:'OperationStopped', failureType:'CommandNotFoundException' });
 });
 
+it('allows a Windows native generation proof to finish when image hashing exceeds the old budget', async () => {
+  const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
+  const home = 'C:\\Users\\Owner\\fixture', executable = 'C:\\native\\codex.exe';
+  const receipt = { status:'alreadyRunning', endpoint:'ws://127.0.0.1:62662', codexHome:home, executable, executableSha256:'a'.repeat(64), ownerSid:'S-1-5-21-1001', processId:10944, processStartTime:'2026-11-03T10:00:00.1234567Z' };
+  const proof = { pid:10944, birth:receipt.processStartTime, boot:'2026-11-01T01:02:03.0000000Z', executable, sha256:'a'.repeat(64), owner:receipt.ownerSid,
+    codexHome:home, peerVerified:true, gatewayId:process.pid, localPort:55001, remotePort:62662, executableContentMatchesExpected:true };
+  let proofTimeoutMs: number | undefined;
+  const run = async (command: string, _args: string[], ...timeouts: number[]) => {
+    if (command.endsWith('Rele.exe')) return { stdout:JSON.stringify(receipt), code:0 };
+    proofTimeoutMs = timeouts[0];
+    if ((proofTimeoutMs ?? 0) < 60_000) {
+      throw Object.assign(new Error('bounded proof timeout'), { code:null, killed:true, signal:'SIGTERM', stderr:'rele-native-proof-stage:process-image-hash-hash-compute\\n' });
+    }
+    return { stdout:JSON.stringify(proof), code:0 };
+  };
+  const generation = await codexNativeGeneration({ kind:'windows-shared', endpoint:receipt.endpoint, localPort:55001, remotePort:62662 }, 10944, home,
+    { platform:'win32', run, installationDirectory:'C:\\Rele' });
+  expect(generation).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
+  expect(proofTimeoutMs).toBeGreaterThanOrEqual(60_000);
+});
+
 it('reports when a Windows proof is valid JSON but fails the native-peer contract', async () => {
   const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
   const home = 'C:\\Users\\Owner\\fixture', executable = 'C:\\native\\codex.exe';
