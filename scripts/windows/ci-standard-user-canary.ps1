@@ -257,7 +257,7 @@ if ($packages.Count -ne 1 -or $packages[0].Version.ToString() -ne $env:RELE_CI_D
         try { if ($task) { Remove-Canary $sid } } catch { $evidence.cleanupError = $_.Exception.Message; $evidence.result = 'failed' }
         $evidence | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $FixtureRoot 'windows-standard-user-results.json') -Encoding UTF8
     }
-    if ($evidence.result -ne 'passed') { throw $evidence.error }
+    if ($evidence.result -ne 'passed') { throw 'The standalone shared fixture failed; see its bounded diagnostics.' }
     exit 0
 }
 
@@ -350,16 +350,12 @@ try {
         $child = Start-Process -FilePath $shell -ArgumentList $arguments -Credential $credential -LoadUserProfile -UseNewEnvironment -WorkingDirectory $FixtureRoot -RedirectStandardOutput (Join-Path $FixtureRoot 'stdout.log') -RedirectStandardError (Join-Path $FixtureRoot 'stderr.log') -PassThru
         if (-not (Wait-CanaryChild -Process $child -Deadline $gatesDeadline)) { throw 'The standard-user shared phase timed out.' }
         if (-not (Test-Path -LiteralPath $resultPath)) {
-            foreach ($log in @('stdout.log', 'stderr.log')) {
-                $logPath = Join-Path $FixtureRoot $log
-                if (Test-Path -LiteralPath $logPath -PathType Leaf) { Get-Content -LiteralPath $logPath -Tail 30 | Write-Output }
-            }
             throw ('The standard-user shared phase did not produce a receipt; ExitCode=' + $child.ExitCode + '.')
         }
         $receipt = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
         if ($receipt.nonce -ne $Nonce -or $receipt.sid -ne $sid -or $receipt.phase -ne 'Shared') { throw 'Invalid standard-user shared phase receipt.' }
         $receipt.PSObject.Properties.Remove('nonce'); $receipt.PSObject.Properties.Remove('sid'); $sharedOutcome = $receipt
-        if ($child.ExitCode -ne 0 -or $receipt.result -ne 'passed' -or $receipt.selfElevated -ne $false) { foreach ($log in @('stdout.log', 'stderr.log')) { Get-Content -LiteralPath (Join-Path $FixtureRoot $log) -Tail 30 | Write-Output }; throw 'The standard-user native shared phase failed.' }
+        if ($child.ExitCode -ne 0 -or $receipt.result -ne 'passed' -or $receipt.selfElevated -ne $false) { throw 'The standard-user native shared phase failed; see the bounded fixture report.' }
         $child.Dispose(); $child = $null
         Remove-Item -LiteralPath $resultPath
         if ($Phase -eq 'Shared') {
@@ -476,11 +472,9 @@ try {
             }
         }
         $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $resultPath -Encoding UTF8
-        Get-Content -LiteralPath $resultPath -Raw | Write-Output
         Copy-Item -LiteralPath $resultPath -Destination (Join-Path $sourceRoot 'windows-standard-user-results.json')
     } else { throw 'The standard-user installer phase did not produce a receipt.' }
     if ($result.result -ne 'passed') {
-        foreach ($log in @('stdout.log', 'stderr.log')) { Get-Content -LiteralPath (Join-Path $FixtureRoot $log) -Tail 30 | Write-Output }
         throw 'The standard-user canary or native gate failed; see the bounded fixture reports.'
     }
 } catch {
@@ -488,7 +482,7 @@ try {
     if (-not (Test-Path -LiteralPath $publishedResult)) {
         @{ result = 'failed'; stage = $parentStage; error = $_.Exception.Message; errorHResult = ('0x{0:X8}' -f $_.Exception.HResult) } | ConvertTo-Json | Set-Content -LiteralPath $publishedResult -Encoding UTF8
     }
-    throw
+    throw 'The isolated Windows canary failed; see the bounded fixture reports.'
 } finally {
     if ($rdpStartedAt) {
         $rdpClientPid = [int]$rdp.Diagnostics['mstscPid']
@@ -655,6 +649,7 @@ try {
                     $sharedDiagnostic = Get-Content -LiteralPath $sharedDiagnosticPath -Raw | ConvertFrom-Json
                     $summary.reportAvailable = $true
                     $summary.result = if ($sharedDiagnostic.result -in @('passed', 'failed')) { $sharedDiagnostic.result } else { 'unknown' }
+                    if ($sharedDiagnostic.failureType) { $summary.failureType = if ([string]$sharedDiagnostic.failureType -match '^[A-Za-z]{1,48}$') { [string]$sharedDiagnostic.failureType } else { 'other' } }
                     $summary.codexVersion = if ([string]$sharedDiagnostic.codexVersion -match '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$') { [string]$sharedDiagnostic.codexVersion } else { 'unknown' }
                     $checks = @($sharedDiagnostic.checks.PSObject.Properties)
                     $summary.checksPassed = @($checks | Where-Object { $_.Value -eq $true }).Count

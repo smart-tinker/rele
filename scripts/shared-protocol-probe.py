@@ -14,6 +14,7 @@ import itertools
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import sys
@@ -36,6 +37,61 @@ ENGINE_WAIT_READ_TIMEOUT_SECONDS = 120
 ENGINE_CANCEL_READ_TIMEOUT_SECONDS = 720
 # backgroundTerminals performs two Windows native identity proofs, each bounded at 30s.
 ENGINE_SHARED_SHELL_START_TIMEOUT_SECONDS = 65
+
+
+def safe_error_type(error):
+    name = type(error).__name__
+    return name if re.fullmatch(r'[A-Za-z]{1,48}', name) else 'other'
+
+
+async def record_cleanup_error(errors, operation, resource, action, process_pid=None, owner_pid=None):
+    started = time.monotonic()
+    try:
+        await action()
+    except Exception as error:
+        errors.append({
+            'operation': operation if operation in ('engine.close', 'observer.close', 'peer.close', 'native.stop') else 'other',
+            'elapsedMs': max(0, min(600000, round((time.monotonic() - started) * 1000))),
+            'errorType': safe_error_type(error),
+            'resource': resource if resource in ('engine-driver-process', 'desktop-shim-process', 'direct-websocket', 'native-owner', 'native-daemon') else 'other',
+            **({'processPid': process_pid} if isinstance(process_pid, int) and not isinstance(process_pid, bool) and process_pid > 0 else {}),
+            **({'ownerPid': owner_pid} if isinstance(owner_pid, int) and not isinstance(owner_pid, bool) and owner_pid > 0 else {}),
+        })
+
+
+def cleanup_failure_message(primary_error, cleanup_errors):
+    if primary_error is not None or not cleanup_errors:
+        return None
+    operations = ', '.join(error['operation'] if error.get('operation') in ('engine.close', 'observer.close', 'peer.close', 'native.stop') else 'other'
+        for error in cleanup_errors[:8])
+    return f'Isolated fixture cleanup failed: {operations}'
+
+
+def public_console_report(report):
+    checks = report.get('checks') if isinstance(report.get('checks'), dict) else {}
+    output = {
+        'result': report.get('result') if report.get('result') in ('passed', 'failed') else 'unknown',
+        'checksPassed': sum(value is True for value in checks.values()),
+        'checksFailed': sum(value is False for value in checks.values()),
+        'cleanupErrors': [],
+        'retainedFixture': bool(report.get('retainedFixture')),
+    }
+    failure_type = report.get('failureType')
+    if isinstance(failure_type, str) and re.fullmatch(r'[A-Za-z]{1,48}', failure_type):
+        output['failureType'] = failure_type
+    cleanup_errors = report.get('cleanupErrors')
+    if not isinstance(cleanup_errors, list):
+        cleanup_errors = []
+    for error in cleanup_errors[-8:]:
+        if not isinstance(error, dict):
+            continue
+        output['cleanupErrors'].append({
+            'operation': error.get('operation') if error.get('operation') in ('engine.close', 'observer.close', 'peer.close', 'native.stop') else 'other',
+            'errorType': error.get('errorType') if isinstance(error.get('errorType'), str) and re.fullmatch(r'[A-Za-z]{1,48}', error['errorType']) else 'other',
+            'elapsedMs': max(0, min(600000, error.get('elapsedMs', 0))) if isinstance(error.get('elapsedMs'), int) and not isinstance(error.get('elapsedMs'), bool) else 0,
+            'resource': error.get('resource') if error.get('resource') in ('engine-driver-process', 'desktop-shim-process', 'direct-websocket', 'native-owner', 'native-daemon') else 'other',
+        })
+    return output
 
 
 def arguments():
@@ -1084,35 +1140,22 @@ enabled=false
             cleanup_errors = []
             for operation, client in (('engine.close', engine), ('observer.close', observer), ('peer.close', peer)):
                 if client:
-                    started = time.monotonic()
                     process = getattr(client, 'process', None)
-                    try:
-                        await client.close()
-                    except Exception as error:
-                        cleanup_errors.append({'operation': operation,
-                            'elapsedMs': round((time.monotonic() - started) * 1000),
-                            'errorType': type(error).__name__,
-                            'resource': 'engine-driver-process' if isinstance(client, EngineDriver) else
-                                'desktop-shim-process' if process else 'direct-websocket',
-                            'processPid': process.pid if process else None,
-                            'ownerPid': locals().get('pid')})
-            started = time.monotonic()
-            try:
+                    resource = 'engine-driver-process' if isinstance(client, EngineDriver) else 'desktop-shim-process' if process else 'direct-websocket'
+                    await record_cleanup_error(cleanup_errors, operation, resource, client.close,
+                        process.pid if process else None, locals().get('pid'))
+            async def stop_native():
                 stopped = await native(env, 'stop')
                 assert stopped['status'] in ('stopped', 'notRunning')
-            except Exception as error:
-                cleanup_errors.append({'operation': 'native.stop',
-                    'elapsedMs': round((time.monotonic() - started) * 1000),
-                    'errorType': type(error).__name__,
-                    'resource': 'native-owner' if os.name == 'nt' else 'native-daemon',
-                    'processPid': None, 'ownerPid': locals().get('pid')})
+            await record_cleanup_error(cleanup_errors, 'native.stop', 'native-owner' if os.name == 'nt' else 'native-daemon', stop_native,
+                owner_pid=locals().get('pid'))
             if cleanup_errors:
                 args.retain_fixture = True
                 report['retainedFixture'] = str(root)
                 report.setdefault('cleanupErrors', []).extend(cleanup_errors)
-                if primary_error is None:
-                    operations = ', '.join(error['operation'] for error in cleanup_errors)
-                    raise RuntimeError(f'Isolated fixture cleanup failed: {operations}')
+                failure = cleanup_failure_message(primary_error, cleanup_errors)
+                if failure:
+                    raise RuntimeError(failure)
 
     try:
         if args.desktop_bundle:
@@ -1125,6 +1168,7 @@ enabled=false
         report['result'] = 'passed'
     except BaseException as error:
         report['result'] = 'failed'
+        report['failureType'] = safe_error_type(error)
         report['exception'] = repr(error)
         report['stderrTail'] = errors[-20:]
         raise
@@ -1144,11 +1188,7 @@ enabled=false
         await asyncio.wait_for(asyncio.gather(*drainers, return_exceptions=True), 10)
         await runner.cleanup()
         args.report.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
-        console_report = dict(report)
-        if console_report.get('retainedFixture'):
-            # The parent needs this local path to retain owned files; CI logs do not.
-            console_report['retainedFixture'] = 'retained'
-        print(json.dumps(console_report, indent=2))
+        print(json.dumps(public_console_report(report), indent=2))
 
 
 if __name__ == '__main__':
@@ -1163,7 +1203,11 @@ if __name__ == '__main__':
             raise SystemExit('Windows Codex fixtures must be created outside RUNNER_TEMP.')
     directory = Path(tempfile.mkdtemp(prefix='rs-', dir=fixture_parent))
     try:
-        asyncio.run(gate(args, directory))
+        try:
+            asyncio.run(gate(args, directory))
+        except Exception as error:
+            print(f'Shared protocol gate failed ({safe_error_type(error)}).', file=sys.stderr)
+            raise SystemExit(1) from None
     finally:
         # A failed owner/receipt guard means a scheduled Task may still reference
         # these private files. Preserve them for exact-identity cleanup by the caller.

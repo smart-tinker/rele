@@ -430,16 +430,17 @@ test('shared fixture cleanup identifies the timed out operation without raw erro
  const cleanup=probe.slice(start,end);
  assert.match(cleanup,/\('engine\.close', engine\).*\('observer\.close', observer\).*\('peer\.close', peer\)/su,
   'label each independently closed fixture client');
- assert.match(cleanup,/'operation':/u,'record the failing operation');
- assert.match(cleanup,/'elapsedMs':/u,'record bounded monotonic elapsed time');
- assert.match(cleanup,/'errorType':/u,'record only the exception category');
- assert.match(cleanup,/'resource':/u,'identify the owned resource');
- assert.match(cleanup,/'native\.stop'/u,'distinguish native stop from client close');
- assert.match(cleanup,/'ownerPid':/u,'include the observed native owner PID when known');
+ assert.match(cleanup,/await record_cleanup_error\(cleanup_errors, operation, resource, client\.close/u,'record close failures without raw exception text');
+ assert.match(cleanup,/await record_cleanup_error\(cleanup_errors, 'native\.stop'/u,'distinguish native stop from client close');
+ assert.match(cleanup,/owner_pid=locals\(\)\.get\('pid'\)/u,'include the observed native owner PID when known');
  assert.doesNotMatch(cleanup,/repr\(error\)|str\(error\)/u,'do not print raw exception details');
- assert.match(cleanup,/if primary_error is None:/u,'keep cleanup diagnostics separate from the primary failure');
- assert.match(probe,/console_report = dict\(report\)[\s\S]*console_report\['retainedFixture'\] = 'retained'[\s\S]*print\(json\.dumps\(console_report,/u,
-  'redact the retained fixture path from public runner output');
+ assert.match(cleanup,/cleanup_failure_message\(primary_error, cleanup_errors\)/u,'keep cleanup diagnostics separate from the primary failure');
+ assert.match(probe,/print\(json\.dumps\(public_console_report\(report\),/u,'print only the allowlisted public report');
+ assert.doesNotMatch(probe,/print\(json\.dumps\(report,/u,'never print the local report directly');
+ const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ assert.doesNotMatch(canary,/Get-Content -LiteralPath \(Join-Path \$FixtureRoot \$log\) -Tail 30 \| Write-Output|Get-Content -LiteralPath \$resultPath -Raw \| Write-Output/u,
+  'do not echo raw standard-user logs or the complete private result to Actions');
+ assert.doesNotMatch(canary,/throw \$evidence\.error|^\s+throw\s*$/mu,'surface a bounded failure instead of raw exception text');
 });
 test('Windows canary summary exposes bounded cleanup failure categories', async()=>{
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
@@ -613,7 +614,7 @@ test('Windows fixture stop wait exceeds the nested owner shutdown deadline', asy
 test('Windows canary forwards only bounded timeout evidence from the failed Desktop probe', async()=>{
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
  const start=canary.indexOf("$timeoutReportPath = Join-Path $FixtureRoot 'reports\\shared-results-actual-desktop.json'");
- const end=canary.indexOf("foreach ($log in @('stdout.log'",start);
+ const end=canary.indexOf('\n        $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $resultPath -Encoding UTF8',start);
  assert.ok(start>=0 && end>start,'failed Windows canary must read the Desktop report from its fixture directory');
  const relay=canary.slice(start,end);
  assert.match(relay,/\.heldRequestTimeout/u,'forward the probe timeout snapshot');
