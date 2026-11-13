@@ -659,6 +659,14 @@ try {
                     $checks = @($sharedDiagnostic.checks.PSObject.Properties)
                     $summary.checksPassed = @($checks | Where-Object { $_.Value -eq $true }).Count
                     $summary.checksFailed = @($checks | Where-Object { $_.Value -eq $false }).Count
+                    if ($sharedDiagnostic.cleanupErrors) {
+                        $summary.cleanupErrors = @($sharedDiagnostic.cleanupErrors | Select-Object -Last 8 | ForEach-Object { [ordered]@{
+                            operation = if ($_.operation -in @('engine.close', 'observer.close', 'peer.close', 'native.stop')) { [string]$_.operation } else { 'other' }
+                            errorType = if ([string]$_.errorType -match '^[A-Za-z]{1,48}$') { [string]$_.errorType } else { 'other' }
+                            elapsedMs = if ($_.elapsedMs -is [int] -or $_.elapsedMs -is [long]) { [Math]::Max(0, [Math]::Min(600000, [long]$_.elapsedMs)) } else { 0 }
+                            resource = if ($_.resource -in @('engine-driver-process', 'desktop-shim-process', 'direct-websocket', 'native-owner', 'native-daemon')) { [string]$_.resource } else { 'other' }
+                        } })
+                    }
                     $evidence = $sharedDiagnostic.heldRequestTimeout
                     if (-not $evidence) { $evidence = $sharedDiagnostic.afterShellCancelWaitFailure }
                     if (-not $evidence) { $evidence = $sharedDiagnostic.cancellationRequestTimeout }

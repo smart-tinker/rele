@@ -441,6 +441,23 @@ test('shared fixture cleanup identifies the timed out operation without raw erro
  assert.match(probe,/console_report = dict\(report\)[\s\S]*console_report\['retainedFixture'\] = 'retained'[\s\S]*print\(json\.dumps\(console_report,/u,
   'redact the retained fixture path from public runner output');
 });
+test('Windows canary summary exposes bounded cleanup failure categories', async()=>{
+ const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ const start=canary.indexOf('$summary = [ordered]@{ stage =');
+ const end=canary.indexOf("Write-Output ('Windows canary bounded diagnostic:",start);
+ const summary=canary.slice(start,end);
+ assert.ok(start>=0&&end>start,'Windows canary must emit a bounded timeout summary');
+ assert.match(summary,/\$summary\.cleanupErrors\s*=\s*@\(\$sharedDiagnostic\.cleanupErrors\s*\|\s*Select-Object -Last 8/u,
+  'emit only the latest cleanup failures');
+ assert.match(summary,/operation = if \(\$_.operation -in @\('engine\.close', 'observer\.close', 'peer\.close', 'native\.stop'\)\)/u,
+  'allow only known cleanup operations');
+ assert.match(summary,/errorType = if \(\[string\]\$_.errorType -match '\^\[A-Za-z\]\{1,48\}\$'/u,'allow only short exception type names');
+ assert.match(summary,/elapsedMs = if \(\$_.elapsedMs -is \[int\] -or \$_.elapsedMs -is \[long\]\) \{ \[Math\]::Max\(0, \[Math\]::Min\(600000/u,
+  'bound elapsed times before logging');
+ assert.match(summary,/resource = if \(\$_.resource -in @\('engine-driver-process', 'desktop-shim-process', 'direct-websocket', 'native-owner', 'native-daemon'\)\)/u,
+  'allow only known resource categories');
+ assert.doesNotMatch(summary,/\.Message|\.Exception|retainedFixture|\.Path/u,'do not print raw errors or runner paths');
+});
 test('browser setup installs the pinned Playwright browser without apt dependencies', async()=>{
  const workflow=await readFile(new URL('../.github/workflows/verify.yml',import.meta.url),'utf8');
  assert.ok(workflow.includes('- run: npx playwright install chromium\n        id: browser_install'));
