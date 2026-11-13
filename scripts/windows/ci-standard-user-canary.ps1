@@ -80,6 +80,22 @@ function Remove-FixtureProfile([string]$Sid, [hashtable]$Facts) {
     $detail = if ($lastError) { $lastError.Message } else { 'The fixture profile is still loaded.' }
     throw ('Fixture profile cleanup timed out; Loaded=' + $profile.Loaded + '; refCount=' + $profile.refCount + '; ' + $detail)
 }
+function Wait-CanaryChild([Diagnostics.Process]$Process, [DateTime]$Deadline) {
+    $lastStage = $null
+    $stdout = Join-Path $FixtureRoot 'stdout.log'
+    while (-not $Process.HasExited) {
+        $remaining = [Math]::Max(0, [int](($Deadline - [DateTime]::UtcNow).TotalMilliseconds))
+        if ($remaining -le 0) { return $false }
+        if ($Process.WaitForExit([Math]::Min($remaining, 30000))) { return $true }
+        $stage = Get-Content -LiteralPath $stdout -Tail 64 -ErrorAction SilentlyContinue |
+            Where-Object { $_ -cmatch '^RELE_CI_STAGE=[a-z0-9.-]{1,96}$' } | Select-Object -Last 1
+        if ($stage -and $stage -ne $lastStage) {
+            Write-Host ('Windows canary progress: ' + $stage)
+            $lastStage = $stage
+        }
+    }
+    return $true
+}
 
 if ($Mode -eq 'Child') {
     $marker = Get-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Raw | ConvertFrom-Json
@@ -118,6 +134,7 @@ if ($Mode -eq 'Child') {
         function Invoke-SharedGates {
             if ($marker.desktopBundle) {
                 $evidence.stage = 'desktop-appx-registration'
+                Write-Output ('RELE_CI_STAGE=' + $evidence.stage)
                 $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
                 $env:RELE_CI_DESKTOP_APPX_NAME = [string]$marker.desktopIdentityName
                 $env:RELE_CI_DESKTOP_APPX_VERSION = [string]$marker.desktopIdentityVersion
@@ -141,6 +158,7 @@ if ($packages.Count -ne 1 -or $packages[0].Version.ToString() -ne $env:RELE_CI_D
                     Remove-Item Env:\RELE_CI_DESKTOP_APPX_NAME, Env:\RELE_CI_DESKTOP_APPX_VERSION -ErrorAction SilentlyContinue
                 }
                 $evidence.stage = 'shared-actual-desktop'
+                Write-Output ('RELE_CI_STAGE=' + $evidence.stage)
                 & $marker.python (Join-Path $sourceRoot 'scripts\shared-protocol-probe.py') --desktop-bundle $marker.desktopBundle --desktop-inventory $marker.desktopInventory --expected-version $marker.desktopVersion --windows-app-template $applicationTemplate --windows-runtime packaged --report (Join-Path $env:RELE_TEST_REPORT_DIR 'shared-results-actual-desktop.json')
                 if ($LASTEXITCODE -ne 0) { throw 'The standard-user actual Desktop bootstrap gate failed.' }
                 $evidence.gates += 'shared-actual-desktop'
@@ -149,6 +167,7 @@ if ($packages.Count -ne 1 -or $packages[0].Version.ToString() -ne $env:RELE_CI_D
             $versions = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1')
             for ($index = 0; $index -lt $versions.Count; $index++) {
                 $version = $versions[$index]; $evidence.stage = 'shared-' + $version
+                Write-Output ('RELE_CI_STAGE=' + $evidence.stage)
                 & $marker.python (Join-Path $sourceRoot 'scripts\shared-protocol-probe.py') --codex-prefix $marker.prefixes[$index] --expected-version $version --windows-app-template $applicationTemplate --windows-runtime packaged --report (Join-Path $env:RELE_TEST_REPORT_DIR ('shared-results-' + $version + '.json'))
                 if ($LASTEXITCODE -ne 0) { throw ('The standard-user native shared gate failed for ' + $version + '.') }
                 $evidence.gates += 'shared-' + $version
@@ -157,6 +176,7 @@ if ($packages.Count -ne 1 -or $packages[0].Version.ToString() -ne $env:RELE_CI_D
         if ($Phase -eq 'Shared') {
             # Independent native primitives must finish before an interactive logon.
             $evidence.stage = 'owner-primitive'
+            Write-Output ('RELE_CI_STAGE=' + $evidence.stage)
             if ((Get-FileHash -LiteralPath (Join-Path $sourceRoot 'dist\native\Rele.Process.exe') -Algorithm SHA256).Hash -ne
                 (Get-FileHash -LiteralPath (Join-Path $applicationTemplate 'dist\native\Rele.Process.exe') -Algorithm SHA256).Hash) { throw 'Source and packaged ProcessHost bytes differ.' }
             & $marker.node (Join-Path $sourceRoot 'scripts\smoke-windows-codex-owner.mjs')
@@ -165,12 +185,14 @@ if ($packages.Count -ne 1 -or $packages[0].Version.ToString() -ne $env:RELE_CI_D
             $evidence.actualDesktopGui = $false
             if (-not $marker.desktopBundle) {
                 $evidence.stage = 'native-cleanup'
+                Write-Output ('RELE_CI_STAGE=' + $evidence.stage)
                 & $marker.node (Join-Path $sourceRoot 'scripts\probe-installer-cleanup.mjs') --native
                 if ($LASTEXITCODE -ne 0) { throw 'The standard-user native stop/workdir cleanup gate failed.' }
                 $evidence.gates += 'native-cleanup'
             }
         } else {
             $evidence.stage = 'interactive-token'
+            Write-Output ('RELE_CI_STAGE=' + $evidence.stage)
             $scheduler = New-Object -ComObject 'Schedule.Service'; $scheduler.Connect(); $folder = $scheduler.GetFolder('\')
             $definition = $scheduler.NewTask(0)
             $definition.Principal.UserId = $sid; $definition.Principal.LogonType = 3; $definition.Principal.RunLevel = 0
@@ -190,6 +212,7 @@ if ($packages.Count -ne 1 -or $packages[0].Version.ToString() -ne $env:RELE_CI_D
             $evidence.taskElevated = $receipt.elevated; $evidence.taskSessionId = $receipt.sessionId; $evidence.canary = 'passed'
             if ($RunGates) {
                 $evidence.stage = 'owner-control'
+                Write-Output ('RELE_CI_STAGE=' + $evidence.stage)
                 $env:RELE_TEST_RELE_STAGE = $applicationTemplate
                 if ($marker.desktopBundle) { $nativeCandidates = @(Join-Path $marker.desktopBundle 'app\resources\codex.exe') }
                 else {
@@ -204,6 +227,7 @@ if ($packages.Count -ne 1 -or $packages[0].Version.ToString() -ne $env:RELE_CI_D
                 $evidence.gates += 'owner-control'
                 Invoke-SharedGates
                 $evidence.stage = 'installer'
+                Write-Output ('RELE_CI_STAGE=' + $evidence.stage)
                 & $marker.node (Join-Path $sourceRoot 'scripts\smoke-windows-installer.mjs')
                 if ($LASTEXITCODE -ne 0) { throw 'The standard-user Windows installer lifecycle gate failed.' }
                 $evidence.gates += 'installer'
@@ -324,8 +348,7 @@ try {
         $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + (Quote $PSCommandPath) + ' -Mode Child -FixtureRoot ' + (Quote $FixtureRoot) + ' -Nonce ' + $Nonce + ' -RunGates -Phase Shared'
         if ($PowerShell7Path) { $arguments += ' -PowerShell7Path ' + (Quote $shell) }
         $child = Start-Process -FilePath $shell -ArgumentList $arguments -Credential $credential -LoadUserProfile -UseNewEnvironment -WorkingDirectory $FixtureRoot -RedirectStandardOutput (Join-Path $FixtureRoot 'stdout.log') -RedirectStandardError (Join-Path $FixtureRoot 'stderr.log') -PassThru
-        $remaining = [Math]::Max(0, [int](($gatesDeadline - [DateTime]::UtcNow).TotalMilliseconds))
-        if (-not $child.WaitForExit($remaining)) { throw 'The standard-user shared phase timed out.' }
+        if (-not (Wait-CanaryChild -Process $child -Deadline $gatesDeadline)) { throw 'The standard-user shared phase timed out.' }
         if (-not (Test-Path -LiteralPath $resultPath)) {
             foreach ($log in @('stdout.log', 'stderr.log')) {
                 $logPath = Join-Path $FixtureRoot $log
@@ -407,7 +430,8 @@ try {
     $credential = $null; $password.Dispose(); $password = $null
     if ($RunGates) { $childDeadline = [Math]::Max(0, [int](($gatesDeadline - [DateTime]::UtcNow).TotalMilliseconds)) }
     if ($childDeadline -le 0) { throw 'The standard-user native gates exceeded their common deadline.' }
-    if (-not $child.WaitForExit($childDeadline)) { throw 'Standard-user fixture child timed out.' }
+    $childCompleted = if ($RunGates) { Wait-CanaryChild -Process $child -Deadline $gatesDeadline } else { $child.WaitForExit($childDeadline) }
+    if (-not $childCompleted) { throw 'Standard-user fixture child timed out.' }
     if (Test-Path -LiteralPath $resultPath) {
         $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
         if ($result.nonce -ne $Nonce -or $result.sid -ne $sid -or $result.phase -ne 'Installer') { throw 'Invalid standard-user installer phase receipt.' }
@@ -591,7 +615,7 @@ try {
             $stdout = Join-Path $FixtureRoot 'stdout.log'
             if (Test-Path -LiteralPath $stdout) {
                 $allowed = @('Windows installer smoke: an unknown startup script is preserved', 'Windows installer smoke: a previous portable process is not killed', 'Windows installer smoke: foreign Desktop settings are preserved without blocking installation', 'Windows installer smoke: the Codex wrapper preserves argv, profile, data and raw bytes', 'Windows installer smoke: launcher restart', 'Windows installer smoke: same-version upgrade with backup', 'Windows installer smoke: owned Desktop settings restore and later foreign changes survive uninstall', 'Windows installer smoke: uninstall preserves data', 'Windows installer cleanup: desktop-environment', 'Windows installer cleanup: held-adapter', 'Windows installer cleanup: native-daemon', 'Windows installer cleanup: files', 'Windows installer cleanup: complete')
-                Get-Content -LiteralPath $stdout -Tail 64 | Where-Object { $_ -in $allowed } | Select-Object -Last 32 | ForEach-Object { $installerProgress.Add([string]$_) }
+                Get-Content -LiteralPath $stdout -Tail 64 | Where-Object { $_ -in $allowed -or $_ -cmatch '^RELE_CI_STAGE=[a-z0-9.-]{1,96}$' } | Select-Object -Last 32 | ForEach-Object { $installerProgress.Add([string]$_) }
             }
         } },
         { if ($retainedSharedFixtures.Count -eq 0) { Remove-Item -LiteralPath $FixtureRoot -Recurse -Force } }

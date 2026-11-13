@@ -42,6 +42,12 @@ test('missing, skipped and failed required steps cannot pass', () => {
  for (const outcome of ['skipped','failure','cancelled']) assert.throws(() => assertSteps({a:{outcome,conclusion:'success'}}, ['a']));
  assert.throws(() => assertSteps({}, ['a']));
 });
+test('required-step failures report every failed outcome', () => {
+ assert.throws(() => assertSteps({
+  standard_user:{outcome:'failure',conclusion:'failure'},
+  browser_install:{outcome:'skipped',conclusion:'skipped'},
+ }, ['browser_install','standard_user']), /Required steps did not pass: browser_install=skipped, standard_user=failure/u);
+});
 async function fixture(fn) {
  const root=await mkdtemp(path.join(tmpdir(),'rele-ci-'));
  try {
@@ -387,12 +393,17 @@ test('shared protocol completion wait fits within its driver response budget', a
 });
 test('Windows canary timeout reports only bounded installer progress', async()=>{
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ const installer=await readFile(new URL('../scripts/smoke-windows-installer.mjs',import.meta.url),'utf8');
  const start=canary.indexOf('$summary = [ordered]@{ stage =');
  const end=canary.indexOf("Write-Output ('Windows canary bounded diagnostic:",start);
  assert.ok(start>=0 && end>start,'Windows canary must emit a bounded timeout summary');
+ assert.match(canary,/WaitForExit\(\[Math\]::Min\(\$remaining, 30000\)\)/u,'poll the bounded fixture process so active progress can be reported');
+ assert.ok(/Write-Host \('Windows canary progress: '/u.test(canary),'send progress outside the captured Boolean return value');
+ assert.match(canary,/RELE_CI_STAGE=\[a-z0-9.-\]\{1,96\}/u,'accept only fixed-format stage labels from the fixture log');
+ assert.match(installer,/RELE_CI_STAGE=installer-reinstall/u,'identify the installer re-adoption phase');
  const summary=canary.slice(start,end);
- assert.match(canary,/Get-Content -LiteralPath \$stdout -Tail 64 \| Where-Object \{ \$_ -in \$allowed \} \| Select-Object -Last 32/u,
-  'retain only allowlisted installer progress labels');
+ assert.ok(/Get-Content -LiteralPath \$stdout -Tail 64(?: -ErrorAction SilentlyContinue)?\s*\|\s*Where-Object \{ \$_ -cmatch/u.test(canary),
+  'retain only bounded installer stage labels');
  assert.match(summary,/\$summary\.installerProgress = @\(\$result\.installerProgress \| Select-Object -Last 8\)/u,
   'include the latest bounded installer progress labels in the timeout summary');
  assert.doesNotMatch(summary,/stdout\.log|stderr\.log/u,'never print raw installer logs');
