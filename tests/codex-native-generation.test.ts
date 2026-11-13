@@ -66,9 +66,9 @@ it.skipIf(process.platform !== 'win32')('proves an owned Windows stdio process w
       return path.win32.normalize(realpathSync.native(left)).toLowerCase() === path.win32.normalize(realpathSync.native(right)).toLowerCase();
     } catch { return false; }
   };
-  const run = async (command:string, args:string[]) => {
+  const run = async (command:string, args:string[], timeoutMs = 30_000) => {
     try {
-      const result = await promisify(execFile)(command, args, { timeout:30_000, maxBuffer:128*1024, windowsHide:true });
+      const result = await promisify(execFile)(command, args, { timeout:timeoutMs, maxBuffer:128*1024, windowsHide:true });
       try {
         const proof = JSON.parse(result.stdout) as Record<string, unknown>;
         const checks = [
@@ -96,7 +96,7 @@ it.skipIf(process.platform !== 'win32')('proves an owned Windows stdio process w
   const generation = await codexNativeGeneration({ kind:'stdio', pid:child.pid!, codexHome:home, executable:expectedExecutable }, child.pid!, home, { platform:'win32', run });
   if (!generation) throw new Error(`Windows native proof failed at ${proofStage ?? 'unknown stage'}`);
   expect(generation).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
-}, 60000);
+}, 180000);
 
 async function proxyFixture(churn = false, coldExecutable = false, symlinkEndpoint = false, pidRecord = true) {
   const home = await mkdtemp(path.join(tmpdir(), 'rele-generation-'));
@@ -321,9 +321,9 @@ it('allows a Windows native generation proof to finish when image hashing exceed
   const proof = { pid:10944, birth:receipt.processStartTime, boot:'2026-11-01T01:02:03.0000000Z', executable, sha256:'a'.repeat(64), owner:receipt.ownerSid,
     codexHome:home, peerVerified:true, gatewayId:process.pid, localPort:55001, remotePort:62662, executableContentMatchesExpected:true };
   let proofTimeoutMs: number | undefined;
-  const run = async (command: string, _args: string[], ...timeouts: number[]) => {
+  const run = async (command: string, _args: string[], timeoutMs?: number) => {
     if (command.endsWith('Rele.exe')) return { stdout:JSON.stringify(receipt), code:0 };
-    proofTimeoutMs = timeouts[0];
+    proofTimeoutMs = timeoutMs;
     if ((proofTimeoutMs ?? 0) < 60_000) {
       throw Object.assign(new Error('bounded proof timeout'), { code:null, killed:true, signal:'SIGTERM', stderr:'rele-native-proof-stage:process-image-hash-hash-compute\\n' });
     }

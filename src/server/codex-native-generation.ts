@@ -284,7 +284,7 @@ try {
 interface CommandResult { stdout: string; code: number | null }
 export interface CodexNativeGenerationOptions {
   platform?: NodeJS.Platform;
-  run?: (command: string, args: string[]) => Promise<CommandResult>;
+  run?: (command: string, args: string[], timeoutMs?: number) => Promise<CommandResult>;
   installationDirectory?: string;
   onProofFailure?: (failure: { stage: string; category: string; failureType: string }) => void;
 }
@@ -307,7 +307,7 @@ async function windowsGeneration(peer: Exclude<CodexNativePeer, { kind: 'proxy' 
     return undefined;
   };
   if (!windowsPath(home)) return fail('input', 'codex-home', 'invalid-contract');
-  const run = options.run ?? (async (command: string, args: string[]) => ({ ...(await execute(command, args, { timeout: 30_000, maxBuffer: 128 * 1024, windowsHide: true })), code: 0 }));
+  const run = options.run ?? (async (command: string, args: string[], timeoutMs = 30_000) => ({ ...(await execute(command, args, { timeout: timeoutMs, maxBuffer: 128 * 1024, windowsHide: true })), code: 0 }));
   const directory = options.installationDirectory ?? fileURLToPath(new URL('../../', import.meta.url));
   let receipt: any;
   if (peer.kind === 'stdio') {
@@ -341,7 +341,7 @@ async function windowsGeneration(peer: Exclude<CodexNativePeer, { kind: 'proxy' 
   const source = WINDOWS_PROOF.replace('__INPUT__', input);
   const systemRoot = process.env.SystemRoot || 'C:\\Windows';
   let result: CommandResult;
-  try { result = await run(path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(source, 'utf16le').toString('base64')]); }
+  try { result = await run(path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(source, 'utf16le').toString('base64')], 120_000); }
   catch (error) {
     const stderr = (error as { stderr?: unknown })?.stderr;
     const failure = typeof stderr === 'string' && /^rele-native-proof:([a-z-]{1,64}):[^:\r\n]{1,96}:([A-Za-z]{1,64}):([A-Za-z0-9-]{1,64})$/mu.exec(stderr);
