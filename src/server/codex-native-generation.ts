@@ -167,14 +167,15 @@ $script:stage='input'
 try {
   $inputProof=ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__INPUT__')))
   $r=$inputProof.receipt; $p=$inputProof.peer; $stdio=$p.kind -eq 'stdio'
+  function Mark-Stage($name) { $script:stage=$name; [Console]::Error.WriteLine('rele-native-proof-stage:'+$name) }
   function Require($ok) { if (-not $ok) { throw 'unproven' } }
   function FileSha256($path) {
     $pathStage=$script:stage
-    $script:stage=$pathStage+'-hash-open'
+    Mark-Stage ($pathStage+'-hash-open')
     $algorithm=[Security.Cryptography.SHA256]::Create()
     try {
       $stream=[IO.File]::OpenRead($path)
-      try { $script:stage=$pathStage+'-hash-compute'; return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
+      try { Mark-Stage ($pathStage+'-hash-compute'); return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
       finally { $stream.Dispose() }
     } finally { $algorithm.Dispose() }
   }
@@ -184,41 +185,42 @@ try {
     catch [System.ArgumentException] { return $false }
   }
   function Identity {
-    $script:stage='process-query'
+    Mark-Stage 'process-query'
     $native=[Diagnostics.Process]::GetProcessById([int]$inputProof.serverId); $helper=$null
     try {
-      $script:stage='process-handle'
+      Mark-Stage 'process-handle'
       Require ($native.Handle -ne [IntPtr]::Zero)
-      $script:stage='owner-query'
+      Mark-Stage 'owner-process-query'
       $record=Get-CimInstance Win32_Process -Filter ("ProcessId="+$native.Id) -ErrorAction Stop
+      Mark-Stage 'owner-sid-query'
       $owner=Invoke-CimMethod -InputObject $record -MethodName GetOwnerSid -ErrorAction Stop
       Require ($owner.ReturnValue -eq 0)
-      $script:stage='image-query'
+      Mark-Stage 'image-query'
       $exe=$native.MainModule.FileName; $birth=$native.StartTime.ToUniversalTime().ToString('o')
-      $script:stage='process-image-hash'
+      Mark-Stage 'process-image-hash'
       $hash=FileSha256 $exe
-      $script:stage='process-identity'
+      Mark-Stage 'process-identity'
       if ($stdio) {
         $gatewayOwner=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         $expectedExecutable=$p.executable
-        $script:stage='stdio-owner-check'
+        Mark-Stage 'stdio-owner-check'
         Require ($owner.Sid -eq $gatewayOwner)
         $expectedParent=$inputProof.gatewayId
-        if ($p.helperExecutable) { $expectedParent=$p.pid } else { $script:stage='stdio-process-id-check'; Require ($native.Id -eq $p.pid) }
-        $script:stage='stdio-parent-check'
+        if ($p.helperExecutable) { $expectedParent=$p.pid } else { Mark-Stage 'stdio-process-id-check'; Require ($native.Id -eq $p.pid) }
+        Mark-Stage 'stdio-parent-check'
         Require ($record.ParentProcessId -eq $expectedParent)
-        $script:stage='stdio-home-path'
+        Mark-Stage 'stdio-home-path'
         $nativeHome=[IO.Path]::GetFullPath($p.codexHome)
-        $script:stage='stdio-home-check'
+        Mark-Stage 'stdio-home-check'
         Require ([IO.Directory]::Exists($nativeHome))
       } else {
         $expectedExecutable=$r.executable
         Require ($owner.Sid -eq $r.ownerSid -and $birth -ceq $r.processStartTime -and $hash -ceq $r.executableSha256)
         $nativeHome=[IO.Path]::GetFullPath($r.codexHome)
       }
-      $script:stage='expected-image-hash'
+      Mark-Stage 'expected-image-hash'
       $executableContentMatchesExpected=MatchesExpectedImage $exe $expectedExecutable $hash
-      $script:stage='boot-query'
+      Mark-Stage 'boot-query'
       $boot=(Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime().ToString('o')
       $result=[ordered]@{pid=$native.Id;birth=$birth;boot=$boot;executable=[IO.Path]::GetFullPath($exe).ToLowerInvariant();sha256=$hash;owner=$owner.Sid;codexHome=$nativeHome.ToLowerInvariant()}
       $result.executableContentMatchesExpected=$executableContentMatchesExpected
@@ -227,11 +229,13 @@ try {
         if ($p.helperExecutable) {
           $helper=[Diagnostics.Process]::GetProcessById([int]$p.pid)
           Require ($helper.Handle -ne [IntPtr]::Zero)
+          Mark-Stage 'helper-process-query'
           $helperRecord=Get-CimInstance Win32_Process -Filter ("ProcessId="+$helper.Id) -ErrorAction Stop
+          Mark-Stage 'helper-owner-query'
           $helperOwner=Invoke-CimMethod -InputObject $helperRecord -MethodName GetOwnerSid -ErrorAction Stop
-          $script:stage='helper-image-hash'
+          Mark-Stage 'helper-image-hash'
           $helperHash=FileSha256 $helper.MainModule.FileName
-          $script:stage='expected-helper-image-hash'
+          Mark-Stage 'expected-helper-image-hash'
           $helperExecutableContentMatchesExpected=MatchesExpectedImage $helper.MainModule.FileName $p.helperExecutable $helperHash
           Require ($helperRecord.ParentProcessId -eq $inputProof.gatewayId -and $helperOwner.ReturnValue -eq 0 -and $helperOwner.Sid -eq $gatewayOwner)
           $result.helperPid=$helper.Id; $result.helperParentPid=[int]$helperRecord.ParentProcessId; $result.helperExecutable=[IO.Path]::GetFullPath($helper.MainModule.FileName).ToLowerInvariant()
@@ -245,28 +249,28 @@ try {
   }
   function Peer {
     if ($stdio) { return }
-    $script:stage='tcp-query'
+    Mark-Stage 'tcp-query'
     $rows=@(Get-NetTCPConnection -State Established -ErrorAction Stop)
-    $script:stage='tcp-match'
+    Mark-Stage 'tcp-match'
     $server=@($rows | Where-Object { $_.LocalAddress -eq '127.0.0.1' -and $_.LocalPort -eq $p.remotePort -and $_.RemoteAddress -eq '127.0.0.1' -and $_.RemotePort -eq $p.localPort })
     $client=@($rows | Where-Object { $_.LocalAddress -eq '127.0.0.1' -and $_.LocalPort -eq $p.localPort -and $_.RemoteAddress -eq '127.0.0.1' -and $_.RemotePort -eq $p.remotePort })
     Require ($server.Count -eq 1 -and $server[0].OwningProcess -eq $r.processId -and $client.Count -eq 1 -and $client[0].OwningProcess -eq $inputProof.gatewayId)
   }
-  $script:stage='peer-before'
+  Mark-Stage 'peer-before'
   Peer
-  $script:stage='identity-before'
+  Mark-Stage 'identity-before'
   $before=Identity
-  $script:stage='peer-after'
+  Mark-Stage 'peer-after'
   Peer
-  $script:stage='identity-after'
+  Mark-Stage 'identity-after'
   $after=Identity
-  $script:stage='identity-compare'
+  Mark-Stage 'identity-compare'
   Require (($before | ConvertTo-Json -Compress) -ceq ($after | ConvertTo-Json -Compress))
   $before.peerVerified=$true; $before.gatewayId=$inputProof.gatewayId
   if (-not $stdio) { $before.localPort=$p.localPort; $before.remotePort=$p.remotePort }
-  $script:stage='proof-output'
+  Mark-Stage 'proof-output'
   $before | ConvertTo-Json -Compress
-  $script:stage='complete'
+  Mark-Stage 'complete'
 } catch {
   $detail=$_.Exception
   while ($detail.InnerException) { $detail=$detail.InnerException }
@@ -346,8 +350,10 @@ async function windowsGeneration(peer: Exclude<CodexNativePeer, { kind: 'proxy' 
       return;
     }
     const childError = error as { code?: unknown; killed?: unknown; signal?: unknown };
-    if (childError?.code === 'ETIMEDOUT' || (childError?.killed === true && childError.signal === 'SIGTERM'))
-      return fail('powershell', 'timeout', 'execution-timeout');
+    if (childError?.code === 'ETIMEDOUT' || (childError?.killed === true && childError.signal === 'SIGTERM')) {
+      const stages = typeof stderr === 'string' ? Array.from(stderr.matchAll(/rele-native-proof-stage:([a-z0-9-]{1,64})/gu), match => match[1]) : [];
+      return fail(stages.at(-1) ?? 'powershell', 'timeout', 'execution-timeout');
+    }
     return fail('powershell', 'unclassified-error', 'execution-error');
   }
   if (result.code !== 0) return fail('powershell', 'nonzero-exit', 'execution-error');

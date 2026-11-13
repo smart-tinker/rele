@@ -297,7 +297,7 @@ it('limits Windows proof diagnostics to a fixed stage, exception type and catego
   expect(proof).toContain("$failureType += '-' + $detail.NativeErrorCode");
   expect(proof).toContain("[Console]::Error.WriteLine('rele-native-proof:' + $script:stage + ':' + $_.Exception.GetType().Name + ':' + $_.CategoryInfo.Category + ':' + $failureType)");
   expect(proof).not.toContain('$_.Exception.Message');
-  expect(proof).toContain("$script:stage='tcp-query'");
+  expect(proof).toContain("Mark-Stage 'tcp-query'");
 });
 
 it('reports only bounded Windows proof failure details when requested', async () => {
@@ -334,26 +334,37 @@ it.each([
   ['status command failure', 'status-error', { stage:'status-probe', category:'command-error', failureType:'execution-error' }],
   ['malformed status JSON', 'status-json', { stage:'status-probe', category:'invalid-json', failureType:'parse-error' }],
   ['malformed proof JSON', 'proof-json', { stage:'proof-output', category:'invalid-json', failureType:'parse-error' }],
-  ['PowerShell execution timeout', 'powershell-timeout', { stage:'powershell', category:'timeout', failureType:'execution-timeout' }],
+  ['PowerShell execution timeout', 'powershell-timeout', { stage:'owner-sid-query', category:'timeout', failureType:'execution-timeout' }],
   ['PowerShell failure without a marker', 'powershell-error', { stage:'powershell', category:'unclassified-error', failureType:'execution-error' }],
 ] as const)('reports bounded diagnostics for %s', async (_label, failureMode, expected) => {
   const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
   const home = 'C:\\Users\\Owner\\fixture', executable = 'C:\\native\\codex.exe';
   const receipt = { status:'alreadyRunning', endpoint:'ws://127.0.0.1:62662', codexHome:home, executable, executableSha256:'a'.repeat(64), ownerSid:'S-1-5-21-1001', processId:10944, processStartTime:'2026-11-03T10:00:00.1234567Z' };
   let failure: unknown;
-  const run = async (command: string) => {
+  let proofScript = '';
+  const run = async (command: string, args: string[] = []) => {
     if (command.endsWith('Rele.exe')) {
       if (failureMode === 'status-error') throw new Error('C:\\private\\fixture');
       return { stdout:failureMode === 'status-json' ? '{"private":"path"' : JSON.stringify(receipt), code:0 };
     }
     if (failureMode === 'proof-json') return { stdout:'{"private":"path"', code:0 };
-    if (failureMode === 'powershell-timeout') throw Object.assign(new Error('private command details'), { code:null, killed:true, signal:'SIGTERM', path:'C:\\private\\fixture' });
+    if (failureMode === 'powershell-timeout') {
+      const encoded = args[args.indexOf('-EncodedCommand') + 1];
+      proofScript = Buffer.from(encoded!, 'base64').toString('utf16le');
+      throw Object.assign(new Error('private command details'), { code:null, killed:true, signal:'SIGTERM', stderr:'rele-native-proof-stage:owner-process-query\nrele-native-proof-stage:owner-sid-query\n', path:'C:\\private\\fixture' });
+    }
     if (failureMode === 'powershell-error') throw new Error('C:\\private\\fixture');
     return { stdout:'', code:1 };
   };
   const generation = await codexNativeGeneration({ kind:'windows-shared', endpoint:receipt.endpoint, localPort:55001, remotePort:62662 }, 10944, home,
     { platform:'win32', run, installationDirectory:'C:\\Rele', onProofFailure:value => { failure = value; } });
   expect(generation).toBeUndefined();
+  if (failureMode === 'powershell-timeout') {
+    expect(proofScript).toContain("function Mark-Stage($name)");
+    expect(proofScript).toContain("Mark-Stage 'owner-sid-query'");
+    expect(proofScript.indexOf("Mark-Stage 'owner-process-query'")).toBeLessThan(proofScript.indexOf('Get-CimInstance Win32_Process'));
+    expect(proofScript.indexOf("Mark-Stage 'owner-sid-query'")).toBeLessThan(proofScript.indexOf('Invoke-CimMethod'));
+  }
   expect(failure).toEqual(expected);
 });
 
