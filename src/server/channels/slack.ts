@@ -6,6 +6,8 @@ import { ChannelError, downloadBounded, endpointId, readableTitle, splitReply, t
 import { escapeSlackText, formatSlackReply } from './slack-format.js';
 import { slackPageControls, slackProgressBlocks, slackProgressPages } from './slack-progress.js';
 import { QUESTION_VIEW, parseQuestionMetadata, questionAnswers, questionCard, questionHash, questionView, resolvedQuestion, resolvedQuestionStatus, supportsQuestionForm } from './slack-questions.js';
+import { CONTROL_VIEW, CONTROL_SHORTCUT, controlMetadata, controlInput, controlModal, controlMessage } from './slack-control.js';
+import type { ControlContext } from '../source-control.js';
 
 type Json = Record<string, any>;
 const SLACK_TS = /^\d+\.\d+$/u;
@@ -19,6 +21,7 @@ const CONVERSATION_TYPES = [
   ['public_channel', 'channels:read'], ['private_channel', 'groups:read'], ['im', 'im:read'], ['mpim', 'mpim:read'],
 ] as const;
 const PAYLOAD_NOISE = new Set(['token', 'access_token', 'refresh_token', 'authorization', 'response_url', 'bot_profile', 'user_profile', 'event_ts', 'client_msg_id', 'team', 'channel', 'reply_count', 'reply_users', 'reply_users_count', 'latest_reply', 'last_read', 'subscribed', 'reactions']);
+const controlErrorMessage = (error: unknown, fallback: string) => error instanceof ChannelError || error instanceof Error && error.message === 'Управление Rele недоступно.' ? error.message : fallback;
 
 export function slackImageAttachments(files: unknown): SlackImageAttachment[] {
   const images: SlackImageAttachment[] = [];
@@ -183,7 +186,7 @@ export class SlackChannel implements Channel {
         // inbox callback must not hold the independent question interaction queue.
         try {
           const envelope = JSON.parse(raw.toString());
-          if (envelope.type === 'interactive' && (envelope.payload?.view?.callback_id === QUESTION_VIEW
+          if (envelope.type === 'interactive' && (envelope.payload?.view?.callback_id === CONTROL_VIEW || envelope.payload?.callback_id === CONTROL_SHORTCUT || envelope.payload?.view?.callback_id === QUESTION_VIEW
               || /^rele[qp]:/u.test(String(envelope.payload?.actions?.[0]?.value ?? '')))) {
             void this.receive(raw.toString(), socket).catch(() => {}); return;
           }
@@ -671,6 +674,61 @@ export class SlackChannel implements Channel {
     })]); } finally { clearTimeout(timer); }
   }
 
+  private async controlContext(payload: Json, saved?: ControlContext): Promise<ControlContext> {
+    const context = await this.questionContext(payload, '', saved);
+    const account = this.requireAccount(), cursors = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const members = await this.api('conversations.members', { channel: context.chatId, limit: 1000, ...(cursor ? { cursor } : {}) });
+      this.requireAccount(account);
+      if (!Array.isArray(members.members)) throw new Error('Slack не подтвердил доступ к этому треду.');
+      if (members.members.includes(context.senderId)) return { accountId: context.accountId, chatId: context.chatId, threadId: context.threadId!,
+        senderId: context.senderId, senderName: context.senderName ?? 'Участник Slack', senderIsBot: false, messageId: context.messageId! };
+      cursor = this.nextCursor(members);
+      if (cursor && (cursors.has(cursor) || cursors.size >= 20)) throw new Error('Не удалось проверить участие в разговоре Slack.');
+      if (cursor) cursors.add(cursor);
+    } while (cursor);
+    throw new Error('Участник больше не имеет доступа к этому разговору Slack.');
+  }
+
+  private async controlInteraction(payload: Json): Promise<void> {
+    let context: ControlContext | undefined;
+    try {
+      if (!this.callbacks.control) throw new Error('Управление Rele недоступно.');
+      const saved = payload.view ? controlMetadata(payload.view.private_metadata) : undefined;
+      context = await this.questionWithinDeadline(() => this.controlContext(payload, saved?.context));
+      const action = payload.actions?.[0];
+      const selected = action?.action_id === 'action' ? action.selected_option?.value : 'model';
+      const view = await this.callbacks.control(context, saved ? { kind: 'preview', id: saved.id, action: selected } : { kind: 'open' });
+      this.requireAccount(context.accountId);
+      const selectedModel = action?.action_id === 'model' ? action.selected_option?.value : payload.view?.state?.values?.model?.model?.selected_option?.value;
+      const selectedEffort = payload.view?.state?.values?.effort?.effort?.selected_option?.value;
+      if (saved) await this.api('views.update', { view_id: payload.view.id, hash: payload.view.hash, view: controlModal(view, context, selectedModel, selectedEffort) });
+      else await this.api('views.open', { trigger_id: payload.trigger_id, view: controlModal(view, context) });
+    } catch (error) {
+      const message = controlErrorMessage(error, 'Не удалось открыть управление Rele. Проверьте подключение и актуальность связи; затем откройте меню сообщения снова.');
+      if (payload.view?.id) await this.api('views.update', { view_id: payload.view.id, hash: payload.view.hash, view: controlMessage(message) }).catch(() => {});
+      else if (payload.trigger_id && payload.team?.id === this.teamId) {
+        try { await this.api('views.open', { trigger_id: payload.trigger_id, view: controlMessage(message) }); }
+        catch { await this.questionFeedback(payload, context ? { ...context, platform: 'slack', approvalId: '' } : undefined); }
+      }
+    }
+  }
+
+  private async controlSubmit(payload: Json): Promise<void> {
+    try {
+      if (!this.callbacks.control) throw new Error('Управление Rele недоступно.');
+      const saved = controlMetadata(payload.view?.private_metadata);
+      const context = await this.controlContext(payload, saved.context);
+      const view = await this.callbacks.control(context, { kind: 'submit', id: saved.id, input: controlInput(payload.view?.state?.values) });
+      this.requireAccount(context.accountId);
+      await this.api('views.update', { view_id: payload.view.id, view: controlModal(view, context) });
+    } catch (error) {
+      if (payload.team?.id !== this.teamId) return;
+      await this.api('views.update', { view_id: payload.view.id, view: controlMessage(controlErrorMessage(error, 'Операция не подтверждена. Проверьте Статус и откройте меню сообщения снова.')) }).catch(() => {});
+    }
+  }
+
   private async questionContext(payload: Json, approvalId: string, source?: { accountId: string; chatId: string; threadId: string; senderId: string; messageId: string }): Promise<ApprovalContext> {
     const accountId = this.requireAccount();
     if (payload.team?.id !== this.teamId || !SLACK_USER.test(payload.user?.id ?? '')
@@ -844,6 +902,18 @@ export class SlackChannel implements Channel {
         void this.refreshNames(source.message, message.endpoint).catch(() => {});
         return;
       }
+    } else if (envelope.type === 'interactive' && envelope.payload?.view?.callback_id === CONTROL_VIEW) {
+      if (envelope.payload.type === 'view_submission') {
+        this.ack(socket, envelope.envelope_id, { response_action: 'update', view: controlMessage('Проверяю источник и состояние Codex…') });
+        this.questionTask(() => this.controlSubmit(envelope.payload));
+      } else {
+        this.ack(socket, envelope.envelope_id);
+        if (envelope.payload.type === 'block_actions') this.questionTask(() => this.controlInteraction(envelope.payload));
+      }
+      return;
+    } else if (envelope.type === 'interactive' && envelope.payload?.type === 'message_action' && envelope.payload?.callback_id === CONTROL_SHORTCUT) {
+      this.ack(socket, envelope.envelope_id);
+      this.questionTask(() => this.controlInteraction(envelope.payload)); return;
     } else if (envelope.type === 'interactive' && envelope.payload?.view?.callback_id === QUESTION_VIEW) {
       if (envelope.payload.type === 'view_submission') this.questionTask(() => this.questionSubmit(envelope.payload, socket, envelope.envelope_id));
       else this.ack(socket, envelope.envelope_id);

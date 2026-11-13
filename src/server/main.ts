@@ -93,6 +93,7 @@ async function main(): Promise<void> {
       endpoint: endpoint => { store.upsertEndpoint(endpoint); },
       action: action => engine.action(action), status: () => { engine.channelStatus(); activity.refresh(true); },
       question: context => engine.question(context),
+      control: (context, command) => engine.control(context, command),
     };
     const next = config.config;
     engine.channels = {

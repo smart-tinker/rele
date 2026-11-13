@@ -14,8 +14,10 @@ import { effectiveSharedCodexHome } from './codex-shared.js';
 import { requestInput } from './inbound-context.js';
 import { MessageToolValidationError } from '../shared/message-tool.js';
 import { ASYNC_QUESTION_METHOD, asyncQuestions, encodeAsyncAnswers, matchAsyncAnswer, parseAsyncAnswers } from './async-questions.js';
+import { SourceControls, type ControlContext, type ControlView } from './source-control.js';
+import type { ControlCommand } from './channels/slack-control.js';
 
-export type CodexGateway = Pick<CodexClient, 'status' | 'isVerifiedVersion' | 'createThread' | 'setThreadName' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'steer' | 'findSteerReceipt' | 'interrupt' | 'backgroundTerminals' | 'terminateBackgroundTerminal' | 'findRequest' | 'retryOverloaded' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Partial<Pick<CodexClient, 'hasPendingRequest' | 'asyncQuestionState'>> & Pick<EventEmitter, 'on' | 'off'>;
+export type CodexGateway = Pick<CodexClient, 'status' | 'isVerifiedVersion' | 'createThread' | 'setThreadName' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'steer' | 'findSteerReceipt' | 'interrupt' | 'backgroundTerminals' | 'terminateBackgroundTerminal' | 'findRequest' | 'retryOverloaded' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Partial<Pick<CodexClient, 'hasPendingRequest' | 'asyncQuestionState' | 'controlSnapshot' | 'controlModels' | 'readControlGoal' | 'updateControlGoal' | 'updateControlModel' | 'controlTurns' | 'controlTurnLocation' | 'controlTurnIndex'>> & Pick<EventEmitter, 'on' | 'off'>;
 export interface EngineOptions {
   config: () => AppConfig;
   temporaryRoot: string;
@@ -46,6 +48,8 @@ export class Engine extends EventEmitter {
   private dispatching = new Set<string>();
   private reconciling = new Set<string>();
   private reconcileAgain = new Set<string>();
+  private completionRechecks = new Map<string, string>();
+  private completionHistoryReads = new Set<string>();
   private provisioning = new Set<string>();
   private ownedThreads = new Set<string>();
   private releasing = new Map<string, Promise<void>>();
@@ -65,6 +69,7 @@ export class Engine extends EventEmitter {
   private changingSelection = false;
   private readonly slackSync: SlackSync;
   private readonly initialMessages: InitialMessages;
+  private readonly sourceControls: SourceControls;
   private steering = new Set<string>();
   private progressSending = false;
   private progressReads = new Map<string, Promise<RequestLocation>>();
@@ -77,7 +82,22 @@ export class Engine extends EventEmitter {
   private nextAsyncQuestionRefresh = 0;
   private retryingOverloads = new Map<string, Promise<{ turnId: string } | undefined>>();
   private slackConnection?: string;
-  private readonly notification = (event: CodexNotification) => this.event(() => this.onNotification(event));
+  private readonly notification = (event: CodexNotification) => {
+    this.sourceControls.notification(event);
+    const epoch = this.epoch;
+    if (event.method === 'turn/completed' || event.method === 'item/completed') {
+      const p = event.params as Record<string, any>;
+      const turnId = event.method === 'turn/completed' ? p.turn?.id
+        : p.item?.type === 'agentMessage' && p.item.phase === 'final_answer' ? p.turnId : undefined;
+      if (typeof turnId === 'string' && typeof p.threadId === 'string') for (const request of this.store.activeRequests()) {
+        if (request.turnId === turnId || request.status === 'starting'
+          && this.store.getConversation(request.conversationId)?.threadId === p.threadId) {
+          this.track((async () => { if (!this.stopped && epoch === this.epoch) await this.reconcile(request.id, true, turnId); })());
+        }
+      }
+    }
+    this.event(() => this.onNotification(event));
+  };
   private readonly serverRequest = (event: CodexServerRequest) => this.event(() => this.onServerRequest(event));
   private readonly connection = () => this.connectionChanged();
 
@@ -85,12 +105,26 @@ export class Engine extends EventEmitter {
     super();
     this.slackSync = new SlackSync(store, platform => this.channels[platform ?? 'slack'], () => this.codex);
     this.initialMessages = new InitialMessages(store, () => this.codex, () => !this.stopped && !this.suspended, options.redact);
+    this.sourceControls = new SourceControls(store, {
+      native: () => this.codex.controlSnapshot && this.codex.controlModels && this.codex.readControlGoal && this.codex.updateControlGoal
+        && this.codex.updateControlModel && this.codex.controlTurns && this.codex.controlTurnLocation && this.codex.controlTurnIndex ? this.codex as CodexClient : undefined,
+      target: () => this.targetFingerprint(), generation: () => `${this.targetFingerprint()}:${this.epoch}`,
+      available: () => !this.stopped && !this.suspended && this.options.config().slack.enabled,
+      channel: () => this.channels.slack, redact: options.redact,
+    });
     codex.on('notification', this.notification);
     codex.on('request', this.serverRequest);
     codex.on('status', this.connection);
   }
 
   suspend(value: boolean): void { this.suspended = value; }
+  control(context: ControlContext, command: ControlCommand): Promise<ControlView> {
+    const task = command.kind === 'open' ? this.sourceControls.open(context)
+      : command.kind === 'preview' && command.id && command.action ? this.sourceControls.preview(context, command.id, command.action)
+        : command.kind === 'submit' && command.id && command.input ? this.sourceControls.submit(context, command.id, command.input)
+          : Promise.reject(new Error('Некорректное действие управления.'));
+    this.track(task); return task;
+  }
   assertCodexSelectionChange(): void {
     // A new executable changes target fingerprints; preserve every unresolved native receipt.
     if (this.store.activeRequests().some(request => request.status !== 'queued' || request.queuedSubmissionId || request.turnId)
@@ -133,7 +167,7 @@ export class Engine extends EventEmitter {
   }
   replaceCodex(next: CodexGateway): void {
     this.codex.off('notification', this.notification); this.codex.off('request', this.serverRequest); this.codex.off('status', this.connection);
-    this.expireApprovals(); this.epoch = randomUUID(); this.connected = false;
+    this.expireApprovals(); this.epoch = randomUUID(); this.completionRechecks.clear(); this.connected = false;
     this.ownedThreads.clear(); this.releasing.clear(); this.retryThreadAfter.clear(); this.progressReads.clear();
     this.codex = next;
     next.on('notification', this.notification); next.on('request', this.serverRequest); next.on('status', this.connection);
@@ -502,6 +536,7 @@ export class Engine extends EventEmitter {
     if (pending) return pending;
     const request = this.store.getRequest(id);
     if (!request || terminal(request.status)) throw new Error('Запрос уже завершён.');
+    if (this.store.getMeta(`control-goal-request:${id}`)) throw new Error('Остановите цель через меню «Управление Rele» исходного сообщения Slack. Общая отмена очереди для хода цели недоступна.');
     if (request.steeredInto) throw new Error('Дополнение относится к уже выполняющемуся запросу. Остановить можно исходный запрос.');
     // A lost cancellation ACK must never let reconciliation restart the original request.
     this.store.setMeta(`cancel-requested:${id}`, '1');
@@ -577,11 +612,14 @@ export class Engine extends EventEmitter {
     this.rememberCommandItems(id, found.commandItems ?? []);
     const rawBaseline = this.store.getMeta(`request-terminal-baseline:${id}`);
     const baseline = rawBaseline ? JSON.parse(rawBaseline) as TerminalBaseline : undefined;
-    if (!baseline || baseline.target !== state.target || typeof baseline.serverGeneration !== 'string'
-      || !/^[a-f0-9]{64}$/u.test(baseline.serverGeneration) || !Array.isArray(baseline.terminals)
-      || baseline.terminals.some(entry => !terminalPair(entry))) {
-      throw new Error('Исходный сервер или снимок команд не подтверждён. Отсутствие терминалов не доказывает завершение прежних процессов.');
-    }
+    const baselineFailure = !baseline ? 'missing'
+      : baseline.target !== state.target ? 'target-changed'
+        : typeof baseline.serverGeneration !== 'string' ? 'generation-missing'
+          : !/^[a-f0-9]{64}$/u.test(baseline.serverGeneration) ? 'generation-invalid'
+            : !Array.isArray(baseline.terminals) || baseline.terminals.some(entry => !terminalPair(entry)) ? 'terminals-invalid' : undefined;
+    if (!baseline || baselineFailure) throw Object.assign(new Error('Исходный сервер или снимок команд не подтверждён. Отсутствие терминалов не доказывает завершение прежних процессов.'), {
+      code: `terminal-baseline-${baselineFailure ?? 'missing'}`,
+    });
     const verifyServer = (snapshot: CodexTerminalSnapshot) => {
       current();
       if (this.isMixed(id)) throw new Error('В ход добавлено сообщение другого клиента Codex. Автоматическая отмена смешанного хода недоступна.');
@@ -590,20 +628,21 @@ export class Engine extends EventEmitter {
       }
     };
     verifyServer(await client.backgroundTerminals(conversation.threadId));
-    if (found.state === 'running' && !state.interruptAttempted) {
-      state.interruptAttempted = true; this.store.setMeta(`cancel-cleanup:${id}`, JSON.stringify(state));
-      try { await client.interrupt(conversation.threadId, found.turnId); }
-      catch (error) { current(); this.emit('diagnostic', this.options.redact(error)); }
-    }
     this.store.setMeta(`cancel-cleanup:${id}`, JSON.stringify(state));
-    const attempted = new Set<string>(), deadline = performance.now() + 2000;
+    const attempted = new Set((state.terminalAttempts ?? []).map(entry => JSON.stringify(entry))), deadline = performance.now() + 2000;
     do {
       current();
       found = await this.findOwnRequest(client, conversation.threadId, id);
       current();
       if (found.mixed || this.isMixed(id) || found.turnId !== state.turnId) throw new Error('Ход отменяемого запроса больше не подтверждён как собственный. Фоновые команды сохранены.');
       const items = this.rememberCommandItems(id, found.commandItems ?? []);
-      if (['completed', 'failed', 'interrupted'].includes(found.state)) {
+      if (found.state === 'running' && !state.interruptAttempted) {
+        state.interruptAttempted = true; this.store.setMeta(`cancel-cleanup:${id}`, JSON.stringify(state));
+        try { await client.interrupt(conversation.threadId, state.turnId); }
+        catch (error) { current(); this.emit('diagnostic', this.options.redact(error)); }
+        continue;
+      }
+      if (['running', 'completed', 'failed', 'interrupted'].includes(found.state)) {
         const snapshot = await client.backgroundTerminals(conversation.threadId);
         verifyServer(snapshot);
         const fresh = snapshot.terminals.filter(entry => !baseline.terminals.some(old => old.itemId === entry.itemId && old.processId === entry.processId));
@@ -623,14 +662,19 @@ export class Engine extends EventEmitter {
           await client.terminateBackgroundTerminal(conversation.threadId, { ...entry, serverId: snapshot.serverId, serverGeneration: snapshot.serverGeneration });
           current();
         }
-        const after = await client.backgroundTerminals(conversation.threadId);
-        verifyServer(after);
-        const latestItems = this.rememberCommandItems(id, []);
-        const pendingStarts = latestItems.some(item => !latestItems.some(other => other.id === item.id && other.completed)
-          && !state.terminalAttempts?.some(attempt => attempt.itemId === item.id));
-        if (!pendingStarts && !after.terminals.some(entry => !baseline.terminals.some(old => old.itemId === entry.itemId && old.processId === entry.processId))) {
-          state.done = true; this.store.setMeta(`cancel-cleanup:${id}`, JSON.stringify(state));
-          this.finishFromHistory(request, found); return;
+        if (found.state === 'running') {
+          continue;
+        }
+        if (['completed', 'failed', 'interrupted'].includes(found.state)) {
+          const after = await client.backgroundTerminals(conversation.threadId);
+          verifyServer(after);
+          const latestItems = this.rememberCommandItems(id, []);
+          const pendingStarts = latestItems.some(item => !latestItems.some(other => other.id === item.id && other.completed)
+            && !state.terminalAttempts?.some(attempt => attempt.itemId === item.id));
+          if (!pendingStarts && !after.terminals.some(entry => !baseline.terminals.some(old => old.itemId === entry.itemId && old.processId === entry.processId))) {
+            state.done = true; this.store.setMeta(`cancel-cleanup:${id}`, JSON.stringify(state));
+            this.finishFromHistory(request, found); return;
+          }
         }
       }
       if (performance.now() >= deadline) break;
@@ -695,8 +739,24 @@ export class Engine extends EventEmitter {
       // Starting a queued item is a separate mutation; persist its fence before the wire write.
       this.store.setMeta(key, found.queuedSubmissionId);
       try {
-        await client.startQueued(this.store.getConversation(current.conversationId)!.threadId, found.queuedSubmissionId);
+        const { turn } = await client.startQueued(this.store.getConversation(current.conversationId)!.threadId, found.queuedSubmissionId);
         if (client !== this.codex || epoch !== this.epoch) throw new Error('Соединение изменилось во время запуска очереди. Требуется сверка.');
+        const latest = this.store.getRequest(current.id)!;
+        if (terminal(latest.status)) return;
+        if (this.store.getMeta(`cancel-requested:${current.id}`)) { this.track(this.cancel(current.id)); return; }
+        if (latest.turnId && latest.turnId !== turn.id) {
+          this.store.setMeta(`mixed:${current.id}`, '1');
+          this.store.updateRequest(current.id, { status: 'uncertain', error: mixedMessage });
+          return;
+        }
+        if (latest.turnId === turn.id) return;
+        if (turn.status === 'inProgress') {
+          const pending = this.store.listApprovals(1000).some(approval => approval.requestId === current.id && approval.status === 'pending' && approval.method !== ASYNC_QUESTION_METHOD);
+          const mixed = this.isMixed(current.id);
+          this.store.updateRequest(current.id, { turnId: turn.id, status: mixed ? 'uncertain' : pending ? 'waiting_approval' : 'running', error: mixed ? mixedMessage : undefined });
+        } else if (['completed', 'failed', 'interrupted'].includes(turn.status)) {
+          this.track(this.reconcile(current.id, true, turn.id));
+        }
       } catch (error) {
         if (error instanceof CodexThreadBusyError) this.store.setMeta(key, '');
         throw error;
@@ -714,10 +774,32 @@ export class Engine extends EventEmitter {
     this.changed();
   }
 
-  async reconcile(id: string): Promise<void> {
+  async reconcile(id: string, completionNotification = false, completionTurnId?: string): Promise<void> {
     // Do not block the notification queue behind cleanup; later canonical command items must flow.
     if (this.cancelling.has(id)) return;
-    if (this.reconciling.has(id)) { this.reconcileAgain.add(id); return; }
+    if (this.reconciling.has(id)) {
+      this.reconcileAgain.add(id);
+      const request = this.store.getRequest(id);
+      const threadId = request && this.store.getConversation(request.conversationId)?.threadId;
+      const turnId = request?.turnId ?? completionTurnId;
+      if (completionNotification && completionTurnId) this.completionRechecks.set(id, completionTurnId);
+      if (!(completionNotification || this.startingQueued.has(id)) || !turnId || !threadId || terminal(request.status)
+        || this.store.getMeta(`cancel-requested:${id}`)) return;
+      const readKey = `${id}\0${turnId}`;
+      if (this.completionHistoryReads.has(readKey)) return;
+      this.completionHistoryReads.add(readKey);
+      const client = this.codex, epoch = this.epoch;
+      try {
+        const found = await this.findCompletionHistory(client, threadId, id), current = this.store.getRequest(id);
+        if (client !== this.codex || epoch !== this.epoch || !current || terminal(current.status)
+          || current.turnId && current.turnId !== turnId || found.turnId !== turnId
+          || !['completed', 'failed', 'interrupted'].includes(found.state)) return;
+        if (!await this.retryOverload(current, found)) this.finishFromHistory(current, found);
+        this.changed(); this.track(this.deliver());
+      } catch (error) { this.emit('diagnostic', this.options.redact(error)); }
+      finally { this.completionHistoryReads.delete(readKey); }
+      return;
+    }
     const request = this.store.getRequest(id);
     if (!request || terminal(request.status) || ['queued', 'transcribing'].includes(request.status)) return;
     if (request.steeredInto) {
@@ -734,9 +816,9 @@ export class Engine extends EventEmitter {
         this.store.updateRequest(id, { status: 'uncertain', error: 'Исходное соединение отмены потеряно. Завершение прежних процессов требует сверки.' });
         return;
       }
-      // Do not duplicate a progress scan, but reconcile with fresh proof after it settles.
+      // A terminal event needs fresh proof without waiting for the Slack progress scan.
       const progressRead = this.progressReads.get(id);
-      if (progressRead) await progressRead.catch(() => {});
+      if (progressRead && !completionNotification) await progressRead.catch(() => {});
       if (this.stopped || client !== this.codex || epoch !== this.epoch) return;
       await this.releasing.get(conversation.id);
       await client.subscribe(conversation.threadId);
@@ -747,14 +829,23 @@ export class Engine extends EventEmitter {
         else this.store.updateRequest(id, { status: 'uncertain', error: 'Результат отмены не подтверждён. Повторный запуск запроса запрещён.' });
         return;
       }
-      const found = await this.findOwnRequest(client, conversation.threadId, id);
+      const found = completionNotification
+        ? await this.findCompletionHistory(client, conversation.threadId, id)
+        : await this.findOwnRequest(client, conversation.threadId, id);
       if (client !== this.codex || epoch !== this.epoch || terminal(this.store.getRequest(id)!.status)) return;
       if (found.mixed) this.store.setMeta(`mixed:${id}`, '1');
       else {
         this.recoverProgress(request.id, found);
         this.syncAsyncQuestions(request, found);
       }
-      if (found.state === 'not_found') this.store.updateRequest(id, { status: 'uncertain', error: 'Запрос не найден в очереди и истории Codex. Автоматическая повторная отправка запрещена; требуется сверка.' });
+      if (found.state === 'not_found') {
+        const pendingApproval = this.store.listApprovals(1000).find(approval => approval.requestId === id && approval.status === 'pending'
+          && approval.method !== ASYNC_QUESTION_METHOD && approval.turnId === request.turnId && approval.rpcId !== null
+          && client.hasPendingRequest?.(approval.rpcId) === true);
+        if (pendingApproval && !this.store.getMeta(`cancel-requested:${id}`))
+          this.store.updateRequest(id, { status: 'waiting_approval', error: undefined });
+        else this.store.updateRequest(id, { status: 'uncertain', error: 'Запрос не найден в очереди и истории Codex. Автоматическая повторная отправка запрещена; требуется сверка.' });
+      }
       else if (found.state === 'queued') {
         this.store.updateRequest(id, { status: 'starting', queuedSubmissionId: found.queuedSubmissionId, error: undefined });
         await this.continueQueued(request, found, true);
@@ -775,7 +866,11 @@ export class Engine extends EventEmitter {
         else if (JSON.parse(progress).statusText === uncertainProgress) this.recordProgress(id, { statusText: undefined });
       }
       this.reconciling.delete(id);
-      if (this.reconcileAgain.delete(id) && !this.stopped) this.track(this.reconcile(id));
+      if (this.reconcileAgain.delete(id) && !this.stopped) {
+        const completionTurnId = this.completionRechecks.get(id);
+        this.completionRechecks.delete(id);
+        this.track(this.reconcile(id, completionTurnId !== undefined, completionTurnId));
+      }
       await this.releaseIdleThread(request.conversationId);
       this.changed();
     }
@@ -784,7 +879,7 @@ export class Engine extends EventEmitter {
   /** Exposed to deterministic integration tests; the timer uses this same path. */
   async pump(): Promise<void> {
     if (this.stopped) return;
-    const work: Promise<unknown>[] = [this.deliver(), this.flushProgress(), this.flushApprovalUpdates(), this.retryPendingQuestions(), this.refreshAsyncQuestions()];
+    const work: Promise<unknown>[] = [this.deliver(), this.flushProgress(), this.flushApprovalUpdates(), this.retryPendingQuestions(), this.refreshAsyncQuestions(), this.sourceControls.recover()];
     if (!this.suspended) {
       await Promise.allSettled(this.store.listAutoLinkIntents().filter(intent => intent.status !== 'completed').map(intent => this.provision(intent)));
       await this.slackSync.backfill();
@@ -892,7 +987,18 @@ export class Engine extends EventEmitter {
   }
 
   private findOwnRequest(client: CodexGateway, threadId: string, requestId: string): Promise<RequestLocation> {
+    if (this.store.getMeta(`control-goal-request:${requestId}`)) return this.sourceControls.requestLocation(requestId);
     return this.readOwnHistory(requestId, inputs => client.findRequest(threadId, requestId, inputs, true));
+  }
+
+  private async findCompletionHistory(client: CodexGateway, threadId: string, requestId: string): Promise<RequestLocation> {
+    let found = await this.findOwnRequest(client, threadId, requestId);
+    for (let attempt = 0; attempt < 4 && !found.mixed
+      && !['completed', 'failed', 'interrupted'].includes(found.state); attempt++) {
+      await delay(250);
+      found = await this.findOwnRequest(client, threadId, requestId);
+    }
+    return found;
   }
 
   private async readOwnHistory(requestId: string, read: (inputs: string[]) => Promise<RequestLocation>): Promise<RequestLocation> {
@@ -944,6 +1050,7 @@ export class Engine extends EventEmitter {
   }
 
   private async steerPending(parent: ReleRequest): Promise<void> {
+    if (this.store.getMeta(`control-goal-request:${parent.id}`)) return;
     const conversation = this.store.getConversation(parent.conversationId)!;
     const client = this.codex, epoch = this.epoch;
     if (this.steering.has(parent.id) || parent.status !== 'running' || !parent.turnId || this.isMixed(parent.id)
@@ -1137,6 +1244,7 @@ export class Engine extends EventEmitter {
         this.store.setMeta(`async-answer-submitting:${request.id}`, this.targetFingerprint());
         this.asyncAnswerDelivery(request.id, 'sending');
       }
+      if (this.store.getMeta(`enqueue-rejected:${request.id}`)) this.store.setMeta(`enqueue-rejected:${request.id}`, '');
       attempted = true;
       const input = answerApproval ? request.text : requestInput(request);
       const result = await (images ? client.enqueue(conversation.threadId, input, request.id, images) : client.enqueue(conversation.threadId, input, request.id));
@@ -1157,7 +1265,11 @@ export class Engine extends EventEmitter {
           this.asyncAnswerDelivery(request.id, 'uncertain');
         } else if (this.stopped) {
           this.store.updateRequest(request.id, { status: 'queued' }); this.asyncAnswerDelivery(request.id, 'queued');
-        } else { this.fail(request.id, this.options.redact(error)); this.asyncAnswerDelivery(request.id, undefined); }
+        } else {
+          this.fail(request.id, this.options.redact(error));
+          if (attempted && error instanceof CodexRpcError) this.store.setMeta(`enqueue-rejected:${request.id}`, this.store.getRequest(request.id)!.updatedAt);
+          this.asyncAnswerDelivery(request.id, undefined);
+        }
       } else if (!request) {
         if (waiting && this.store.getRequest(waiting.id)?.status === 'queued') this.store.updateRequest(waiting.id, { error: this.options.redact(error) });
         this.retryThreadAfter.set(conversationId, Date.now() + 5_000);
@@ -1178,9 +1290,13 @@ export class Engine extends EventEmitter {
     const conversation = this.store.getConversation(conversationId);
     if (!conversation) return;
     const client = this.codex;
-    const release = client.releaseThread(conversation.threadId).then(() => {
+    const release = (async () => {
+      if (client.status().transport === 'managed' && !await this.sourceControls.canReleaseNative(conversationId)) return;
+      if (client !== this.codex || this.dispatching.has(conversationId)
+        || this.store.activeRequests().some(row => row.conversationId === conversationId && row.status !== 'queued')) return;
+      await client.releaseThread(conversation.threadId);
       if (this.codex === client) this.ownedThreads.delete(conversationId);
-    }).catch(error => {
+    })().catch(error => {
       this.emit('diagnostic', this.options.redact(error));
     }).finally(() => { if (this.releasing.get(conversationId) === release) this.releasing.delete(conversationId); });
     this.releasing.set(conversationId, release);
@@ -1348,6 +1464,7 @@ export class Engine extends EventEmitter {
 
   private async onNotification({ method, params }: CodexNotification): Promise<void> {
     const p = params as Record<string, any>;
+    if (method === 'thread/goal/updated' && typeof p.threadId === 'string' && typeof p.turnId === 'string') await this.sourceControls.ensureRequest(p.threadId, p.turnId);
     const nativeQuestions = ['item/started', 'item/completed'].includes(method) ? asyncQuestions(p.item) : [];
     if (nativeQuestions.length) {
       const client = this.codex, epoch = this.epoch;
@@ -1375,7 +1492,7 @@ export class Engine extends EventEmitter {
     if (method === 'turn/started') for (const active of this.store.activeRequests()) {
       if (!active.steeredInto && this.store.getMeta(`overload-retry:${active.id}`) && this.store.getConversation(active.conversationId)?.threadId === p.threadId) await this.reconcile(active.id);
     }
-    const progressRequest = this.store.activeRequests().find(request => !request.steeredInto && request.turnId === p.turnId
+    const progressRequest = this.store.activeRequests().find(request => !request.steeredInto && !this.store.getMeta(`control-goal-request:${request.id}`) && request.turnId === p.turnId
       && this.store.getConversation(request.conversationId)?.threadId === p.threadId);
     if (progressRequest && !this.isMixed(progressRequest.id)) {
       if (method === 'error' && p.willRetry === true && p.error?.codexErrorInfo === 'serverOverloaded') {
@@ -1417,9 +1534,6 @@ export class Engine extends EventEmitter {
           }
         }
       }
-    } else if (method === 'turn/completed' && p.turn?.id) {
-      // A history read must not hold notifications from unrelated threads.
-      for (const request of this.store.activeRequests()) if (request.turnId === p.turn.id || (request.status === 'starting' && this.store.getConversation(request.conversationId)?.threadId === p.threadId)) this.track(this.reconcile(request.id));
     } else if (method === 'serverRequest/resolved') {
       for (const [key, pending] of this.pendingQuestions) if (pending.epoch === this.epoch
         && pending.event.id === p.requestId && (pending.event.params as Record<string, unknown>).threadId === p.threadId) this.pendingQuestions.delete(key);
@@ -1479,6 +1593,7 @@ export class Engine extends EventEmitter {
   }
 
   private recoverProgress(id: string, found: RequestLocation): void {
+    if (this.store.getMeta(`control-goal-request:${id}`)) return;
     if (!found.publicHistory) {
       const progress = JSON.parse(this.store.getMeta(`request-progress:${id}`) ?? '{}') as RequestProgress;
       if (!progress.segments && found.commentary?.length) this.recordProgress(id, { steps: found.commentary }, true);
@@ -1644,6 +1759,7 @@ export class Engine extends EventEmitter {
     const rejectUnowned = async () => { if (managed) await client.rejectRequest(event.id, 'Rele cannot authorize this request without its original message.'); };
     const reviewHint = managed ? 'Действие отклонено. Сверьте запрос в панели Rele.' : 'Продолжите в Codex.';
     const p = event.params as Record<string, any>;
+    if (typeof p.threadId === 'string' && typeof p.turnId === 'string') await this.sourceControls.ensureRequest(p.threadId, p.turnId);
     for (const active of this.store.activeRequests()) if (!active.steeredInto && this.store.getConversation(active.conversationId)?.threadId === p.threadId
       && this.retryingOverloads.has(active.id)) await this.retryingOverloads.get(active.id)!.catch(() => {});
     if (!current()) return;
@@ -1726,8 +1842,10 @@ export class Engine extends EventEmitter {
   }
 
   private async retryOverload(request: ReleRequest, found: RequestLocation): Promise<boolean> {
+    if (this.store.getMeta(`control-goal-request:${request.id}`)) return false;
     if (found.state !== 'failed' || found.failureReason !== 'serverOverloaded' || !found.turnId || found.mixed || this.isMixed(request.id)) return false;
     if (this.store.getMeta(`cancel-requested:${request.id}`)) { this.track(this.cancel(request.id)); return true; }
+    if (this.retryingOverloads.has(request.id)) return true;
     if (found.retryBlocked) return false;
     const key = `overload-retry:${request.id}`, raw = this.store.getMeta(key);
     let retry = raw ? JSON.parse(raw) as OverloadRetry : undefined;
@@ -1781,6 +1899,11 @@ export class Engine extends EventEmitter {
   }
 
   private finishFromHistory(request: ReleRequest, found: RequestLocation): void {
+    if (this.store.getMeta(`control-goal-request:${request.id}`) && ['completed', 'failed', 'interrupted'].includes(found.state)) {
+      this.store.finishRequest(request.id, { status: found.state as 'completed' | 'failed' | 'interrupted', turnId: found.turnId,
+        ...(found.mixed ? { error: mixedMessage } : {}) }, []);
+      return;
+    }
     const cleanup = this.cancelCleanup(request.id);
     if (this.cancelling.has(request.id) && !cleanup?.done || cleanup && !cleanup.done) {
       this.store.updateRequest(request.id, { status: 'uncertain', error: 'Ожидается подтверждение остановки фоновых команд.' });
@@ -1844,7 +1967,7 @@ export class Engine extends EventEmitter {
     if (this.stopped) return;
     const connected = this.codex.status().connected;
     if (!connected && this.connected) {
-      this.epoch = randomUUID(); this.expireApprovals();
+      this.epoch = randomUUID(); this.completionRechecks.clear(); this.expireApprovals();
       this.ownedThreads.clear(); this.retryThreadAfter.clear(); this.progressReads.clear();
       for (const request of this.store.activeRequests()) if (['starting', 'running', 'waiting_approval'].includes(request.status)) this.store.updateRequest(request.id, { status: 'uncertain', error: 'Соединение с Codex прервано. Требуется сверка очереди и истории.' });
     }

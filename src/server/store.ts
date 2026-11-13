@@ -938,6 +938,27 @@ export class Store {
     return (access.mode !== 'mention' || message.directMention === true) && this.acceptsRequest(message, access.allowedSenderIds,
       { allowAllSenders: !this.isDirectMessage(message.endpoint), requireMention: false });
   }
+  sourceAllowsControl(endpointId: string, senderId: string): boolean {
+    const endpoint = this.getEndpoint(endpointId), binding = this.bindingForEndpoint(endpointId);
+    return !!endpoint && !!binding && this.acceptsSourceRequest({ endpoint, sender: { id: senderId, name: '', isBot: false },
+      eventId: '', messageId: '', text: '', directMention: true }, binding);
+  }
+  recordGoalTurn(input: { ownerId: string; conversationId: string; threadId: string; turnId: string; origin: Origin; objective: string }): ReleRequest | undefined {
+    return this.transaction(() => {
+      const eventId = `native-goal:${input.ownerId}:${input.turnId}`;
+      const existing = this.db.prepare('SELECT * FROM requests WHERE conversation_id=? AND event_id=?').get(input.conversationId, eventId);
+      if (existing) return this.requestFromRow(existing);
+      const conversation = this.getConversation(input.conversationId), binding = this.bindingForEndpoint(input.origin.endpointId);
+      if (conversation?.threadId !== input.threadId || binding?.conversationId !== input.conversationId
+        || this.activeRequests().some(request => request.conversationId === input.conversationId && request.status !== 'queued')) return;
+      const id = randomUUID(), now = new Date().toISOString();
+      this.db.prepare(`INSERT INTO requests (id,conversation_id,event_id,origin,text,status,turn_id,created_at,updated_at)
+        VALUES (?,?,?,?,?,'running',?,?,?)`).run(id, input.conversationId, eventId, JSON.stringify(input.origin), input.objective, input.turnId, now, now);
+      this.setMeta(`control-goal-request:${id}`, input.ownerId);
+      this.setMeta(`request-started:${id}`, String(Date.now()));
+      return this.getRequest(id);
+    });
+  }
   canDispatchSlackImages(request: ReleRequest): boolean {
     const binding = this.bindingForEndpoint(request.origin.endpointId);
     if (!binding || binding.conversationId !== request.conversationId) return false;
@@ -1100,6 +1121,12 @@ export class Store {
     return input?.requestId === request.id && input.state !== 'refused' ? { ...request, steeredInto: input.parentRequestId,
       turnId: input.turnId, status: input.state === 'applied' ? 'completed' : 'uncertain', error: input.error } : request;
   }
+  requestReceivedAt(id: string): string | undefined {
+    return optional(this.db.prepare('SELECT created_at FROM inbound_events WHERE request_id=?').get(id)?.created_at ?? null);
+  }
+  listRequestDeliveries(id: string): Delivery[] {
+    return this.db.prepare('SELECT * FROM deliveries WHERE request_id=? ORDER BY ordinal,rowid').all(id).map(toDelivery);
+  }
   listRequests(limit = 100): ReleRequest[] { return this.db.prepare('SELECT * FROM requests ORDER BY rowid DESC LIMIT ?').all(limitValue(limit)).map(row => this.requestFromRow(row)); }
   listPendingRequests(): ReleRequest[] { return this.db.prepare("SELECT * FROM requests WHERE status='queued' ORDER BY rowid").all().map(row => this.requestFromRow(row)).filter(request => !request.steeredInto); }
   activeRequests(): ReleRequest[] {
@@ -1111,6 +1138,9 @@ export class Store {
       UNION ALL SELECT 1 FROM meta WHERE
         (key LIKE 'cancel-cleanup:%' AND COALESCE(json_extract(value,'$.done'),0)<>1)
         OR (key LIKE 'steering-input:%' AND json_extract(value,'$.state') IN ('sending','uncertain'))
+        OR (key LIKE 'source-control:%' AND (json_extract(value,'$.state')='sending'
+          OR (json_extract(value,'$.goal') IS NOT NULL AND COALESCE(json_extract(value,'$.goalClosed'),0)<>1
+            AND COALESCE(json_extract(value,'$.nativeSettled'),0)<>1)))
       LIMIT 1`).get();
   }
   claimNextRequest(conversationId: string, requestId?: string): ReleRequest | undefined {

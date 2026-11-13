@@ -12,6 +12,7 @@ import type { CodexUpdateState, DashboardState, DesktopIntegrationState, Endpoin
 import { ChannelError } from './channels/common.js';
 import { discoverCodex } from './codex-discovery.js';
 import { MessageToolValidationError } from '../shared/message-tool.js';
+import { messageTrace, sameTraceOrigin } from '../shared/message-trace.js';
 
 export interface AppServices {
   store: Store;
@@ -54,6 +55,7 @@ export function createApp(services: AppServices) {
   const app = Fastify({ logger: false, bodyLimit: 100_000, requestTimeout: 30_000, trustProxy: false });
   const { store, config, engine } = services;
   const launchTokens = new Map<string, number>();
+  const startedAt = new Date().toISOString();
   app.addHook('onClose', async () => { launchTokens.clear(); });
   app.addHook('onRequest', async (request, reply) => {
     if (!localHost(request.headers.host)) return reply.code(403).send({ error: 'Панель доступна только через локальный адрес.' });
@@ -149,6 +151,21 @@ export function createApp(services: AppServices) {
       sourceRoutes: endpoints.map(endpoint => store.getSourceRoute(endpoint.id, legacyRule(endpoint))),
       conversations: store.listConversations(), endpoints, requests: store.listRequests(250), deliveries: store.listDeliveries(500), approvals: store.listApprovals(250), config: publicConfig(config.config),
     };
+  });
+  app.get<{ Params: { kind: string; id: string } }>('/api/traces/:kind/:id', async request => {
+    const { kind, id } = request.params;
+    if (kind !== 'requests' && kind !== 'deliveries') throw new ApiError(404, 'Трасса не найдена.');
+    const delivery = kind === 'deliveries' ? store.getDelivery(id) : undefined;
+    let item = kind === 'requests' ? store.getRequest(id) : delivery?.requestId ? store.getRequest(delivery.requestId) : undefined;
+    if (item && delivery && !sameTraceOrigin(item.origin, delivery.origin)) item = undefined;
+    const origin = delivery?.origin ?? item?.origin;
+    if (!origin) throw new ApiError(404, 'Нет сохранённой записи; это не доказывает отсутствие сообщения.');
+    const source = engine.channels[origin.platform]?.state;
+    return messageTrace({ origin, request: item, deliveries: item ? store.listRequestDeliveries(item.id) : delivery ? [delivery] : [],
+      receivedAt: item ? store.requestReceivedAt(item.id) : undefined,
+      enqueueRejectedAt: item ? store.getMeta(`enqueue-rejected:${item.id}`) : undefined,
+      nativeThreadId: (item ? store.getConversation(item.conversationId)?.threadId : undefined) ?? delivery?.nativeThreadId,
+      startedAt, capturedAt: new Date().toISOString(), connected: { codex: services.codex().status().connected, source: !!source?.connected && source.accountId === origin.accountId } });
   });
   app.get('/api/threads', async request => {
     const query = object(request.query); fields(query, ['archived', 'refresh']);

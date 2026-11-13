@@ -1,9 +1,10 @@
 import { afterEach, expect, it } from 'vitest';
+import { realpathSync, statSync } from 'node:fs';
 import { spawn, execFile } from 'node:child_process';
 import net from 'node:net';
 import { promisify } from 'node:util';
 import { once } from 'node:events';
-import { copyFile, lstat, lutimes, mkdir, mkdtemp, readFile, rename, rm, stat, unlink, utimes, writeFile } from 'node:fs/promises';
+import { copyFile, lstat, lutimes, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, unlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -11,6 +12,91 @@ import { CodexClient } from '../src/server/codex.js';
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
+
+it('matches filesystem aliases for an owned Windows stdio profile', async () => {
+  const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
+  const name = `rele-native-generation-${process.pid}-${Date.now()}`;
+  const root = process.platform === 'win32' ? await mkdtemp(path.join(tmpdir(), name)) : `C:\\Users\\Owner\\${name}`;
+  if (process.platform === 'win32') cleanup.push(() => rm(root, { recursive:true, force:true }));
+  const home = path.win32.join(root, 'home'), aliasHome = path.win32.join(root, 'home-alias');
+  await mkdir(home, { recursive:true });
+  await symlink(home, aliasHome, process.platform === 'win32' ? 'junction' : 'dir');
+  cleanup.push(async () => { await rm(aliasHome, { recursive:true, force:true }); await rm(home, { recursive:true, force:true }); });
+
+  const executable = process.platform === 'win32' ? process.execPath : 'C:\\native\\codex.exe';
+  const proof = { pid:process.pid, birth:'2026-11-03T10:00:00.1234567Z', boot:'2026-11-01T01:02:03.0000000Z', executable,
+    sha256:'a'.repeat(64), owner:'S-1-5-21-1001', gatewayOwner:'S-1-5-21-1001', codexHome:aliasHome,
+    peerVerified:true, parentPid:process.pid, gatewayId:process.pid };
+  const peer = { kind:'stdio' as const, pid:process.pid, executable, codexHome:aliasHome };
+  const run = async () => ({ stdout:JSON.stringify(proof), code:0 });
+  expect(await codexNativeGeneration(peer, process.pid, home, { platform:'win32', run })).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
+});
+
+it('accepts a short executable alias only when Windows proof confirms matching bytes', async () => {
+  const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
+  const home = 'C:\\Users\\Owner\\fixture', executable = 'C:\\Users\\runneradmin\\AppData\\Local\\Temp\\node.exe';
+  const shortExecutable = 'C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\node.exe';
+  const proof = { pid:process.pid, birth:'2026-11-03T10:00:00.1234567Z', boot:'2026-11-01T01:02:03.0000000Z', executable,
+    executableContentMatchesExpected:true, sha256:'a'.repeat(64), owner:'S-1-5-21-1001', gatewayOwner:'S-1-5-21-1001', codexHome:home,
+    peerVerified:true, parentPid:process.pid, gatewayId:process.pid };
+  const peer = { kind:'stdio' as const, pid:process.pid, executable:shortExecutable, codexHome:home };
+  const run = async () => ({ stdout:JSON.stringify(proof), code:0 });
+  expect(await codexNativeGeneration(peer, process.pid, home, { platform:'win32', run })).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
+  expect(await codexNativeGeneration(peer, process.pid, home, { platform:'win32', run:async () => ({ stdout:JSON.stringify({ ...proof, executableContentMatchesExpected:false }), code:0 }) })).toBeUndefined();
+});
+
+it.skipIf(process.platform !== 'win32')('proves an owned Windows stdio process when the expected executable has matching bytes at another path', async () => {
+  const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
+  const root = await mkdtemp(path.join(tmpdir(), 'rele-native-proof-'));
+  cleanup.push(() => rm(root, { recursive:true, force:true }));
+  const home = path.join(root, 'home'), executable = path.join(root, 'node.exe');
+  await mkdir(home);
+  await copyFile(process.execPath, executable);
+  const expectedExecutable = process.execPath;
+  const child = spawn(executable, ['-e', 'setInterval(() => {}, 1000)'], { stdio:'ignore', windowsHide:true });
+  cleanup.push(async () => { if (child.exitCode === null && child.signalCode === null) { child.kill(); await once(child, 'close'); } });
+  await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+  let proofStage: string | undefined;
+  const sameFile = (left: unknown, right: string) => {
+    if (typeof left !== 'string') return false;
+    if (path.win32.normalize(left).toLowerCase() === path.win32.normalize(right).toLowerCase()) return true;
+    try {
+      const a = statSync(left, { bigint:true }), b = statSync(right, { bigint:true });
+      if (a.dev !== 0n && b.dev !== 0n && a.ino !== 0n && b.ino !== 0n) return a.dev === b.dev && a.ino === b.ino;
+      return path.win32.normalize(realpathSync.native(left)).toLowerCase() === path.win32.normalize(realpathSync.native(right)).toLowerCase();
+    } catch { return false; }
+  };
+  const run = async (command:string, args:string[], timeoutMs = 30_000) => {
+    try {
+      const result = await promisify(execFile)(command, args, { timeout:timeoutMs, maxBuffer:128*1024, windowsHide:true });
+      try {
+        const proof = JSON.parse(result.stdout) as Record<string, unknown>;
+        const checks = [
+          ['peer', proof.peerVerified === true], ['pid', proof.pid === child.pid], ['gateway', proof.gatewayId === process.pid],
+          ['birth', typeof proof.birth === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$/u.test(proof.birth) && Number.isFinite(Date.parse(proof.birth))],
+          ['owner', typeof proof.owner === 'string' && /^S-1-\d+(?:-\d+)+$/u.test(proof.owner)],
+          ['hash', typeof proof.sha256 === 'string' && /^[a-f0-9]{64}$/u.test(proof.sha256)],
+          ['executable-path', typeof proof.executable === 'string' && /^[A-Za-z]:\\/u.test(proof.executable) && path.win32.isAbsolute(proof.executable)],
+          ['home-path', typeof proof.codexHome === 'string' && /^[A-Za-z]:\\/u.test(proof.codexHome) && path.win32.isAbsolute(proof.codexHome)],
+          ['image-hash', proof.executableContentMatchesExpected === true],
+          ['executable', sameFile(proof.executable, expectedExecutable)], ['home', sameFile(proof.codexHome, home)],
+          ['boot', typeof proof.boot === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$/u.test(proof.boot) && Number.isFinite(Date.parse(proof.boot))],
+          ['parent', proof.parentPid === process.pid], ['gateway-owner', proof.gatewayOwner === proof.owner],
+        ];
+        proofStage = `proof-fields:${checks.filter(([, ok]) => !ok).map(([name]) => name).join(',') || 'ok'}`;
+      } catch { proofStage = `proof-output:${result.stdout.trim() ? 'invalid-json' : 'empty'}`; }
+      return { stdout:result.stdout, code:0 };
+    } catch (error) {
+      const stderr = String((error as { stderr?:string }).stderr ?? '');
+      const marker = /rele-native-proof:([a-z-]+)(?::([A-Za-z]+):([A-Za-z]+)(?::([A-Za-z0-9-]+))?)?/u.exec(stderr);
+      proofStage = marker ? [marker[1], marker[2], marker[3], marker[4]].filter(Boolean).join(':') : 'powershell-invocation';
+      return { stdout:'', code:1 };
+    }
+  };
+  const generation = await codexNativeGeneration({ kind:'stdio', pid:child.pid!, codexHome:home, executable:expectedExecutable }, child.pid!, home, { platform:'win32', run });
+  if (!generation) throw new Error(`Windows native proof failed at ${proofStage ?? 'unknown stage'}`);
+  expect(generation).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
+}, 180000);
 
 async function proxyFixture(churn = false, coldExecutable = false, symlinkEndpoint = false, pidRecord = true) {
   const home = await mkdtemp(path.join(tmpdir(), 'rele-generation-'));
@@ -196,6 +282,113 @@ it('Windows proof survives a new client port and future controller while keeping
   expect(await prove()).not.toBe(first);
 });
 
+it('limits Windows proof diagnostics to a fixed stage, exception type and category', async () => {
+  const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
+  const home = 'C:\\Users\\Owner\\fixture', executable = 'C:\\native\\codex.exe';
+  const receipt = { status:'alreadyRunning', endpoint:'ws://127.0.0.1:62662', codexHome:home, executable, executableSha256:'a'.repeat(64), ownerSid:'S-1-5-21-1001', processId:10944, processStartTime:'2026-11-03T10:00:00.1234567Z' };
+  let proof = '';
+  const run = async (command: string, args: string[]) => {
+    if (command.endsWith('Rele.exe')) return { stdout:JSON.stringify(receipt), code:0 };
+    proof = Buffer.from(args.at(-1)!, 'base64').toString('utf16le');
+    return { stdout:'', code:1 };
+  };
+  const generation = await Reflect.apply(codexNativeGeneration, undefined, [{ kind:'windows-shared', endpoint:receipt.endpoint, localPort:55001, remotePort:62662 }, 10944, home, { platform:'win32', run, installationDirectory:'C:\\Rele' }]);
+  expect(generation).toBeUndefined();
+  expect(proof).toContain("$failureType += '-' + $detail.NativeErrorCode");
+  expect(proof).toContain("[Console]::Error.WriteLine('rele-native-proof:' + $script:stage + ':' + $_.Exception.GetType().Name + ':' + $_.CategoryInfo.Category + ':' + $failureType)");
+  expect(proof).not.toContain('$_.Exception.Message');
+  expect(proof).toContain("Mark-Stage 'tcp-query'");
+});
+
+it('reports only bounded Windows proof failure details when requested', async () => {
+  const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
+  const home = 'C:\\Users\\Owner\\fixture', executable = 'C:\\native\\codex.exe';
+  const receipt = { status:'alreadyRunning', endpoint:'ws://127.0.0.1:62662', codexHome:home, executable, executableSha256:'a'.repeat(64), ownerSid:'S-1-5-21-1001', processId:10944, processStartTime:'2026-11-03T10:00:00.1234567Z' };
+  let failure: unknown;
+  const run = async (command: string) => {
+    if (command.endsWith('Rele.exe')) return { stdout:JSON.stringify(receipt), code:0 };
+    throw Object.assign(new Error('private path and command details'), { stderr:'rele-native-proof:tcp-query:RuntimeException:OperationStopped:CommandNotFoundException\r\nC:\\private\\fixture' });
+  };
+  await Reflect.apply(codexNativeGeneration, undefined, [{ kind:'windows-shared', endpoint:receipt.endpoint, localPort:55001, remotePort:62662 }, 10944, home,
+    { platform:'win32', run, installationDirectory:'C:\\Rele', onProofFailure:(value: unknown) => { failure = value; } }]);
+  expect(failure).toEqual({ stage:'tcp-query', category:'OperationStopped', failureType:'CommandNotFoundException' });
+});
+
+it('allows a Windows native generation proof to finish when image hashing exceeds the old budget', async () => {
+  const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
+  const home = 'C:\\Users\\Owner\\fixture', executable = 'C:\\native\\codex.exe';
+  const receipt = { status:'alreadyRunning', endpoint:'ws://127.0.0.1:62662', codexHome:home, executable, executableSha256:'a'.repeat(64), ownerSid:'S-1-5-21-1001', processId:10944, processStartTime:'2026-11-03T10:00:00.1234567Z' };
+  const proof = { pid:10944, birth:receipt.processStartTime, boot:'2026-11-01T01:02:03.0000000Z', executable, sha256:'a'.repeat(64), owner:receipt.ownerSid,
+    codexHome:home, peerVerified:true, gatewayId:process.pid, localPort:55001, remotePort:62662, executableContentMatchesExpected:true };
+  let proofTimeoutMs: number | undefined;
+  const run = async (command: string, _args: string[], timeoutMs?: number) => {
+    if (command.endsWith('Rele.exe')) return { stdout:JSON.stringify(receipt), code:0 };
+    proofTimeoutMs = timeoutMs;
+    if ((proofTimeoutMs ?? 0) < 60_000) {
+      throw Object.assign(new Error('bounded proof timeout'), { code:null, killed:true, signal:'SIGTERM', stderr:'rele-native-proof-stage:process-image-hash-hash-compute\\n' });
+    }
+    return { stdout:JSON.stringify(proof), code:0 };
+  };
+  const generation = await codexNativeGeneration({ kind:'windows-shared', endpoint:receipt.endpoint, localPort:55001, remotePort:62662 }, 10944, home,
+    { platform:'win32', run, installationDirectory:'C:\\Rele' });
+  expect(generation).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
+  expect(proofTimeoutMs).toBeGreaterThanOrEqual(60_000);
+});
+
+it('reports when a Windows proof is valid JSON but fails the native-peer contract', async () => {
+  const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
+  const home = 'C:\\Users\\Owner\\fixture', executable = 'C:\\native\\codex.exe';
+  const receipt = { status:'alreadyRunning', endpoint:'ws://127.0.0.1:62662', codexHome:home, executable, executableSha256:'a'.repeat(64), ownerSid:'S-1-5-21-1001', processId:10944, processStartTime:'2026-11-03T10:00:00.1234567Z' };
+  const proof = { pid:10944, birth:receipt.processStartTime, boot:'2026-11-01T01:02:03.0000000Z', executable, sha256:'a'.repeat(64), owner:receipt.ownerSid,
+    codexHome:home, peerVerified:false, parentPid:process.pid, gatewayId:process.pid, gatewayOwner:receipt.ownerSid, localPort:55001, remotePort:62662 };
+  let failure: unknown;
+  const run = async (command: string) => command.endsWith('Rele.exe')
+    ? { stdout:JSON.stringify(receipt), code:0 }
+    : { stdout:JSON.stringify(proof), code:0 };
+  const generation = await codexNativeGeneration({ kind:'windows-shared', endpoint:receipt.endpoint, localPort:55001, remotePort:62662 }, 10944, home,
+    { platform:'win32', run, installationDirectory:'C:\\Rele', onProofFailure:value => { failure = value; } });
+  expect(generation).toBeUndefined();
+  expect(failure).toEqual({ stage:'proof-contract', category:'peer-identity', failureType:'contract-mismatch' });
+});
+
+it.each([
+  ['status command failure', 'status-error', { stage:'status-probe', category:'command-error', failureType:'execution-error' }],
+  ['malformed status JSON', 'status-json', { stage:'status-probe', category:'invalid-json', failureType:'parse-error' }],
+  ['malformed proof JSON', 'proof-json', { stage:'proof-output', category:'invalid-json', failureType:'parse-error' }],
+  ['PowerShell execution timeout', 'powershell-timeout', { stage:'owner-sid-query', category:'timeout', failureType:'execution-timeout' }],
+  ['PowerShell failure without a marker', 'powershell-error', { stage:'powershell', category:'unclassified-error', failureType:'execution-error' }],
+] as const)('reports bounded diagnostics for %s', async (_label, failureMode, expected) => {
+  const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
+  const home = 'C:\\Users\\Owner\\fixture', executable = 'C:\\native\\codex.exe';
+  const receipt = { status:'alreadyRunning', endpoint:'ws://127.0.0.1:62662', codexHome:home, executable, executableSha256:'a'.repeat(64), ownerSid:'S-1-5-21-1001', processId:10944, processStartTime:'2026-11-03T10:00:00.1234567Z' };
+  let failure: unknown;
+  let proofScript = '';
+  const run = async (command: string, args: string[] = []) => {
+    if (command.endsWith('Rele.exe')) {
+      if (failureMode === 'status-error') throw new Error('C:\\private\\fixture');
+      return { stdout:failureMode === 'status-json' ? '{"private":"path"' : JSON.stringify(receipt), code:0 };
+    }
+    if (failureMode === 'proof-json') return { stdout:'{"private":"path"', code:0 };
+    if (failureMode === 'powershell-timeout') {
+      const encoded = args[args.indexOf('-EncodedCommand') + 1];
+      proofScript = Buffer.from(encoded!, 'base64').toString('utf16le');
+      throw Object.assign(new Error('private command details'), { code:null, killed:true, signal:'SIGTERM', stderr:'rele-native-proof-stage:owner-process-query\nrele-native-proof-stage:owner-sid-query\n', path:'C:\\private\\fixture' });
+    }
+    if (failureMode === 'powershell-error') throw new Error('C:\\private\\fixture');
+    return { stdout:'', code:1 };
+  };
+  const generation = await codexNativeGeneration({ kind:'windows-shared', endpoint:receipt.endpoint, localPort:55001, remotePort:62662 }, 10944, home,
+    { platform:'win32', run, installationDirectory:'C:\\Rele', onProofFailure:value => { failure = value; } });
+  expect(generation).toBeUndefined();
+  if (failureMode === 'powershell-timeout') {
+    expect(proofScript).toContain("function Mark-Stage($name)");
+    expect(proofScript).toContain("Mark-Stage 'owner-sid-query'");
+    expect(proofScript.indexOf("Mark-Stage 'owner-process-query'")).toBeLessThan(proofScript.indexOf('Get-CimInstance Win32_Process'));
+    expect(proofScript.indexOf("Mark-Stage 'owner-sid-query'")).toBeLessThan(proofScript.indexOf('Invoke-CimMethod'));
+  }
+  expect(failure).toEqual(expected);
+});
+
 it.each([
   { peerVerified:false }, { pid:10945 }, { owner:'S-1-5-21-1002' }, { sha256:'b'.repeat(64) },
   { codexHome:'C:\\Users\\Other\\fixture' }, { birth:'2026-11-03T10:00:00.1234568Z' },
@@ -223,20 +416,27 @@ it.skipIf(process.platform !== 'win32')('binds the real Windows TCP peer and ful
   const execute = promisify(execFile);
   const powershell = path.win32.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const inspect = `$ErrorActionPreference='Stop'; $p=[Diagnostics.Process]::GetProcessById(${server.pid}); $o=Invoke-CimMethod -InputObject (Get-CimInstance Win32_Process -Filter 'ProcessId=${server.pid}') -MethodName GetOwnerSid; [ordered]@{processId=$p.Id;processStartTime=$p.StartTime.ToUniversalTime().ToString('o');ownerSid=$o.Sid;executable=$p.MainModule.FileName;executableSha256=(Get-FileHash -LiteralPath $p.MainModule.FileName -Algorithm SHA256).Hash.ToLowerInvariant()} | ConvertTo-Json -Compress`;
-  const physical = JSON.parse((await execute(powershell, ['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(inspect,'utf16le').toString('base64')], { timeout:10000 })).stdout);
+  const physical = JSON.parse((await execute(powershell, ['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(inspect,'utf16le').toString('base64')], { timeout:30000 })).stdout);
   const receipt = { ...physical, status:'alreadyRunning', endpoint:`ws://127.0.0.1:${port}`, codexHome:home };
-  const run = async (command: string, args: string[]) => command.endsWith('Rele.exe')
-    ? { stdout:JSON.stringify(receipt), code:0 }
-    : { ...(await execute(command,args,{ timeout:5000 })), code:0 };
+  let failureStage: string | undefined;
+  const run = async (command: string, args: string[]) => {
+    if (command.endsWith('Rele.exe')) return { stdout:JSON.stringify(receipt), code:0 };
+    try { return { ...(await execute(command,args,{ timeout:30000 })), code:0 }; }
+    catch (error) {
+      const failure = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string };
+      failureStage = `${failure.stderr ?? ''}\n${failure.stdout ?? ''}`.match(/rele-native-proof:([a-z-]+)/u)?.[1];
+      return { stdout:failure.stdout ?? '', code:typeof failure.code === 'number' ? failure.code : 1 };
+    }
+  };
   const peer = { kind:'windows-shared' as const, endpoint:receipt.endpoint, localPort:socket.localPort!, remotePort:port };
   const first = await codexNativeGeneration(peer, server.pid!, home, { run });
-  expect(first).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
+  expect(first, `Windows native proof failed at fixed stage: ${failureStage ?? 'unreported'}`).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
   expect(await codexNativeGeneration({ ...peer, localPort:peer.localPort+1 }, server.pid!, home, { run })).toBeUndefined();
   // Same listener/PID but no actual connected peer must never earn the proof.
   socket.destroy();
   await new Promise(resolve => setTimeout(resolve, 30));
   expect(await codexNativeGeneration(peer, server.pid!, home, { run })).toBeUndefined();
-}, 30000);
+}, 60000);
 
 
 it('proves a direct owned Windows stdio child without controller or TCP evidence', async () => {

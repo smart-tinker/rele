@@ -1,0 +1,27 @@
+name: Bug or change
+description: A reproducible problem or a bounded improvement
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, private conversations, or machine-specific personal data. Check existing issues first.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and impact
+      description: What is wrong, who is affected, and why does this need changing?
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Reproduction or evidence
+      description: Include version/SHA, sanitized steps, actual and expected behavior; distinguish observations from hypotheses.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and acceptance criteria
+      description: Observable Definition of Done, required regression tests, exclusions, and native acceptance if applicable.
+    validations:
+      required: true

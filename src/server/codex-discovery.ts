@@ -12,8 +12,11 @@ import { codexEnvironment, environmentValue, fileExists, isDesktopLauncher, reso
 export const WINDOWS_CODEX_PROCESS_PROVIDER_SCRIPT = String.raw`
 [void][Reflection.Assembly]::Load('System.Management, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a')
 function Close-ReleProcessQuery($query) {
-  try { foreach ($row in $query.objects) { $row.Dispose() } }
-  finally { try { if ($query.collection) { $query.collection.Dispose() } } finally { $query.searcher.Dispose() } }
+  try { foreach ($row in $query.objects) { [Console]::Error.WriteLine('rele-discovery:query-row-close'); $row.Dispose() } }
+  finally {
+    try { if ($query.collection) { [Console]::Error.WriteLine('rele-discovery:query-collection-close'); $query.collection.Dispose() } }
+    finally { [Console]::Error.WriteLine('rele-discovery:query-searcher-close'); $query.searcher.Dispose(); [Console]::Error.WriteLine('rele-discovery:done') }
+  }
 }
 function Get-ReleProcessQuery([string]$filter, [bool]$parentOnly = $false) {
   $fields = if ($parentOnly) { 'Name,ExecutablePath,ParentProcessId' } else { 'Name,ExecutablePath,CommandLine,ProcessId,ParentProcessId' }
@@ -166,7 +169,7 @@ export interface CodexDiscoveryOptions {
 }
 
 function probeStage(value: unknown): string | undefined {
-  return typeof value === 'string' && ['startup', 'process-provider', 'process-query', 'process-parse', 'owner-query', 'parent-query', 'packages', 'json-provider', 'json', 'done'].includes(value) ? value : undefined;
+  return typeof value === 'string' && ['startup', 'process-provider', 'process-query', 'process-parse', 'owner-query', 'parent-query', 'query-row-close', 'query-collection-close', 'query-searcher-close', 'packages', 'json-provider', 'json', 'done'].includes(value) ? value : undefined;
 }
 interface WindowsProcess {
   executable: string;

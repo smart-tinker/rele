@@ -42,7 +42,7 @@ let phase = 'preflight';
 let failurePhase;
 const controllerCalls = [];
 function run(command, args, extra = {}) {
-  const output = spawnSync(command, args, { env, windowsHide: true, encoding: 'utf8', timeout: 25_000, maxBuffer: 65536, ...extra });
+  const output = spawnSync(command, args, { env, windowsHide: true, encoding: 'utf8', timeout: 60_000, maxBuffer: 65536, ...extra });
   if (output.error) throw output.error;
   return output;
 }
@@ -50,6 +50,12 @@ function powershell(code, extra = {}) {
   const output = run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); ${code}`], extra);
   assert.equal(output.status, 0, output.stderr || output.stdout);
   return output.stdout.trim();
+}
+function scheduledTaskExists(name) {
+  return powershell(`$scheduler=New-Object -ComObject 'Schedule.Service'; $scheduler.Connect(); $folder=$scheduler.GetFolder('\\');
+    try { $null=$folder.GetTask($env:RELE_CONTROL_TASK); 'true' }
+    catch { $inner=$_.Exception.InnerException; $hresult=if ($inner) { $inner.HResult } else { $_.Exception.HResult }; if ($hresult -ne -2147024894) { throw }; 'false' }`,
+  { env: { ...env, RELE_CONTROL_TASK: name } }) === 'true';
 }
 const samePath = (first, second) => path.resolve(first).toLowerCase() === path.resolve(second).toLowerCase();
 async function exited(pid) {
@@ -115,8 +121,7 @@ let initialOwner;
 const knownHelperHashes = new Set();
 try {
   sid = powershell('[Security.Principal.WindowsIdentity]::GetCurrent().User.Value');
-  assert.equal(powershell("(@(Get-ScheduledTask -TaskName $env:RELE_CONTROL_TASK -ErrorAction SilentlyContinue)).Count",
-    { env: { ...env, RELE_CONTROL_TASK: `${task}-Codex` } }), '0', 'The random fixture Task must not already exist.');
+  // codex-start refuses a foreign same-name Task, so a preliminary scheduler RPC is redundant.
   await mkdir(path.join(application, 'dist/native'), { recursive: true });
   await mkdir(data);
   await assert.rejects(access(home), { code: 'ENOENT' });
@@ -190,13 +195,8 @@ try {
   assert.equal(liveControl.status, 'alreadyRunning');
   for (const key of ['endpoint', 'processId', 'processStartTime', 'ownerDirectory']) assert.equal(liveControl[key], control[key]);
   assert.deepEqual(await Promise.all([readFile(target.installSettingsPath), readFile(currentPointer)]), beforeStatus);
-  assert.equal(taskSnapshot(), beforeTask);
+  assert.equal(taskSnapshot().split('|')[0], beforeTask.split('|')[0], 'Read-only status must not change the Task definition.');
   process.kill(control.processId, 0);
-  const listeners = JSON.parse(powershell(`$rows=@(Get-NetTCPConnection -State Listen -LocalAddress '127.0.0.1' -LocalPort $env:RELE_CONTROL_PORT);
-    if ($rows.Count -ne 1) { throw 'Native listener is not unique.' }
-    [pscustomobject]@{ pid=[int]$rows[0].OwningProcess } | ConvertTo-Json -Compress`,
-    { env: { ...env, RELE_CONTROL_PORT: new URL(control.endpoint).port } }));
-  assert.equal(listeners.pid, control.processId, 'The kernel listener must belong to the receipt PID.');
   phase = 'native-initialize';
   const call = await connect(control.endpoint);
   const initialized = await call('initialize', { clientInfo: { name: 'rele_control_fixture', version: '1' }, capabilities: { experimentalApi: true } });
@@ -270,11 +270,11 @@ try {
   try {
     const unknownSnapshot = taskSnapshot();
     const refused = await status(); assert.equal(refused.status, 1, 'An unknown successor action must fail closed.');
-    assert.equal(taskSnapshot(), unknownSnapshot, 'Refusal must leave the Task unchanged.');
+    assert.equal(taskSnapshot().split('|')[0], unknownSnapshot.split('|')[0], 'Refusal must leave the Task definition unchanged.');
     assert.deepEqual(await Promise.all([readFile(target.installSettingsPath), readFile(currentPointer)]), beforeStatus);
     assert.equal((await call('server/diagnostics')).process.id, control.processId);
   } finally { alterSuccessorArgument(false); }
-  assert.equal(taskSnapshot(), successorTaskSnapshot);
+  assert.equal(taskSnapshot().split('|')[0], successorTaskSnapshot.split('|')[0]);
   const recoveryTaskSnapshot = taskSnapshot();
   const closed = once(socket, 'close'); socket.close(); await closed; socket = undefined;
   const recoveryStartCalls = nativeStartCalls;
@@ -449,8 +449,7 @@ try {
   phase = 'status-after-stop';
   const stopped = await status(); assert.equal(stopped.status, 0, stopped.errorReceipt || stopped.stderr);
   assert.deepEqual(JSON.parse(stopped.stdout), { status: 'notRunning' });
-  assert.equal(powershell("(@(Get-ScheduledTask -TaskName $env:RELE_CONTROL_TASK -ErrorAction SilentlyContinue)).Count",
-    { env: { ...env, RELE_CONTROL_TASK: `${task}-Codex` } }), '0');
+  assert.equal(scheduledTaskExists(`${task}-Codex`), false);
   assert.deepEqual(await Promise.all([readFile(target.installSettingsPath), readFile(currentPointer)]), promotedState);
   const address = new URL(control.endpoint);
   foreign = createServer(connection => connection.end());

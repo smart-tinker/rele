@@ -25,11 +25,16 @@ import websockets
 from websockets.exceptions import ConnectionClosedError
 from websockets.protocol import State
 
-VERSIONS = ['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6']
+VERSIONS = ['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1']
 REPO = Path(__file__).resolve().parent.parent
 NODE = shutil.which('node')
 DRIVER = REPO / 'scripts/probe-shared-codex.ts'
 SHIM = REPO / 'dist/server/codex-cli.js'
+ENGINE_READ_TIMEOUT_SECONDS = 70
+ENGINE_WAIT_READ_TIMEOUT_SECONDS = 120
+ENGINE_CANCEL_READ_TIMEOUT_SECONDS = 720
+# backgroundTerminals performs two Windows native identity proofs, each bounded at 30s.
+ENGINE_SHARED_SHELL_START_TIMEOUT_SECONDS = 65
 
 
 def arguments():
@@ -40,11 +45,13 @@ def arguments():
     source.add_argument('--desktop-bundle', type=Path)
     parser.add_argument('--desktop-inventory', type=Path)
     parser.add_argument('--installed-desktop', action='store_true')
-    parser.add_argument('--expected-version', choices=VERSIONS, required=True)
+    parser.add_argument('--expected-version', required=True)
     parser.add_argument('--report', type=Path, required=True)
     parser.add_argument('--windows-app-template', type=Path)
     parser.add_argument('--windows-runtime', choices=['source', 'packaged'], default='source')
     args = parser.parse_args()
+    if args.expected_version not in VERSIONS and not args.desktop_bundle:
+        parser.error('Unlisted versions require a measured Desktop inventory.')
     args.retain_fixture = False
     if args.installed_desktop and (os.name != 'nt' or not args.desktop_bundle or not args.desktop_inventory):
         parser.error('Installed Desktop mode requires Windows, --desktop-bundle and the signed --desktop-inventory.')
@@ -186,8 +193,8 @@ class EngineDriver:
     def __init__(self, process):
         self.process = process
 
-    async def read(self):
-        line = await asyncio.wait_for(self.process.stdout.readline(), 55)
+    async def read(self, timeout=ENGINE_READ_TIMEOUT_SECONDS):
+        line = await asyncio.wait_for(self.process.stdout.readline(), timeout)
         if not line:
             raise RuntimeError('Shared Engine driver exited before responding')
         return json.loads(line)
@@ -195,7 +202,9 @@ class EngineDriver:
     async def command(self, action, **fields):
         self.process.stdin.write((json.dumps({'action': action, **fields}) + '\n').encode())
         await self.process.stdin.drain()
-        return await self.read()
+        # Cancellation may repeat Windows generation proofs, each with 30-second subprocess limits.
+        timeout = ENGINE_CANCEL_READ_TIMEOUT_SECONDS if action == 'cancel' else ENGINE_WAIT_READ_TIMEOUT_SECONDS if action == 'wait' else ENGINE_READ_TIMEOUT_SECONDS
+        return await self.read(timeout)
 
     async def close(self):
         if self.process.returncode is not None:
@@ -215,7 +224,7 @@ async def gate(args, root):
     report = {'codexVersion': args.expected_version, 'platform': os.name, 'actualDesktopTested': False, 'actualDesktopGui': False,
               'actualDesktopBundle': bool(args.desktop_bundle), 'installedDesktop': args.installed_desktop, 'actualDesktopBackendExecuted': False,
               'realModelRequests': 0, 'realMessengerRequests': 0, 'checks': {}}
-    records, actions, holds, errors, drainers, processes = [], [], [], [], [], []
+    records, actions, holds, errors, drainers, processes, provider_trace = [], [], [], [], [], [], []
     native_executables = {}
     windows_fixtures = {}
     if os.name == 'nt':
@@ -239,6 +248,8 @@ async def gate(args, root):
         initial = any(part.get('text', '').endswith('На это сообщение ответь NOREPLY.')
                       for part in latest_user.get('content', []) if isinstance(part, dict))
         action, event = ('initial', None) if initial else actions.pop(0) if actions else ('final', None)
+        trace = {'index': index, 'action': action, 'result': 'pending'}
+        provider_trace.append(trace)
         records.append(body)
         response = web.StreamResponse(headers={'Content-Type': 'text/event-stream'})
         await response.prepare(request)
@@ -275,7 +286,9 @@ async def gate(args, root):
             await response.write(frame({'type': 'response.completed', 'response': {'id': f'resp-{index}',
                 'usage': {'input_tokens': 10, 'output_tokens': 3, 'total_tokens': 13}}}))
             await response.write_eof()
+            trace['result'] = 'sent'
         except ConnectionError:
+            trace['result'] = 'disconnected'
             pass  # The shared cancellation intentionally closes a held synthetic stream.
         return response
 
@@ -491,7 +504,10 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
             return None, None
         if thread:
             command += ['--thread', thread]
-        process = await spawn(command, env, REPO)
+        driver_env = env
+        if os.name == 'nt' and os.environ.get('RELE_CI_SHARED_DIAGNOSTICS') == '1':
+            driver_env = {**env, 'RELE_CI_SHARED_DIAGNOSTICS': '1'}
+        process = await spawn(command, driver_env, REPO)
         client = EngineDriver(process)
         ready = await client.read()
         if os.name == 'nt':
@@ -530,6 +546,36 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
             if flags not in variants:
                 variants.append(flags)
         return client
+
+    async def held_request_evidence(engine, peer, thread):
+        evidence = {'providerRequestCount': len(records)}
+        try:
+            engine_snapshot = await asyncio.wait_for(engine.command('snapshot'), 5)
+            evidence['engineRequests'] = [
+                {key: row.get(key) for key in ('eventId', 'status', 'turnId')}
+                for row in engine_snapshot.get('requests', [])[-8:]
+            ]
+            evidence['engineApprovals'] = [
+                {key: row.get(key) for key in ('id', 'requestId', 'method', 'status', 'turnId')}
+                for row in engine_snapshot.get('approvals', [])[-8:]
+            ]
+            evidence['engineProtocolEvents'] = engine_snapshot.get('observedProtocolEvents', [])[-24:]
+            evidence['driverOperations'] = engine_snapshot.get('driverOperations', [])
+            evidence['reconciliationStageTrace'] = engine_snapshot.get('reconciliationStageTrace', [])[-32:]
+        except Exception as error:
+            evidence['engineSnapshotError'] = type(error).__name__
+        try:
+            native_snapshot = await asyncio.wait_for(peer.call('thread/read', {'threadId': thread}), 5)
+            evidence['nativeTurnStatus'] = native_snapshot.get('thread', {}).get('status', {}).get('type')
+        except Exception as error:
+            evidence['nativeThreadReadError'] = type(error).__name__
+        evidence['observedTurns'] = [
+            {'method': event.get('method'), 'turnId': event.get('params', {}).get('turn', {}).get('id')}
+            for event in peer.events if event.get('method') in ('turn/started', 'turn/completed')
+        ][-8:]
+        evidence['providerTrace'] = provider_trace[-8:]
+        evidence['queuedProviderActionTypes'] = [action for action, _ in actions[-8:]]
+        return evidence
 
     async def wait_records(count):
         while len(records) < count:
@@ -653,6 +699,16 @@ disable_paste_burst=true
 screen_reader_detection_done=true
 [projects.{json.dumps(str(workspace))}]
 trust_level="trusted"
+'''
+        if args.desktop_bundle:
+            # Desktop's enabled-only MCP overrides need a complete, inert stdio definition.
+            scenario_config += f'''
+[mcp_servers.codex_app]
+command={json.dumps(str(home / 'disabled-mcp-fixture'))}
+enabled=false
+[mcp_servers.code-review]
+command={json.dumps(str(home / 'disabled-mcp-fixture'))}
+enabled=false
 '''
         (home / 'config.toml').write_text(scenario_config, encoding='utf-8')
         env = {**base_env, 'CODEX_HOME': str(home), 'RELE_DATA_DIR': str(directory / 'rele')}
@@ -778,12 +834,22 @@ trust_level="trusted"
             # A real Rele request is active while its client/engine process is closed.
             hold = asyncio.Event(); holds.append(hold); actions.append(('hold', hold))
             before = len(records)
-            await engine.command('ingest', platform='telegram', eventId='held-telegram', text='held-original-request', loseAck=True)
-            await asyncio.wait_for(wait_records(before + 1), 25)
-            running = await engine.command('wait', status='running')
-            assert running['droppedQueueAcks'] == 1, 'The synthetic queue ACK was not withheld'
-            request = next(row for row in running['requests'] if row['eventId'] == 'held-telegram')
+            started_before = {event.get('params', {}).get('turn', {}).get('id') for event in peer.events
+                              if event.get('method') == 'turn/started'}
+            try:
+                await engine.command('ingest', platform='telegram', eventId='held-telegram', text='held-original-request', loseAck=True)
+                turn_started = await peer.wait(lambda event: event.get('method') == 'turn/started'
+                    and event.get('params', {}).get('threadId') == thread
+                    and event.get('params', {}).get('turn', {}).get('id') not in started_before,
+                    timeout=ENGINE_READ_TIMEOUT_SECONDS)
+                accepted = await engine.command('snapshot')
+                assert accepted['droppedQueueAcks'] == 1, 'The synthetic queue ACK was not withheld'
+            except (TimeoutError, RuntimeError):
+                report['heldRequestTimeout'] = await held_request_evidence(engine, peer, thread)
+                raise
+            request = next(row for row in accepted['requests'] if row['eventId'] == 'held-telegram')
             assert str(uuid.UUID(request['id'])) == request['id']
+            turn_id = turn_started['params']['turn']['id']
             await engine.close(); engine = None
             assert (await peer.call('server/diagnostics'))['process']['id'] == pid
             assert (await peer.call('thread/read', {'threadId': thread}))['thread']['status']['type'] != 'idle'
@@ -792,19 +858,23 @@ trust_level="trusted"
             hold.set()
             completed = await engine.command('wait')
             recovered = next(row for row in completed['requests'] if row['id'] == request['id'])
-            assert recovered['status'] == 'completed' and recovered['origin'] == request['origin']
+            assert recovered['status'] == 'completed' and recovered['origin'] == request['origin'] and recovered['turnId'] == turn_id
             assert len(records) == before + 1, 'Rele restart replayed an accepted native request'
             assert any(row['requestId'] == request['id'] and row['origin']['platform'] == 'telegram' and row['status'] == 'sent'
                        for row in completed['deliveries'])
             report['checks']['rele_restart_after_lost_ack_preserves_active_native_turn_uuid_without_resend'] = True
             if args.desktop_bundle:
                 report['desktopBootstrap']['recoveredRequestId'] = request['id']
-                report['desktopBootstrap']['recoveredTurnId'] = request['turnId']
+                report['desktopBootstrap']['recoveredTurnId'] = turn_id
                 report['desktopBootstrap']['recoveryNativeProcessId'] = restarted['runtimeProcessId']
             # An origin-owned approval is resolved by the real Engine; Desktop sees it.
             actions.append(('approval', None))
             await engine.command('ingest', platform='telegram', eventId='approval', text='shared-approval-request')
-            pending = await engine.command('wait', status='waiting_approval')
+            try:
+                pending = await engine.command('wait', status='waiting_approval')
+            except (TimeoutError, RuntimeError):
+                report['approvalWaitFailure'] = await held_request_evidence(engine, peer, thread)
+                raise
             approval = next(item for item in pending['approvals'] if item['status'] == 'pending')
             wire = await peer.wait(lambda event: event.get('method') == 'item/commandExecution/requestApproval'
                                    and event['params'].get('turnId') == approval['turnId'])
@@ -862,7 +932,8 @@ trust_level="trusted"
             # The command is bounded and writes only inside this disposable workspace.
             ready_file, late_file = workspace / 'cancel-ready.json', workspace / 'cancel-late.txt'
             command_file = workspace / 'cancel-child.cjs'
-            shell_delay = 90 if os.name == 'nt' else 12
+            # Keep the marker timer beyond the bounded Windows cancellation proof window.
+            shell_delay = ENGINE_CANCEL_READ_TIMEOUT_SECONDS + 120 if os.name == 'nt' else 60
             # PowerShell 5 strips embedded JS quotes from native -e arguments.
             command_file.write_text(f'const f=require("node:fs");f.writeFileSync(process.argv[2],JSON.stringify({{pid:process.pid}}));setTimeout(()=>f.writeFileSync(process.argv[3],"not-stopped"),{shell_delay * 1000});', encoding='utf-8')
             command_args = [str(Path(NODE).resolve(strict=True)), str(command_file), str(ready_file), str(late_file)]
@@ -874,16 +945,18 @@ trust_level="trusted"
                 ('hold', hold_cancel)])
             before = len(records)
             await engine.command('ingest', platform='telegram', eventId='cancel', text='shared-cancel-request')
-            deadline = asyncio.get_running_loop().time() + 25
+            deadline = asyncio.get_running_loop().time() + ENGINE_SHARED_SHELL_START_TIMEOUT_SECONDS
             while True:
                 pending = await engine.command('snapshot')
                 shell_approvals = [item for item in pending['approvals'] if item['status'] == 'pending']
                 if shell_approvals or ready_file.is_file():
                     break
-                assert asyncio.get_running_loop().time() < deadline, 'Shell neither started nor requested approval'
+                if asyncio.get_running_loop().time() >= deadline:
+                    report['cancellationRequestTimeout'] = await held_request_evidence(engine, peer, thread)
+                    report['cancellationRequestTimeout']['readyFileExists'] = ready_file.is_file()
+                    raise AssertionError('Shell neither started nor requested approval')
                 await asyncio.sleep(.05)
             assert len(shell_approvals) <= 1 and all(item['method'] == 'item/commandExecution/requestApproval' and item['requestId'] == next(row['id'] for row in pending['requests'] if row['eventId'] == 'cancel') for item in shell_approvals), 'Unexpected shell approval'
-            shell_deadline = asyncio.get_running_loop().time() + shell_delay + 3
             if shell_approvals:
                 await engine.command('answer', approvalId=shell_approvals[0]['id'], decision='accept')
             await asyncio.wait_for(wait_records(before + 2), 25)
@@ -898,10 +971,17 @@ trust_level="trusted"
                 and event['params'].get('turnId') == cancel['turnId']
                 and event['params'].get('item', {}).get('type') == 'commandExecution')
             item_id = command_item['params']['item']['id']
-            terminal_page = await peer.call('thread/backgroundTerminals/list', {'threadId': thread, 'limit': 100})
-            assert not terminal_page.get('nextCursor'), 'Unexpected terminal pagination in the disposable fixture'
-            terminals = terminal_page['data']
-            assert len([item for item in terminals if item['itemId'] == item_id]) == 1
+            terminal_deadline = asyncio.get_running_loop().time() + 2
+            while True:
+                terminal_page = await peer.call('thread/backgroundTerminals/list', {'threadId': thread, 'limit': 100})
+                assert not terminal_page.get('nextCursor'), 'Unexpected terminal pagination in the disposable fixture'
+                terminals = terminal_page['data']
+                matching_terminals = [item for item in terminals if item['itemId'] == item_id]
+                if matching_terminals:
+                    break
+                assert asyncio.get_running_loop().time() < terminal_deadline, 'Started command did not appear as a background terminal'
+                await asyncio.sleep(.05)
+            assert len(matching_terminals) == 1
             assert (await engine.command('snapshot', processId=child_pid))['probeProcessAlive']
             queued = await engine.command('ingest', platform='slack', eventId='after-shell-cancel', text='shared-after-shell-cancel')
             following = next(row for row in queued['requests'] if row['eventId'] == 'after-shell-cancel')
@@ -912,10 +992,16 @@ trust_level="trusted"
             assert len(witnesses) == 1 and witnesses[0] == {'threadId': thread, 'turnId': cancel['turnId'],
                 'processId': child_pid, 'processAlive': True, 'markerExists': False}, 'Native interrupt was not dispatched against the live fixture child before its delayed marker'
             assert not cancelled['probeProcessAlive'], 'Engine cancelled the model but left its shell child alive'
+            assert asyncio.get_running_loop().time() < shell_deadline, 'Windows cancellation exceeded the delayed-marker proof window'
+            assert not late_file.exists(), 'Cancelled shell wrote its delayed marker'
             aborted = await peer.completed(cancel['turnId'])
             assert aborted['params']['turn']['status'] == 'interrupted'
             hold_cancel.set()
-            completed = await engine.command('wait')
+            try:
+                completed = await engine.command('wait')
+            except RuntimeError:
+                report['afterShellCancelWaitFailure'] = await held_request_evidence(engine, peer, thread)
+                raise
             following_rows = [row for row in completed['requests'] if row['id'] == following['id']]
             assert len(following_rows) == 1 and following_rows[0]['status'] == 'completed'
             assert following_rows[0]['origin'] == following['origin']
@@ -928,8 +1014,6 @@ trust_level="trusted"
             assert not terminal_page.get('nextCursor'), 'Unexpected terminal pagination in the disposable fixture'
             terminals = terminal_page['data']
             assert not any(item['itemId'] == item_id for item in terminals)
-            await asyncio.sleep(max(0, shell_deadline - asyncio.get_running_loop().time()))
-            assert not late_file.exists(), 'Cancelled shell wrote its delayed marker'
             report['checks']['origin_engine_cancels_exact_native_turn_seen_by_desktop'] = True
             report['checks']['engine_shell_stop_cleans_owned_process_before_next_origin_turn_without_backend_restart'] = True
             if args.expected_version == '0.166.0-alpha.6':
@@ -993,8 +1077,6 @@ trust_level="trusted"
         finally:
             for event in holds:
                 event.set()
-            if shell_deadline:
-                await asyncio.sleep(max(0, shell_deadline - asyncio.get_running_loop().time()))
             primary_error = sys.exc_info()[1]
             cleanup_errors = []
             for client in (engine, observer, peer):
@@ -1050,7 +1132,15 @@ trust_level="trusted"
 
 if __name__ == '__main__':
     args = arguments()
-    directory = Path(tempfile.mkdtemp(prefix='rs-', dir=os.environ.get('RUNNER_TEMP')))
+    fixture_parent = os.environ.get('USERPROFILE') if os.name == 'nt' else os.environ.get('RUNNER_TEMP')
+    if not fixture_parent or not Path(fixture_parent).is_dir():
+        raise SystemExit('Isolated fixture parent is unavailable.')
+    if os.name == 'nt':
+        temp_parent = Path(os.environ['RUNNER_TEMP']).resolve()
+        profile_parent = Path(fixture_parent).resolve()
+        if profile_parent == temp_parent or temp_parent in profile_parent.parents:
+            raise SystemExit('Windows Codex fixtures must be created outside RUNNER_TEMP.')
+    directory = Path(tempfile.mkdtemp(prefix='rs-', dir=fixture_parent))
     try:
         asyncio.run(gate(args, directory))
     finally:

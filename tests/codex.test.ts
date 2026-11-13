@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { execFile } from 'node:child_process';
 import { once } from 'node:events';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -11,9 +12,13 @@ import { SharedCodexError } from '../src/server/codex-shared.js';
 import { Engine } from '../src/server/engine.js';
 import { Store } from '../src/server/store.js';
 import { defaultConfig } from '../src/server/config.js';
+import { codexNativeGeneration, type CodexNativePeer } from '../src/server/codex-native-generation.js';
 import { initialMessageKey } from '../src/server/initial-message.js';
 import { asyncQuestions, encodeAsyncAnswers } from '../src/server/async-questions.js';
 import type { Endpoint } from '../src/shared/types.js';
+import { promisify } from 'node:util';
+
+const execute = promisify(execFile);
 
 interface Rpc { id?: string | number; method?: string; params: Record<string, unknown>; result?: unknown; error?: { code: number; message: string } }
 type Handler = (message: Rpc, socket: WebSocket) => unknown | Promise<unknown>;
@@ -171,6 +176,65 @@ async function until(predicate: () => boolean): Promise<void> {
     await new Promise(resolve => setTimeout(resolve, 10));
   }
 }
+
+describe('native source controls', () => {
+  it('recovers an exact recorded Goal turn beyond the latest page without mixing newer turns', async () => {
+    const f = await fixture({ 'thread/turns/list': message => message.params.cursor === 'older'
+      ? { data: [{ id: 'old-goal-turn', status: 'completed', items: [{ type: 'agentMessage', id: 'old-result', phase: 'final_answer', text: 'Owned old result' }] }], nextCursor: null }
+      : { data: [{ id: 'newer-foreign-turn', status: 'completed', items: [{ type: 'userMessage', clientId: 'other' }] }], nextCursor: 'older' } });
+    await f.client.connect();
+    expect(await f.client.controlTurns(threadId, ['old-goal-turn'])).toMatchObject([{ id: 'old-goal-turn', items: [{ text: 'Owned old result' }] }]);
+  });
+  it('reads configuration and Goal capability without resuming or starting work', async () => {
+    const f = await fixture({
+      'thread/read': () => ({ thread: { ...rawThread, model: 'fixture-model', reasoningEffort: 'high' } }),
+      'experimentalFeature/list': () => ({ data: [{ name: 'goals', enabled: true }], nextCursor: null }),
+      'thread/goal/get': () => ({ goal: null }),
+    });
+    await f.client.connect();
+    const before = f.calls.length;
+    expect(await f.client.controlSnapshot(threadId)).toMatchObject({ model: 'fixture-model', effort: 'high', runtimeStatus: 'idle', goalSupported: true, goal: null, queued: 0 });
+    expect(f.calls.slice(before).map(call => call.method)).not.toContain('thread/resume');
+    expect(f.calls.slice(before).some(call => ['turn/start', 'thread/queue/add', 'thread/goal/set'].includes(call.method ?? ''))).toBe(false);
+  });
+
+  it('checks each model effort and changes only future thread defaults, without an inference probe', async () => {
+    const f = await fixture({
+      'model/list': () => ({ data: [{ id: 'fixture-model', model: 'fixture-model', displayName: 'Fixture', supportedReasoningEfforts: [{ reasoningEffort: 'high' }], defaultReasoningEffort: 'high' }], nextCursor: null }),
+      'thread/settings/update': () => ({}),
+    });
+    await f.client.connect();
+    await expect(f.client.updateControlModel(threadId, 'fixture-model', 'low')).rejects.toThrow();
+    expect(f.calls.some(call => call.method === 'thread/settings/update')).toBe(false);
+    await f.client.updateControlModel(threadId, 'fixture-model', 'high');
+    expect(f.calls.filter(call => call.method === 'thread/settings/update').map(call => call.params)).toEqual([{ threadId, model: 'fixture-model', effort: 'high' }]);
+    expect(f.calls.some(call => ['turn/start', 'turn/settings/update', 'thread/resume'].includes(call.method ?? ''))).toBe(false);
+  });
+  it('revalidates admission after the model catalog await and before settings/update', async () => {
+    let admitted = true;
+    const f = await fixture({ 'model/list': () => {
+      admitted = false;
+      return { data: [{ model: 'fixture-model', displayName: 'Fixture', supportedReasoningEfforts: [{ reasoningEffort: 'high' }], defaultReasoningEffort: 'high' }], nextCursor: null };
+    }, 'thread/settings/update': () => ({}) });
+    await f.client.connect();
+    await expect(f.client.updateControlModel(threadId, 'fixture-model', 'high', () => { if (!admitted) throw new Error('Source revoked'); })).rejects.toThrow('Source revoked');
+    expect(f.calls.some(call => call.method === 'thread/settings/update')).toBe(false);
+  });
+
+  it('uses native user-origin Goal mutations, preserves zero accounting, and rejects malformed snapshots', async () => {
+    const goal = { threadId, objective: 'Ship\nDone: tests pass', status: 'active', tokenBudget: 5000, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 100, updatedAt: 100 };
+    const f = await fixture({ 'thread/goal/set': message => ({ goal: { ...goal, status: message.params.status ?? 'active' } }) });
+    await f.client.connect();
+    expect(await f.client.updateControlGoal(threadId, { objective: goal.objective, tokenBudget: 5000 })).toEqual(goal);
+    expect(await f.client.updateControlGoal(threadId, { status: 'paused' })).toMatchObject({ status: 'paused' });
+    expect(f.calls.filter(call => call.method === 'thread/goal/set').map(call => call.params)).toEqual([
+      { threadId, origin: 'user', objective: goal.objective, tokenBudget: 5000 }, { threadId, origin: 'user', status: 'paused' },
+    ]);
+    await expect(f.client.updateControlGoal(threadId, { objective: ' ' })).rejects.toThrow();
+    f.handlers['thread/goal/set'] = () => ({ goal: { ...goal, threadId: 'other' } });
+    await expect(f.client.updateControlGoal(threadId, { status: 'paused' })).rejects.toThrow();
+  });
+});
 
 describe('Codex socket health', () => {
   it('invalidates a socket without matching pongs, preserves another client and permits a fresh connection', async () => {
@@ -977,8 +1041,28 @@ describe('Codex shared-runtime adapter', () => {
     expect(f.calls.filter(call => call.method === 'thread/backgroundTerminals/terminate').map(call => call.params))
       .toEqual([{ threadId, processId: '1234' }]);
     terminals[0].processId = '9999';
-    await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, itemId: 'own-command', processId: '1234' })).rejects.toThrow();
+    await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, itemId: 'own-command', processId: '1234' }))
+      .rejects.toMatchObject({ identityFailure: 'terminal-process-changed' });
+    terminals.push({ itemId: 'own-command', processId: '1111', command: 'duplicate-command-body' });
+    await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, itemId: 'own-command', processId: '1234' }))
+      .rejects.toMatchObject({ identityFailure: 'terminal-ambiguous' });
     expect(f.calls.filter(call => call.method === 'thread/backgroundTerminals/terminate')).toHaveLength(1);
+  });
+
+  it('does not terminate a process when the exact background terminal already disappeared', async () => {
+    const generation = 'a'.repeat(64);
+    const f = await fixture({
+      'server/diagnostics': () => ({ process: { id: 42 }, gauges: [] }),
+      'thread/backgroundTerminals/terminate': () => ({ terminated: true }),
+    });
+    await f.client.connect();
+    const terminateCalls = f.calls.filter(call => call.method === 'thread/backgroundTerminals/terminate').length;
+    vi.spyOn(f.client, 'backgroundTerminals')
+      .mockResolvedValueOnce({ serverId: 42, serverGeneration: generation, terminals: [{ itemId: 'own-command', processId: '1234' }] })
+      .mockResolvedValueOnce({ serverId: 42, serverGeneration: generation, terminals: [] });
+    const snapshot = await f.client.backgroundTerminals(threadId);
+    await expect(f.client.terminateBackgroundTerminal(threadId, { ...snapshot.terminals[0], serverId:snapshot.serverId, serverGeneration:generation })).resolves.toBeUndefined();
+    expect(f.calls.filter(call => call.method === 'thread/backgroundTerminals/terminate')).toHaveLength(terminateCalls);
   });
 
   it('forwards approval requests and rejects responses after another client resolves them', async () => {
@@ -1358,11 +1442,40 @@ describe('Codex managed runtime', () => {
       'thread/backgroundTerminals/terminate': () => ({ terminated: true }),
     });
     await f.client.connect();
-    for (const serverGeneration of ['a'.repeat(64), 'A'.repeat(64), 'a'.repeat(63), '']) {
-      await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, serverGeneration, itemId: 'own-command', processId: '1234' })).rejects.toMatchObject({ code: 'terminal-identity-changed' });
+    await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, serverGeneration: 'a'.repeat(64), itemId: 'own-command', processId: '1234' }))
+      .rejects.toMatchObject({ code: 'terminal-identity-changed', identityFailure: 'server-generation-unconfirmed' });
+    for (const serverGeneration of ['A'.repeat(64), 'a'.repeat(63), '']) {
+      await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, serverGeneration, itemId: 'own-command', processId: '1234' }))
+        .rejects.toMatchObject({ code: 'terminal-identity-changed', identityFailure: 'target-generation-invalid' });
     }
     expect(f.calls.some(call => call.method === 'thread/backgroundTerminals/terminate')).toBe(false);
     expect(await f.client.backgroundTerminals(threadId)).not.toHaveProperty('serverGeneration');
+  });
+
+  it('classifies a server identity change without sending native termination', async () => {
+    let serverId = 42;
+    const f = await fixture({
+      'server/diagnostics': () => ({ process: { id: serverId }, gauges: [] }),
+      'thread/backgroundTerminals/list': () => ({ data: [{ itemId: 'own-command', processId: '1234' }], nextCursor: null }),
+      'thread/backgroundTerminals/terminate': () => ({ terminated: true }),
+    });
+    await f.client.connect();
+    const snapshot = await f.client.backgroundTerminals(threadId);
+    serverId++;
+
+    await expect(f.client.terminateBackgroundTerminal(threadId, { ...snapshot.terminals[0], serverId: snapshot.serverId }))
+      .rejects.toMatchObject({ code: 'terminal-identity-changed', identityFailure: 'server-id-changed' });
+    expect(f.calls.some(call => call.method === 'thread/backgroundTerminals/terminate')).toBe(false);
+  });
+
+  it('classifies a confirmed server generation change without sending native termination', async () => {
+    const f = await fixture();
+    await f.client.connect();
+    vi.spyOn(f.client, 'backgroundTerminals').mockResolvedValue({ serverId: 42, serverGeneration: 'b'.repeat(64), terminals: [{ itemId: 'own-command', processId: '1234' }] });
+
+    await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, serverGeneration: 'a'.repeat(64), itemId: 'own-command', processId: '1234' }))
+      .rejects.toMatchObject({ code: 'terminal-identity-changed', identityFailure: 'server-generation-changed' });
+    expect(f.calls.some(call => call.method === 'thread/backgroundTerminals/terminate')).toBe(false);
   });
 
   it.skipIf(!['linux', 'win32'].includes(process.platform))('proves a stable generation for the actual owned stdio peer and changes it for a replacement process', async () => {
@@ -1372,7 +1485,47 @@ describe('Codex managed runtime', () => {
     await f.client.connect();
     const first = await f.client.backgroundTerminals(threadId);
     expect(first.serverId).toBe((await f.records())[0].pid);
-    expect(first).toHaveProperty('serverGeneration', expect.stringMatching(/^[a-f0-9]{64}$/u));
+    let proofFailure = 'preflight';
+    if (process.platform === 'win32' && !first.serverGeneration) {
+      const peer = Reflect.get(f.client, 'nativePeer') as CodexNativePeer | undefined;
+      const stdioPeer = peer?.kind === 'stdio' ? peer : undefined;
+      const expectedPeerPid = stdioPeer?.pid;
+      const expectedExecutable = stdioPeer?.executable;
+      const helperExecutable = stdioPeer?.helperExecutable;
+      const run = async (command: string, args: string[]) => {
+        try {
+          const result = await execute(command, args, { timeout:30_000, maxBuffer:128*1024, windowsHide:true });
+          let proof: Record<string, unknown>;
+          try { proof = JSON.parse(result.stdout) as Record<string, unknown>; }
+          catch { proofFailure = result.stdout.trim() ? 'proof-output-invalid-json' : 'proof-output-empty'; return { ...result, code:0 }; }
+          const validTime = (value: unknown) => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$/u.test(value) && Number.isFinite(Date.parse(value));
+          const validPath = (value: unknown) => typeof value === 'string' && /^[A-Za-z]:\\/u.test(value) && path.win32.isAbsolute(value);
+          const samePath = (left: unknown, right: string | undefined) => typeof left === 'string' && right !== undefined && path.win32.normalize(left).toLowerCase() === path.win32.normalize(right).toLowerCase();
+          const checks: [string, boolean][] = [
+            ['peer', proof.peerVerified === true], ['pid', proof.pid === first.serverId], ['gateway', proof.gatewayId === process.pid],
+            ['birth', validTime(proof.birth)], ['boot', validTime(proof.boot)], ['owner', typeof proof.owner === 'string' && /^S-1-\d+(?:-\d+)+$/u.test(proof.owner)],
+            ['sha', typeof proof.sha256 === 'string' && /^[a-f0-9]{64}$/u.test(proof.sha256)], ['executable-path', validPath(proof.executable)],
+            ['home', validPath(proof.codexHome) && samePath(proof.codexHome, home)], ['parent', proof.parentPid === (helperExecutable ? expectedPeerPid : process.pid)],
+            ['gateway-owner', proof.gatewayOwner === proof.owner], ['image', proof.executableContentMatchesExpected === true || samePath(proof.executable, expectedExecutable)],
+            ['helper-pid', helperExecutable === undefined || proof.helperPid === expectedPeerPid],
+            ['helper-parent', helperExecutable === undefined || proof.helperParentPid === process.pid],
+            ['helper-owner', helperExecutable === undefined || proof.helperOwner === proof.owner],
+            ['helper-path', helperExecutable === undefined || validPath(proof.helperExecutable)],
+            ['helper-image', helperExecutable === undefined || proof.helperExecutableContentMatchesExpected === true || samePath(proof.helperExecutable, helperExecutable)],
+            ['helper-birth', helperExecutable === undefined || validTime(proof.helperBirth)],
+            ['helper-sha', helperExecutable === undefined || typeof proof.helperSha256 === 'string' && /^[a-f0-9]{64}$/u.test(proof.helperSha256)],
+          ];
+          proofFailure = `proof-validation:${checks.filter(([, ok]) => !ok).map(([name]) => name).join(',') || 'unclassified'}`;
+          return { ...result, code:0 };
+        } catch (error) {
+          const stderr = String((error as { stderr?:string }).stderr ?? '');
+          proofFailure = stderr.match(/rele-native-proof:([a-z-]+)/u)?.[1] ?? 'powershell-invocation';
+          return { stdout:'', code:1 };
+        }
+      };
+      await codexNativeGeneration(peer, first.serverId, home, { platform:'win32', run });
+    }
+    expect(first, `Windows native proof returned no generation (${proofFailure})`).toHaveProperty('serverGeneration', expect.stringMatching(/^[a-f0-9]{64}$/u));
     expect(await f.client.backgroundTerminals(threadId)).toEqual(first);
     await expect(f.client.terminateBackgroundTerminal(threadId, { serverId:first.serverId, serverGeneration:'0'.repeat(64), itemId:'fixture-command', processId:'1234' })).rejects.toMatchObject({ code:'terminal-identity-changed' });
     expect((await f.calls()).filter(call => call.method === 'thread/backgroundTerminals/terminate')).toHaveLength(0);
