@@ -93,6 +93,9 @@ def public_console_report(report):
     failure_code = report.get('failureCode')
     if failure_code in ('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty', 'engine-driver-exited-before-response'):
         output['failureCode'] = failure_code
+    exit_code = report.get('engineDriverExitCode')
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        output['engineDriverExitCode'] = max(-(2**31), min(2**32 - 1, exit_code))
     cleanup_errors = report.get('cleanupErrors')
     if not isinstance(cleanup_errors, list):
         cleanup_errors = []
@@ -267,7 +270,10 @@ class EngineDriver:
     async def read(self, timeout=ENGINE_READ_TIMEOUT_SECONDS):
         line = await asyncio.wait_for(self.process.stdout.readline(), timeout)
         if not line:
-            raise RuntimeError('Shared Engine driver exited before responding')
+            error = RuntimeError('Shared Engine driver exited before responding')
+            if isinstance(self.process.returncode, int) and not isinstance(self.process.returncode, bool):
+                error.engine_driver_exit_code = self.process.returncode
+            raise error
         return json.loads(line)
 
     async def command(self, action, **fields):
@@ -1184,6 +1190,9 @@ enabled=false
         report['result'] = 'failed'
         report['failureType'] = safe_error_type(error)
         report['failureCode'] = safe_failure_code(error)
+        exit_code = getattr(error, 'engine_driver_exit_code', None)
+        if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+            report['engineDriverExitCode'] = exit_code
         report['exception'] = repr(error)
         report['stderrTail'] = errors[-20:]
         raise

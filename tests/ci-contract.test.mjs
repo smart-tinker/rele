@@ -466,6 +466,8 @@ test('Windows canary forwards only allowlisted native failure codes', async()=>{
  const summary=canary.slice(start,end);
  assert.match(summary,/if \(\$sharedDiagnostic\.failureCode\) \{ \$summary\.failureCode = if \(\[string\]\$sharedDiagnostic\.failureCode -in @\('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty', 'engine-driver-exited-before-response'\)\) \{ \[string\]\$sharedDiagnostic\.failureCode \} else \{ 'other' \} \}/u,
   'copy only the exact non-sensitive native failure code allowlist');
+ assert.match(summary,/engineDriverExitCode -is \[int\] -or \$sharedDiagnostic\.engineDriverExitCode -is \[long\].*\$summary\.engineDriverExitCode = \[long\]\$sharedDiagnostic\.engineDriverExitCode/u,
+  'forward only a bounded numeric driver exit code');
  assert.doesNotMatch(summary,/\.exception|\.Message|\.Exception/u,'never include raw exception content');
 });
 test('browser setup installs the pinned Playwright browser without apt dependencies', async()=>{

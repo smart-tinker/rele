@@ -8,20 +8,37 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PROBE = ROOT / 'scripts/shared-protocol-probe.py'
-HELPERS = {'safe_error_type', 'safe_failure_code', 'record_cleanup_error', 'cleanup_failure_message', 'public_console_report'}
+HELPERS = {'safe_error_type', 'safe_failure_code', 'record_cleanup_error', 'cleanup_failure_message', 'public_console_report', 'EngineDriver'}
 
 
 def load_helpers(test):
     module = ast.parse(PROBE.read_text(encoding='utf-8'))
-    functions = [node for node in module.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in HELPERS]
+    functions = [node for node in module.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in HELPERS]
     missing = HELPERS - {function.name for function in functions}
     test.assertEqual(missing, set(), f'missing testable cleanup diagnostics: {sorted(missing)}')
-    namespace = {'re': re, 'time': time}
+    namespace = {'re': re, 'time': time, 'asyncio': asyncio, 'ENGINE_READ_TIMEOUT_SECONDS': 1}
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(PROBE), 'exec'), namespace)
     return namespace
 
 
 class CleanupDiagnostics(unittest.TestCase):
+    def test_engine_eof_preserves_only_the_driver_exit_code(self):
+        helpers = load_helpers(self)
+
+        class Process:
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_eof()
+                self.returncode = 23
+
+        async def read_eof():
+            driver = helpers['EngineDriver'](Process())
+            with self.assertRaisesRegex(RuntimeError, '^Shared Engine driver exited before responding$') as raised:
+                await driver.read()
+            self.assertEqual(getattr(raised.exception, 'engine_driver_exit_code', None), 23)
+
+        asyncio.run(read_eof())
+
     def test_failure_code_only_maps_known_static_native_failures(self):
         helpers = load_helpers(self)
         self.assertEqual(
@@ -77,6 +94,7 @@ class CleanupDiagnostics(unittest.TestCase):
             'result': 'failed',
             'failureType': 'TimeoutError',
             'failureCode': 'native-cancellation-queue-not-empty',
+            'engineDriverExitCode': 23,
             'checks': {'first': True, 'second': False},
             'cleanupErrors': [{
                 'operation': 'native.stop', 'errorType': 'TimeoutError', 'elapsedMs': 900000,
@@ -91,6 +109,7 @@ class CleanupDiagnostics(unittest.TestCase):
             'result': 'failed',
             'failureType': 'TimeoutError',
             'failureCode': 'native-cancellation-queue-not-empty',
+            'engineDriverExitCode': 23,
             'checksPassed': 1,
             'checksFailed': 1,
             'cleanupErrors': [{
@@ -106,6 +125,9 @@ class CleanupDiagnostics(unittest.TestCase):
         self.assertNotIn('ownerPid', serialized)
         self.assertNotIn('exception', serialized)
         self.assertNotIn('stderrTail', serialized)
+
+        report['engineDriverExitCode'] = 'C:\\private\\runner'
+        self.assertNotIn('engineDriverExitCode', helpers['public_console_report'](report))
 
         report['failureCode'] = 'engine-driver-exited-before-response'
         self.assertEqual(helpers['public_console_report'](report)['failureCode'], 'engine-driver-exited-before-response')
