@@ -8,7 +8,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PROBE = ROOT / 'scripts/shared-protocol-probe.py'
-HELPERS = {'safe_error_type', 'record_cleanup_error', 'cleanup_failure_message', 'public_console_report'}
+HELPERS = {'safe_error_type', 'safe_failure_code', 'record_cleanup_error', 'cleanup_failure_message', 'public_console_report'}
 
 
 def load_helpers(test):
@@ -22,6 +22,18 @@ def load_helpers(test):
 
 
 class CleanupDiagnostics(unittest.TestCase):
+    def test_failure_code_only_maps_known_static_native_assertions(self):
+        helpers = load_helpers(self)
+        self.assertEqual(
+            helpers['safe_failure_code'](AssertionError('Native background terminals are not confirmed empty through EOF')),
+            'native-background-terminals-not-empty',
+        )
+        self.assertEqual(
+            helpers['safe_failure_code'](AssertionError('Native cancellation queue is not confirmed empty through EOF')),
+            'native-cancellation-queue-not-empty',
+        )
+        self.assertIsNone(helpers['safe_failure_code'](AssertionError('private path and conversation text')))
+
     def test_successful_cleanup_leaves_no_error(self):
         helpers = load_helpers(self)
         errors = []
@@ -59,6 +71,7 @@ class CleanupDiagnostics(unittest.TestCase):
         report = {
             'result': 'failed',
             'failureType': 'TimeoutError',
+            'failureCode': 'native-cancellation-queue-not-empty',
             'checks': {'first': True, 'second': False},
             'cleanupErrors': [{
                 'operation': 'native.stop', 'errorType': 'TimeoutError', 'elapsedMs': 900000,
@@ -72,6 +85,7 @@ class CleanupDiagnostics(unittest.TestCase):
         self.assertEqual(output, {
             'result': 'failed',
             'failureType': 'TimeoutError',
+            'failureCode': 'native-cancellation-queue-not-empty',
             'checksPassed': 1,
             'checksFailed': 1,
             'cleanupErrors': [{
@@ -85,6 +99,11 @@ class CleanupDiagnostics(unittest.TestCase):
         self.assertNotIn('conversation text', serialized)
         self.assertNotIn('processPid', serialized)
         self.assertNotIn('ownerPid', serialized)
+        self.assertNotIn('exception', serialized)
+        self.assertNotIn('stderrTail', serialized)
+
+        report['failureCode'] = 'private path and conversation text'
+        self.assertNotIn('failureCode', helpers['public_console_report'](report))
 
 
 if __name__ == '__main__':

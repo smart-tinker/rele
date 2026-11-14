@@ -459,6 +459,15 @@ test('Windows canary summary exposes bounded cleanup failure categories', async(
   'allow only known resource categories');
  assert.doesNotMatch(summary,/\.Message|\.Exception|retainedFixture|\.Path/u,'do not print raw errors or runner paths');
 });
+test('Windows canary forwards only allowlisted native failure codes', async()=>{
+ const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ const start=canary.indexOf('$summary = [ordered]@{ stage =');
+ const end=canary.indexOf("Write-Output ('Windows canary bounded diagnostic:",start);
+ const summary=canary.slice(start,end);
+ assert.match(summary,/if \(\$sharedDiagnostic\.failureCode\) \{ \$summary\.failureCode = if \(\[string\]\$sharedDiagnostic\.failureCode -in @\('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty'\)\) \{ \[string\]\$sharedDiagnostic\.failureCode \} else \{ 'other' \} \}/u,
+  'copy only the exact non-sensitive native failure code allowlist');
+ assert.doesNotMatch(summary,/\.exception|\.Message|\.Exception/u,'never include raw exception content');
+});
 test('browser setup installs the pinned Playwright browser without apt dependencies', async()=>{
  const workflow=await readFile(new URL('../.github/workflows/verify.yml',import.meta.url),'utf8');
  assert.ok(workflow.includes('- run: npx playwright install chromium\n        id: browser_install'));
