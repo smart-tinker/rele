@@ -119,7 +119,7 @@ Desktop обращается к серверу напрямую: установ�
 
 ## Разработка
 
-Стандарт работы: [issue и критерии → scope → ветка/PR → GitHub Actions → draft RC → приёмка готового пакета](docs/DEVELOPMENT.md). Draft PR запускает быстрые проверки на Ubuntu и Windows; ready PR и `main` запускают полный набор и сборку пакетов на тех же двух GitHub-hosted runner-ах. Обычные PR/main-проверки не загружают workflow artifacts. Ручной release dispatch из `main` может передать проверенные пакеты publisher-у и создать draft RC после quota guard. Приёмка опубликованного пакета остаётся отдельной проверкой на Windows и Linux acceptance host. Issue закрывается только после принятия его критериев.
+Стандарт работы: [issue и критерии → scope → ветка/PR → GitHub Actions → draft RC → приёмка готового пакета](docs/DEVELOPMENT.md). Draft PR запускает быстрые проверки на Ubuntu и Windows; ready PR и `main` запускают полный набор и сборку пакетов на тех же двух GitHub-hosted runner-ах. Обычные CI-запуски не загружают workflow artifacts. При ручном release dispatch из `main` обе ОС загружают проверенные пакеты прямо в неопубликованный draft Release; publisher сверяет загруженные файлы и provenance без пересборки. Actions Artifacts и кэш не используются. Приёмка опубликованного пакета остаётся отдельной проверкой на Windows и Linux acceptance host. Issue закрывается только после принятия его критериев.
 
 GitHub Actions выполняет автоматические проверки проекта. Следующие команды оставлены для локальной разработки и точечной диагностики; это не отдельный release-build маршрут. Для них требуется Node.js **24.19.0** и npm:
 
@@ -145,7 +145,7 @@ npm run test:e2e
 
 ## GitHub Actions
 
-GitHub Actions проверяет PR и `main` на стандартных Windows/Linux runners; draft PR получает быстрый набор, ready PR и `main` — полный, включая сборку пакетов. Workflow не использует npm cache и не загружает artifacts в обычных PR/main runs. Только отдельный ручной release dispatch из `main` проходит quota guard, передаёт проверенные пакеты publisher-у и создаёт draft RC. См. [схему CI](docs/CI.md) и [стандарт разработки](docs/DEVELOPMENT.md).
+GitHub Actions проверяет PR и `main` на стандартных Windows/Linux runners; draft PR получает быстрый набор, ready PR и `main` — полный, включая сборку пакетов. Workflow не использует npm cache или Actions Artifacts. Ручной release dispatch из `main` загружает проверенные пакеты обеих ОС прямо в draft Release; publisher скачивает их оттуда для проверки и оставляет draft неопубликованным. См. [схему CI](docs/CI.md) и [стандарт разработки](docs/DEVELOPMENT.md).
 
 ## Лицензия
 

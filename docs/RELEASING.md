@@ -51,7 +51,7 @@ git ls-remote --tags https://github.com/smart-tinker/rele.git 'refs/tags/v0.1.1-
 
 | Этап | Что требуется | Что этап доказывает |
 |---|---|---|
-| Подготовка draft RC | Согласованный scope/issues, review, frozen source/build SHA; полный Windows/Linux набор [CI](CI.md#tdd-через-pr), штатные пакеты и provenance; release/quota guards [CI](CI.md#выпуск-и-бесплатные-лимиты) | Проверенные исходники и точные пакеты; draft ещё не распространён |
+| Подготовка draft RC | Согласованный scope/issues, review, frozen source/build SHA; полный Windows/Linux набор [CI](CI.md#tdd-через-pr), штатные пакеты и provenance; release/tag guards [CI](CI.md#выпуск-и-actions-storage) | Проверенные исходники и точные пакеты; draft ещё не распространён |
 | Публикация RC | Draft прошёл сверку ниже; принятое соответствие `main`, свободное имя, полный комплект файлов, разрешение Эльдара на распространение RC | `draft=false`, `prerelease=true`, не Latest; native-результаты и ограничения явно указаны |
 | Приёмка RC | Готовые пакеты на согласованных Windows/Linux acceptance hosts по [DEVELOPMENT](DEVELOPMENT.md#рабочий-цикл) и [ACCEPTANCE](ACCEPTANCE.md) | Работа установленного приложения и выполнение критериев issues |
 | Подготовка и публикация stable | RC принят; отдельное разрешение; финальная версия/тег, полные автоматические gates и native-приёмка финальных байтов, весь [ACCEPTANCE](ACCEPTANCE.md) без открытых обязательных критериев | `draft=false`, `prerelease=false`; Latest только для отдельно рекомендованной версии |
@@ -127,10 +127,11 @@ evidence автоматически. CI run и его `verification.json` под
 - CI bundle/publisher принимают только RC, связывают обе ОС с одним SHA/run/attempt,
   проверяют файлы и SHA256, отклоняют занятые tag/release и изменившийся `main`.
   Ручной `release: true` из `main` создаёт только `draft=true, prerelease=true`.
-- После подтверждения digest загруженных файлов publisher удаляет только два
-  transfer-artifact этого run/attempt. Действующие разрешение storage, резерв,
-  retention и остановка при API-ошибке описаны в [CI](CI.md#выпуск-и-бесплатные-лимиты).
-  Временные Actions artifacts разрешены этим контрактом; старые данные не удаляются.
+- Каждый OS runner загружает проверенные пакеты прямо в подготовленный draft
+  Release. Publisher скачивает эти же assets, проверяет их SHA256 и attestations,
+  затем помечает draft проверенным без пересборки или повторной загрузки пакетов.
+  Workflow не использует Actions Artifacts или cache и не требует резерва Actions
+  storage; публикация остаётся отдельным ручным переходом.
 - Автоматическая публикация RC/stable, назначение Latest и проверка native-приёмки
   не реализованы. Publisher задаёт `target_commitish`, но не делает независимый
   readback реального tag commit после публикации. Это обязательные операторские
