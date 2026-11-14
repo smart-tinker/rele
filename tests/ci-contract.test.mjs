@@ -461,7 +461,7 @@ test('Windows canary summary exposes bounded cleanup failure categories', async(
   'forward only known cleanup failure codes');
  assert.match(summary,/engineDriverExitCode = if \(\$_.engineDriverExitCode -is \[int\] -or \$_.engineDriverExitCode -is \[long\]\) \{ \[Math\]::Max\(-2147483648, \[Math\]::Min\(4294967295, \[long\]\$_.engineDriverExitCode\)\) \}/u,
   'forward only bounded numeric cleanup exit codes');
- assert.match(summary,/engineDriverStage = if \(\$_.engineDriverStage -in @\('codex-connect'.*'windows-socket-verification'\)\) \{ \[string\]\$_.engineDriverStage \}/u,
+ assert.match(summary,/engineDriverStage = if \(\$_.engineDriverStage -in @\('codex-connect'.*'windows-socket-verification', 'engine-close-response', 'engine-close-process-exit'\)\) \{ \[string\]\$_.engineDriverStage \}/u,
   'forward only allowlisted cleanup startup stages');
  assert.doesNotMatch(summary,/\.Message|\.Exception|retainedFixture|\.Path|processPid|ownerPid/u,'do not print raw errors, runner paths, or process identifiers');
 });
@@ -670,7 +670,11 @@ test('shared Windows startup failure reports only an allowlisted driver stage', 
   'the Windows receipt must allow the shared resolver completion stage');
  assert.match(probe,/safe_engine_driver_stage\(value\.get\('probeStage'\)\)/u,'consume only allowlisted progress messages before the first driver response');
  assert.match(probe,/engine_driver_stage/u,'EOF diagnostics must retain the last accepted stage');
- assert.match(canary,/engineDriverStage -in @\('codex-connect'.*'windows-socket-verification'\)/u,'the Windows receipt must forward only allowlisted stages');
+ assert.match(canary,/engineDriverStage -in @\('codex-connect'.*'windows-socket-verification', 'engine-close-response', 'engine-close-process-exit'\)/u,'the Windows receipt must forward only allowlisted stages');
+ for(const stage of ['engine-close-response','engine-close-process-exit']) {
+  assert.ok(probe.includes(`'${stage}'`),`the Python probe must retain ${stage}`);
+  assert.ok(canary.includes(`'${stage}'`),`the Windows receipt must retain ${stage}`);
+ }
  for(const stage of ['windows-installation','windows-owner-status','windows-desktop-discovery','windows-desktop-selection','windows-package-preparation',
   'windows-package-verification','windows-version-command','windows-owner-start','windows-owner-receipt','windows-owner-executable','windows-socket-verification']) {
   assert.ok(resolver.includes(`reportWindowsSharedProbeStage(env, '${stage}')`),`the Windows resolver must mark ${stage}`);
