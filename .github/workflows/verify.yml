@@ -15,7 +15,7 @@ jobs:
     if: github.event.repository.private == false && (!inputs.release || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
     name: ${{ github.event.pull_request.draft && 'Fast' || 'Verify' }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.os == 'windows-2025' && 190 || 60 }}
+    timeout-minutes: ${{ matrix.os == 'windows-2025' && 215 || 60 }}
     strategy:
       fail-fast: false
       max-parallel: 2

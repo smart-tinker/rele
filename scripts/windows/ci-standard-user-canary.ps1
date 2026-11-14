@@ -340,8 +340,8 @@ try {
     }
     $credential = New-Object System.Management.Automation.PSCredential ($env:COMPUTERNAME + '\' + $account), $password
     $resultPath = Join-Path $FixtureRoot 'windows-standard-user-results.json'
-    # Shared versions and the RDP installer lifecycle share one deadline; the old 130-minute budget expired during uninstall.
-    if ($RunGates) { $gatesDeadline = [DateTime]::UtcNow.AddMinutes($(if ($Phase -eq 'Shared') { 60 } else { 145 })) }
+    # The 145-minute run reached the final version report but expired before the canary exited.
+    if ($RunGates) { $gatesDeadline = [DateTime]::UtcNow.AddMinutes($(if ($Phase -eq 'Shared') { 60 } else { 155 })) }
     if ($RunGates) {
         $parentStage = 'shared'
         $marker.phase = 'Shared'; $marker | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8
