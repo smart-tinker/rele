@@ -15,7 +15,7 @@ jobs:
     if: github.event.repository.private == false && (!inputs.release || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
     name: ${{ github.event.pull_request.draft && 'Fast' || 'Verify' }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.os == 'windows-2025' && 160 || 60 }}
+    timeout-minutes: ${{ matrix.os == 'windows-2025' && 190 || 60 }}
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -44,6 +44,10 @@ jobs:
         id: types
       - run: node --test tests/ci-contract.test.mjs
         id: ci_contract
+      - name: Verify cleanup diagnostics are safe and preserve the primary error
+        id: cleanup_diagnostics
+        if: env.FULL == 'true'
+        run: python tests/ci-cleanup-diagnostics.py
       - run: npm test
         id: unit
       - run: npm run build
@@ -172,7 +176,7 @@ jobs:
         if: always()
         env:
           STEPS: ${{ toJSON(steps) }}
-          REQUIRED: install types ci_contract unit build browser_install browser ui ${{ env.FULL == 'true' && 'fixture native_controls package protocol managed voice_fixture' || '' }} ${{ env.FULL == 'true' && runner.os == 'Linux' && 'debian shared voice_linux' || '' }} ${{ env.FULL == 'true' && runner.os == 'Windows' && 'cleanup desktop desktop_provision standard_user voice_windows' || '' }}
+          REQUIRED: install types ci_contract unit build browser_install browser ui ${{ env.FULL == 'true' && 'cleanup_diagnostics fixture native_controls package protocol managed voice_fixture' || '' }} ${{ env.FULL == 'true' && runner.os == 'Linux' && 'debian shared voice_linux' || '' }} ${{ env.FULL == 'true' && runner.os == 'Windows' && 'cleanup desktop desktop_provision standard_user voice_windows' || '' }}
         run: node scripts/ci.mjs steps
       - name: Bind packages to this verified commit and run
         if: github.event_name == 'workflow_dispatch' && inputs.release

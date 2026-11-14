@@ -480,6 +480,7 @@ try {
   const changedDesktopEnvironment = { ...desktopEnvironment(), CODEX_APP_SERVER_WS_URL: foreignDesktopEnvironment.CODEX_APP_SERVER_WS_URL };
   desktopEnvironment(changedDesktopEnvironment);
   console.log('Windows installer smoke: uninstall preserves data');
+  console.log('RELE_CI_STAGE=installer-uninstall');
   run(path.join(application, 'unins000.exe'), ['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', `/LOG=${path.join(temporary, 'uninstall.log')}`]);
   uninstalled = true;
   await stopped(instance.address);
@@ -495,12 +496,16 @@ try {
   assert.equal(await readFile(path.join(data, 'config.json'), 'utf8'), configured);
   assert.equal(await readFile(path.join(data, 'preserve-me.txt'), 'utf8'), 'installer smoke data\n');
   assert.equal(powershell("(@(Get-ScheduledTask -TaskName ($env:RELE_SMOKE_TASK + '-Codex') -ErrorAction SilentlyContinue)).Count"), '0');
+  console.log('RELE_CI_STAGE=installer-uninstall-verified');
   console.log('Windows installer smoke: reinstall adopts the surviving native owner without a second launch');
+  console.log('RELE_CI_STAGE=installer-reinstall');
   desktopEnvironment(emptyDesktopEnvironment);
   uninstalled = false;
   run(installer, [...installArguments, '/TASKS=desktop', `/LOG=${path.join(temporary, 'reinstall.log')}`]);
   instance = await ready();
+  console.log('RELE_CI_STAGE=installer-reinstall-ready');
   await sharedBackendPid(codexFixture, sharedPid);
+  console.log('RELE_CI_STAGE=installer-reinstall-owner-verified');
   const reinstalled = await assertOwnedDesktopEnvironment();
   assert.equal(reinstalled.CodexWebSocketOwnerDirectory, heldOwnerDirectory);
   assert.equal(reinstalled.CodexWebSocketEndpoint, integratedEnvironment.CODEX_APP_SERVER_WS_URL);

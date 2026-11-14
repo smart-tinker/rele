@@ -5,7 +5,11 @@ import path from 'node:path';
 
 export const PLATFORM_LIMIT = 100 * 1024 ** 2;
 export function assertSteps(steps, required) {
- for (const id of required) assert.ok(steps[id]?.outcome === 'success' && steps[id]?.conclusion === 'success', `Required step ${id} did not pass`);
+ const failed=required.filter(id=>steps[id]?.outcome!=='success'||steps[id]?.conclusion!=='success').map(id=>{
+  const step=steps[id];
+  return `${id}=${step?.outcome==='success'?step.conclusion:step?.outcome??'missing'}`;
+ });
+ assert.equal(failed.length,0,`Required steps did not pass: ${failed.join(', ')}`);
 }
 export function packageNames(platform, version) {
  assert.ok(['linux','windows'].includes(platform));

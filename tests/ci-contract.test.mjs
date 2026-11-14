@@ -42,6 +42,12 @@ test('missing, skipped and failed required steps cannot pass', () => {
  for (const outcome of ['skipped','failure','cancelled']) assert.throws(() => assertSteps({a:{outcome,conclusion:'success'}}, ['a']));
  assert.throws(() => assertSteps({}, ['a']));
 });
+test('required-step failures report every failed outcome', () => {
+ assert.throws(() => assertSteps({
+  standard_user:{outcome:'failure',conclusion:'failure'},
+  browser_install:{outcome:'skipped',conclusion:'skipped'},
+ }, ['browser_install','standard_user']), /Required steps did not pass: browser_install=skipped, standard_user=failure/u);
+});
 async function fixture(fn) {
  const root=await mkdtemp(path.join(tmpdir(),'rele-ci-'));
  try {
@@ -373,8 +379,8 @@ test('Windows job timeout leaves room for its bounded standard-user native gate'
  const gateTimeout=canary.match(/AddMinutes\(\$\(if \(\$Phase -eq 'Shared'\) \{ (\d+) \} else \{ (\d+) \}\)\)/u);
  assert.ok(jobTimeout,'give Windows its own timeout without extending Ubuntu');
  assert.ok(gateTimeout,'read the native gate deadline from the canary');
- assert.ok(Number(gateTimeout[2])>=130,'leave room for the observed 100-minute shared suite and the installer lifecycle gate');
- assert.ok(Number(jobTimeout[1])>=Number(gateTimeout[2])+20,'leave twenty minutes for runner setup, later checks, and cleanup');
+ assert.ok(Number(gateTimeout[2])>=145,'leave time for the observed shared suite and the installer lifecycle that exceeded the old deadline');
+ assert.ok(Number(jobTimeout[1])>=Number(gateTimeout[2])+45,'leave time for runner setup, later checks, and cleanup');
  assert.equal(Number(jobTimeout[2]),60,'keep the Ubuntu timeout unchanged');
 });
 test('shared protocol completion wait fits within its driver response budget', async()=>{
@@ -387,15 +393,71 @@ test('shared protocol completion wait fits within its driver response budget', a
 });
 test('Windows canary timeout reports only bounded installer progress', async()=>{
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ const installer=await readFile(new URL('../scripts/smoke-windows-installer.mjs',import.meta.url),'utf8');
  const start=canary.indexOf('$summary = [ordered]@{ stage =');
  const end=canary.indexOf("Write-Output ('Windows canary bounded diagnostic:",start);
  assert.ok(start>=0 && end>start,'Windows canary must emit a bounded timeout summary');
+ assert.match(canary,/WaitForExit\(\[Math\]::Min\(\$remaining, 30000\)\)/u,'poll the bounded fixture process so active progress can be reported');
+ assert.ok(/Write-Host \('Windows canary progress: '/u.test(canary),'send progress outside the captured Boolean return value');
+ assert.match(canary,/RELE_CI_STAGE=\[a-z0-9.-\]\{1,96\}/u,'accept only fixed-format stage labels from the fixture log');
+ assert.match(installer,/RELE_CI_STAGE=installer-reinstall/u,'identify the installer re-adoption phase');
  const summary=canary.slice(start,end);
- assert.match(canary,/Get-Content -LiteralPath \$stdout -Tail 64 \| Where-Object \{ \$_ -in \$allowed \} \| Select-Object -Last 32/u,
-  'retain only allowlisted installer progress labels');
+ assert.ok(/Get-Content -LiteralPath \$stdout -Tail 64(?: -ErrorAction SilentlyContinue)?\s*\|\s*Where-Object \{ \$_ -cmatch/u.test(canary),
+  'retain only bounded installer stage labels');
  assert.match(summary,/\$summary\.installerProgress = @\(\$result\.installerProgress \| Select-Object -Last 8\)/u,
   'include the latest bounded installer progress labels in the timeout summary');
  assert.doesNotMatch(summary,/stdout\.log|stderr\.log/u,'never print raw installer logs');
+});
+test('Windows canary timeout reports bounded native RPC and driver stages', async()=>{
+ const harness=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ const evidenceStart=harness.indexOf('    async def held_request_evidence(');
+ const evidenceEnd=harness.indexOf('\n    async def wait_records',evidenceStart);
+ const summaryStart=canary.indexOf('$summary = [ordered]@{ stage =');
+ const summaryEnd=canary.indexOf("Write-Output ('Windows canary bounded diagnostic:",summaryStart);
+ assert.ok(evidenceStart>=0&&evidenceEnd>evidenceStart&&summaryStart>=0&&summaryEnd>summaryStart,'Windows timeout path must collect and emit bounded diagnostics');
+ const evidence=harness.slice(evidenceStart,evidenceEnd),summary=canary.slice(summaryStart,summaryEnd);
+ assert.match(evidence,/evidence\['rpcTrace'\] = engine_snapshot\.get\('rpcTrace', \[\]\)\[-16:\]/u,'capture the latest native RPC stages');
+ assert.match(summary,/\$summary\.rpcTrace = @\(\$evidence\.rpcTrace \| Select-Object -Last 16\)/u,'print only the latest bounded RPC trace');
+ assert.match(summary,/\$summary\.driverOperations = @\(\$evidence\.driverOperations \| Select-Object -Last 16\)/u,'print only the latest bounded driver operation stages');
+ assert.doesNotMatch(summary,/payload|\.input\b|\.text\b|stdout\.log|stderr\.log/u,'timeout diagnostics must exclude request content and raw logs');
+});
+test('shared fixture cleanup identifies the timed out operation without raw error text', async()=>{
+ const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ const start=probe.indexOf('cleanup_errors = []',probe.indexOf('async def scenario(order):'));
+ const end=probe.indexOf('\n\n    try:\n        if args.desktop_bundle:',start);
+ assert.ok(start>=0 && end>start,'capture cleanup failures in the isolated scenario');
+ const cleanup=probe.slice(start,end);
+ assert.match(cleanup,/\('engine\.close', engine\).*\('observer\.close', observer\).*\('peer\.close', peer\)/su,
+  'label each independently closed fixture client');
+ assert.match(cleanup,/await record_cleanup_error\(cleanup_errors, operation, resource, client\.close/u,'record close failures without raw exception text');
+ assert.match(cleanup,/await record_cleanup_error\(cleanup_errors, 'native\.stop'/u,'distinguish native stop from client close');
+ assert.match(cleanup,/owner_pid=locals\(\)\.get\('pid'\)/u,'include the observed native owner PID when known');
+ assert.doesNotMatch(cleanup,/repr\(error\)|str\(error\)/u,'do not print raw exception details');
+ assert.match(cleanup,/cleanup_failure_message\(primary_error, cleanup_errors\)/u,'keep cleanup diagnostics separate from the primary failure');
+ assert.match(probe,/print\(json\.dumps\(public_console_report\(report\),/u,'print only the allowlisted public report');
+ assert.doesNotMatch(probe,/print\(json\.dumps\(report,/u,'never print the local report directly');
+ const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ assert.doesNotMatch(canary,/Get-Content -LiteralPath \(Join-Path \$FixtureRoot \$log\) -Tail 30 \| Write-Output|Get-Content -LiteralPath \$resultPath -Raw \| Write-Output/u,
+  'do not echo raw standard-user logs or the complete private result to Actions');
+ assert.doesNotMatch(canary,/throw \$evidence\.error|^\s+throw\s*$/mu,'surface a bounded failure instead of raw exception text');
+});
+test('Windows canary summary exposes bounded cleanup failure categories', async()=>{
+ const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ const start=canary.indexOf('$summary = [ordered]@{ stage =');
+ const end=canary.indexOf("Write-Output ('Windows canary bounded diagnostic:",start);
+ const summary=canary.slice(start,end);
+ assert.ok(start>=0&&end>start,'Windows canary must emit a bounded timeout summary');
+ assert.match(summary,/\$summary\.cleanupErrors\s*=\s*@\(\$sharedDiagnostic\.cleanupErrors\s*\|\s*Select-Object -Last 8/u,
+  'emit only the latest cleanup failures');
+ assert.match(summary,/operation = if \(\$_.operation -in @\('engine\.close', 'observer\.close', 'peer\.close', 'native\.stop'\)\)/u,
+  'allow only known cleanup operations');
+ assert.match(summary,/errorType = if \(\[string\]\$_.errorType -match '\^\[A-Za-z\]\{1,48\}\$'/u,'allow only short exception type names');
+ assert.match(summary,/elapsedMs = if \(\$_.elapsedMs -is \[int\] -or \$_.elapsedMs -is \[long\]\) \{ \[Math\]::Max\(0, \[Math\]::Min\(600000/u,
+  'bound elapsed times before logging');
+ assert.match(summary,/resource = if \(\$_.resource -in @\('engine-driver-process', 'desktop-shim-process', 'direct-websocket', 'native-owner', 'native-daemon'\)\)/u,
+  'allow only known resource categories');
+ assert.doesNotMatch(summary,/\.Message|\.Exception|retainedFixture|\.Path/u,'do not print raw errors or runner paths');
 });
 test('browser setup installs the pinned Playwright browser without apt dependencies', async()=>{
  const workflow=await readFile(new URL('../.github/workflows/verify.yml',import.meta.url),'utf8');
@@ -539,10 +601,20 @@ test('Windows shared driver read deadline covers both native identity proofs', a
  const timeout=Number(probe.match(/ENGINE_READ_TIMEOUT_SECONDS\s*=\s*(\d+)/u)?.[1]);
  assert.ok(timeout >= 65,'allow the two 30-second native identity proofs plus fixture overhead');
 });
+test('Windows fixture stop wait exceeds the nested owner shutdown deadline', async()=>{
+ const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ const fixture=await readFile(new URL('../scripts/installer-codex-fixture.mjs',import.meta.url),'utf8');
+ const ownerStop=probe.slice(probe.indexOf('    async def owner_stop(env):'),probe.indexOf('\n    async def native(env, operation):'));
+ const outerTimeout=Number(ownerStop.match(/output_and_exit\(process,\s*(\d+)\)/u)?.[1])*1000;
+ const innerTimeout=Number(fixture.match(/timeout:\s*(?:scheduledDirectory\s*\?\s*75_000\s*:\s*)?(\d+)_000,\s*windowsHide: true/u)?.[1])*1000;
+ assert.match(ownerStop,/stopInstallerCodex\(target\)/u,'owner-stop uses the standard fixture shutdown deadline');
+ assert.ok(innerTimeout >= 75_000,'allow the bounded Windows owner shutdown to finish under a loaded shared gate');
+ assert.ok(outerTimeout >= innerTimeout+15_000,'allow 15 seconds for the nested Windows shutdown helper to exit');
+});
 test('Windows canary forwards only bounded timeout evidence from the failed Desktop probe', async()=>{
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
  const start=canary.indexOf("$timeoutReportPath = Join-Path $FixtureRoot 'reports\\shared-results-actual-desktop.json'");
- const end=canary.indexOf("foreach ($log in @('stdout.log'",start);
+ const end=canary.indexOf('\n        $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $resultPath -Encoding UTF8',start);
  assert.ok(start>=0 && end>start,'failed Windows canary must read the Desktop report from its fixture directory');
  const relay=canary.slice(start,end);
  assert.match(relay,/\.heldRequestTimeout/u,'forward the probe timeout snapshot');
