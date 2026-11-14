@@ -3,6 +3,8 @@
 Конфигурация реализована в `.github/workflows/ci.yml`. Репозиторий `rele` публичный;
 GitHub Actions запускает автоматические проверки для PR и `main`. Public guard
 оставляет jobs выключенными, если visibility репозитория изменится на private.
+Релизные переходы, разрешение публикации и отдельные RC/stable gates —
+[RELEASING](RELEASING.md); ниже описана реализованная автоматизация.
 
 ```mermaid
 flowchart TD
@@ -22,7 +24,7 @@ flowchart TD
 | Ready PR, `main`, ручной dispatch с `release: false` | те же 2, затем CI gate на Ubuntu | Всё выше + сборка пакетов, установка/удаление, protocol и managed для всех поддерживаемых версий Codex, CPU voice |
 | Windows, полный режим | Windows job | Заблокированные файлы при cleanup, Desktop backend, owner/pipe, installer/native shared под обычным пользователем |
 | Linux, полный режим | Ubuntu job | Debian/systemd lifecycle, native shared/recovery, voice с запрещёнными network syscalls |
-| Ручной release из main | 2, затем CI gate и publisher на Ubuntu | Проверки → временные пакеты → сверка SHA/commit/run → draft release без пересборки |
+| Ручной release из main | 1 Ubuntu подготовки → 2 ОС → CI gate → 1 Ubuntu publisher | Непроверенный draft → проверки и attestation → прямая загрузка пакетов в draft → сверка скачанных assets/SHA/provenance → проверенный draft без пересборки |
 
 `CI gate` — единый check workflow после matrix; он завершается ошибкой, если
 хотя бы одна ОС не прошла. Сейчас активный ruleset защищает `main` от удаления и
@@ -50,37 +52,22 @@ RED и GREEN — отдельные push/run на двух матричных ru
 runner не нужен. Для диагностики можно запускать тот же тест локально, но hosted
 результаты привязаны к точному SHA PR.
 
-## Выпуск и бесплатные лимиты
+## Выпуск и Actions storage
 
 Обычные PR/main и ручной dispatch с `release: false` не загружают workflow
-artifacts. Ручной `release: true` разрешён только из `main`; он запускает полный
-набор проверок и publisher. Перед выпуском версия package.json должна быть новым `X.Y.Z-rc.N`:
-существующий tag/release никогда не перезаписывается. Publisher перепроверяет,
-что main не изменился, и принимает ровно два комплекта текущего run/attempt.
+artifacts. Ручной `release: true` разрешён только из `main` и запускает полный
+набор проверок. После них обе ОС загружают проверенные и подписанные пакеты прямо
+в предварительно созданный неопубликованный draft Release. Publisher скачивает
+точно эти Release assets, сверяет размеры, SHA-256 и attestations, затем помечает
+тот же draft проверенным без пересборки и повторной загрузки пакетов.
 
-Каждый комплект ограничен 100 MiB; резервируется 200 MiB. Retention — один день,
-кэш отключён. После подтверждения SHA-256 всех файлов draft release удаляются
-только два transfer-artifact этого запуска. При частичной ошибке draft остаётся
-для разбирательства; нельзя вслепую повторять выпуск или удалять старые данные.
+Этот workflow не использует Actions Artifacts или cache и не требует резерва
+Actions storage либо `CI_STORAGE_APPROVAL`. Частичный сбой может оставить draft
+с неполным комплектом; перед любым повтором сначала сверить его состояние и assets.
+Публикация RC остаётся отдельным ручным действием.
 
-Загрузка закрыта по умолчанию. После проверки **account-wide** остатка storage
-(включая Packages и другие репозитории) и нулевого бюджета с запретом платного
-превышения оператор задаёт repository variable `CI_STORAGE_APPROVAL`:
-
-```json
-{"checkedAt":"<текущее UTC-время ISO 8601>","freeBytes":262144000,"paidUsageBlocked":true}
-```
-
-Это операторское подтверждение, а не автоматически прочитанный billing status.
-Оно действует шесть часов. Дополнительно API проверяет, что текущие artifacts
-репозитория вместе с резервом укладываются в консервативные 500 MiB. При отсутствии
-подтверждения, недостатке квоты или ошибке API upload не выполняется. Не выдавать
-подтверждение при параллельных потребителях, способных исчерпать резерв; нулевой
-бюджет аккаунта остаётся обязательной защитой от платы. Накопленное ранее usage
-не обнуляется удалением файлов. Старый backup/Actions retention не меняется этим PR.
-
-Hosted runs исполняют Windows Desktop fixture, standard-user canary и ограничены
-timeout 60 минут. Каждый конкретный результат относится только к своему SHA; run
+Hosted runs исполняют Windows Desktop fixture и standard-user canary; ограничения
+времени для каждой ОС задаются в `timeout-minutes` workflow. Каждый результат относится только к своему SHA; run
 в статусе `in_progress`, `skipped` или с failure не доказывает успешный gate.
 CI не заменяет acceptance установленного пакета, а release dispatch не является
 разрешением на stable или раскатку.

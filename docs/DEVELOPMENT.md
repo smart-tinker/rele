@@ -4,11 +4,13 @@
 параллельных GitHub-hosted runner-а: `ubuntu-24.04` и `windows-2025`, затем один
 короткий Ubuntu `CI gate`. Draft PR получает быстрые проверки; ready PR и `main`
 полный набор, включая сборку пакетов. В workflow есть public guard: jobs
-выполняются только для публичного репозитория. Кэш отключён; обычные PR/main
-runs не загружают artifacts. Только ручной release dispatch из `main` проходит
-quota guard, временно передаёт пакеты publisher-у (retention transfer artifacts —
-до одного дня) и создаёт draft RC.
+выполняются только для публичного репозитория. Кэш и Actions Artifacts не
+используются. Ручной release dispatch из `main` создаёт неопубликованный draft;
+каждый OS runner загружает в него проверенные пакеты, а publisher скачивает их
+оттуда для сверки SHA и provenance.
 GitHub Actions не заменяет приёмку готового пакета.
+Переходы draft → RC → stable, разрешение публикации и сверка байтов определены
+в [каноническом регламенте выпуска](RELEASING.md).
 
 Текущая сборка и автоматические проверки выполняются на hosted runners. Приёмка
 остаётся отдельным этапом: **Windows acceptance host — Windows**, **Linux
@@ -45,10 +47,11 @@ build/package scripts. На Windows и Linux acceptance hosts передаютс
    штатных пакетов на GitHub-hosted Windows и Ubuntu runners. Зафиксировать commit,
    версии инструментов и SHA256 пакетов. Новый diff, сбой или изменение среды
    требуют соответствующей перепроверки; узкий probe не заменяет итоговые gates.
-4. Провести PR через review и `main`. Отдельный ручной release dispatch после
-   quota guard передаёт проверенные байты publisher-у и создаёт draft RC без
-   пересборки. Опубликованные assets/tag RC неизменяемы: последующие исправления
-   выпускаются следующим RC, а не заменяют прежний пакет.
+4. Провести PR через review и `main`. Ручной release dispatch создаёт draft до
+   матрицы; обе ОС загружают в него проверенные байты, а publisher сверяет
+   загруженные assets и provenance без пересборки. Draft остаётся неопубликованным.
+   Дальнейшие переходы и неизменяемость опубликованных файлов — по
+   [RELEASING](RELEASING.md).
 5. После публикации RC в этапе приёмки на Windows и Linux acceptance hosts
    проверить SHA256 полученных installers/portable, установить готовое приложение
    и выполнить приёмку его работы, обновления и восстановления. Windows
