@@ -44,6 +44,15 @@ def safe_error_type(error):
     return name if re.fullmatch(r'[A-Za-z]{1,48}', name) else 'other'
 
 
+def safe_failure_code(error):
+    if not isinstance(error, AssertionError):
+        return None
+    return {
+        'Native background terminals are not confirmed empty through EOF': 'native-background-terminals-not-empty',
+        'Native cancellation queue is not confirmed empty through EOF': 'native-cancellation-queue-not-empty',
+    }.get(str(error))
+
+
 async def record_cleanup_error(errors, operation, resource, action, process_pid=None, owner_pid=None):
     started = time.monotonic()
     try:
@@ -79,6 +88,9 @@ def public_console_report(report):
     failure_type = report.get('failureType')
     if isinstance(failure_type, str) and re.fullmatch(r'[A-Za-z]{1,48}', failure_type):
         output['failureType'] = failure_type
+    failure_code = report.get('failureCode')
+    if failure_code in ('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty'):
+        output['failureCode'] = failure_code
     cleanup_errors = report.get('cleanupErrors')
     if not isinstance(cleanup_errors, list):
         cleanup_errors = []
@@ -1169,6 +1181,7 @@ enabled=false
     except BaseException as error:
         report['result'] = 'failed'
         report['failureType'] = safe_error_type(error)
+        report['failureCode'] = safe_failure_code(error)
         report['exception'] = repr(error)
         report['stderrTail'] = errors[-20:]
         raise

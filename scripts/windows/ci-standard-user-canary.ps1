@@ -650,6 +650,7 @@ try {
                     $summary.reportAvailable = $true
                     $summary.result = if ($sharedDiagnostic.result -in @('passed', 'failed')) { $sharedDiagnostic.result } else { 'unknown' }
                     if ($sharedDiagnostic.failureType) { $summary.failureType = if ([string]$sharedDiagnostic.failureType -match '^[A-Za-z]{1,48}$') { [string]$sharedDiagnostic.failureType } else { 'other' } }
+                    if ($sharedDiagnostic.failureCode) { $summary.failureCode = if ([string]$sharedDiagnostic.failureCode -in @('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty')) { [string]$sharedDiagnostic.failureCode } else { 'other' } }
                     $summary.codexVersion = if ([string]$sharedDiagnostic.codexVersion -match '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$') { [string]$sharedDiagnostic.codexVersion } else { 'unknown' }
                     $checks = @($sharedDiagnostic.checks.PSObject.Properties)
                     $summary.checksPassed = @($checks | Where-Object { $_.Value -eq $true }).Count
