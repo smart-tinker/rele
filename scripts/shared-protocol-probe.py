@@ -55,6 +55,11 @@ def safe_failure_code(error):
     }.get(str(error))
 
 
+def safe_engine_driver_stage(value):
+    return value if value in ('codex-connect', 'thread-catalog', 'engine-start', 'native-diagnostics',
+                              'desktop-package-verification', 'ready') else None
+
+
 async def record_cleanup_error(errors, operation, resource, action, process_pid=None, owner_pid=None):
     started = time.monotonic()
     try:
@@ -93,6 +98,9 @@ def public_console_report(report):
     failure_code = report.get('failureCode')
     if failure_code in ('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty', 'engine-driver-exited-before-response'):
         output['failureCode'] = failure_code
+    driver_stage = safe_engine_driver_stage(report.get('engineDriverStage'))
+    if driver_stage:
+        output['engineDriverStage'] = driver_stage
     exit_code = report.get('engineDriverExitCode')
     if isinstance(exit_code, int) and not isinstance(exit_code, bool):
         output['engineDriverExitCode'] = max(-(2**31), min(2**32 - 1, exit_code))
@@ -266,15 +274,26 @@ class Rpc:
 class EngineDriver:
     def __init__(self, process):
         self.process = process
+        self.startup_stage = None
 
     async def read(self, timeout=ENGINE_READ_TIMEOUT_SECONDS):
-        line = await asyncio.wait_for(self.process.stdout.readline(), timeout)
-        if not line:
-            error = RuntimeError('Shared Engine driver exited before responding')
-            if isinstance(self.process.returncode, int) and not isinstance(self.process.returncode, bool):
-                error.engine_driver_exit_code = self.process.returncode
-            raise error
-        return json.loads(line)
+        while True:
+            line = await asyncio.wait_for(self.process.stdout.readline(), timeout)
+            if not line:
+                error = RuntimeError('Shared Engine driver exited before responding')
+                if isinstance(self.process.returncode, int) and not isinstance(self.process.returncode, bool):
+                    error.engine_driver_exit_code = self.process.returncode
+                if self.startup_stage:
+                    error.engine_driver_stage = self.startup_stage
+                raise error
+            value = json.loads(line)
+            stage = safe_engine_driver_stage(value.get('probeStage')) if isinstance(value, dict) else None
+            if stage:
+                self.startup_stage = stage
+                continue
+            if self.startup_stage == 'ready':
+                self.startup_stage = None
+            return value
 
     async def command(self, action, **fields):
         self.process.stdin.write((json.dumps({'action': action, **fields}) + '\n').encode())
@@ -1193,6 +1212,9 @@ enabled=false
         exit_code = getattr(error, 'engine_driver_exit_code', None)
         if isinstance(exit_code, int) and not isinstance(exit_code, bool):
             report['engineDriverExitCode'] = exit_code
+        driver_stage = safe_engine_driver_stage(getattr(error, 'engine_driver_stage', None))
+        if driver_stage:
+            report['engineDriverStage'] = driver_stage
         report['exception'] = repr(error)
         report['stderrTail'] = errors[-20:]
         raise
