@@ -655,9 +655,9 @@ test('shared Windows startup failure reports only an allowlisted driver stage', 
  const driver=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
- for(const stage of ['codex-connect','thread-catalog','engine-start','native-diagnostics','desktop-package-verification','ready'])
+ for(const stage of ['codex-connect','shared-codex-resolution','codex-websocket-open','thread-catalog','engine-start','native-diagnostics','desktop-package-verification','ready'])
   assert.ok(driver.includes(`emitProbeStage('${stage}')`),`the shared driver must mark ${stage}`);
- assert.match(probe,/def safe_engine_driver_stage\(value\):[\s\S]{0,300}'codex-connect'[\s\S]*'native-diagnostics'[\s\S]*'desktop-package-verification'/u,
+ assert.match(probe,/def safe_engine_driver_stage\(value\):[\s\S]{0,300}'codex-connect'[\s\S]*'shared-codex-resolution'[\s\S]*'codex-websocket-open'[\s\S]*'native-diagnostics'[\s\S]*'desktop-package-verification'/u,
   'the Python driver must accept only bounded startup stages');
  assert.match(probe,/safe_engine_driver_stage\(value\.get\('probeStage'\)\)/u,'consume only allowlisted progress messages before the first driver response');
  assert.match(probe,/engine_driver_stage/u,'EOF diagnostics must retain the last accepted stage');

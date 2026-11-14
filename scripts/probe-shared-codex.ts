@@ -20,7 +20,7 @@ const { values } = parseArgs({ options: {
   'windows-install-dir': { type: 'string' }, 'runtime-directory': { type: 'string' },
 } });
 const ENGINE_WAIT_TIMEOUT_MS = 90_000;
-const emitProbeStage = (probeStage: 'codex-connect' | 'thread-catalog' | 'engine-start' | 'native-diagnostics' | 'desktop-package-verification' | 'ready') =>
+const emitProbeStage = (probeStage: 'codex-connect' | 'shared-codex-resolution' | 'codex-websocket-open' | 'thread-catalog' | 'engine-start' | 'native-diagnostics' | 'desktop-package-verification' | 'ready') =>
   process.stdout.write(JSON.stringify({ probeStage }) + '\n');
 if (!values.executable || !values.home || !values.directory || !process.env.RELE_DATA_DIR) throw new Error('Missing isolated fixture paths');
 if ((values['windows-install-dir'] || values['runtime-directory']) && process.platform !== 'win32') throw new Error('Windows fixture options require Windows');
@@ -30,9 +30,19 @@ const { CodexClient } = values['runtime-directory'] ? await load('codex') as typ
 const { Engine } = values['runtime-directory'] ? await load('engine') as typeof import('../src/server/engine.js') : { Engine: SourceEngine };
 const { Store } = values['runtime-directory'] ? await load('store') as typeof import('../src/server/store.js') : { Store: SourceStore };
 const configModule = values['runtime-directory'] ? await load('config') as typeof import('../src/server/config.js') : { ConfigStore, defaultConfig, defaultDataDirectory };
+const runtimeShared = values['runtime-directory'] ? await load('codex-shared') as typeof import('../src/server/codex-shared.js') : undefined;
 // Source gates select their disposable installation through the existing production seam.
 // Packaged gates use the compiled module's default installation location, without this seam.
-const options = values['windows-install-dir'] ? { shared: (target: Parameters<typeof ensureWindowsSharedCodex>[0], settings: Parameters<typeof ensureWindowsSharedCodex>[1]) => ensureWindowsSharedCodex(target, settings, values['windows-install-dir']) } : {};
+const resolveShared = values['windows-install-dir']
+  ? (target: Parameters<typeof ensureWindowsSharedCodex>[0], settings: Parameters<typeof ensureWindowsSharedCodex>[1]) => ensureWindowsSharedCodex(target, settings, values['windows-install-dir']!)
+  : runtimeShared?.ensureSharedCodex;
+const reportStartupStages = !values['expect-error'] && !values['profile-socket'] && !values.prepare;
+const options = resolveShared ? { shared: async (target: Parameters<typeof ensureWindowsSharedCodex>[0], settings: Parameters<typeof ensureWindowsSharedCodex>[1]) => {
+  if (reportStartupStages) emitProbeStage('shared-codex-resolution');
+  const result = await resolveShared(target, settings);
+  if (reportStartupStages) emitProbeStage('codex-websocket-open');
+  return result;
+} } : {};
 const config = { ...structuredClone(configModule.defaultConfig), codex: {
   transport: 'shared' as const, executable: values.executable, endpoint: '', codexHome: values.home,
 } };

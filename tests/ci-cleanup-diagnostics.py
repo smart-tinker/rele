@@ -45,7 +45,7 @@ class CleanupDiagnostics(unittest.TestCase):
         class Process:
             def __init__(self):
                 self.stdout = asyncio.StreamReader()
-                self.stdout.feed_data(b'{"probeStage":"native-diagnostics"}\n')
+                self.stdout.feed_data(b'{"probeStage":"codex-websocket-open"}\n')
                 self.stdout.feed_eof()
                 self.returncode = 0
 
@@ -53,7 +53,7 @@ class CleanupDiagnostics(unittest.TestCase):
             driver = helpers['EngineDriver'](Process())
             with self.assertRaisesRegex(RuntimeError, '^Shared Engine driver exited before responding$') as raised:
                 await driver.read()
-            self.assertEqual(getattr(raised.exception, 'engine_driver_stage', None), 'native-diagnostics')
+            self.assertEqual(getattr(raised.exception, 'engine_driver_stage', None), 'codex-websocket-open')
 
         asyncio.run(read_eof())
 
@@ -93,6 +93,8 @@ class CleanupDiagnostics(unittest.TestCase):
     def test_engine_driver_stage_only_maps_known_startup_stages(self):
         helpers = load_helpers(self)
         self.assertEqual(helpers['safe_engine_driver_stage']('native-diagnostics'), 'native-diagnostics')
+        self.assertEqual(helpers['safe_engine_driver_stage']('shared-codex-resolution'), 'shared-codex-resolution')
+        self.assertEqual(helpers['safe_engine_driver_stage']('codex-websocket-open'), 'codex-websocket-open')
         self.assertIsNone(helpers['safe_engine_driver_stage']('C:\\private\\runner'))
 
     def test_successful_cleanup_leaves_no_error(self):
