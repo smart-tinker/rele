@@ -39,6 +39,28 @@ class CleanupDiagnostics(unittest.TestCase):
 
         asyncio.run(read_eof())
 
+    def test_engine_eof_waits_for_the_process_exit_code(self):
+        helpers = load_helpers(self)
+
+        class Process:
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_eof()
+                self.returncode = None
+
+            async def wait(self):
+                await asyncio.sleep(0)
+                self.returncode = 23
+                return self.returncode
+
+        async def read_eof():
+            driver = helpers['EngineDriver'](Process())
+            with self.assertRaisesRegex(RuntimeError, '^Shared Engine driver exited before responding$') as raised:
+                await driver.read()
+            self.assertEqual(getattr(raised.exception, 'engine_driver_exit_code', None), 23)
+
+        asyncio.run(read_eof())
+
     def test_engine_eof_preserves_allowlisted_startup_stage(self):
         helpers = load_helpers(self)
 

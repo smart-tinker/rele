@@ -286,8 +286,14 @@ class EngineDriver:
             line = await asyncio.wait_for(self.process.stdout.readline(), timeout)
             if not line:
                 error = RuntimeError('Shared Engine driver exited before responding')
-                if isinstance(self.process.returncode, int) and not isinstance(self.process.returncode, bool):
-                    error.engine_driver_exit_code = self.process.returncode
+                exit_code = self.process.returncode
+                if exit_code is None:
+                    try:
+                        exit_code = await asyncio.wait_for(self.process.wait(), 2)
+                    except TimeoutError:
+                        exit_code = self.process.returncode
+                if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+                    error.engine_driver_exit_code = exit_code
                 if self.startup_stage:
                     error.engine_driver_stage = self.startup_stage
                 raise error
