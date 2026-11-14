@@ -20,6 +20,8 @@ const { values } = parseArgs({ options: {
   'windows-install-dir': { type: 'string' }, 'runtime-directory': { type: 'string' },
 } });
 const ENGINE_WAIT_TIMEOUT_MS = 90_000;
+const emitProbeStage = (probeStage: 'codex-connect' | 'shared-codex-resolution' | 'shared-codex-resolved' | 'thread-catalog' | 'engine-start' | 'native-diagnostics' | 'desktop-package-verification' | 'ready') =>
+  process.stdout.write(JSON.stringify({ probeStage }) + '\n');
 if (!values.executable || !values.home || !values.directory || !process.env.RELE_DATA_DIR) throw new Error('Missing isolated fixture paths');
 if ((values['windows-install-dir'] || values['runtime-directory']) && process.platform !== 'win32') throw new Error('Windows fixture options require Windows');
 if (values['windows-install-dir'] && values['runtime-directory']) throw new Error('Choose source installation seam or packaged default location');
@@ -28,9 +30,19 @@ const { CodexClient } = values['runtime-directory'] ? await load('codex') as typ
 const { Engine } = values['runtime-directory'] ? await load('engine') as typeof import('../src/server/engine.js') : { Engine: SourceEngine };
 const { Store } = values['runtime-directory'] ? await load('store') as typeof import('../src/server/store.js') : { Store: SourceStore };
 const configModule = values['runtime-directory'] ? await load('config') as typeof import('../src/server/config.js') : { ConfigStore, defaultConfig, defaultDataDirectory };
+const runtimeShared = values['runtime-directory'] ? await load('codex-shared') as typeof import('../src/server/codex-shared.js') : undefined;
 // Source gates select their disposable installation through the existing production seam.
 // Packaged gates use the compiled module's default installation location, without this seam.
-const options = values['windows-install-dir'] ? { shared: (target: Parameters<typeof ensureWindowsSharedCodex>[0], settings: Parameters<typeof ensureWindowsSharedCodex>[1]) => ensureWindowsSharedCodex(target, settings, values['windows-install-dir']) } : {};
+const resolveShared = values['windows-install-dir']
+  ? (target: Parameters<typeof ensureWindowsSharedCodex>[0], settings: Parameters<typeof ensureWindowsSharedCodex>[1]) => ensureWindowsSharedCodex(target, settings, values['windows-install-dir']!)
+  : runtimeShared?.ensureSharedCodex;
+const reportStartupStages = !values['expect-error'] && !values['profile-socket'] && !values.prepare;
+const options = resolveShared ? { shared: async (target: Parameters<typeof ensureWindowsSharedCodex>[0], settings: Parameters<typeof ensureWindowsSharedCodex>[1]) => {
+  if (reportStartupStages) emitProbeStage('shared-codex-resolution');
+  const result = await resolveShared(target, settings);
+  if (reportStartupStages) emitProbeStage('shared-codex-resolved');
+  return result;
+} } : {};
 const config = { ...structuredClone(configModule.defaultConfig), codex: {
   transport: 'shared' as const, executable: values.executable, endpoint: '', codexHome: values.home,
 } };
@@ -176,6 +188,7 @@ if (values['expect-error']) {
         throw error;
       }
     };
+    emitProbeStage('codex-connect');
     await codex.connect();
     // Snapshot polling would evict the dispatch stages from this bounded trace.
     codex.subscribe = observe('subscribe', traceReconciliationStage('subscribe', codex.subscribe.bind(codex)));
@@ -210,6 +223,7 @@ if (values['expect-error']) {
       if (loseNextQueueAck) { loseNextQueueAck = false; droppedQueueAcks++; throw new Error('Synthetic lost queue ACK after native acceptance'); }
       return result;
     });
+    emitProbeStage('thread-catalog');
     const previous = store.listConversations()[0];
     threadId = previous?.threadId ?? threadId;
     if (!threadId) {
@@ -228,6 +242,7 @@ if (values['expect-error']) {
     }
     if (!previous) store.createConversation({ name: 'Original shared fixture', threadId, cwd: values.directory!,
       bindings: Object.values(endpoints).map(endpoint => ({ platform: endpoint.platform, endpointId: endpoint.id, allowedSenderIds: ['fixture-user'] })) });
+    emitProbeStage('engine-start');
     engine = new Engine(store, codex, { config: () => config, temporaryRoot: values.directory!, redact: value => String(value) });
     const engineInternals = engine as unknown as {
       dispatch: (conversationId: string) => Promise<void>;
@@ -335,12 +350,15 @@ if (values['expect-error']) {
   const input = createInterface({ input: process.stdin });
   try {
     await start();
+    emitProbeStage('native-diagnostics');
     const ready = await snapshot();
     let preparedRuntime;
     if (process.platform === 'win32') {
+      emitProbeStage('desktop-package-verification');
       const shared = values['runtime-directory'] ? await load('codex-shared') as typeof import('../src/server/codex-shared.js') : { readPreparedDesktopCodexPackage };
       preparedRuntime = await shared.readPreparedDesktopCodexPackage(ready.status.executable!, {}, true);
     }
+    emitProbeStage('ready');
     process.stdout.write(JSON.stringify({ ready: true, ...ready, preparedRuntime }) + '\n');
     for await (const line of input) {
       const command = JSON.parse(line) as { action: string; platform?: Platform; text?: string; eventId?: string;

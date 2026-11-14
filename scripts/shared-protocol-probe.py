@@ -27,7 +27,7 @@ import websockets
 from websockets.exceptions import ConnectionClosedError
 from websockets.protocol import State
 
-VERSIONS = ['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1']
+VERSIONS = ['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1', '0.169.0-alpha.11.1']
 REPO = Path(__file__).resolve().parent.parent
 NODE = shutil.which('node')
 DRIVER = REPO / 'scripts/probe-shared-codex.ts'
@@ -44,16 +44,44 @@ def safe_error_type(error):
     return name if re.fullmatch(r'[A-Za-z]{1,48}', name) else 'other'
 
 
+def safe_failure_code(error):
+    if isinstance(error, RuntimeError):
+        return {'Shared Engine driver exited before responding': 'engine-driver-exited-before-response'}.get(str(error))
+    if not isinstance(error, AssertionError):
+        return None
+    return {
+        'Native background terminals are not confirmed empty through EOF': 'native-background-terminals-not-empty',
+        'Native cancellation queue is not confirmed empty through EOF': 'native-cancellation-queue-not-empty',
+    }.get(str(error))
+
+
+def safe_engine_driver_stage(value):
+    return value if value in ('codex-connect', 'shared-codex-resolution', 'shared-codex-resolved',
+                              'thread-catalog', 'engine-start', 'native-diagnostics',
+                              'desktop-package-verification', 'ready', 'windows-installation',
+                              'windows-owner-status', 'windows-desktop-discovery', 'windows-desktop-selection',
+                              'windows-package-preparation', 'windows-package-verification',
+                              'windows-version-command', 'windows-owner-start', 'windows-owner-receipt',
+                              'windows-owner-executable', 'windows-socket-verification') else None
+
+
 async def record_cleanup_error(errors, operation, resource, action, process_pid=None, owner_pid=None):
     started = time.monotonic()
     try:
         await action()
     except Exception as error:
+        failure_code = safe_failure_code(error)
+        driver_stage = safe_engine_driver_stage(getattr(error, 'engine_driver_stage', None))
+        exit_code = getattr(error, 'engine_driver_exit_code', None)
         errors.append({
             'operation': operation if operation in ('engine.close', 'observer.close', 'peer.close', 'native.stop') else 'other',
             'elapsedMs': max(0, min(600000, round((time.monotonic() - started) * 1000))),
             'errorType': safe_error_type(error),
             'resource': resource if resource in ('engine-driver-process', 'desktop-shim-process', 'direct-websocket', 'native-owner', 'native-daemon') else 'other',
+            **({'failureCode': failure_code} if failure_code else {}),
+            **({'engineDriverStage': driver_stage} if driver_stage else {}),
+            **({'engineDriverExitCode': max(-(2**31), min(2**32 - 1, exit_code))}
+               if isinstance(exit_code, int) and not isinstance(exit_code, bool) else {}),
             **({'processPid': process_pid} if isinstance(process_pid, int) and not isinstance(process_pid, bool) and process_pid > 0 else {}),
             **({'ownerPid': owner_pid} if isinstance(owner_pid, int) and not isinstance(owner_pid, bool) and owner_pid > 0 else {}),
         })
@@ -79,6 +107,15 @@ def public_console_report(report):
     failure_type = report.get('failureType')
     if isinstance(failure_type, str) and re.fullmatch(r'[A-Za-z]{1,48}', failure_type):
         output['failureType'] = failure_type
+    failure_code = report.get('failureCode')
+    if failure_code in ('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty', 'engine-driver-exited-before-response'):
+        output['failureCode'] = failure_code
+    driver_stage = safe_engine_driver_stage(report.get('engineDriverStage'))
+    if driver_stage:
+        output['engineDriverStage'] = driver_stage
+    exit_code = report.get('engineDriverExitCode')
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        output['engineDriverExitCode'] = max(-(2**31), min(2**32 - 1, exit_code))
     cleanup_errors = report.get('cleanupErrors')
     if not isinstance(cleanup_errors, list):
         cleanup_errors = []
@@ -90,6 +127,10 @@ def public_console_report(report):
             'errorType': error.get('errorType') if isinstance(error.get('errorType'), str) and re.fullmatch(r'[A-Za-z]{1,48}', error['errorType']) else 'other',
             'elapsedMs': max(0, min(600000, error.get('elapsedMs', 0))) if isinstance(error.get('elapsedMs'), int) and not isinstance(error.get('elapsedMs'), bool) else 0,
             'resource': error.get('resource') if error.get('resource') in ('engine-driver-process', 'desktop-shim-process', 'direct-websocket', 'native-owner', 'native-daemon') else 'other',
+            **({'failureCode': error.get('failureCode')} if error.get('failureCode') in ('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty', 'engine-driver-exited-before-response') else {}),
+            **({'engineDriverStage': safe_engine_driver_stage(error.get('engineDriverStage'))} if safe_engine_driver_stage(error.get('engineDriverStage')) else {}),
+            **({'engineDriverExitCode': max(-(2**31), min(2**32 - 1, error['engineDriverExitCode']))}
+               if isinstance(error.get('engineDriverExitCode'), int) and not isinstance(error.get('engineDriverExitCode'), bool) else {}),
         })
     return output
 
@@ -249,12 +290,32 @@ class Rpc:
 class EngineDriver:
     def __init__(self, process):
         self.process = process
+        self.startup_stage = None
 
     async def read(self, timeout=ENGINE_READ_TIMEOUT_SECONDS):
-        line = await asyncio.wait_for(self.process.stdout.readline(), timeout)
-        if not line:
-            raise RuntimeError('Shared Engine driver exited before responding')
-        return json.loads(line)
+        while True:
+            line = await asyncio.wait_for(self.process.stdout.readline(), timeout)
+            if not line:
+                error = RuntimeError('Shared Engine driver exited before responding')
+                exit_code = self.process.returncode
+                if exit_code is None:
+                    try:
+                        exit_code = await asyncio.wait_for(self.process.wait(), 2)
+                    except TimeoutError:
+                        exit_code = self.process.returncode
+                if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+                    error.engine_driver_exit_code = exit_code
+                if self.startup_stage:
+                    error.engine_driver_stage = self.startup_stage
+                raise error
+            value = json.loads(line)
+            stage = safe_engine_driver_stage(value.get('probeStage')) if isinstance(value, dict) else None
+            if stage:
+                self.startup_stage = stage
+                continue
+            if self.startup_stage == 'ready':
+                self.startup_stage = None
+            return value
 
     async def command(self, action, **fields):
         self.process.stdin.write((json.dumps({'action': action, **fields}) + '\n').encode())
@@ -264,13 +325,16 @@ class EngineDriver:
         return await self.read(timeout)
 
     async def close(self):
-        if self.process.returncode is not None:
-            assert self.process.returncode == 0
-            return
-        result = await self.command('close')
-        assert result['backendAlive'], 'Closing Rele stopped the shared native backend'
-        await asyncio.wait_for(self.process.wait(), 15)
-        assert self.process.returncode == 0
+        if self.process.returncode is None:
+            result = await self.command('close')
+            assert result['backendAlive'], 'Closing Rele stopped the shared native backend'
+            await asyncio.wait_for(self.process.wait(), 15)
+        if self.process.returncode != 0:
+            error = AssertionError()
+            error.engine_driver_exit_code = self.process.returncode
+            if self.startup_stage:
+                error.engine_driver_stage = self.startup_stage
+            raise error
 
 
 def frame(event):
@@ -1169,6 +1233,13 @@ enabled=false
     except BaseException as error:
         report['result'] = 'failed'
         report['failureType'] = safe_error_type(error)
+        report['failureCode'] = safe_failure_code(error)
+        exit_code = getattr(error, 'engine_driver_exit_code', None)
+        if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+            report['engineDriverExitCode'] = exit_code
+        driver_stage = safe_engine_driver_stage(getattr(error, 'engine_driver_stage', None))
+        if driver_stage:
+            report['engineDriverStage'] = driver_stage
         report['exception'] = repr(error)
         report['stderrTail'] = errors[-20:]
         raise
