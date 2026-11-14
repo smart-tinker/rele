@@ -653,6 +653,7 @@ test('Windows parent failure prints only bounded shared-gate counts and states',
 });
 test('shared Windows startup failure reports only an allowlisted driver stage', async()=>{
  const driver=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');
+ const resolver=await readFile(new URL('../src/server/codex-shared.ts',import.meta.url),'utf8');
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
  for(const stage of ['codex-connect','shared-codex-resolution','codex-websocket-open','thread-catalog','engine-start','native-diagnostics','desktop-package-verification','ready'])
@@ -662,6 +663,12 @@ test('shared Windows startup failure reports only an allowlisted driver stage', 
  assert.match(probe,/safe_engine_driver_stage\(value\.get\('probeStage'\)\)/u,'consume only allowlisted progress messages before the first driver response');
  assert.match(probe,/engine_driver_stage/u,'EOF diagnostics must retain the last accepted stage');
  assert.match(canary,/engineDriverStage -in @\('codex-connect'.*'ready'\)/u,'the Windows receipt must forward only allowlisted stages');
+ for(const stage of ['windows-installation','windows-owner-status','windows-desktop-discovery','windows-desktop-selection','windows-package-preparation',
+  'windows-package-verification','windows-version-command','windows-owner-start','windows-owner-receipt','windows-owner-executable','windows-socket-verification']) {
+  assert.ok(resolver.includes(`reportWindowsSharedProbeStage(env, '${stage}')`),`the Windows resolver must mark ${stage}`);
+  assert.ok(probe.includes(`'${stage}'`),`the Python probe must retain ${stage}`);
+  assert.ok(canary.includes(`'${stage}'`),`the Windows receipt must retain ${stage}`);
+ }
 });
 test('shared cancellation diagnostics preserve the original error if snapshot fails', async()=>{
  const probe=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');

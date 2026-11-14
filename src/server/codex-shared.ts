@@ -19,6 +19,14 @@ export class SharedCodexError extends Error {
 }
 
 interface CommandResult { stdout: string; code: number | null }
+type WindowsSharedProbeStage =
+  | 'windows-installation' | 'windows-owner-status' | 'windows-desktop-discovery' | 'windows-desktop-selection'
+  | 'windows-package-preparation' | 'windows-package-verification' | 'windows-version-command'
+  | 'windows-owner-start' | 'windows-owner-receipt' | 'windows-owner-executable' | 'windows-socket-verification';
+function reportWindowsSharedProbeStage(env: NodeJS.ProcessEnv, probeStage: WindowsSharedProbeStage): void {
+  if (environmentValue(env, 'RELE_CI_SHARED_DIAGNOSTICS') === '1') process.stdout.write(JSON.stringify({ probeStage }) + '\n');
+}
+
 export interface SharedCodexOptions {
   env?: NodeJS.ProcessEnv;
   discover?: typeof discoverCodex;
@@ -436,6 +444,7 @@ export async function ensureWindowsSharedCodex(target: CodexConnectionTarget, op
     return metadata;
   };
   try {
+    reportWindowsSharedProbeStage(env, 'windows-installation');
     const before = await installation();
     const validateReceipt = async (result: CommandResult, executable?: string, existingOnly = false): Promise<WindowsCodexReceipt> => {
       const receipt = JSON.parse(result.stdout) as WindowsCodexReceipt;
@@ -471,6 +480,7 @@ export async function ensureWindowsSharedCodex(target: CodexConnectionTarget, op
       if (prepared && (selected === 'codex' || samePath(selected, prepared.sourceSelection) || samePath(selected, prepared.sourceExecutable) || samePath(selected, prepared.executable))) return prepared.executable;
     };
     // The saved executable is desired policy; an existing owned server remains actual until explicit maintenance.
+    reportWindowsSharedProbeStage(env, 'windows-owner-status');
     const current = await run(path.join(installationDirectory, 'Rele.exe'), ['codex-status', '--quiet', '--codex-home', home], timeoutMs, env);
     const status = JSON.parse(current.stdout) as { status?: unknown; pendingUpdate?: unknown; pendingExe?: unknown } | null;
     if (current.code !== 0 || !status || !['notRunning', 'alreadyRunning'].includes(String(status.status))) throw invalid();
@@ -481,7 +491,9 @@ export async function ensureWindowsSharedCodex(target: CodexConnectionTarget, op
       selected = status.pendingExe;
     } else if (prior) selected = prior;
     else if (selected === 'codex') {
+      reportWindowsSharedProbeStage(env, 'windows-desktop-discovery');
       const discovery = await (options.discover ?? discoverCodex)({ env, ...(target.codexHome ? { codexHome: target.codexHome } : {}) });
+      reportWindowsSharedProbeStage(env, 'windows-desktop-selection');
       const candidates = discovery.installations.filter(item => item.version && SUPPORTED_CODEX_VERSIONS.includes(item.version))
         .sort((a, b) => compareCodexInstallations(a, b, 'win32'));
       const candidateResults: { source: string; version: string; result: string }[] = [];
@@ -518,24 +530,31 @@ export async function ensureWindowsSharedCodex(target: CodexConnectionTarget, op
     }
     let executable = resolved ?? await nativeCodexExecutable(await resolveSharedCodexExecutable({ ...target, executable: selected }, { ...options, env }), 'win32');
     if (status.status !== 'alreadyRunning' && status.pendingUpdate !== true) {
+      reportWindowsSharedProbeStage(env, 'windows-package-preparation');
       const prepared = await prepareDesktopCodexPackage(executable, { ...options, env }, target.executable);
       if (!prepared && path.basename(path.dirname(executable)).toLowerCase() === 'resources') throw new SharedCodexError('Полная исходная поставка Codex не подтверждена. Сервер не запускался.', 'shared-desktop-package-invalid');
       executable = prepared ?? executable;
     }
     if (status.status !== 'alreadyRunning') {
+      reportWindowsSharedProbeStage(env, 'windows-package-verification');
       const cached = await readPreparedDesktopCodexPackage(executable, { ...options, env }, true);
       if (!cached) {
+        reportWindowsSharedProbeStage(env, 'windows-version-command');
         const version = await run(executable, ['--version'], Math.min(timeoutMs, 4_000), env);
         if (/^codex(?:-cli)?\s+0\.166\.0-alpha\.6(?:\s|$)/u.test(version.stdout)) throw new SharedCodexError('Для нового Codex требуется подтверждённый полный пакет. Сервер не запускался.', 'shared-desktop-package-invalid');
       }
     }
     if (path.basename(executable).toLowerCase() !== 'codex.exe') throw new SharedCodexError('Общему Windows Codex нужен штатный codex.exe из установленного Desktop.', 'shared-cli-unverified');
     const deadline = Date.now() + timeoutMs;
+    reportWindowsSharedProbeStage(env, 'windows-owner-start');
     const result = await run(path.join(installationDirectory, 'Rele.exe'), ['codex-start', '--quiet', '--codex-executable', executable, '--codex-home', home,
       '--preserve-active'], timeoutMs, env);
+    reportWindowsSharedProbeStage(env, 'windows-owner-receipt');
     const receipt = await validateReceipt(result, executable);
+    reportWindowsSharedProbeStage(env, 'windows-owner-executable');
     const actual = await resolveSharedCodexExecutable({ ...target, executable: receipt.executable }, { ...options, env });
     if (!samePath(await realpath(actual), await realpath(receipt.executable))) throw invalid();
+    reportWindowsSharedProbeStage(env, 'windows-socket-verification');
     for (;;) {
       try { await verifyWindowsCodexSocket(receipt, Math.max(1, deadline - Date.now())); break; }
       catch (error) {

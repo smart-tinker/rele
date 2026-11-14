@@ -58,7 +58,11 @@ def safe_failure_code(error):
 def safe_engine_driver_stage(value):
     return value if value in ('codex-connect', 'shared-codex-resolution', 'codex-websocket-open',
                               'thread-catalog', 'engine-start', 'native-diagnostics',
-                              'desktop-package-verification', 'ready') else None
+                              'desktop-package-verification', 'ready', 'windows-installation',
+                              'windows-owner-status', 'windows-desktop-discovery', 'windows-desktop-selection',
+                              'windows-package-preparation', 'windows-package-verification',
+                              'windows-version-command', 'windows-owner-start', 'windows-owner-receipt',
+                              'windows-owner-executable', 'windows-socket-verification') else None
 
 
 async def record_cleanup_error(errors, operation, resource, action, process_pid=None, owner_pid=None):

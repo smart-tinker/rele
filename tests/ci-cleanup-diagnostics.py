@@ -95,6 +95,8 @@ class CleanupDiagnostics(unittest.TestCase):
         self.assertEqual(helpers['safe_engine_driver_stage']('native-diagnostics'), 'native-diagnostics')
         self.assertEqual(helpers['safe_engine_driver_stage']('shared-codex-resolution'), 'shared-codex-resolution')
         self.assertEqual(helpers['safe_engine_driver_stage']('codex-websocket-open'), 'codex-websocket-open')
+        self.assertEqual(helpers['safe_engine_driver_stage']('windows-owner-start'), 'windows-owner-start')
+        self.assertEqual(helpers['safe_engine_driver_stage']('windows-socket-verification'), 'windows-socket-verification')
         self.assertIsNone(helpers['safe_engine_driver_stage']('C:\\private\\runner'))
 
     def test_successful_cleanup_leaves_no_error(self):
