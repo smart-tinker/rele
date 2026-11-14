@@ -45,6 +45,8 @@ def safe_error_type(error):
 
 
 def safe_failure_code(error):
+    if isinstance(error, RuntimeError):
+        return {'Shared Engine driver exited before responding': 'engine-driver-exited-before-response'}.get(str(error))
     if not isinstance(error, AssertionError):
         return None
     return {
@@ -89,7 +91,7 @@ def public_console_report(report):
     if isinstance(failure_type, str) and re.fullmatch(r'[A-Za-z]{1,48}', failure_type):
         output['failureType'] = failure_type
     failure_code = report.get('failureCode')
-    if failure_code in ('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty'):
+    if failure_code in ('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty', 'engine-driver-exited-before-response'):
         output['failureCode'] = failure_code
     cleanup_errors = report.get('cleanupErrors')
     if not isinstance(cleanup_errors, list):

@@ -22,7 +22,7 @@ def load_helpers(test):
 
 
 class CleanupDiagnostics(unittest.TestCase):
-    def test_failure_code_only_maps_known_static_native_assertions(self):
+    def test_failure_code_only_maps_known_static_native_failures(self):
         helpers = load_helpers(self)
         self.assertEqual(
             helpers['safe_failure_code'](AssertionError('Native background terminals are not confirmed empty through EOF')),
@@ -32,7 +32,12 @@ class CleanupDiagnostics(unittest.TestCase):
             helpers['safe_failure_code'](AssertionError('Native cancellation queue is not confirmed empty through EOF')),
             'native-cancellation-queue-not-empty',
         )
+        self.assertEqual(
+            helpers['safe_failure_code'](RuntimeError('Shared Engine driver exited before responding')),
+            'engine-driver-exited-before-response',
+        )
         self.assertIsNone(helpers['safe_failure_code'](AssertionError('private path and conversation text')))
+        self.assertIsNone(helpers['safe_failure_code'](RuntimeError('private path and conversation text')))
 
     def test_successful_cleanup_leaves_no_error(self):
         helpers = load_helpers(self)
@@ -101,6 +106,9 @@ class CleanupDiagnostics(unittest.TestCase):
         self.assertNotIn('ownerPid', serialized)
         self.assertNotIn('exception', serialized)
         self.assertNotIn('stderrTail', serialized)
+
+        report['failureCode'] = 'engine-driver-exited-before-response'
+        self.assertEqual(helpers['public_console_report'](report)['failureCode'], 'engine-driver-exited-before-response')
 
         report['failureCode'] = 'private path and conversation text'
         self.assertNotIn('failureCode', helpers['public_console_report'](report))
