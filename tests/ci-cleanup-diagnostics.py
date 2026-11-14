@@ -175,28 +175,22 @@ class CleanupDiagnostics(unittest.TestCase):
 
         class Process:
             def __init__(self):
-                self.stdout = asyncio.StreamReader()
-                self.stdout.feed_data(b'{"probeStage":"native-diagnostics"}\n')
-                self.stdout.feed_eof()
                 self.returncode = 23
 
         errors = []
 
         async def record():
             driver = helpers['EngineDriver'](Process())
-
-            async def close():
-                await driver.read()
-
-            await helpers['record_cleanup_error'](errors, 'engine.close', 'engine-driver-process', close, 101, 202)
+            driver.startup_stage = 'native-diagnostics'
+            await helpers['record_cleanup_error'](errors, 'engine.close', 'engine-driver-process', driver.close, 101, 202)
 
         asyncio.run(record())
-        self.assertEqual(errors[0]['failureCode'], 'engine-driver-exited-before-response')
+        self.assertEqual(errors[0]['errorType'], 'AssertionError')
         self.assertEqual(errors[0]['engineDriverExitCode'], 23)
         self.assertEqual(errors[0]['engineDriverStage'], 'native-diagnostics')
 
         report = helpers['public_console_report']({'result': 'failed', 'cleanupErrors': errors})
-        self.assertEqual(report['cleanupErrors'][0]['failureCode'], 'engine-driver-exited-before-response')
+        self.assertEqual(report['cleanupErrors'][0]['errorType'], 'AssertionError')
         self.assertEqual(report['cleanupErrors'][0]['engineDriverExitCode'], 23)
         self.assertEqual(report['cleanupErrors'][0]['engineDriverStage'], 'native-diagnostics')
         self.assertNotIn('processPid', json.dumps(report))

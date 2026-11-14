@@ -325,13 +325,16 @@ class EngineDriver:
         return await self.read(timeout)
 
     async def close(self):
-        if self.process.returncode is not None:
-            assert self.process.returncode == 0
-            return
-        result = await self.command('close')
-        assert result['backendAlive'], 'Closing Rele stopped the shared native backend'
-        await asyncio.wait_for(self.process.wait(), 15)
-        assert self.process.returncode == 0
+        if self.process.returncode is None:
+            result = await self.command('close')
+            assert result['backendAlive'], 'Closing Rele stopped the shared native backend'
+            await asyncio.wait_for(self.process.wait(), 15)
+        if self.process.returncode != 0:
+            error = AssertionError()
+            error.engine_driver_exit_code = self.process.returncode
+            if self.startup_stage:
+                error.engine_driver_stage = self.startup_stage
+            raise error
 
 
 def frame(event):
