@@ -500,7 +500,7 @@ test('Windows native proof failure details use only the existing bounded CI diag
  assert.match(source,/event:\s*'codex-native-proof-failure'/u);
 });
 test('the current signed Desktop backend is covered by every supported Codex probe', async()=>{
- const version='0.167.0-alpha.4.1';
+ const version='0.169.0-alpha.11.1';
  for(const file of ['../scripts/protocol-probe.py','../scripts/managed-protocol-probe.py','../scripts/shared-protocol-probe.py','../scripts/windows/ci-standard-user-canary.ps1']) {
   const source=await readFile(new URL(file,import.meta.url),'utf8');
   assert.ok(source.includes(version),`${file} must test the current signed Desktop backend`);

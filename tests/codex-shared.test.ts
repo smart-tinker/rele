@@ -334,7 +334,7 @@ describe('Windows direct shared Codex', () => {
     expect(f.run.mock.calls.find(([, args]) => args[0] === 'codex-start')?.[1]).toContain(f.receipt.executable);
   });
 
-  it.each(['0.165.0-alpha.1.2', '0.166.0-alpha.5.1'])('automatically chooses supported %s while ignoring a newer unsupported installation', async version => {
+  it.each(['0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.169.0-alpha.11.1'])('automatically chooses supported %s while ignoring a newer unsupported installation', async version => {
     const f = await windowsFixture(), newer = await desktopFixture(path.join(f.home, 'newer')), unsupported = await desktopFixture(path.join(f.home, 'unsupported'));
     f.discovery.installations.unshift(
       { executable: unsupported, name: 'Unverified Desktop', source: 'desktop-install', version: '9.0.0', running: false },
