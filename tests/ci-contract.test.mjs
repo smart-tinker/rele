@@ -662,7 +662,7 @@ test('shared Windows startup failure reports only an allowlisted driver stage', 
   'the Python driver must accept only bounded startup stages');
  assert.match(probe,/safe_engine_driver_stage\(value\.get\('probeStage'\)\)/u,'consume only allowlisted progress messages before the first driver response');
  assert.match(probe,/engine_driver_stage/u,'EOF diagnostics must retain the last accepted stage');
- assert.match(canary,/engineDriverStage -in @\('codex-connect'.*'ready'\)/u,'the Windows receipt must forward only allowlisted stages');
+ assert.match(canary,/engineDriverStage -in @\('codex-connect'.*'windows-socket-verification'\)/u,'the Windows receipt must forward only allowlisted stages');
  for(const stage of ['windows-installation','windows-owner-status','windows-desktop-discovery','windows-desktop-selection','windows-package-preparation',
   'windows-package-verification','windows-version-command','windows-owner-start','windows-owner-receipt','windows-owner-executable','windows-socket-verification']) {
   assert.ok(resolver.includes(`reportWindowsSharedProbeStage(env, '${stage}')`),`the Windows resolver must mark ${stage}`);
