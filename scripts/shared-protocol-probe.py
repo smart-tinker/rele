@@ -56,7 +56,7 @@ def safe_failure_code(error):
 
 
 def safe_engine_driver_stage(value):
-    return value if value in ('codex-connect', 'shared-codex-resolution', 'codex-websocket-open',
+    return value if value in ('codex-connect', 'shared-codex-resolution', 'shared-codex-resolved',
                               'thread-catalog', 'engine-start', 'native-diagnostics',
                               'desktop-package-verification', 'ready', 'windows-installation',
                               'windows-owner-status', 'windows-desktop-discovery', 'windows-desktop-selection',
@@ -70,11 +70,18 @@ async def record_cleanup_error(errors, operation, resource, action, process_pid=
     try:
         await action()
     except Exception as error:
+        failure_code = safe_failure_code(error)
+        driver_stage = safe_engine_driver_stage(getattr(error, 'engine_driver_stage', None))
+        exit_code = getattr(error, 'engine_driver_exit_code', None)
         errors.append({
             'operation': operation if operation in ('engine.close', 'observer.close', 'peer.close', 'native.stop') else 'other',
             'elapsedMs': max(0, min(600000, round((time.monotonic() - started) * 1000))),
             'errorType': safe_error_type(error),
             'resource': resource if resource in ('engine-driver-process', 'desktop-shim-process', 'direct-websocket', 'native-owner', 'native-daemon') else 'other',
+            **({'failureCode': failure_code} if failure_code else {}),
+            **({'engineDriverStage': driver_stage} if driver_stage else {}),
+            **({'engineDriverExitCode': max(-(2**31), min(2**32 - 1, exit_code))}
+               if isinstance(exit_code, int) and not isinstance(exit_code, bool) else {}),
             **({'processPid': process_pid} if isinstance(process_pid, int) and not isinstance(process_pid, bool) and process_pid > 0 else {}),
             **({'ownerPid': owner_pid} if isinstance(owner_pid, int) and not isinstance(owner_pid, bool) and owner_pid > 0 else {}),
         })
@@ -120,6 +127,10 @@ def public_console_report(report):
             'errorType': error.get('errorType') if isinstance(error.get('errorType'), str) and re.fullmatch(r'[A-Za-z]{1,48}', error['errorType']) else 'other',
             'elapsedMs': max(0, min(600000, error.get('elapsedMs', 0))) if isinstance(error.get('elapsedMs'), int) and not isinstance(error.get('elapsedMs'), bool) else 0,
             'resource': error.get('resource') if error.get('resource') in ('engine-driver-process', 'desktop-shim-process', 'direct-websocket', 'native-owner', 'native-daemon') else 'other',
+            **({'failureCode': error.get('failureCode')} if error.get('failureCode') in ('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty', 'engine-driver-exited-before-response') else {}),
+            **({'engineDriverStage': safe_engine_driver_stage(error.get('engineDriverStage'))} if safe_engine_driver_stage(error.get('engineDriverStage')) else {}),
+            **({'engineDriverExitCode': max(-(2**31), min(2**32 - 1, error['engineDriverExitCode']))}
+               if isinstance(error.get('engineDriverExitCode'), int) and not isinstance(error.get('engineDriverExitCode'), bool) else {}),
         })
     return output
 

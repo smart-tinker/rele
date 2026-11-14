@@ -20,7 +20,7 @@ const { values } = parseArgs({ options: {
   'windows-install-dir': { type: 'string' }, 'runtime-directory': { type: 'string' },
 } });
 const ENGINE_WAIT_TIMEOUT_MS = 90_000;
-const emitProbeStage = (probeStage: 'codex-connect' | 'shared-codex-resolution' | 'codex-websocket-open' | 'thread-catalog' | 'engine-start' | 'native-diagnostics' | 'desktop-package-verification' | 'ready') =>
+const emitProbeStage = (probeStage: 'codex-connect' | 'shared-codex-resolution' | 'shared-codex-resolved' | 'thread-catalog' | 'engine-start' | 'native-diagnostics' | 'desktop-package-verification' | 'ready') =>
   process.stdout.write(JSON.stringify({ probeStage }) + '\n');
 if (!values.executable || !values.home || !values.directory || !process.env.RELE_DATA_DIR) throw new Error('Missing isolated fixture paths');
 if ((values['windows-install-dir'] || values['runtime-directory']) && process.platform !== 'win32') throw new Error('Windows fixture options require Windows');
@@ -40,7 +40,7 @@ const reportStartupStages = !values['expect-error'] && !values['profile-socket']
 const options = resolveShared ? { shared: async (target: Parameters<typeof ensureWindowsSharedCodex>[0], settings: Parameters<typeof ensureWindowsSharedCodex>[1]) => {
   if (reportStartupStages) emitProbeStage('shared-codex-resolution');
   const result = await resolveShared(target, settings);
-  if (reportStartupStages) emitProbeStage('codex-websocket-open');
+  if (reportStartupStages) emitProbeStage('shared-codex-resolved');
   return result;
 } } : {};
 const config = { ...structuredClone(configModule.defaultConfig), codex: {

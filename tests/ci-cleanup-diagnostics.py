@@ -67,7 +67,7 @@ class CleanupDiagnostics(unittest.TestCase):
         class Process:
             def __init__(self):
                 self.stdout = asyncio.StreamReader()
-                self.stdout.feed_data(b'{"probeStage":"codex-websocket-open"}\n')
+                self.stdout.feed_data(b'{"probeStage":"shared-codex-resolved"}\n')
                 self.stdout.feed_eof()
                 self.returncode = 0
 
@@ -75,7 +75,7 @@ class CleanupDiagnostics(unittest.TestCase):
             driver = helpers['EngineDriver'](Process())
             with self.assertRaisesRegex(RuntimeError, '^Shared Engine driver exited before responding$') as raised:
                 await driver.read()
-            self.assertEqual(getattr(raised.exception, 'engine_driver_stage', None), 'codex-websocket-open')
+            self.assertEqual(getattr(raised.exception, 'engine_driver_stage', None), 'shared-codex-resolved')
 
         asyncio.run(read_eof())
 
@@ -92,6 +92,22 @@ class CleanupDiagnostics(unittest.TestCase):
             driver = helpers['EngineDriver'](Process())
             self.assertEqual(await driver.read(), {'ready': True})
             self.assertIsNone(driver.startup_stage)
+
+        asyncio.run(read_ready())
+
+    def test_engine_driver_consumes_shared_resolver_completion_stage(self):
+        helpers = load_helpers(self)
+
+        class Process:
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data(b'{"probeStage":"shared-codex-resolved"}\n{"ready":true}\n')
+                self.returncode = None
+
+        async def read_ready():
+            driver = helpers['EngineDriver'](Process())
+            self.assertEqual(await driver.read(), {'ready': True})
+            self.assertEqual(driver.startup_stage, 'shared-codex-resolved')
 
         asyncio.run(read_ready())
 
@@ -116,7 +132,8 @@ class CleanupDiagnostics(unittest.TestCase):
         helpers = load_helpers(self)
         self.assertEqual(helpers['safe_engine_driver_stage']('native-diagnostics'), 'native-diagnostics')
         self.assertEqual(helpers['safe_engine_driver_stage']('shared-codex-resolution'), 'shared-codex-resolution')
-        self.assertEqual(helpers['safe_engine_driver_stage']('codex-websocket-open'), 'codex-websocket-open')
+        self.assertEqual(helpers['safe_engine_driver_stage']('shared-codex-resolved'), 'shared-codex-resolved')
+        self.assertIsNone(helpers['safe_engine_driver_stage']('codex-websocket-open'))
         self.assertEqual(helpers['safe_engine_driver_stage']('windows-owner-start'), 'windows-owner-start')
         self.assertEqual(helpers['safe_engine_driver_stage']('windows-socket-verification'), 'windows-socket-verification')
         self.assertIsNone(helpers['safe_engine_driver_stage']('C:\\private\\runner'))
@@ -152,6 +169,38 @@ class CleanupDiagnostics(unittest.TestCase):
         self.assertNotIn('synthetic conversation', json.dumps(errors))
         self.assertEqual(helpers['cleanup_failure_message'](None, errors), 'Isolated fixture cleanup failed: engine.close')
         self.assertIsNone(helpers['cleanup_failure_message'](ValueError('primary failure'), errors))
+
+    def test_engine_close_cleanup_preserves_allowlisted_driver_failure_diagnostics(self):
+        helpers = load_helpers(self)
+
+        class Process:
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data(b'{"probeStage":"native-diagnostics"}\n')
+                self.stdout.feed_eof()
+                self.returncode = 23
+
+        errors = []
+
+        async def record():
+            driver = helpers['EngineDriver'](Process())
+
+            async def close():
+                await driver.read()
+
+            await helpers['record_cleanup_error'](errors, 'engine.close', 'engine-driver-process', close, 101, 202)
+
+        asyncio.run(record())
+        self.assertEqual(errors[0]['failureCode'], 'engine-driver-exited-before-response')
+        self.assertEqual(errors[0]['engineDriverExitCode'], 23)
+        self.assertEqual(errors[0]['engineDriverStage'], 'native-diagnostics')
+
+        report = helpers['public_console_report']({'result': 'failed', 'cleanupErrors': errors})
+        self.assertEqual(report['cleanupErrors'][0]['failureCode'], 'engine-driver-exited-before-response')
+        self.assertEqual(report['cleanupErrors'][0]['engineDriverExitCode'], 23)
+        self.assertEqual(report['cleanupErrors'][0]['engineDriverStage'], 'native-diagnostics')
+        self.assertNotIn('processPid', json.dumps(report))
+        self.assertNotIn('ownerPid', json.dumps(report))
 
     def test_console_report_exposes_only_bounded_allowlisted_fields(self):
         helpers = load_helpers(self)

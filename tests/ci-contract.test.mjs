@@ -457,7 +457,13 @@ test('Windows canary summary exposes bounded cleanup failure categories', async(
   'bound elapsed times before logging');
  assert.match(summary,/resource = if \(\$_.resource -in @\('engine-driver-process', 'desktop-shim-process', 'direct-websocket', 'native-owner', 'native-daemon'\)\)/u,
   'allow only known resource categories');
- assert.doesNotMatch(summary,/\.Message|\.Exception|retainedFixture|\.Path/u,'do not print raw errors or runner paths');
+ assert.match(summary,/failureCode = if \(\$_.failureCode -in @\('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty', 'engine-driver-exited-before-response'\)\) \{ \[string\]\$_.failureCode \} elseif \(\$_.failureCode\) \{ 'other' \} else \{ \$null \}/u,
+  'forward only known cleanup failure codes');
+ assert.match(summary,/engineDriverExitCode = if \(\$_.engineDriverExitCode -is \[int\] -or \$_.engineDriverExitCode -is \[long\]\) \{ \[Math\]::Max\(-2147483648, \[Math\]::Min\(4294967295, \[long\]\$_.engineDriverExitCode\)\) \}/u,
+  'forward only bounded numeric cleanup exit codes');
+ assert.match(summary,/engineDriverStage = if \(\$_.engineDriverStage -in @\('codex-connect'.*'windows-socket-verification'\)\) \{ \[string\]\$_.engineDriverStage \}/u,
+  'forward only allowlisted cleanup startup stages');
+ assert.doesNotMatch(summary,/\.Message|\.Exception|retainedFixture|\.Path|processPid|ownerPid/u,'do not print raw errors, runner paths, or process identifiers');
 });
 test('Windows canary forwards only allowlisted native failure codes', async()=>{
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
@@ -656,10 +662,12 @@ test('shared Windows startup failure reports only an allowlisted driver stage', 
  const resolver=await readFile(new URL('../src/server/codex-shared.ts',import.meta.url),'utf8');
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
- for(const stage of ['codex-connect','shared-codex-resolution','codex-websocket-open','thread-catalog','engine-start','native-diagnostics','desktop-package-verification','ready'])
+ for(const stage of ['codex-connect','shared-codex-resolution','shared-codex-resolved','thread-catalog','engine-start','native-diagnostics','desktop-package-verification','ready'])
   assert.ok(driver.includes(`emitProbeStage('${stage}')`),`the shared driver must mark ${stage}`);
- assert.match(probe,/def safe_engine_driver_stage\(value\):[\s\S]{0,300}'codex-connect'[\s\S]*'shared-codex-resolution'[\s\S]*'codex-websocket-open'[\s\S]*'native-diagnostics'[\s\S]*'desktop-package-verification'/u,
+ assert.match(probe,/def safe_engine_driver_stage\(value\):[\s\S]{0,300}'codex-connect'[\s\S]*'shared-codex-resolution'[\s\S]*'shared-codex-resolved'[\s\S]*'native-diagnostics'[\s\S]*'desktop-package-verification'/u,
   'the Python driver must accept only bounded startup stages');
+ assert.match(canary,/\$sharedDiagnostic\.engineDriverStage -in @\('codex-connect'.*'shared-codex-resolved'/u,
+  'the Windows receipt must allow the shared resolver completion stage');
  assert.match(probe,/safe_engine_driver_stage\(value\.get\('probeStage'\)\)/u,'consume only allowlisted progress messages before the first driver response');
  assert.match(probe,/engine_driver_stage/u,'EOF diagnostics must retain the last accepted stage');
  assert.match(canary,/engineDriverStage -in @\('codex-connect'.*'windows-socket-verification'\)/u,'the Windows receipt must forward only allowlisted stages');
