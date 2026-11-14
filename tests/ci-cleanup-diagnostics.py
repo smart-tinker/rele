@@ -21,6 +21,28 @@ def load_helpers(test):
     return namespace
 
 
+class FakeEngineProcess:
+    def __init__(self, response=None, timeout_on_wait=False):
+        self.stdout = asyncio.StreamReader()
+        if response:
+            self.stdout.feed_data(response)
+        self.stdin = self
+        self.returncode = None
+        self.timeout_on_wait = timeout_on_wait
+
+    def write(self, value):
+        pass
+
+    async def drain(self):
+        pass
+
+    async def wait(self):
+        if self.timeout_on_wait:
+            raise TimeoutError()
+        self.returncode = 0
+        return 0
+
+
 class CleanupDiagnostics(unittest.TestCase):
     def test_engine_eof_preserves_only_the_driver_exit_code(self):
         helpers = load_helpers(self)
@@ -111,6 +133,36 @@ class CleanupDiagnostics(unittest.TestCase):
 
         asyncio.run(read_ready())
 
+    def test_engine_close_response_timeout_has_a_safe_phase(self):
+        helpers = load_helpers(self)
+
+        async def close():
+            driver = helpers['EngineDriver'](FakeEngineProcess())
+            with self.assertRaises(TimeoutError) as raised:
+                await driver.close()
+            self.assertEqual(getattr(raised.exception, 'engine_driver_stage', None), 'engine-close-response')
+
+        asyncio.run(close())
+
+    def test_engine_close_process_exit_timeout_has_a_safe_phase(self):
+        helpers = load_helpers(self)
+
+        async def close():
+            driver = helpers['EngineDriver'](FakeEngineProcess(b'{"backendAlive":true}\n', timeout_on_wait=True))
+            with self.assertRaises(TimeoutError) as raised:
+                await driver.close()
+            self.assertEqual(getattr(raised.exception, 'engine_driver_stage', None), 'engine-close-process-exit')
+
+        asyncio.run(close())
+
+    def test_engine_close_succeeds_when_process_exits_cleanly(self):
+        helpers = load_helpers(self)
+
+        async def close():
+            await helpers['EngineDriver'](FakeEngineProcess(b'{"backendAlive":true}\n')).close()
+
+        asyncio.run(close())
+
     def test_failure_code_only_maps_known_static_native_failures(self):
         helpers = load_helpers(self)
         self.assertEqual(
@@ -133,6 +185,8 @@ class CleanupDiagnostics(unittest.TestCase):
         self.assertEqual(helpers['safe_engine_driver_stage']('native-diagnostics'), 'native-diagnostics')
         self.assertEqual(helpers['safe_engine_driver_stage']('shared-codex-resolution'), 'shared-codex-resolution')
         self.assertEqual(helpers['safe_engine_driver_stage']('shared-codex-resolved'), 'shared-codex-resolved')
+        self.assertEqual(helpers['safe_engine_driver_stage']('engine-close-response'), 'engine-close-response')
+        self.assertEqual(helpers['safe_engine_driver_stage']('engine-close-process-exit'), 'engine-close-process-exit')
         self.assertIsNone(helpers['safe_engine_driver_stage']('codex-websocket-open'))
         self.assertEqual(helpers['safe_engine_driver_stage']('windows-owner-start'), 'windows-owner-start')
         self.assertEqual(helpers['safe_engine_driver_stage']('windows-socket-verification'), 'windows-socket-verification')
