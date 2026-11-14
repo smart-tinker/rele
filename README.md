@@ -18,7 +18,7 @@ WSL и отдельный компонент Rele Node исключены из �
 подтверждается отдельно для конкретной версии и пакета.
 
 [Страница GitHub Releases](https://github.com/smart-tinker/rele/releases) — источник
-доступных пакетов. На 2026-11-12 там нет опубликованных выпусков и файлов,
+доступных пакетов. На 2026-11-14 там нет опубликованных выпусков и файлов,
 поэтому сейчас в этом репозитории нет installer или portable-пакета для загрузки.
 Git-теги и исторические заметки не являются пакетами и сами по себе не подтверждают
 совместимость или приёмку. Дождитесь реального выпуска с файлами, SHA-256 и
@@ -123,7 +123,7 @@ Desktop обращается к серверу напрямую: установ�
 
 ## Разработка
 
-Стандарт работы: [issue и критерии → scope → ветка/PR → GitHub Actions → draft RC → приёмка готового пакета](docs/DEVELOPMENT.md). Draft PR запускает быстрые проверки на Ubuntu и Windows; ready PR и `main` запускают полный набор и сборку пакетов на тех же двух GitHub-hosted runner-ах. Обычные PR/main-проверки не загружают workflow artifacts. Ручной release dispatch из `main` может передать проверенные пакеты publisher-у и создать draft RC после quota guard. Приёмка опубликованного пакета остаётся отдельной проверкой на Windows и Linux acceptance host. Issue закрывается только после принятия его критериев.
+Стандарт работы: [issue и критерии → scope → ветка/PR → GitHub Actions → draft RC → приёмка готового пакета](docs/DEVELOPMENT.md). Draft PR запускает быстрые проверки на Ubuntu и Windows; ready PR и `main` запускают полный набор и сборку пакетов на тех же двух GitHub-hosted runner-ах. Обычные PR/main-проверки не загружают workflow artifacts. Ручной release dispatch из `main` запускает один workflow run: параллельные Ubuntu и Windows jobs загружают проверенные пакеты в один непубликованный draft Release, а publisher скачивает и проверяет их оттуда. Actions Artifacts и кэш не используются; отдельная квота Actions artifact storage не нужна. Приёмка опубликованного пакета остаётся отдельной проверкой на Windows и Linux acceptance host. Issue закрывается только после принятия его критериев.
 
 GitHub Actions выполняет автоматические проверки проекта. Следующие команды оставлены для локальной разработки и точечной диагностики; это не отдельный release-build маршрут. Для них требуется Node.js **24.19.0** и npm:
 
@@ -149,7 +149,7 @@ npm run test:e2e
 
 ## GitHub Actions
 
-GitHub Actions проверяет PR и `main` на стандартных Windows/Linux runners; draft PR получает быстрый набор, ready PR и `main` — полный, включая сборку пакетов. Workflow не использует npm cache и не загружает artifacts в обычных PR/main runs. Только отдельный ручной release dispatch из `main` проходит quota guard, передаёт проверенные пакеты publisher-у и создаёт draft RC. См. [схему CI](docs/CI.md) и [стандарт разработки](docs/DEVELOPMENT.md).
+GitHub Actions проверяет PR и `main` на стандартных Windows/Linux runners; draft PR получает быстрый набор, ready PR и `main` — полный, включая сборку пакетов. Workflow не использует npm cache и не загружает artifacts в обычных PR/main runs. Только ручной release dispatch из `main` создаёт непубликованный draft RC, принимает проверенные пакеты от двух OS jobs через assets этого Release и проверяет их на publisher-е. Actions Artifacts и кэш не используются. См. [схему CI](docs/CI.md) и [стандарт разработки](docs/DEVELOPMENT.md).
 
 ## Лицензия
 
