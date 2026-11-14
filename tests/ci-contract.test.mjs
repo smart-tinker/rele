@@ -379,8 +379,8 @@ test('Windows job timeout leaves room for its bounded standard-user native gate'
  const gateTimeout=canary.match(/AddMinutes\(\$\(if \(\$Phase -eq 'Shared'\) \{ (\d+) \} else \{ (\d+) \}\)\)/u);
  assert.ok(jobTimeout,'give Windows its own timeout without extending Ubuntu');
  assert.ok(gateTimeout,'read the native gate deadline from the canary');
- assert.ok(Number(gateTimeout[2])>=145,'leave time for the observed shared suite and the installer lifecycle that exceeded the old deadline');
- assert.ok(Number(jobTimeout[1])>=Number(gateTimeout[2])+45,'leave time for runner setup, later checks, and cleanup');
+ assert.ok(Number(gateTimeout[2])>=155,'leave time beyond the observed 145-minute run that exhausted the old canary deadline');
+ assert.ok(Number(jobTimeout[1])>=Number(gateTimeout[2])+60,'leave time for runner setup, later checks, and cleanup');
  assert.equal(Number(jobTimeout[2]),60,'keep the Ubuntu timeout unchanged');
 });
 test('shared protocol completion wait fits within its driver response budget', async()=>{
@@ -457,7 +457,24 @@ test('Windows canary summary exposes bounded cleanup failure categories', async(
   'bound elapsed times before logging');
  assert.match(summary,/resource = if \(\$_.resource -in @\('engine-driver-process', 'desktop-shim-process', 'direct-websocket', 'native-owner', 'native-daemon'\)\)/u,
   'allow only known resource categories');
- assert.doesNotMatch(summary,/\.Message|\.Exception|retainedFixture|\.Path/u,'do not print raw errors or runner paths');
+ assert.match(summary,/failureCode = if \(\$_.failureCode -in @\('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty', 'engine-driver-exited-before-response'\)\) \{ \[string\]\$_.failureCode \} elseif \(\$_.failureCode\) \{ 'other' \} else \{ \$null \}/u,
+  'forward only known cleanup failure codes');
+ assert.match(summary,/engineDriverExitCode = if \(\$_.engineDriverExitCode -is \[int\] -or \$_.engineDriverExitCode -is \[long\]\) \{ \[Math\]::Max\(-2147483648, \[Math\]::Min\(4294967295, \[long\]\$_.engineDriverExitCode\)\) \}/u,
+  'forward only bounded numeric cleanup exit codes');
+ assert.match(summary,/engineDriverStage = if \(\$_.engineDriverStage -in @\('codex-connect'.*'windows-socket-verification'\)\) \{ \[string\]\$_.engineDriverStage \}/u,
+  'forward only allowlisted cleanup startup stages');
+ assert.doesNotMatch(summary,/\.Message|\.Exception|retainedFixture|\.Path|processPid|ownerPid/u,'do not print raw errors, runner paths, or process identifiers');
+});
+test('Windows canary forwards only allowlisted native failure codes', async()=>{
+ const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ const start=canary.indexOf('$summary = [ordered]@{ stage =');
+ const end=canary.indexOf("Write-Output ('Windows canary bounded diagnostic:",start);
+ const summary=canary.slice(start,end);
+ assert.match(summary,/if \(\$sharedDiagnostic\.failureCode\) \{ \$summary\.failureCode = if \(\[string\]\$sharedDiagnostic\.failureCode -in @\('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty', 'engine-driver-exited-before-response'\)\) \{ \[string\]\$sharedDiagnostic\.failureCode \} else \{ 'other' \} \}/u,
+  'copy only the exact non-sensitive native failure code allowlist');
+ assert.match(summary,/engineDriverExitCode -is \[int\] -or \$sharedDiagnostic\.engineDriverExitCode -is \[long\].*\$summary\.engineDriverExitCode = \[long\]\$sharedDiagnostic\.engineDriverExitCode/u,
+  'forward only a bounded numeric driver exit code');
+ assert.doesNotMatch(summary,/\.exception|\.Message|\.Exception/u,'never include raw exception content');
 });
 test('browser setup installs the pinned Playwright browser without apt dependencies', async()=>{
  const workflow=await readFile(new URL('../.github/workflows/verify.yml',import.meta.url),'utf8');
@@ -489,7 +506,7 @@ test('Windows native proof failure details use only the existing bounded CI diag
  assert.match(source,/event:\s*'codex-native-proof-failure'/u);
 });
 test('the current signed Desktop backend is covered by every supported Codex probe', async()=>{
- const version='0.167.0-alpha.4.1';
+ const version='0.169.0-alpha.11.1';
  for(const file of ['../scripts/protocol-probe.py','../scripts/managed-protocol-probe.py','../scripts/shared-protocol-probe.py','../scripts/windows/ci-standard-user-canary.ps1']) {
   const source=await readFile(new URL(file,import.meta.url),'utf8');
   assert.ok(source.includes(version),`${file} must test the current signed Desktop backend`);
@@ -639,6 +656,27 @@ test('Windows parent failure prints only bounded shared-gate counts and states',
   assert.ok(summary.includes(field),`print the bounded timeout field ${field}`);
  }
  assert.doesNotMatch(summary,/stderrTail|exception|payload|requestId|turnId|sharedReport/u,'never print raw errors, payloads, IDs, or the complete report');
+});
+test('shared Windows startup failure reports only an allowlisted driver stage', async()=>{
+ const driver=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');
+ const resolver=await readFile(new URL('../src/server/codex-shared.ts',import.meta.url),'utf8');
+ const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ for(const stage of ['codex-connect','shared-codex-resolution','shared-codex-resolved','thread-catalog','engine-start','native-diagnostics','desktop-package-verification','ready'])
+  assert.ok(driver.includes(`emitProbeStage('${stage}')`),`the shared driver must mark ${stage}`);
+ assert.match(probe,/def safe_engine_driver_stage\(value\):[\s\S]{0,300}'codex-connect'[\s\S]*'shared-codex-resolution'[\s\S]*'shared-codex-resolved'[\s\S]*'native-diagnostics'[\s\S]*'desktop-package-verification'/u,
+  'the Python driver must accept only bounded startup stages');
+ assert.match(canary,/\$sharedDiagnostic\.engineDriverStage -in @\('codex-connect'.*'shared-codex-resolved'/u,
+  'the Windows receipt must allow the shared resolver completion stage');
+ assert.match(probe,/safe_engine_driver_stage\(value\.get\('probeStage'\)\)/u,'consume only allowlisted progress messages before the first driver response');
+ assert.match(probe,/engine_driver_stage/u,'EOF diagnostics must retain the last accepted stage');
+ assert.match(canary,/engineDriverStage -in @\('codex-connect'.*'windows-socket-verification'\)/u,'the Windows receipt must forward only allowlisted stages');
+ for(const stage of ['windows-installation','windows-owner-status','windows-desktop-discovery','windows-desktop-selection','windows-package-preparation',
+  'windows-package-verification','windows-version-command','windows-owner-start','windows-owner-receipt','windows-owner-executable','windows-socket-verification']) {
+  assert.ok(resolver.includes(`reportWindowsSharedProbeStage(env, '${stage}')`),`the Windows resolver must mark ${stage}`);
+  assert.ok(probe.includes(`'${stage}'`),`the Python probe must retain ${stage}`);
+  assert.ok(canary.includes(`'${stage}'`),`the Windows receipt must retain ${stage}`);
+ }
 });
 test('shared cancellation diagnostics preserve the original error if snapshot fails', async()=>{
  const probe=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');

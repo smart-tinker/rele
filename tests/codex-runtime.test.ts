@@ -9,6 +9,7 @@ describe('Codex semantic version ordering', () => {
     ['0.165.0-alpha.1.2', '0.166.0-alpha.5.1'],
     ['0.166.0-alpha.5.1', '0.166.0-alpha.6'],
     ['0.166.0-alpha.6', '0.167.0-alpha.3.2'],
+    ['0.167.0-alpha.4.1', '0.169.0-alpha.11.1'],
     ['0.165.0-alpha.2', '0.165.0-alpha.11'],
     ['0.165.0-alpha.11', '0.165.0-alpha.11.2'],
     ['0.165.0-1', '0.165.0-alpha'],

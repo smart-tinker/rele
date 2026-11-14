@@ -56,5 +56,5 @@ class WorkflowContract(unittest.TestCase):
   contract=next(step for step in steps if step.get('name')=='Read the supported Codex contract')
   self.assertIn('SUPPORTED_CODEX_VERSIONS.at(-1)',contract['run']);self.assertIn('CODEX_GOALS_VERSION=',contract['run'])
   required=next(step for step in steps if step.get('name')=='Require every applicable check')['env']['REQUIRED']
-  self.assertIn("env.FULL == 'true' && 'fixture native_controls",required)
+  self.assertIn("env.FULL == 'true' && 'cleanup_diagnostics fixture native_controls",required)
 if __name__=='__main__':unittest.main()
