@@ -422,6 +422,18 @@ test('Windows canary timeout reports bounded native RPC and driver stages', asyn
  assert.match(summary,/\$summary\.driverOperations = @\(\$evidence\.driverOperations \| Select-Object -Last 16\)/u,'print only the latest bounded driver operation stages');
  assert.doesNotMatch(summary,/payload|\.input\b|\.text\b|stdout\.log|stderr\.log/u,'timeout diagnostics must exclude request content and raw logs');
 });
+test('shared-gate failures expose only a bounded probe function and line', async()=>{
+ const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ const start=canary.indexOf('$summary = [ordered]@{ stage =');
+ const end=canary.indexOf("Write-Output ('Windows canary bounded diagnostic:",start);
+ const summary=canary.slice(start,end);
+ assert.match(probe,/def safe_failure_location\(error\):/u,'capture the last source frame from the shared probe');
+ assert.match(probe,/failure_location = safe_failure_location\(error\)[\s\S]{0,120}report\['failureLocation'\] = failure_location/u,'retain the bounded location in the local failure report');
+ assert.ok(start>=0&&end>start,'Windows canary must emit a bounded shared-gate diagnostic');
+ assert.match(summary,/failureLocation[\s\S]*function[\s\S]*line/u,'forward only the probe function and line');
+ assert.doesNotMatch(summary,/traceback|\.Exception|\.Message|\.Path/u,'do not forward raw traceback, error text or paths');
+});
 test('shared fixture cleanup identifies the timed out operation without raw error text', async()=>{
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
  const start=probe.indexOf('cleanup_errors = []',probe.indexOf('async def scenario(order):'));
@@ -461,7 +473,7 @@ test('Windows canary summary exposes bounded cleanup failure categories', async(
   'forward only known cleanup failure codes');
  assert.match(summary,/engineDriverExitCode = if \(\$_.engineDriverExitCode -is \[int\] -or \$_.engineDriverExitCode -is \[long\]\) \{ \[Math\]::Max\(-2147483648, \[Math\]::Min\(4294967295, \[long\]\$_.engineDriverExitCode\)\) \}/u,
   'forward only bounded numeric cleanup exit codes');
- assert.match(summary,/engineDriverStage = if \(\$_.engineDriverStage -in @\('codex-connect'.*'windows-socket-verification'\)\) \{ \[string\]\$_.engineDriverStage \}/u,
+ assert.match(summary,/engineDriverStage = if \(\$_.engineDriverStage -in @\('codex-connect'.*'windows-socket-verification', 'engine-close-request', 'engine-close-ack'\)\) \{ \[string\]\$_.engineDriverStage \}/u,
   'forward only allowlisted cleanup startup stages');
  assert.doesNotMatch(summary,/\.Message|\.Exception|retainedFixture|\.Path|processPid|ownerPid/u,'do not print raw errors, runner paths, or process identifiers');
 });
@@ -670,7 +682,7 @@ test('shared Windows startup failure reports only an allowlisted driver stage', 
   'the Windows receipt must allow the shared resolver completion stage');
  assert.match(probe,/safe_engine_driver_stage\(value\.get\('probeStage'\)\)/u,'consume only allowlisted progress messages before the first driver response');
  assert.match(probe,/engine_driver_stage/u,'EOF diagnostics must retain the last accepted stage');
- assert.match(canary,/engineDriverStage -in @\('codex-connect'.*'windows-socket-verification'\)/u,'the Windows receipt must forward only allowlisted stages');
+ assert.match(canary,/engineDriverStage -in @\('codex-connect'.*'windows-socket-verification', 'engine-close-request', 'engine-close-ack'\)/u,'the Windows receipt must forward only allowlisted stages');
  for(const stage of ['windows-installation','windows-owner-status','windows-desktop-discovery','windows-desktop-selection','windows-package-preparation',
   'windows-package-verification','windows-version-command','windows-owner-start','windows-owner-receipt','windows-owner-executable','windows-socket-verification']) {
   assert.ok(resolver.includes(`reportWindowsSharedProbeStage(env, '${stage}')`),`the Windows resolver must mark ${stage}`);

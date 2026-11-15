@@ -8,7 +8,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PROBE = ROOT / 'scripts/shared-protocol-probe.py'
-HELPERS = {'safe_error_type', 'safe_failure_code', 'safe_engine_driver_stage', 'record_cleanup_error', 'cleanup_failure_message', 'public_console_report', 'EngineDriver'}
+HELPERS = {'safe_error_type', 'safe_failure_code', 'safe_engine_driver_stage', 'safe_failure_location', 'public_failure_location', 'record_cleanup_error', 'cleanup_failure_message', 'public_console_report', 'EngineDriver'}
 
 
 def load_helpers(test):
@@ -16,12 +16,57 @@ def load_helpers(test):
     functions = [node for node in module.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in HELPERS]
     missing = HELPERS - {function.name for function in functions}
     test.assertEqual(missing, set(), f'missing testable cleanup diagnostics: {sorted(missing)}')
-    namespace = {'re': re, 'json': json, 'time': time, 'asyncio': asyncio, 'ENGINE_READ_TIMEOUT_SECONDS': 1}
+    namespace = {'Path': pathlib.Path, '__file__': str(PROBE), 're': re, 'json': json, 'time': time, 'asyncio': asyncio, 'ENGINE_READ_TIMEOUT_SECONDS': 1}
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(PROBE), 'exec'), namespace)
     return namespace
 
 
 class CleanupDiagnostics(unittest.TestCase):
+    def test_failure_location_reports_only_probe_function_and_line(self):
+        helpers = load_helpers(self)
+
+        class Stdin:
+            def write(self, value):
+                return None
+
+            async def drain(self):
+                return None
+
+        class Process:
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data(b'{"stopped":true}\n')
+                self.stdin = Stdin()
+                self.returncode = None
+
+        async def close():
+            try:
+                await helpers['EngineDriver'](Process()).close()
+            except AssertionError as error:
+                location = helpers['safe_failure_location'](error)
+            else:
+                self.fail('EngineDriver.close must reject the incomplete close acknowledgement')
+            self.assertEqual(location['function'], 'close')
+            self.assertIsInstance(location['line'], int)
+            self.assertGreater(location['line'], 0)
+            errors = []
+            await helpers['record_cleanup_error'](
+                errors, 'engine.close', 'engine-driver-process', helpers['EngineDriver'](Process()).close, 101, 202)
+            report = helpers['public_console_report']({
+                'result': 'failed',
+                'failureLocation': {**location, 'path': 'C:\\private\\runner'},
+                'cleanupErrors': errors,
+                'exception': 'C:\\private\\runner and synthetic conversation',
+            })
+            self.assertEqual(report['failureLocation'], location)
+            self.assertEqual(report['cleanupErrors'][0]['failureLocation']['function'], 'close')
+            self.assertIsInstance(report['cleanupErrors'][0]['failureLocation']['line'], int)
+            self.assertNotIn('private', json.dumps(report))
+            self.assertNotIn('synthetic conversation', json.dumps(report))
+            self.assertNotIn(str(PROBE.parent), json.dumps(report))
+
+        asyncio.run(close())
+
     def test_engine_eof_preserves_only_the_driver_exit_code(self):
         helpers = load_helpers(self)
 
@@ -136,6 +181,8 @@ class CleanupDiagnostics(unittest.TestCase):
         self.assertIsNone(helpers['safe_engine_driver_stage']('codex-websocket-open'))
         self.assertEqual(helpers['safe_engine_driver_stage']('windows-owner-start'), 'windows-owner-start')
         self.assertEqual(helpers['safe_engine_driver_stage']('windows-socket-verification'), 'windows-socket-verification')
+        self.assertEqual(helpers['safe_engine_driver_stage']('engine-close-request'), 'engine-close-request')
+        self.assertEqual(helpers['safe_engine_driver_stage']('engine-close-ack'), 'engine-close-ack')
         self.assertIsNone(helpers['safe_engine_driver_stage']('C:\\private\\runner'))
 
     def test_successful_cleanup_leaves_no_error(self):
@@ -195,6 +242,100 @@ class CleanupDiagnostics(unittest.TestCase):
         self.assertEqual(report['cleanupErrors'][0]['engineDriverStage'], 'native-diagnostics')
         self.assertNotIn('processPid', json.dumps(report))
         self.assertNotIn('ownerPid', json.dumps(report))
+
+    def test_engine_close_ignores_a_late_wait_response_before_the_close_ack(self):
+        helpers = load_helpers(self)
+
+        class Stdin:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, value):
+                self.writes.append(value)
+
+            async def drain(self):
+                return None
+
+        class Process:
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data(
+                    b'{"action":"wait","done":true}\n'
+                    b'{"stopped":true,"runtimeProcessId":123,"backendAlive":true}\n'
+                )
+                self.stdin = Stdin()
+                self.returncode = None
+
+            async def wait(self):
+                self.returncode = 0
+                return self.returncode
+
+        async def close():
+            process = Process()
+            await helpers['EngineDriver'](process).close()
+            self.assertEqual(len(process.stdin.writes), 1)
+            self.assertEqual(json.loads(process.stdin.writes[0]), {'action': 'close'})
+            self.assertEqual(process.returncode, 0)
+
+        asyncio.run(close())
+
+    def test_engine_close_read_timeout_preserves_the_safe_close_stage(self):
+        helpers = load_helpers(self)
+
+        class Stdout:
+            async def readline(self):
+                raise TimeoutError()
+
+        class Stdin:
+            def write(self, value):
+                return None
+
+            async def drain(self):
+                return None
+
+        class Process:
+            def __init__(self):
+                self.stdout = Stdout()
+                self.stdin = Stdin()
+                self.returncode = None
+
+        async def close():
+            with self.assertRaises(TimeoutError) as raised:
+                await helpers['EngineDriver'](Process()).close()
+            self.assertEqual(getattr(raised.exception, 'engine_driver_stage', None), 'engine-close-request')
+
+        asyncio.run(close())
+
+    def test_engine_close_fails_closed_without_a_close_ack(self):
+        helpers = load_helpers(self)
+
+        class Stdin:
+            def write(self, value):
+                return None
+
+            async def drain(self):
+                return None
+
+        class Process:
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data(b'{"backendAlive":true}\n')
+                self.stdin = Stdin()
+                self.returncode = None
+                self.wait_calls = 0
+
+            async def wait(self):
+                self.wait_calls += 1
+                self.returncode = 0
+                return self.returncode
+
+        async def close():
+            process = Process()
+            with self.assertRaisesRegex(AssertionError, 'Shared Engine driver did not acknowledge close'):
+                await helpers['EngineDriver'](process).close()
+            self.assertEqual(process.wait_calls, 0)
+
+        asyncio.run(close())
 
     def test_console_report_exposes_only_bounded_allowlisted_fields(self):
         helpers = load_helpers(self)
