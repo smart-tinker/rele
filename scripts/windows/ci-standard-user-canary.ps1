@@ -340,8 +340,8 @@ try {
     }
     $credential = New-Object System.Management.Automation.PSCredential ($env:COMPUTERNAME + '\' + $account), $password
     $resultPath = Join-Path $FixtureRoot 'windows-standard-user-results.json'
-    # The 145-minute run reached the final version report but expired before the canary exited.
-    if ($RunGates) { $gatesDeadline = [DateTime]::UtcNow.AddMinutes($(if ($Phase -eq 'Shared') { 60 } else { 155 })) }
+    # The 155-minute run expired as the installer phase began.
+    if ($RunGates) { $gatesDeadline = [DateTime]::UtcNow.AddMinutes($(if ($Phase -eq 'Shared') { 60 } else { 170 })) }
     if ($RunGates) {
         $parentStage = 'shared'
         $marker.phase = 'Shared'; $marker | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8

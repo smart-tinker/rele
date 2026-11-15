@@ -392,7 +392,7 @@ test('Windows job timeout leaves room for its bounded standard-user native gate'
  const gateTimeout=canary.match(/AddMinutes\(\$\(if \(\$Phase -eq 'Shared'\) \{ (\d+) \} else \{ (\d+) \}\)\)/u);
  assert.ok(jobTimeout,'give Windows its own timeout without extending Ubuntu');
  assert.ok(gateTimeout,'read the native gate deadline from the canary');
- assert.ok(Number(gateTimeout[2])>=155,'leave time beyond the observed 145-minute run that exhausted the old canary deadline');
+ assert.ok(Number(gateTimeout[2])>=170,'leave 15 minutes beyond the observed 155-minute run that expired as the installer phase began');
  assert.ok(Number(jobTimeout[1])>=Number(gateTimeout[2])+60,'leave time for runner setup, later checks, and cleanup');
  assert.equal(Number(jobTimeout[2]),60,'keep the Ubuntu timeout unchanged');
 });
