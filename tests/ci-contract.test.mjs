@@ -422,6 +422,18 @@ test('Windows canary timeout reports bounded native RPC and driver stages', asyn
  assert.match(summary,/\$summary\.driverOperations = @\(\$evidence\.driverOperations \| Select-Object -Last 16\)/u,'print only the latest bounded driver operation stages');
  assert.doesNotMatch(summary,/payload|\.input\b|\.text\b|stdout\.log|stderr\.log/u,'timeout diagnostics must exclude request content and raw logs');
 });
+test('shared-gate failures expose only a bounded probe function and line', async()=>{
+ const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ const start=canary.indexOf('$summary = [ordered]@{ stage =');
+ const end=canary.indexOf("Write-Output ('Windows canary bounded diagnostic:",start);
+ const summary=canary.slice(start,end);
+ assert.match(probe,/def safe_failure_location\(error\):/u,'capture the last source frame from the shared probe');
+ assert.match(probe,/report\['failureLocation'\] = safe_failure_location\(error\)/u,'retain the location in the local failure report');
+ assert.ok(start>=0&&end>start,'Windows canary must emit a bounded shared-gate diagnostic');
+ assert.match(summary,/failureLocation[\s\S]*function[\s\S]*line/u,'forward only the probe function and line');
+ assert.doesNotMatch(summary,/traceback|\.Exception|\.Message|\.Path/u,'do not forward raw traceback, error text or paths');
+});
 test('shared fixture cleanup identifies the timed out operation without raw error text', async()=>{
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
  const start=probe.indexOf('cleanup_errors = []',probe.indexOf('async def scenario(order):'));
