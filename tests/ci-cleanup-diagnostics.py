@@ -8,7 +8,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PROBE = ROOT / 'scripts/shared-protocol-probe.py'
-HELPERS = {'safe_error_type', 'safe_failure_code', 'safe_engine_driver_stage', 'record_cleanup_error', 'cleanup_failure_message', 'public_console_report', 'EngineDriver'}
+HELPERS = {'safe_error_type', 'safe_failure_code', 'safe_engine_driver_stage', 'safe_failure_location', 'record_cleanup_error', 'cleanup_failure_message', 'public_console_report', 'EngineDriver'}
 
 
 def load_helpers(test):
@@ -16,12 +16,48 @@ def load_helpers(test):
     functions = [node for node in module.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in HELPERS]
     missing = HELPERS - {function.name for function in functions}
     test.assertEqual(missing, set(), f'missing testable cleanup diagnostics: {sorted(missing)}')
-    namespace = {'re': re, 'json': json, 'time': time, 'asyncio': asyncio, 'ENGINE_READ_TIMEOUT_SECONDS': 1}
+    namespace = {'Path': pathlib.Path, '__file__': str(PROBE), 're': re, 'json': json, 'time': time, 'asyncio': asyncio, 'ENGINE_READ_TIMEOUT_SECONDS': 1}
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(PROBE), 'exec'), namespace)
     return namespace
 
 
 class CleanupDiagnostics(unittest.TestCase):
+    def test_failure_location_reports_only_probe_function_and_line(self):
+        helpers = load_helpers(self)
+
+        class Stdin:
+            def write(self, value):
+                return None
+
+            async def drain(self):
+                return None
+
+        class Process:
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data(b'{"stopped":true}\n')
+                self.stdin = Stdin()
+                self.returncode = None
+
+        async def close():
+            with self.assertRaises(AssertionError) as raised:
+                await helpers['EngineDriver'](Process()).close()
+            location = helpers['safe_failure_location'](raised.exception)
+            self.assertEqual(location['function'], 'close')
+            self.assertIsInstance(location['line'], int)
+            self.assertGreater(location['line'], 0)
+            report = helpers['public_console_report']({
+                'result': 'failed',
+                'failureLocation': location,
+                'exception': 'C:\\private\\runner and synthetic conversation',
+            })
+            self.assertEqual(report['failureLocation'], location)
+            self.assertNotIn('private', json.dumps(report))
+            self.assertNotIn('synthetic conversation', json.dumps(report))
+            self.assertNotIn(str(PROBE.parent), json.dumps(report))
+
+        asyncio.run(close())
+
     def test_engine_eof_preserves_only_the_driver_exit_code(self):
         helpers = load_helpers(self)
 
