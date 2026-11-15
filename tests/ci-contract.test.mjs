@@ -211,20 +211,16 @@ test('package smoke uses a fixed extractor and verifies the bundled runtime by s
  const source=await readFile(new URL('../scripts/smoke-package.mjs',import.meta.url),'utf8');
  assert.doesNotMatch(source,/function run\(command,/u);
  assert.doesNotMatch(source,/process\.argv\[2\]/u);
- assert.match(source,/const extractor = process\.platform === 'win32' \? 'tar\.exe' : 'tar';/u);
+ assert.match(source,/const extractor = process\.platform === 'win32' \? 'powershell\.exe' : 'tar';/u);
  assert.match(source,/execFileSync\(extractor,\s*extractionArgs,\s*\{[^}]*shell:\s*false\s*\}/u);
  assert.match(source,/child = spawn\(/u);
  assert.match(source,/new URL\('api\/health'/u);
 });
-test('Windows package smoke extracts ZIPs with tar arguments, not a PowerShell command', async()=>{
+test('Windows package smoke expands ZIPs with a static PowerShell command and environment paths', async()=>{
  const source=await readFile(new URL('../scripts/smoke-package.mjs',import.meta.url),'utf8');
- assert.match(source,/process\.platform === 'win32'\s+\? \['-xf', extractionArchive, '-C', temporary\]\s+: \['-xzf', archive, '-C', temporary\]/u);
-});
-test('Windows tar receives a relative archive path so drive letters are not parsed as remote hosts', async()=>{
- const source=await readFile(new URL('../scripts/smoke-package.mjs',import.meta.url),'utf8');
- assert.match(source,/const extractionArchive = process\.platform === 'win32'\s+\? path\.relative\(root, archive\)\.replaceAll\(path\.sep, '\/'\)\s+: archive;/u);
- assert.match(source,/\? \['-xf', extractionArchive, '-C', temporary\]/u);
- assert.match(source,/execFileSync\(extractor,\s*extractionArgs,\s*\{[^}]*cwd:\s*root[^}]*shell:\s*false\s*\}/u);
+ assert.match(source,/process\.platform === 'win32'\s+\? \['-NoProfile', '-NonInteractive', '-Command', 'Expand-Archive -LiteralPath \$env:RELE_SMOKE_ARCHIVE -DestinationPath \$env:RELE_SMOKE_DESTINATION'\]\s+: \['-xzf', archive, '-C', temporary\]/u);
+ assert.match(source,/env:\s*\{ \.\.\.process\.env, RELE_SMOKE_ARCHIVE:\s*archive, RELE_SMOKE_DESTINATION:\s*temporary \}/u);
+ assert.match(source,/execFileSync\(extractor,\s*extractionArgs,\s*\{[^}]*shell:\s*false\s*\}/u);
 });
 test('shared wait timeout reports bounded request correlation without message bodies', async()=>{
  let summarize;
