@@ -207,9 +207,9 @@ test('workflow requirement lists tolerate empty conditional groups', async()=>{
   assert.equal(result.status,0,result.stderr);
  }
 });
-test('package smoke subprocesses explicitly disable shell interpretation', async()=>{
+test('package smoke subprocesses use execFileSync with shell interpretation disabled', async()=>{
  const source=await readFile(new URL('../scripts/smoke-package.mjs',import.meta.url),'utf8');
- assert.match(source,/spawnSync\(command,\s*args,\s*\{[^}]*\.\.\.options,\s*shell:\s*false\s*\}/u);
+ assert.match(source,/execFileSync\(command,\s*args,\s*\{[^}]*\.\.\.options,\s*shell:\s*false\s*\}/u);
 });
 test('Windows package smoke extracts ZIPs with tar arguments, not a PowerShell command', async()=>{
  const source=await readFile(new URL('../scripts/smoke-package.mjs',import.meta.url),'utf8');

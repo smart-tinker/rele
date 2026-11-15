@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
@@ -23,10 +23,7 @@ let closed;
 let childError;
 let primaryError;
 function run(command, args, options = {}) {
-  const result = spawnSync(command, args, { encoding: 'utf8', windowsHide: true, ...options, shell: false });
-  if (result.error) throw result.error;
-  assert.equal(result.status, 0, result.stderr || `${command} failed`);
-  return result.stdout;
+  return execFileSync(command, args, { encoding: 'utf8', windowsHide: true, ...options, shell: false });
 }
 try {
   if (process.platform === 'win32') run('tar.exe', ['-xf', archive, '-C', temporary]);
