@@ -38,6 +38,8 @@ try {
   const manifest = JSON.parse(await readFile(path.join(extracted, 'manifest.json'), 'utf8'));
   assert.equal(manifest.version, metadata.version);
   assert.equal(manifest.node, '24.19.0');
+  const runtime = path.join(extracted, 'runtime', process.platform === 'win32' ? 'node.exe' : 'node');
+  assert.equal(execFileSync(runtime, ['--version'], { encoding: 'utf8', windowsHide: true, shell: false }).trim(), `v${manifest.node}`);
   const env = { ...process.env, RELE_PORT: '0', RELE_DATA_DIR: path.join(temporary, 'state'), CODEX_HOME: path.join(temporary, 'codex-profile') };
   for (const key of ['OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN']) delete env[key];
   child = spawn(process.platform === 'win32' ? path.join(extracted, 'dist/native/Rele.Process.exe') : path.join(extracted, 'start-rele.sh'),

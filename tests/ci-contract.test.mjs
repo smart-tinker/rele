@@ -213,6 +213,9 @@ test('package smoke uses a fixed extractor and verifies the bundled runtime by s
  assert.doesNotMatch(source,/process\.argv\[2\]/u);
  assert.match(source,/const extractor = process\.platform === 'win32' \? 'powershell\.exe' : 'tar';/u);
  assert.match(source,/execFileSync\(extractor,\s*extractionArgs,\s*\{[^}]*shell:\s*false\s*\}/u);
+ assert.match(source,/const runtime = path\.join\(extracted, 'runtime', process\.platform === 'win32' \? 'node\.exe' : 'node'\);/u);
+ assert.match(source,/execFileSync\(runtime,\s*\['--version'\],\s*\{[^}]*shell:\s*false[^}]*\}\)\.trim\(\)/u);
+ assert.match(source,/`v\$\{manifest\.node\}`/u);
  assert.match(source,/child = spawn\(/u);
  assert.match(source,/new URL\('api\/health'/u);
 });
