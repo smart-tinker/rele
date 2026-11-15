@@ -196,6 +196,42 @@ class CleanupDiagnostics(unittest.TestCase):
         self.assertNotIn('processPid', json.dumps(report))
         self.assertNotIn('ownerPid', json.dumps(report))
 
+    def test_engine_close_ignores_a_late_wait_response_before_the_close_ack(self):
+        helpers = load_helpers(self)
+
+        class Stdin:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, value):
+                self.writes.append(value)
+
+            async def drain(self):
+                return None
+
+        class Process:
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data(
+                    b'{"action":"wait","done":true}\n'
+                    b'{"stopped":true,"runtimeProcessId":123,"backendAlive":true}\n'
+                )
+                self.stdin = Stdin()
+                self.returncode = None
+
+            async def wait(self):
+                self.returncode = 0
+                return self.returncode
+
+        async def close():
+            process = Process()
+            await helpers['EngineDriver'](process).close()
+            self.assertEqual(len(process.stdin.writes), 1)
+            self.assertEqual(json.loads(process.stdin.writes[0]), {'action': 'close'})
+            self.assertEqual(process.returncode, 0)
+
+        asyncio.run(close())
+
     def test_console_report_exposes_only_bounded_allowlisted_fields(self):
         helpers = load_helpers(self)
         report = {
