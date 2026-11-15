@@ -23,14 +23,14 @@ let closed;
 let childError;
 let primaryError;
 try {
-  const extractor = process.platform === 'win32' ? 'tar.exe' : 'tar';
-  const extractionArchive = process.platform === 'win32'
-    ? path.relative(root, archive).replaceAll(path.sep, '/')
-    : archive;
+  const extractor = process.platform === 'win32' ? 'powershell.exe' : 'tar';
+  const extractionEnv = process.platform === 'win32'
+    ? { ...process.env, RELE_SMOKE_ARCHIVE: archive, RELE_SMOKE_DESTINATION: temporary }
+    : process.env;
   const extractionArgs = process.platform === 'win32'
-    ? ['-xf', extractionArchive, '-C', temporary]
+    ? ['-NoProfile', '-NonInteractive', '-Command', 'Expand-Archive -LiteralPath $env:RELE_SMOKE_ARCHIVE -DestinationPath $env:RELE_SMOKE_DESTINATION -ErrorAction Stop']
     : ['-xzf', archive, '-C', temporary];
-  execFileSync(extractor, extractionArgs, { cwd: root, encoding: 'utf8', windowsHide: true, shell: false });
+  execFileSync(extractor, extractionArgs, { cwd: root, env: extractionEnv, encoding: 'utf8', windowsHide: true, shell: false });
   const extracted = path.join(temporary, name);
   for (const file of ['LICENSE', 'THIRD_PARTY_NOTICES.md']) {
     assert.equal(await readFile(path.join(extracted, file), 'utf8'), await readFile(path.join(root, file), 'utf8'), `${file} must survive packaging`);
