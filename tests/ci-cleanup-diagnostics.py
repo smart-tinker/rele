@@ -40,9 +40,12 @@ class CleanupDiagnostics(unittest.TestCase):
                 self.returncode = None
 
         async def close():
-            with self.assertRaises(AssertionError) as raised:
+            try:
                 await helpers['EngineDriver'](Process()).close()
-            location = helpers['safe_failure_location'](raised.exception)
+            except AssertionError as error:
+                location = helpers['safe_failure_location'](error)
+            else:
+                self.fail('EngineDriver.close must reject the incomplete close acknowledgement')
             self.assertEqual(location['function'], 'close')
             self.assertIsInstance(location['line'], int)
             self.assertGreater(location['line'], 0)
