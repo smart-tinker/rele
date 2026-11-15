@@ -326,7 +326,22 @@ class EngineDriver:
 
     async def close(self):
         if self.process.returncode is None:
-            result = await self.command('close')
+            self.process.stdin.write((json.dumps({'action': 'close'}) + '\n').encode())
+            await self.process.stdin.drain()
+            deadline = asyncio.get_running_loop().time() + ENGINE_READ_TIMEOUT_SECONDS
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError('Shared Engine driver did not acknowledge close')
+                result = await self.read(remaining)
+                if isinstance(result, dict) and result.get('stopped') is True:
+                    if not isinstance(result.get('backendAlive'), bool):
+                        raise RuntimeError('Shared Engine driver returned an invalid close response')
+                    break
+                # A timed-out parent read can leave its command reply ahead of close's ACK.
+                if (not isinstance(result, dict) or
+                        result.get('action') not in ('ingest', 'wait', 'answer', 'resume', 'cancel', 'snapshot')):
+                    raise RuntimeError('Shared Engine driver returned an invalid close response')
             assert result['backendAlive'], 'Closing Rele stopped the shared native backend'
             await asyncio.wait_for(self.process.wait(), 15)
         if self.process.returncode != 0:

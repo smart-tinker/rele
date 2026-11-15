@@ -111,6 +111,65 @@ class CleanupDiagnostics(unittest.TestCase):
 
         asyncio.run(read_ready())
 
+    def test_engine_close_ignores_a_late_command_reply_before_its_ack(self):
+        helpers = load_helpers(self)
+
+        class Process:
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data(b'{"action":"wait","done":true}\n'
+                                      b'{"stopped":true,"runtimeProcessId":123,"backendAlive":true}\n')
+                self.stdout.feed_eof()
+                self.stdin = self
+                self.returncode = None
+                self.written = []
+
+            def write(self, value):
+                self.written.append(value)
+
+            async def drain(self):
+                return None
+
+            async def wait(self):
+                self.returncode = 0
+                return self.returncode
+
+        async def close():
+            process = Process()
+            await helpers['EngineDriver'](process).close()
+            self.assertEqual(len(process.written), 1)
+            self.assertEqual(json.loads(process.written[0]), {'action': 'close'})
+
+        asyncio.run(close())
+
+    def test_engine_close_rejects_dead_or_malformed_backend_acknowledgments(self):
+        helpers = load_helpers(self)
+
+        class Process:
+            def __init__(self, response):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data((json.dumps(response) + '\n').encode())
+                self.stdout.feed_eof()
+                self.stdin = self
+                self.returncode = None
+
+            def write(self, _value):
+                return None
+
+            async def drain(self):
+                return None
+
+        async def close():
+            for response, error, message in (
+                ({'stopped': True, 'backendAlive': False}, AssertionError, 'Closing Rele stopped'),
+                ({'stopped': True, 'backendAlive': 'unknown'}, RuntimeError, 'invalid close response'),
+            ):
+                with self.subTest(response=response):
+                    with self.assertRaisesRegex(error, message):
+                        await helpers['EngineDriver'](Process(response)).close()
+
+        asyncio.run(close())
+
     def test_failure_code_only_maps_known_static_native_failures(self):
         helpers = load_helpers(self)
         self.assertEqual(
