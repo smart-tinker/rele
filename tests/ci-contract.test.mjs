@@ -218,7 +218,7 @@ test('package smoke uses a fixed extractor and verifies the bundled runtime by s
 });
 test('Windows package smoke extracts ZIPs with tar arguments, not a PowerShell command', async()=>{
  const source=await readFile(new URL('../scripts/smoke-package.mjs',import.meta.url),'utf8');
- assert.match(source,/process\.platform === 'win32'\s+\? \['-xf', archive, '-C', temporary\]\s+: \['-xzf', archive, '-C', temporary\]/u);
+ assert.match(source,/process\.platform === 'win32'\s+\? \['-xf', extractionArchive, '-C', temporary\]\s+: \['-xzf', archive, '-C', temporary\]/u);
 });
 test('Windows tar receives a relative archive path so drive letters are not parsed as remote hosts', async()=>{
  const source=await readFile(new URL('../scripts/smoke-package.mjs',import.meta.url),'utf8');
