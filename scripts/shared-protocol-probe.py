@@ -66,6 +66,32 @@ def safe_engine_driver_stage(value):
                               'engine-close-request', 'engine-close-ack') else None
 
 
+def safe_failure_location(error):
+    source = Path(__file__).resolve()
+    frame = error.__traceback__
+    location = None
+    while frame is not None:
+        code = frame.tb_frame.f_code
+        if Path(code.co_filename).resolve() == source:
+            function = code.co_name
+            line = frame.tb_lineno
+            if isinstance(line, int) and 1 <= line <= 100000:
+                location = {'function': function if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,63}', function) else 'other', 'line': line}
+        frame = frame.tb_next
+    return location
+
+
+def public_failure_location(value):
+    if not isinstance(value, dict):
+        return None
+    function = value.get('function')
+    line = value.get('line')
+    if isinstance(function, str) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,63}', function) \
+            and isinstance(line, int) and not isinstance(line, bool) and 1 <= line <= 100000:
+        return {'function': function, 'line': line}
+    return None
+
+
 async def record_cleanup_error(errors, operation, resource, action, process_pid=None, owner_pid=None):
     started = time.monotonic()
     try:
@@ -73,6 +99,7 @@ async def record_cleanup_error(errors, operation, resource, action, process_pid=
     except Exception as error:
         failure_code = safe_failure_code(error)
         driver_stage = safe_engine_driver_stage(getattr(error, 'engine_driver_stage', None))
+        failure_location = safe_failure_location(error)
         exit_code = getattr(error, 'engine_driver_exit_code', None)
         errors.append({
             'operation': operation if operation in ('engine.close', 'observer.close', 'peer.close', 'native.stop') else 'other',
@@ -81,6 +108,7 @@ async def record_cleanup_error(errors, operation, resource, action, process_pid=
             'resource': resource if resource in ('engine-driver-process', 'desktop-shim-process', 'direct-websocket', 'native-owner', 'native-daemon') else 'other',
             **({'failureCode': failure_code} if failure_code else {}),
             **({'engineDriverStage': driver_stage} if driver_stage else {}),
+            **({'failureLocation': failure_location} if failure_location else {}),
             **({'engineDriverExitCode': max(-(2**31), min(2**32 - 1, exit_code))}
                if isinstance(exit_code, int) and not isinstance(exit_code, bool) else {}),
             **({'processPid': process_pid} if isinstance(process_pid, int) and not isinstance(process_pid, bool) and process_pid > 0 else {}),
@@ -108,6 +136,9 @@ def public_console_report(report):
     failure_type = report.get('failureType')
     if isinstance(failure_type, str) and re.fullmatch(r'[A-Za-z]{1,48}', failure_type):
         output['failureType'] = failure_type
+    failure_location = public_failure_location(report.get('failureLocation'))
+    if failure_location:
+        output['failureLocation'] = failure_location
     failure_code = report.get('failureCode')
     if failure_code in ('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty', 'engine-driver-exited-before-response'):
         output['failureCode'] = failure_code
@@ -130,6 +161,8 @@ def public_console_report(report):
             'resource': error.get('resource') if error.get('resource') in ('engine-driver-process', 'desktop-shim-process', 'direct-websocket', 'native-owner', 'native-daemon') else 'other',
             **({'failureCode': error.get('failureCode')} if error.get('failureCode') in ('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty', 'engine-driver-exited-before-response') else {}),
             **({'engineDriverStage': safe_engine_driver_stage(error.get('engineDriverStage'))} if safe_engine_driver_stage(error.get('engineDriverStage')) else {}),
+            **({'failureLocation': public_failure_location(error.get('failureLocation'))}
+               if public_failure_location(error.get('failureLocation')) else {}),
             **({'engineDriverExitCode': max(-(2**31), min(2**32 - 1, error['engineDriverExitCode']))}
                if isinstance(error.get('engineDriverExitCode'), int) and not isinstance(error.get('engineDriverExitCode'), bool) else {}),
         })
@@ -1244,6 +1277,9 @@ enabled=false
         report['result'] = 'failed'
         report['failureType'] = safe_error_type(error)
         report['failureCode'] = safe_failure_code(error)
+        failure_location = safe_failure_location(error)
+        if failure_location:
+            report['failureLocation'] = failure_location
         exit_code = getattr(error, 'engine_driver_exit_code', None)
         if isinstance(exit_code, int) and not isinstance(exit_code, bool):
             report['engineDriverExitCode'] = exit_code

@@ -8,7 +8,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PROBE = ROOT / 'scripts/shared-protocol-probe.py'
-HELPERS = {'safe_error_type', 'safe_failure_code', 'safe_engine_driver_stage', 'safe_failure_location', 'record_cleanup_error', 'cleanup_failure_message', 'public_console_report', 'EngineDriver'}
+HELPERS = {'safe_error_type', 'safe_failure_code', 'safe_engine_driver_stage', 'safe_failure_location', 'public_failure_location', 'record_cleanup_error', 'cleanup_failure_message', 'public_console_report', 'EngineDriver'}
 
 
 def load_helpers(test):
@@ -46,12 +46,18 @@ class CleanupDiagnostics(unittest.TestCase):
             self.assertEqual(location['function'], 'close')
             self.assertIsInstance(location['line'], int)
             self.assertGreater(location['line'], 0)
+            errors = []
+            await helpers['record_cleanup_error'](
+                errors, 'engine.close', 'engine-driver-process', helpers['EngineDriver'](Process()).close, 101, 202)
             report = helpers['public_console_report']({
                 'result': 'failed',
-                'failureLocation': location,
+                'failureLocation': {**location, 'path': 'C:\\private\\runner'},
+                'cleanupErrors': errors,
                 'exception': 'C:\\private\\runner and synthetic conversation',
             })
             self.assertEqual(report['failureLocation'], location)
+            self.assertEqual(report['cleanupErrors'][0]['failureLocation']['function'], 'close')
+            self.assertIsInstance(report['cleanupErrors'][0]['failureLocation']['line'], int)
             self.assertNotIn('private', json.dumps(report))
             self.assertNotIn('synthetic conversation', json.dumps(report))
             self.assertNotIn(str(PROBE.parent), json.dumps(report))
