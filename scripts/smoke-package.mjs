@@ -23,7 +23,7 @@ let closed;
 let childError;
 let primaryError;
 function run(command, args, options = {}) {
-  const result = spawnSync(command, args, { encoding: 'utf8', windowsHide: true, ...options });
+  const result = spawnSync(command, args, { encoding: 'utf8', windowsHide: true, ...options, shell: false });
   if (result.error) throw result.error;
   assert.equal(result.status, 0, result.stderr || `${command} failed`);
   return result.stdout;
