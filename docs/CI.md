@@ -44,10 +44,10 @@ Dependabot отдельно открывает еженедельные PR дл�
 
 `CI gate` завершается ошибкой, если хотя бы одна ОС выбранной matrix не прошла;
 невыбранный release/обычный caller обязан быть `skipped`. Он не агрегирует CodeQL
-и dependency review. Активный ruleset защищает `main` от удаления и force-push,
-требует разрешения review threads и успешный `CI gate` от GitHub Actions на
-актуальной ветке (проверено 2026-11-12). Security workflows добавлены; включение их
-в required checks после интеграции отслеживается в issue #8.
+и dependency review: это отдельные обязательные checks. Активный ruleset защищает
+`main` от удаления и force-push, требует разрешения review threads и успешных
+`CI gate`, `CodeQL` и `Dependency review` от GitHub Actions на актуальной ветке
+(сверено с GitHub 2026-11-14).
 
 Версии Codex берутся из `SUPPORTED_CODEX_VERSIONS`, отдельного списка в YAML нет.
 Фикстуры используют изолированные профили и подменённый model endpoint; реальные
