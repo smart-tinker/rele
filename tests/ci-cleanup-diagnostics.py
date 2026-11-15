@@ -261,6 +261,37 @@ class CleanupDiagnostics(unittest.TestCase):
 
         asyncio.run(close())
 
+    def test_engine_close_fails_closed_without_a_close_ack(self):
+        helpers = load_helpers(self)
+
+        class Stdin:
+            def write(self, value):
+                return None
+
+            async def drain(self):
+                return None
+
+        class Process:
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data(b'{"backendAlive":true}\n')
+                self.stdin = Stdin()
+                self.returncode = None
+                self.wait_calls = 0
+
+            async def wait(self):
+                self.wait_calls += 1
+                self.returncode = 0
+                return self.returncode
+
+        async def close():
+            process = Process()
+            with self.assertRaisesRegex(AssertionError, 'Shared Engine driver did not acknowledge close'):
+                await helpers['EngineDriver'](process).close()
+            self.assertEqual(process.wait_calls, 0)
+
+        asyncio.run(close())
+
     def test_console_report_exposes_only_bounded_allowlisted_fields(self):
         helpers = load_helpers(self)
         report = {
