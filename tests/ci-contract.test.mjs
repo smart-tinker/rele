@@ -207,13 +207,18 @@ test('workflow requirement lists tolerate empty conditional groups', async()=>{
   assert.equal(result.status,0,result.stderr);
  }
 });
-test('package smoke subprocesses use execFileSync with shell interpretation disabled', async()=>{
+test('package smoke uses a fixed extractor and verifies the bundled runtime by serving', async()=>{
  const source=await readFile(new URL('../scripts/smoke-package.mjs',import.meta.url),'utf8');
- assert.match(source,/execFileSync\(command,\s*args,\s*\{[^}]*\.\.\.options,\s*shell:\s*false\s*\}/u);
+ assert.doesNotMatch(source,/function run\(command,/u);
+ assert.doesNotMatch(source,/process\.argv\[2\]/u);
+ assert.match(source,/const extractor = process\.platform === 'win32' \? 'tar\.exe' : 'tar';/u);
+ assert.match(source,/execFileSync\(extractor,\s*extractionArgs,\s*\{[^}]*shell:\s*false\s*\}/u);
+ assert.match(source,/child = spawn\(/u);
+ assert.match(source,/new URL\('api\/health'/u);
 });
 test('Windows package smoke extracts ZIPs with tar arguments, not a PowerShell command', async()=>{
  const source=await readFile(new URL('../scripts/smoke-package.mjs',import.meta.url),'utf8');
- assert.match(source,/if \(process\.platform === 'win32'\) run\('tar\.exe', \['-xf', archive, '-C', temporary\]\);/u);
+ assert.match(source,/process\.platform === 'win32'\s+\? \['-xf', archive, '-C', temporary\]\s+: \['-xzf', archive, '-C', temporary\]/u);
 });
 test('shared wait timeout reports bounded request correlation without message bodies', async()=>{
  let summarize;
