@@ -220,6 +220,12 @@ test('Windows package smoke extracts ZIPs with tar arguments, not a PowerShell c
  const source=await readFile(new URL('../scripts/smoke-package.mjs',import.meta.url),'utf8');
  assert.match(source,/process\.platform === 'win32'\s+\? \['-xf', archive, '-C', temporary\]\s+: \['-xzf', archive, '-C', temporary\]/u);
 });
+test('Windows tar receives a relative archive path so drive letters are not parsed as remote hosts', async()=>{
+ const source=await readFile(new URL('../scripts/smoke-package.mjs',import.meta.url),'utf8');
+ assert.match(source,/const extractionArchive = process\.platform === 'win32'\s+\? path\.relative\(root, archive\)\.replaceAll\(path\.sep, '\/'\)\s+: archive;/u);
+ assert.match(source,/\? \['-xf', extractionArchive, '-C', temporary\]/u);
+ assert.match(source,/execFileSync\(extractor,\s*extractionArgs,\s*\{[^}]*cwd:\s*root[^}]*shell:\s*false\s*\}/u);
+});
 test('shared wait timeout reports bounded request correlation without message bodies', async()=>{
  let summarize;
  try { ({summarizeSharedWaitFailure:summarize}=await import('../scripts/shared-probe-diagnostics.mjs')); }
