@@ -429,7 +429,7 @@ test('shared-gate failures expose only a bounded probe function and line', async
  const end=canary.indexOf("Write-Output ('Windows canary bounded diagnostic:",start);
  const summary=canary.slice(start,end);
  assert.match(probe,/def safe_failure_location\(error\):/u,'capture the last source frame from the shared probe');
- assert.match(probe,/report\['failureLocation'\] = safe_failure_location\(error\)/u,'retain the location in the local failure report');
+ assert.match(probe,/failure_location = safe_failure_location\(error\)[\s\S]{0,120}report\['failureLocation'\] = failure_location/u,'retain the bounded location in the local failure report');
  assert.ok(start>=0&&end>start,'Windows canary must emit a bounded shared-gate diagnostic');
  assert.match(summary,/failureLocation[\s\S]*function[\s\S]*line/u,'forward only the probe function and line');
  assert.doesNotMatch(summary,/traceback|\.Exception|\.Message|\.Path/u,'do not forward raw traceback, error text or paths');
