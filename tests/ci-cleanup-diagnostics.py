@@ -136,6 +136,8 @@ class CleanupDiagnostics(unittest.TestCase):
         self.assertIsNone(helpers['safe_engine_driver_stage']('codex-websocket-open'))
         self.assertEqual(helpers['safe_engine_driver_stage']('windows-owner-start'), 'windows-owner-start')
         self.assertEqual(helpers['safe_engine_driver_stage']('windows-socket-verification'), 'windows-socket-verification')
+        self.assertEqual(helpers['safe_engine_driver_stage']('engine-close-request'), 'engine-close-request')
+        self.assertEqual(helpers['safe_engine_driver_stage']('engine-close-ack'), 'engine-close-ack')
         self.assertIsNone(helpers['safe_engine_driver_stage']('C:\\private\\runner'))
 
     def test_successful_cleanup_leaves_no_error(self):
@@ -229,6 +231,33 @@ class CleanupDiagnostics(unittest.TestCase):
             self.assertEqual(len(process.stdin.writes), 1)
             self.assertEqual(json.loads(process.stdin.writes[0]), {'action': 'close'})
             self.assertEqual(process.returncode, 0)
+
+        asyncio.run(close())
+
+    def test_engine_close_read_timeout_preserves_the_safe_close_stage(self):
+        helpers = load_helpers(self)
+
+        class Stdout:
+            async def readline(self):
+                raise TimeoutError()
+
+        class Stdin:
+            def write(self, value):
+                return None
+
+            async def drain(self):
+                return None
+
+        class Process:
+            def __init__(self):
+                self.stdout = Stdout()
+                self.stdin = Stdin()
+                self.returncode = None
+
+        async def close():
+            with self.assertRaises(TimeoutError) as raised:
+                await helpers['EngineDriver'](Process()).close()
+            self.assertEqual(getattr(raised.exception, 'engine_driver_stage', None), 'engine-close-request')
 
         asyncio.run(close())
 

@@ -62,7 +62,8 @@ def safe_engine_driver_stage(value):
                               'windows-owner-status', 'windows-desktop-discovery', 'windows-desktop-selection',
                               'windows-package-preparation', 'windows-package-verification',
                               'windows-version-command', 'windows-owner-start', 'windows-owner-receipt',
-                              'windows-owner-executable', 'windows-socket-verification') else None
+                              'windows-owner-executable', 'windows-socket-verification',
+                              'engine-close-request', 'engine-close-ack') else None
 
 
 async def record_cleanup_error(errors, operation, resource, action, process_pid=None, owner_pid=None):
@@ -326,9 +327,18 @@ class EngineDriver:
 
     async def close(self):
         if self.process.returncode is None:
-            result = await self.command('close')
-            assert result['backendAlive'], 'Closing Rele stopped the shared native backend'
-            await asyncio.wait_for(self.process.wait(), 15)
+            self.startup_stage = 'engine-close-request'
+            try:
+                result = await self.command('close')
+                while isinstance(result, dict) and result.get('action') == 'wait':
+                    result = await self.read()
+                self.startup_stage = 'engine-close-ack'
+                assert isinstance(result, dict) and result.get('stopped') is True, 'Shared Engine driver did not acknowledge close'
+                assert result.get('backendAlive'), 'Closing Rele stopped the shared native backend'
+                await asyncio.wait_for(self.process.wait(), 15)
+            except Exception as error:
+                error.engine_driver_stage = self.startup_stage
+                raise
         if self.process.returncode != 0:
             error = AssertionError()
             error.engine_driver_exit_code = self.process.returncode
