@@ -1,5 +1,6 @@
 import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
+import rateLimit from '@fastify/rate-limit';
 import { existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
@@ -53,6 +54,19 @@ function localHost(host: string | undefined): boolean {
 
 export function createApp(services: AppServices) {
   const app = Fastify({ logger: false, bodyLimit: 100_000, requestTimeout: 30_000, trustProxy: false });
+  const rateLimitGroup = (request: { method: string; url: string }) => {
+    const route = request.url.split('?')[0];
+    if (request.method === 'POST' && route === '/api/codex/connect') return 'connect';
+    if (request.method === 'GET' && route === '/api/codex/desktop-integration') return 'desktop-status';
+    return 'default';
+  };
+  app.register(rateLimit, {
+    global: false,
+    timeWindow: '1 minute',
+    max: request => rateLimitGroup(request) === 'connect' ? 5 : rateLimitGroup(request) === 'desktop-status' ? 60 : 600,
+    keyGenerator: request => `${request.ip}:${rateLimitGroup(request)}`,
+  });
+  app.addHook('onRequest', (request, reply) => app.rateLimit().call(app, request, reply));
   const { store, config, engine } = services;
   const launchTokens = new Map<string, number>();
   const startedAt = new Date().toISOString();
