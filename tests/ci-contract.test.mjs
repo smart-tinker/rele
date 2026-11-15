@@ -211,6 +211,10 @@ test('package smoke subprocesses explicitly disable shell interpretation', async
  const source=await readFile(new URL('../scripts/smoke-package.mjs',import.meta.url),'utf8');
  assert.match(source,/spawnSync\(command,\s*args,\s*\{[^}]*\.\.\.options,\s*shell:\s*false\s*\}/u);
 });
+test('Windows package smoke extracts ZIPs with tar arguments, not a PowerShell command', async()=>{
+ const source=await readFile(new URL('../scripts/smoke-package.mjs',import.meta.url),'utf8');
+ assert.match(source,/if \(process\.platform === 'win32'\) run\('tar\.exe', \['-xf', archive, '-C', temporary\]\);/u);
+});
 test('shared wait timeout reports bounded request correlation without message bodies', async()=>{
  let summarize;
  try { ({summarizeSharedWaitFailure:summarize}=await import('../scripts/shared-probe-diagnostics.mjs')); }

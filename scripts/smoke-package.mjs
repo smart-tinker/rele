@@ -29,9 +29,7 @@ function run(command, args, options = {}) {
   return result.stdout;
 }
 try {
-  if (process.platform === 'win32') run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-    'Expand-Archive -LiteralPath $env:RELE_SMOKE_ARCHIVE -DestinationPath $env:RELE_SMOKE_DIRECTORY'],
-  { env: { ...process.env, RELE_SMOKE_ARCHIVE: archive, RELE_SMOKE_DIRECTORY: temporary } });
+  if (process.platform === 'win32') run('tar.exe', ['-xf', archive, '-C', temporary]);
   else run('tar', ['-xzf', archive, '-C', temporary]);
   const extracted = path.join(temporary, name);
   for (const file of ['LICENSE', 'THIRD_PARTY_NOTICES.md']) {
