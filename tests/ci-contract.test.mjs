@@ -219,12 +219,14 @@ test('package smoke uses a fixed extractor and verifies the bundled runtime by s
  assert.match(source,/child = spawn\(/u);
  assert.match(source,/new URL\('api\/health'/u);
 });
-test('Windows package smoke expands ZIPs with a static PowerShell command and environment paths', async()=>{
+test('Windows package smoke passes ZIP paths as arguments to a static PowerShell script', async()=>{
  const source=await readFile(new URL('../scripts/smoke-package.mjs',import.meta.url),'utf8');
- assert.match(source,/process\.platform === 'win32'\s+\? \['-NoProfile', '-NonInteractive', '-Command', 'Expand-Archive -LiteralPath \$env:RELE_SMOKE_ARCHIVE -DestinationPath \$env:RELE_SMOKE_DESTINATION -ErrorAction Stop'\]\s+: \['-xzf', archive, '-C', temporary\]/u);
- assert.match(source,/const extractionEnv = process\.platform === 'win32'\s+\?\s*\{\s*\.\.\.process\.env, RELE_SMOKE_ARCHIVE:\s*archive, RELE_SMOKE_DESTINATION:\s*temporary\s*\}\s+: process\.env;/u);
- assert.match(source,/env:\s*extractionEnv/u);
+ assert.match(source,/process\.platform === 'win32'\s+\? \['-NoProfile', '-NonInteractive', '-File', path\.join\(root, 'scripts', 'extract-package-archive\.ps1'\), archive, temporary\]\s+: \['-xzf', archive, '-C', temporary\]/u);
+ assert.doesNotMatch(source,/RELE_SMOKE_/u);
  assert.match(source,/execFileSync\(extractor,\s*extractionArgs,\s*\{[^}]*shell:\s*false\s*\}/u);
+ const extractor=await readFile(new URL('../scripts/extract-package-archive.ps1',import.meta.url),'utf8');
+ assert.match(extractor,/param\s*\(\s*\[string\]\s*\$Archive,\s*\[string\]\s*\$Destination\s*\)/u);
+ assert.match(extractor,/Expand-Archive -LiteralPath \$Archive -DestinationPath \$Destination -ErrorAction Stop/u);
 });
 test('shared wait timeout reports bounded request correlation without message bodies', async()=>{
  let summarize;
