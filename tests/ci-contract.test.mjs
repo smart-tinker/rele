@@ -460,8 +460,18 @@ test('Windows canary summary exposes bounded cleanup failure categories', async(
  const end=canary.indexOf("Write-Output ('Windows canary bounded diagnostic:",start);
  const summary=canary.slice(start,end);
  assert.ok(start>=0&&end>start,'Windows canary must emit a bounded timeout summary');
+ assert.match(summary,/\$summary\.canaryCleanupErrors\s*=\s*@\(\$result\.cleanupErrors\s*\|\s*Select-Object -Last 8/u,
+  'report the parent canary cleanup failures that decide the gate result');
  assert.match(summary,/\$summary\.cleanupErrors\s*=\s*@\(\$sharedDiagnostic\.cleanupErrors\s*\|\s*Select-Object -Last 8/u,
-  'emit only the latest cleanup failures');
+  'preserve the existing nested shared-probe cleanup field');
+ assert.match(summary,/step = if \(\$_\.step -in @\('retained-shared-report'.*'fixture'\)\) \{ \[string\]\$_.step \}/u,
+  'allow only known parent cleanup step names');
+ assert.match(summary,/errorType = if \(\[string\]\$_.errorType -match '\^\[A-Za-z\]\{1,48\}\$'/u,
+  'allow only short parent cleanup exception type names');
+ assert.match(summary,/hresult = if \(\[string\]\$_.hresult -match '\^0x\[0-9A-Fa-f\]\{8\}\$'/u,
+  'forward only a formatted HRESULT');
+ assert.match(summary,/elapsedMs = if \(\$_.elapsedMs -is \[int\] -or \$_.elapsedMs -is \[long\]\) \{ \[Math\]::Max\(0, \[Math\]::Min\(600000/u,
+  'bound parent cleanup elapsed times before logging');
  assert.match(summary,/operation = if \(\$_.operation -in @\('engine\.close', 'observer\.close', 'peer\.close', 'native\.stop'\)\)/u,
   'allow only known cleanup operations');
  assert.match(summary,/errorType = if \(\[string\]\$_.errorType -match '\^\[A-Za-z\]\{1,48\}\$'/u,'allow only short exception type names');
