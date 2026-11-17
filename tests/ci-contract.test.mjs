@@ -420,6 +420,9 @@ test('Windows canary timeout reports bounded native RPC and driver stages', asyn
  assert.match(evidence,/evidence\['rpcTrace'\] = engine_snapshot\.get\('rpcTrace', \[\]\)\[-16:\]/u,'capture the latest native RPC stages');
  assert.match(summary,/\$summary\.rpcTrace = @\(\$evidence\.rpcTrace \| Select-Object -Last 16\)/u,'print only the latest bounded RPC trace');
  assert.match(summary,/\$summary\.driverOperations = @\(\$evidence\.driverOperations \| Select-Object -Last 16\)/u,'print only the latest bounded driver operation stages');
+ assert.match(summary,/\$summary\.engineRequestDetails = @\([\s\S]*?event = [\s\S]*?status = [\s\S]*?Select-Object -Last 8\)/u,'identify the timed-out synthetic request without its opaque IDs');
+ assert.match(summary,/\$summary\.engineProtocolEvents = @\(\$evidence\.engineProtocolEvents \| Select-Object kind, method \| Select-Object -Last 24\)/u,'print only safe protocol method names');
+ assert.match(summary,/\$summary\.reconciliationStages = @\(\$evidence\.reconciliationStageTrace \| Select-Object operation, phase, elapsedMs, resultState, errorType \| Select-Object -Last 32\)/u,'print only bounded reconciliation stage metadata');
  assert.doesNotMatch(summary,/payload|\.input\b|\.text\b|stdout\.log|stderr\.log/u,'timeout diagnostics must exclude request content and raw logs');
 });
 test('shared-gate failures expose only a bounded probe function and line', async()=>{

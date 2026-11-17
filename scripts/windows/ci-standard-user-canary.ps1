@@ -690,6 +690,14 @@ try {
                             $requestStatuses[$status] = @($evidence.engineRequests | Where-Object { $_.status -eq $status }).Count
                         }
                         $summary.engineRequestStatuses = $requestStatuses
+                        $summary.engineRequestDetails = @($evidence.engineRequests | Select-Object -Last 8 | ForEach-Object {
+                            [ordered]@{
+                                event = if ($_.eventId -in @('cancel', 'after-shell-cancel')) { [string]$_.eventId } else { 'other' }
+                                status = if ($_.status -in @('queued', 'transcribing', 'starting', 'running', 'waiting_approval', 'completed', 'failed', 'interrupted', 'cancelled', 'uncertain')) { [string]$_.status } else { 'unknown' }
+                            }
+                        })
+                        $summary.engineProtocolEvents = @($evidence.engineProtocolEvents | Select-Object kind, method | Select-Object -Last 24)
+                        $summary.reconciliationStages = @($evidence.reconciliationStageTrace | Select-Object operation, phase, elapsedMs, resultState, errorType | Select-Object -Last 32)
                         $approvalStatuses = [ordered]@{}
                         foreach ($status in @('pending', 'answered', 'expired')) { $approvalStatuses[$status] = @($evidence.engineApprovals | Where-Object { $_.status -eq $status }).Count }
                         $summary.approvalStatuses = $approvalStatuses
