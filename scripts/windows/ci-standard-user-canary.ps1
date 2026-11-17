@@ -697,7 +697,7 @@ try {
                             }
                         })
                         $summary.engineProtocolEvents = @($evidence.engineProtocolEvents | Select-Object kind, method | Select-Object -Last 24)
-                        $summary.reconciliationStages = @($evidence.reconciliationStageTrace | Select-Object operation, phase, elapsedMs, resultState, errorType | Select-Object -Last 32)
+                        $summary.reconciliationStages = @($evidence.reconciliationStageTrace | Select-Object operation, phase, @{ Name = 'elapsedMs'; Expression = { if (($_.elapsedMs -is [int] -or $_.elapsedMs -is [long]) -and [long]$_.elapsedMs -ge 0 -and [long]$_.elapsedMs -le 7200000) { [long]$_.elapsedMs } else { $null } } }, resultState, errorType | Select-Object -Last 32)
                         $approvalStatuses = [ordered]@{}
                         foreach ($status in @('pending', 'answered', 'expired')) { $approvalStatuses[$status] = @($evidence.engineApprovals | Where-Object { $_.status -eq $status }).Count }
                         $summary.approvalStatuses = $approvalStatuses

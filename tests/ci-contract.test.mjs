@@ -422,7 +422,9 @@ test('Windows canary timeout reports bounded native RPC and driver stages', asyn
  assert.match(summary,/\$summary\.driverOperations = @\(\$evidence\.driverOperations \| Select-Object -Last 16\)/u,'print only the latest bounded driver operation stages');
  assert.match(summary,/\$summary\.engineRequestDetails = @\([\s\S]*?event = [\s\S]*?status = [\s\S]*?Select-Object -Last 8\)/u,'identify the timed-out synthetic request without its opaque IDs');
  assert.match(summary,/\$summary\.engineProtocolEvents = @\(\$evidence\.engineProtocolEvents \| Select-Object kind, method \| Select-Object -Last 24\)/u,'print only safe protocol method names');
- assert.match(summary,/\$summary\.reconciliationStages = @\(\$evidence\.reconciliationStageTrace \| Select-Object operation, phase, elapsedMs, resultState, errorType \| Select-Object -Last 32\)/u,'print only bounded reconciliation stage metadata');
+ assert.match(summary,/\$summary\.reconciliationStages = @\(\$evidence\.reconciliationStageTrace \| Select-Object operation, phase, @\{ Name = 'elapsedMs'; Expression = \{/u,'project only reconciliation stage metadata and sanitize elapsed time');
+ assert.match(summary,/resultState, errorType \| Select-Object -Last 32\)/u,'print only the latest bounded reconciliation stage metadata');
+ assert.match(summary,/Expression = \{ if \(\(\$_.elapsedMs -is \[int\] -or \$_.elapsedMs -is \[long\]\) -and \[long\]\$_.elapsedMs -ge 0 -and \[long\]\$_.elapsedMs -le 7200000\) \{ \[long\]\$_.elapsedMs \} else \{ \$null \} \}/u,'omit invalid durations and durations beyond the two-hour job bound');
  assert.doesNotMatch(summary,/payload|\.input\b|\.text\b|stdout\.log|stderr\.log/u,'timeout diagnostics must exclude request content and raw logs');
 });
 test('shared-gate failures expose only a bounded probe function and line', async()=>{
