@@ -228,6 +228,27 @@ test('workflow requirement lists tolerate empty conditional groups', async()=>{
   assert.equal(result.status,0,result.stderr);
  }
 });
+test('package smoke uses a fixed extractor and verifies the bundled runtime by serving', async()=>{
+ const source=await readFile(new URL('../scripts/smoke-package.mjs',import.meta.url),'utf8');
+ assert.doesNotMatch(source,/function run\(command,/u);
+ assert.doesNotMatch(source,/process\.argv\[2\]/u);
+ assert.match(source,/const extractor = process\.platform === 'win32' \? 'powershell\.exe' : 'tar';/u);
+ assert.match(source,/execFileSync\(extractor,\s*extractionArgs,\s*\{[^}]*shell:\s*false\s*\}/u);
+ assert.match(source,/const runtime = path\.join\(extracted, 'runtime', process\.platform === 'win32' \? 'node\.exe' : 'node'\);/u);
+ assert.match(source,/execFileSync\(runtime,\s*\['--version'\],\s*\{[^}]*shell:\s*false[^}]*\}\)\.trim\(\)/u);
+ assert.match(source,/`v\$\{manifest\.node\}`/u);
+ assert.match(source,/child = spawn\(/u);
+ assert.match(source,/new URL\('api\/health'/u);
+});
+test('Windows package smoke passes ZIP paths as arguments to a static PowerShell script', async()=>{
+ const source=await readFile(new URL('../scripts/smoke-package.mjs',import.meta.url),'utf8');
+ assert.match(source,/process\.platform === 'win32'\s+\? \['-NoProfile', '-NonInteractive', '-File', path\.join\(root, 'scripts', 'extract-package-archive\.ps1'\), archive, temporary\]\s+: \['-xzf', archive, '-C', temporary\]/u);
+ assert.doesNotMatch(source,/RELE_SMOKE_/u);
+ assert.match(source,/execFileSync\(extractor,\s*extractionArgs,\s*\{[^}]*shell:\s*false\s*\}/u);
+ const extractor=await readFile(new URL('../scripts/extract-package-archive.ps1',import.meta.url),'utf8');
+ assert.match(extractor,/param\s*\(\s*\[string\]\s*\$Archive,\s*\[string\]\s*\$Destination\s*\)/u);
+ assert.match(extractor,/Expand-Archive -LiteralPath \$Archive -DestinationPath \$Destination -ErrorAction Stop/u);
+});
 test('shared wait timeout reports bounded request correlation without message bodies', async()=>{
  let summarize;
  try { ({summarizeSharedWaitFailure:summarize}=await import('../scripts/shared-probe-diagnostics.mjs')); }
