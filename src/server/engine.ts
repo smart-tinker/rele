@@ -627,7 +627,7 @@ export class Engine extends EventEmitter {
         throw new Error('Сервер Codex изменился или его поколение не подтверждено. Завершение прежних процессов не подтверждено.');
       }
     };
-    verifyServer(await client.backgroundTerminals(conversation.threadId));
+    verifyServer(await client.backgroundTerminals(conversation.threadId, { verifyStableGeneration: true }));
     this.store.setMeta(`cancel-cleanup:${id}`, JSON.stringify(state));
     const attempted = new Set((state.terminalAttempts ?? []).map(entry => JSON.stringify(entry))), deadline = performance.now() + 2000;
     do {
@@ -643,7 +643,7 @@ export class Engine extends EventEmitter {
         continue;
       }
       if (['running', 'completed', 'failed', 'interrupted'].includes(found.state)) {
-        const snapshot = await client.backgroundTerminals(conversation.threadId);
+        const snapshot = await client.backgroundTerminals(conversation.threadId, { verifyStableGeneration: true });
         verifyServer(snapshot);
         const fresh = snapshot.terminals.filter(entry => !baseline.terminals.some(old => old.itemId === entry.itemId && old.processId === entry.processId));
         for (const entry of fresh) {
@@ -666,7 +666,7 @@ export class Engine extends EventEmitter {
           continue;
         }
         if (['completed', 'failed', 'interrupted'].includes(found.state)) {
-          const after = await client.backgroundTerminals(conversation.threadId);
+          const after = await client.backgroundTerminals(conversation.threadId, { verifyStableGeneration: true });
           verifyServer(after);
           const latestItems = this.rememberCommandItems(id, []);
           const pendingStarts = latestItems.some(item => !latestItems.some(other => other.id === item.id && other.completed)

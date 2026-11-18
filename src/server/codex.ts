@@ -597,33 +597,36 @@ export class CodexClient extends EventEmitter {
     await this.call('turn/interrupt', { threadId, turnId });
   }
 
-  async backgroundTerminals(threadId: string): Promise<CodexTerminalSnapshot> {
+  async backgroundTerminals(threadId: string, options: { verifyStableGeneration?: boolean } = {}): Promise<CodexTerminalSnapshot> {
     this.requireQueue();
     const runtime = this.runtime, peer = this.nativePeer;
     const diagnostic = await this.diagnostics();
-    const entries = await this.pages<CodexTerminal>('thread/backgroundTerminals/list', { threadId, limit: 100 });
     const current = () => runtime === this.runtime && peer === this.nativePeer && this.state.connected;
-    const validEntries = !entries.some(entry => !entry || typeof entry.itemId !== 'string' || !entry.itemId || !nativeProcessId(entry.processId));
-    if (!current() || !Number.isSafeInteger(diagnostic?.process?.id) || diagnostic.process.id <= 0 || !validEntries) {
-      throw new CodexTransportError('Codex не подтвердил идентичность фоновых команд. Отмена команды требует сверки.', 'terminal-identity-unconfirmed');
-    }
+    const serverId = diagnostic?.process?.id;
+    const unconfirmed = () => new CodexTransportError('Codex не подтвердил идентичность фоновых команд. Отмена команды требует сверки.', 'terminal-identity-unconfirmed');
+    if (!current() || !Number.isSafeInteger(serverId) || serverId <= 0) throw unconfirmed();
     const proofDiagnostics = peer?.kind === 'windows-shared' && process.env.RELE_CI_SHARED_DIAGNOSTICS === '1'
       ? { onProofFailure: (failure: { stage: string; category: string; failureType: string }) => {
           process.stderr.write(`${JSON.stringify({ event:'codex-native-proof-failure', ...failure })}\n`);
         } }
       : undefined;
-    const generation = runtime ? await codexNativeGeneration(peer, diagnostic?.process?.id, runtime.codexHome, proofDiagnostics) : undefined;
-    if (!current()) {
-      throw new CodexTransportError('Codex не подтвердил идентичность фоновых команд. Отмена команды требует сверки.', 'terminal-identity-unconfirmed');
-    }
+    const prove = () => runtime ? codexNativeGeneration(peer, serverId, runtime.codexHome, proofDiagnostics) : undefined;
+    const before = options.verifyStableGeneration ? await prove() : undefined;
+    if (!current()) throw unconfirmed();
+    const entries = await this.pages<CodexTerminal>('thread/backgroundTerminals/list', { threadId, limit: 100 });
+    const validEntries = !entries.some(entry => !entry || typeof entry.itemId !== 'string' || !entry.itemId || !nativeProcessId(entry.processId));
+    if (!current() || !validEntries) throw unconfirmed();
+    const after = options.verifyStableGeneration ? before ? await prove() : undefined : await prove();
+    if (!current()) throw unconfirmed();
+    const generation = options.verifyStableGeneration ? before && before === after ? before : undefined : after;
     return { serverId: diagnostic.process.id, ...(generation ? { serverGeneration: generation } : {}), terminals: entries.map(({ itemId, processId }) => ({ itemId, processId })) };
   }
 
   async terminateBackgroundTerminal(threadId: string, target: CodexTerminal & { serverId: number; serverGeneration?: string }): Promise<void> {
-    const current = await this.backgroundTerminals(threadId);
+    const current = await this.backgroundTerminals(threadId, { verifyStableGeneration: true });
     const matching = current.terminals.filter(entry => entry.itemId === target.itemId);
     const identityFailure = current.serverId !== target.serverId ? 'server-id-changed'
-      : target.serverGeneration === undefined ? undefined
+      : target.serverGeneration === undefined ? 'server-generation-unconfirmed'
         : !/^[a-f0-9]{64}$/u.test(target.serverGeneration) ? 'target-generation-invalid'
           : current.serverGeneration === undefined ? 'server-generation-unconfirmed'
             : current.serverGeneration !== target.serverGeneration ? 'server-generation-changed' : undefined;

@@ -2058,6 +2058,7 @@ describe('Engine scoped shell cancellation', () => {
   it.each(['different-generation', 'missing-generation', 'invalid-generation', 'legacy-baseline'] as const)(
     'refuses Stop before interrupt when native identity is %s', async identity => {
       const f = fixture(), request = await shell(f);
+      const backgroundTerminalCalls = f.codex.backgroundTerminals.mock.calls.length;
       if (identity === 'legacy-baseline') {
         const baseline = JSON.parse(f.store.getMeta(`request-terminal-baseline:${request.id}`)!);
         delete baseline.serverGeneration;
@@ -2066,6 +2067,9 @@ describe('Engine scoped shell cancellation', () => {
         : identity === 'invalid-generation' ? 'A'.repeat(64) : undefined;
 
       await expect(f.engine.cancel(request.id)).rejects.toThrow();
+      if (identity === 'different-generation') {
+        expect(f.codex.backgroundTerminals).toHaveBeenNthCalledWith(backgroundTerminalCalls + 1, THREAD, { verifyStableGeneration: true });
+      }
       expect(f.store.getRequest(request.id)?.status).toBe('uncertain');
       expect(f.codex.interrupt).not.toHaveBeenCalled();
       expect(f.codex.terminateBackgroundTerminal).not.toHaveBeenCalled();
