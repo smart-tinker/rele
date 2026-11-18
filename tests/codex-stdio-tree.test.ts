@@ -5,7 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { expect, test } from 'vitest';
 import { CodexStdioTransport } from '../src/server/codex-stdio.js';
 
-async function isRunning(pid: number): Promise<boolean> {
+async function isRunning(pid: number, readProcStat: () => Promise<string> = () => readFile(`/proc/${pid}/stat`, 'utf8')): Promise<boolean> {
   try { process.kill(pid, 0); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
@@ -13,17 +13,29 @@ async function isRunning(pid: number): Promise<boolean> {
   }
   if (process.platform === 'linux') {
     try {
-      const stat = await readFile(`/proc/${pid}/stat`, 'utf8');
+      const stat = await readProcStat();
       // An orphan may await reaping by PID 1, but a zombie cannot keep pipes open.
       const state = stat.slice(stat.lastIndexOf(')') + 2, stat.lastIndexOf(')') + 3);
       return !['Z', 'X', 'x'].includes(state);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ESRCH') return false;
       throw error;
     }
   }
   return true;
 }
+
+test.skipIf(process.platform !== 'linux')('treats vanished proc stats as stopped and preserves live and zombie checks', async () => {
+  const errno = (code: string) => Object.assign(new Error(code), { code });
+  await expect(isRunning(process.pid, async () => { throw errno('ESRCH'); })).resolves.toBe(false);
+  await expect(isRunning(process.pid, async () => { throw errno('ENOENT'); })).resolves.toBe(false);
+  await expect(isRunning(process.pid, async () => '1 (synthetic process) S 0')).resolves.toBe(true);
+  for (const state of ['Z', 'X', 'x']) {
+    await expect(isRunning(process.pid, async () => `1 (synthetic process) ${state} 0`)).resolves.toBe(false);
+  }
+  await expect(isRunning(process.pid, async () => { throw errno('EACCES'); })).rejects.toMatchObject({ code: 'EACCES' });
+});
 
 async function bounded<T>(promise: Promise<T>, milliseconds: number, message: string): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
@@ -107,7 +119,7 @@ async function checkProcessTree(rootExits: boolean): Promise<void> {
     ).toBe('ready');
     expect(grandchildParentPid).toBe(rootPid);
     expect(grandchildPid).not.toBe(rootPid);
-    expect(await Promise.all([...ownedPids].map(isRunning))).toEqual([true, true]);
+    expect(await Promise.all([...ownedPids].map(pid => isRunning(pid)))).toEqual([true, true]);
     if (rootExits) {
       await transport.send(exitCommand);
       // The guard must stop the orphan and close its pipes before close() or cleanup can help.
@@ -118,7 +130,7 @@ async function checkProcessTree(rootExits: boolean): Promise<void> {
     }
     expect(closed).toBe(1);
     expect(failures).toEqual([]);
-    await expect.poll(() => Promise.all([...ownedPids].map(isRunning)), { timeout: 2000, interval: 20 })
+    await expect.poll(() => Promise.all([...ownedPids].map(pid => isRunning(pid))), { timeout: 2000, interval: 20 })
       .toEqual([false, false]);
   } finally {
     const cleanup = async () => {
@@ -129,7 +141,7 @@ async function checkProcessTree(rootExits: boolean): Promise<void> {
         catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
       }
       const deadline = Date.now() + 2000;
-      while ((await Promise.all([...ownedPids].map(isRunning))).some(Boolean)) {
+      while ((await Promise.all([...ownedPids].map(pid => isRunning(pid)))).some(Boolean)) {
         if (Date.now() >= deadline) throw new Error('Owned fixture PID survived SIGKILL');
         await delay(20);
       }

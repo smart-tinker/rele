@@ -10,7 +10,7 @@ test('reports only allowlisted operations from a synthetic managed wait RED', ()
     "sys.path.insert(0, 'scripts')",
     'from managed_probe_report import managed_wait_failure',
     'report = {}',
-    "result = {'phase': 'engine.pump', 'failure': 'timeout', 'pendingOperations': ['dispatch.slackSync.drain', 'rpc.thread/inject_items', 'rpc.thread/inject_items', 'synthetic-private-provider-detail', {'private': 'payload'}]}",
+    "result = {'phase': 'engine.pump', 'failure': 'timeout', 'pendingOperations': ['dispatch.slackSync.drain', 'rpc.thread/inject_items', 'rpc.thread/inject_items', 'synthetic-private-provider-detail', {'private': 'payload'}], 'rejectedOperations': ['rpc.thread/read', 'rpc.thread/read', 'synthetic-private-provider-detail', {'private': 'rejected-payload'}]}",
     'error = managed_wait_failure(result, report)',
     "print(json.dumps({'error': error, 'report': report}, sort_keys=True))",
   ].join('\n');
@@ -20,9 +20,19 @@ test('reports only allowlisted operations from a synthetic managed wait RED', ()
   assert.equal(output.status, 0, output.stderr);
   assert.deepEqual(JSON.parse(output.stdout), {
     error: 'Managed fixture wait timeout during engine.pump',
-    report: { pendingOperations: ['dispatch.slackSync.drain', 'rpc.thread/inject_items'] },
+    report: { pendingOperations: ['dispatch.slackSync.drain', 'rpc.thread/inject_items'], rejectedOperations: ['rpc.thread/read'] },
   });
   assert.doesNotMatch(output.stdout, /synthetic-private-provider-detail|payload/);
+});
+
+test('retains a rejected operation label after removing it from the pending snapshot', async () => {
+  const { createManagedOperationTrace } = await import('../scripts/managed-probe-wait.mjs');
+  const trace = createManagedOperationTrace();
+  const error = new Error('synthetic-private-provider-detail');
+  await assert.rejects(trace.observe('rpc.thread/read', () => Promise.reject(error)), value => value === error);
+  assert.deepEqual(trace.pendingOperations(), []);
+  assert.deepEqual(trace.rejectedOperations(), ['rpc.thread/read']);
+  assert.doesNotMatch(JSON.stringify(trace.rejectedOperations()), /synthetic-private-provider-detail/);
 });
 import { waitManagedQueue } from '../scripts/managed-probe-wait.mjs';
 

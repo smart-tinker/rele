@@ -16,6 +16,15 @@ export type ManagedCloseResult = { ok: true; childExited: true } | {
   childExited: boolean;
 };
 
+export interface ManagedOperationTrace {
+  observe<T>(label: string, operation: () => Promise<T>): Promise<T>;
+  pendingOperations(): string[];
+  rejectedOperations(): string[];
+  clearRejected(): void;
+}
+
+export function createManagedOperationTrace(): ManagedOperationTrace;
+
 export function waitManagedQueue(
   activeCount: () => number,
   pump: () => Promise<unknown>,

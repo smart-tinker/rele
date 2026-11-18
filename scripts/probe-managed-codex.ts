@@ -6,7 +6,7 @@ import { copyFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import assert from 'node:assert/strict';
-import { closeManagedFixture, waitManagedQueue } from './managed-probe-wait.mjs';
+import { closeManagedFixture, createManagedOperationTrace, waitManagedQueue } from './managed-probe-wait.mjs';
 import { CodexClient, CodexTransportError } from '../src/server/codex.js';
 import { CodexContextReceipts } from '../src/server/codex-context-receipts.js';
 import { Engine } from '../src/server/engine.js';
@@ -44,18 +44,14 @@ const slackHistory: SlackTranscriptMessage[] = [{
 let codex!: CodexClient;
 let engine!: Engine;
 const diagnostics: string[] = [];
-const pendingOperations = new Map<number, string>();
-let nextPendingOperation = 0;
+const operationTrace = createManagedOperationTrace();
 let oldPid: number | undefined;
 const safeRpcMethods = new Set([
   'server/diagnostics', 'thread/backgroundTerminals/list', 'thread/inject_items', 'thread/queue/add',
   'thread/queue/list', 'thread/read', 'thread/resume', 'thread/turns/list', 'thread/unsubscribe',
 ]);
 function observe<T>(label: string, operation: () => Promise<T>): Promise<T> {
-  const id = ++nextPendingOperation;
-  pendingOperations.set(id, label);
-  try { return operation().finally(() => pendingOperations.delete(id)); }
-  catch (error) { pendingOperations.delete(id); throw error; }
+  return operationTrace.observe(label, operation);
 }
 function observeMethod(target: object, method: string, label: string): void {
   const methods = target as Record<string, unknown>;
@@ -65,7 +61,6 @@ function observeMethod(target: object, method: string, label: string): void {
     return observe(label, () => (operation as (this: unknown, ...args: unknown[]) => Promise<unknown>).apply(this, args));
   };
 }
-function pendingOperationLabels(): string[] { return [...new Set(pendingOperations.values())].sort(); }
 let ownedPid: number | undefined;
 let shutdown: ReturnType<typeof closeManagedFixture> | undefined;
 function processAlive(pid: number): boolean {
@@ -203,10 +198,12 @@ try {
       );
       if (!result.ok) {
         process.stdout.write(JSON.stringify({ action: command.action, ...result,
-          activeRequestCount: store.activeRequests().length, pendingOperations: pendingOperationLabels() }) + '\n');
+          activeRequestCount: store.activeRequests().length, pendingOperations: operationTrace.pendingOperations(),
+          rejectedOperations: operationTrace.rejectedOperations() }) + '\n');
         process.exitCode = 1;
         continue;
       }
+      operationTrace.clearRejected();
     } else if (command.action === 'fresh-context') {
       freshContext = await freshContextProof();
     } else if (command.action === 'restart') {

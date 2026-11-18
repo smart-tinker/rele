@@ -599,22 +599,24 @@ export class CodexClient extends EventEmitter {
 
   async backgroundTerminals(threadId: string): Promise<CodexTerminalSnapshot> {
     this.requireQueue();
-    const runtime = this.runtime;
+    const runtime = this.runtime, peer = this.nativePeer;
     const diagnostic = await this.diagnostics();
-    const peer = this.nativePeer;
+    const entries = await this.pages<CodexTerminal>('thread/backgroundTerminals/list', { threadId, limit: 100 });
+    const current = () => runtime === this.runtime && peer === this.nativePeer && this.state.connected;
+    const validEntries = !entries.some(entry => !entry || typeof entry.itemId !== 'string' || !entry.itemId || !nativeProcessId(entry.processId));
+    if (!current() || !Number.isSafeInteger(diagnostic?.process?.id) || diagnostic.process.id <= 0 || !validEntries) {
+      throw new CodexTransportError('Codex не подтвердил идентичность фоновых команд. Отмена команды требует сверки.', 'terminal-identity-unconfirmed');
+    }
     const proofDiagnostics = peer?.kind === 'windows-shared' && process.env.RELE_CI_SHARED_DIAGNOSTICS === '1'
       ? { onProofFailure: (failure: { stage: string; category: string; failureType: string }) => {
           process.stderr.write(`${JSON.stringify({ event:'codex-native-proof-failure', ...failure })}\n`);
         } }
       : undefined;
     const generation = runtime ? await codexNativeGeneration(peer, diagnostic?.process?.id, runtime.codexHome, proofDiagnostics) : undefined;
-    const entries = await this.pages<CodexTerminal>('thread/backgroundTerminals/list', { threadId, limit: 100 });
-    const after = generation && runtime ? await codexNativeGeneration(peer, diagnostic.process.id, runtime.codexHome, proofDiagnostics) : undefined;
-    if (runtime !== this.runtime || peer !== this.nativePeer || !this.state.connected || !Number.isSafeInteger(diagnostic?.process?.id) || diagnostic.process.id <= 0
-      || entries.some(entry => !entry || typeof entry.itemId !== 'string' || !entry.itemId || !nativeProcessId(entry.processId))) {
+    if (!current()) {
       throw new CodexTransportError('Codex не подтвердил идентичность фоновых команд. Отмена команды требует сверки.', 'terminal-identity-unconfirmed');
     }
-    return { serverId: diagnostic.process.id, ...(generation && generation === after ? { serverGeneration: generation } : {}), terminals: entries.map(({ itemId, processId }) => ({ itemId, processId })) };
+    return { serverId: diagnostic.process.id, ...(generation ? { serverGeneration: generation } : {}), terminals: entries.map(({ itemId, processId }) => ({ itemId, processId })) };
   }
 
   async terminateBackgroundTerminal(threadId: string, target: CodexTerminal & { serverId: number; serverGeneration?: string }): Promise<void> {

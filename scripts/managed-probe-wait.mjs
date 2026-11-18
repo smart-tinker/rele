@@ -48,3 +48,29 @@ export async function closeManagedFixture(stopEngine, closeCodex, ownedChildExit
   if (engineRejected) return { ok: false, phase: 'engine.stop', failure: 'rejected', childExited: true };
   return { ok: true, childExited: true };
 }
+
+export function createManagedOperationTrace() {
+  const pending = new Map();
+  const rejected = new Set();
+  let next = 0;
+  return {
+    observe(label, operation) {
+      const id = ++next;
+      pending.set(id, label);
+      let result;
+      try {
+        result = operation();
+      } catch (error) {
+        rejected.add(label);
+        pending.delete(id);
+        throw error;
+      }
+      return Promise.resolve(result)
+        .catch(error => { rejected.add(label); throw error; })
+        .finally(() => pending.delete(id));
+    },
+    pendingOperations() { return [...new Set(pending.values())].sort(); },
+    rejectedOperations() { return [...rejected].sort(); },
+    clearRejected() { rejected.clear(); },
+  };
+}

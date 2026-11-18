@@ -40,10 +40,11 @@ def managed_wait_failure(result, report):
     failure = result.get('failure')
     if not isinstance(phase, str) or phase not in WAIT_PHASES or not isinstance(failure, str) or failure not in WAIT_FAILURES:
         return None
-    pending = result.get('pendingOperations')
-    if isinstance(pending, list):
-        report['pendingOperations'] = sorted({
-            operation for operation in pending
-            if isinstance(operation, str) and operation in SAFE_PENDING_OPERATIONS
-        })
+    for field in ('pendingOperations', 'rejectedOperations'):
+        operations = result.get(field)
+        if isinstance(operations, list):
+            report[field] = sorted({
+                operation for operation in operations
+                if isinstance(operation, str) and operation in SAFE_PENDING_OPERATIONS
+            })
     return f'Managed fixture wait {failure} during {phase}'
