@@ -40,3 +40,8 @@ export function summarizeSharedNativeRequest(location: {
  mixed: boolean;
  finalAnswerPresent: boolean;
 };
+export function lookupSharedNativeRequest(codex: {
+ findRequest(threadId: string, clientId: string, ownInputIds: readonly string[], followRetries: boolean): Promise<{
+  state?: string; turnId?: string; queuedSubmissionId?: string; mixed?: boolean; text?: string;
+ }>;
+}, threadId: string, requests: Array<{id: string; eventId: string}>, requestId: string, eventId: string): Promise<ReturnType<typeof summarizeSharedNativeRequest> | undefined>;

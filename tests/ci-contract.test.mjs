@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { assertSteps, writeBundle, verifyBundles } from '../scripts/ci-contract.mjs';
-import { summarizeSharedNativeRequest } from '../scripts/shared-probe-diagnostics.mjs';
+import { lookupSharedNativeRequest, summarizeSharedNativeRequest } from '../scripts/shared-probe-diagnostics.mjs';
 const sha = 'a'.repeat(40), run = '123', attempt = '1', version = '0.1.2-rc.1';
 const candidate={repository:'owner/repo',version,commit:sha,runId:run,attempt};
 async function releaseBackend(root) {
@@ -78,6 +78,27 @@ test('native request diagnostics expose state without IDs or response text',()=>
  assert.equal(summarizeSharedNativeRequest({state:'running',queuedSubmissionId:'synthetic-queue-id',text:'NOREPLY'}).queuedSubmissionFound,true);
  assert.equal(summarizeSharedNativeRequest({state:'running',queuedSubmissionId:'synthetic-queue-id',text:'NOREPLY'}).finalAnswerPresent,false);
  assert.equal(summarizeSharedNativeRequest({state:'unexpected',failureReason:'private detail'}).state,'unknown');
+});
+test('native request lookup follows the unique event request and skips ambiguous events',async()=>{
+ const requests=[
+  {id:'other-request',eventId:'other'},
+  {id:'cancel-request',eventId:'cancel'},
+  {id:'last-request',eventId:'last'},
+ ];
+ const calls=[];
+ const codex={findRequest:async(...args)=>{
+  calls.push(args);
+  return {state:'queued',queuedSubmissionId:'private-queue-id',text:'private fixture content'};
+ }};
+ const summary=await lookupSharedNativeRequest(codex,'fixture-thread',requests,'cancel-request','cancel');
+ assert.deepEqual(calls,[['fixture-thread','cancel-request',['cancel-request'],true]]);
+ assert.deepEqual(summary,{state:'queued',turnAssigned:false,queuedSubmissionFound:true,mixed:false,finalAnswerPresent:true});
+ assert.doesNotMatch(JSON.stringify(summary),/private-queue-id|private fixture content/u);
+ const ambiguous=await lookupSharedNativeRequest(codex,'fixture-thread',[
+  ...requests,{id:'duplicate-cancel',eventId:'cancel'},
+ ],'cancel-request','cancel');
+ assert.equal(ambiguous,undefined);
+ assert.equal(calls.length,1);
 });
 test('unlisted file is rejected',()=>fixture(async root=>{
  await writeFile(path.join(root,'linux','extra'),'extra');await assert.rejects(verifyBundles(root,version,sha,run,attempt));
@@ -614,7 +635,7 @@ test('shared native gate records bounded request state without payloads on timeo
  const cancel=probe.indexOf("await engine.command('ingest', platform='telegram', eventId='cancel'");
  const afterCancel=probe.indexOf('await asyncio.wait_for(wait_records(before + 2), 25)',cancel);
  assert.ok(cancel>=0 && afterCancel>cancel,'bounded shell probe must wait for the request result');
- assert.match(probe.slice(cancel,afterCancel),/report\['cancellationRequestTimeout'\] = await held_request_evidence\(engine, peer, thread\)/u,'capture queue and request state before failing the shell timeout');
+ assert.match(probe.slice(cancel,afterCancel),/report\['cancellationRequestTimeout'\] = await held_request_evidence\(engine, peer, thread, event_id='cancel'\)/u,'capture queue and request state before failing the shell timeout');
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
  assert.match(canary,/if \(\$null -ne \$timeoutReport\.cancellationRequestTimeout\) \{\s*\$result \| Add-Member -Force -NotePropertyName cancellationRequestTimeout -NotePropertyValue \$timeoutReport\.cancellationRequestTimeout\s*\}/u,'forward the cancellation timeout snapshot into the Windows job failure report');
 });

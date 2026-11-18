@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { summarizeSharedNativeRequest, summarizeSharedWaitFailure } from './shared-probe-diagnostics.mjs';
+import { lookupSharedNativeRequest, summarizeSharedNativeRequest, summarizeSharedWaitFailure } from './shared-probe-diagnostics.mjs';
 import { ConfigStore, defaultConfig, defaultDataDirectory } from '../src/server/config.js';
 import { CodexClient as SourceCodexClient, type CodexServerRequest } from '../src/server/codex.js';
 import { Engine as SourceEngine } from '../src/server/engine.js';
@@ -402,6 +402,17 @@ if (values['expect-error']) {
           throw new Error(`Shared requests did not reach expected state: ${JSON.stringify(evidence)}`);
         }
         await engine!.pump(); await engine!.settled();
+      } else if (command.action === 'findRequest') {
+        const lookup = lookupSharedNativeRequest(codex!, threadId!, store.listRequests(), command.requestId!, command.eventId!).then(
+          nativeRequest => ({ nativeRequest }), error => ({ error }));
+        const native = await Promise.race([lookup, delay(5000).then(() => ({ timeout: true as const }))]);
+        if ('nativeRequest' in native) process.stdout.write(JSON.stringify({ action: command.action, ...(native.nativeRequest ? { nativeRequest: native.nativeRequest } : {}) }) + '\n');
+        else if ('error' in native) {
+          const errorType = native.error instanceof Error ? native.error.name : 'UnknownError';
+          const nativeRequestErrorType = ['ConnectionResetError', 'CodexTransportError', 'CodexRpcError', 'Error', 'UnknownError'].includes(errorType) ? errorType : 'other';
+          process.stdout.write(JSON.stringify({ action: command.action, nativeRequestErrorType }) + '\n');
+        } else process.stdout.write(JSON.stringify({ action: command.action, nativeRequestTimedOut: true }) + '\n');
+        continue;
       } else if (command.action === 'answer') {
         if (command.decision !== undefined && !['accept', 'decline'].includes(command.decision)) throw new Error('Invalid fixture approval decision');
         await engine!.resolveApproval(command.approvalId!, command.decision ?? 'decline');
