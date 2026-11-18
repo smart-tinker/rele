@@ -569,6 +569,7 @@ try {
     foreach ($name in @('shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json', 'shared-results-0.163.0-alpha.11.2.json', 'shared-results-0.164.0-alpha.11.1.json', 'shared-results-0.165.0-alpha.1.2.json', 'shared-results-0.166.0-alpha.5.1.json', 'shared-results-0.166.0-alpha.6.json', 'shared-results-0.167.0-alpha.3.2.json', 'shared-results-0.167.0-alpha.4.1.json', 'shared-results-0.169.0-alpha.11.1.json', 'shared-results-actual-desktop.json')) {
         $reportPath = Join-Path $FixtureRoot ('reports\' + $name)
         if (Test-Path -LiteralPath $reportPath -PathType Leaf) {
+            $reportTimer = [Diagnostics.Stopwatch]::StartNew()
             try {
                 $sharedReport = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
                 if ($sharedReport.retainedFixture) {
@@ -578,7 +579,7 @@ try {
                 }
             } catch {
                 $retainedSharedFixtures += $FixtureRoot
-                $cleanupFailures += @{ step = 'retained-shared-report'; hresult = ('0x{0:X8}' -f $_.Exception.HResult); message = 'Shared cleanup evidence is invalid; preserve the owning fixture.' }
+                $cleanupFailures += @{ step = 'retained-shared-report'; errorType = $_.Exception.GetType().Name; hresult = ('0x{0:X8}' -f $_.Exception.HResult); elapsedMs = [Math]::Min(600000, [Math]::Max(0, [long]$reportTimer.ElapsedMilliseconds)) }
             }
         }
     }
@@ -615,7 +616,8 @@ try {
         { if ($retainedSharedFixtures.Count -eq 0) { Remove-Item -LiteralPath $FixtureRoot -Recurse -Force } }
     )) {
         $stepName = @('child', 'rdp-session', 'rdp-setting', 'redirector-stop', 'redirector-startup', 'service-stop', 'service-startup', 'task-diagnostic-channel', 'rdp-diagnostic-channel', 'task', 'profile', 'user', 'reports', 'fixture')[$cleanupStep++]
-        try { & $action } catch { $message = $_.Exception.Message; $cleanupFailures += @{ step = $stepName; hresult = ('0x{0:X8}' -f $_.Exception.HResult); message = $message.Substring(0, [Math]::Min(512, $message.Length)) } }
+        $cleanupTimer = [Diagnostics.Stopwatch]::StartNew()
+        try { & $action } catch { $cleanupFailures += @{ step = $stepName; errorType = $_.Exception.GetType().Name; hresult = ('0x{0:X8}' -f $_.Exception.HResult); elapsedMs = [Math]::Min(600000, [Math]::Max(0, [long]$cleanupTimer.ElapsedMilliseconds)) } }
     }
     $publishedResult = Join-Path $sourceRoot 'windows-standard-user-results.json'
     if (Test-Path -LiteralPath $publishedResult) {
@@ -644,6 +646,14 @@ try {
             if ([string]$result.stage -match '^shared-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)$') { $sharedDiagnosticName = 'shared-results-' + $Matches[1] + '.json' }
             $sharedDiagnosticPath = Join-Path $sourceRoot $sharedDiagnosticName
             $summary = [ordered]@{ stage = if ($parentStage -in @('shared', 'rdp-session', 'installer')) { $parentStage } else { 'unknown' }; reportAvailable = $false }
+            if ($result.cleanupErrors) {
+                $summary.canaryCleanupErrors = @($result.cleanupErrors | Select-Object -Last 8 | ForEach-Object { [ordered]@{
+                    step = if ($_.step -in @('retained-shared-report', 'child', 'rdp-session', 'rdp-setting', 'redirector-stop', 'redirector-startup', 'service-stop', 'service-startup', 'task-diagnostic-channel', 'rdp-diagnostic-channel', 'task', 'profile', 'user', 'reports', 'fixture')) { [string]$_.step } else { 'other' }
+                    errorType = if ([string]$_.errorType -match '^[A-Za-z]{1,48}$') { [string]$_.errorType } else { 'other' }
+                    hresult = if ([string]$_.hresult -match '^0x[0-9A-Fa-f]{8}$') { [string]$_.hresult } else { $null }
+                    elapsedMs = if ($_.elapsedMs -is [int] -or $_.elapsedMs -is [long]) { [Math]::Max(0, [Math]::Min(600000, [long]$_.elapsedMs)) } else { 0 }
+                } })
+            }
             if (Test-Path -LiteralPath $sharedDiagnosticPath -PathType Leaf) {
                 try {
                     $sharedDiagnostic = Get-Content -LiteralPath $sharedDiagnosticPath -Raw | ConvertFrom-Json
@@ -680,6 +690,14 @@ try {
                             $requestStatuses[$status] = @($evidence.engineRequests | Where-Object { $_.status -eq $status }).Count
                         }
                         $summary.engineRequestStatuses = $requestStatuses
+                        $summary.engineRequestDetails = @($evidence.engineRequests | Select-Object -Last 8 | ForEach-Object {
+                            [ordered]@{
+                                event = if ($_.eventId -in @('cancel', 'after-shell-cancel')) { [string]$_.eventId } else { 'other' }
+                                status = if ($_.status -in @('queued', 'transcribing', 'starting', 'running', 'waiting_approval', 'completed', 'failed', 'interrupted', 'cancelled', 'uncertain')) { [string]$_.status } else { 'unknown' }
+                            }
+                        })
+                        $summary.engineProtocolEvents = @($evidence.engineProtocolEvents | Select-Object kind, method | Select-Object -Last 24)
+                        $summary.reconciliationStages = @($evidence.reconciliationStageTrace | Select-Object operation, phase, @{ Name = 'elapsedMs'; Expression = { if (($_.elapsedMs -is [int] -or $_.elapsedMs -is [long]) -and [long]$_.elapsedMs -ge 0 -and [long]$_.elapsedMs -le 10200000) { [long]$_.elapsedMs } else { $null } } }, resultState, errorType | Select-Object -Last 32)
                         $approvalStatuses = [ordered]@{}
                         foreach ($status in @('pending', 'answered', 'expired')) { $approvalStatuses[$status] = @($evidence.engineApprovals | Where-Object { $_.status -eq $status }).Count }
                         $summary.approvalStatuses = $approvalStatuses
