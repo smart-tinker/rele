@@ -14,6 +14,7 @@ import shutil
 import socket
 import tempfile
 import uuid
+from managed_probe_report import managed_wait_failure
 from aiohttp import web
 import websockets
 
@@ -220,8 +221,10 @@ stream_max_retries=0
         result = await bridge_read(timeout)
         if result.get('ok') is False:
             phase, failure = result.get('phase'), result.get('failure')
-            if action == 'wait' and phase in {'engine.pump', 'engine.settled', 'wait.pause', 'active-requests', 'final-settled', 'final-pump'} and failure in {'timeout', 'rejected'}:
-                raise RuntimeError(f'Managed fixture wait {failure} during {phase}')
+            if action == 'wait':
+                message = managed_wait_failure(result, report)
+                if message is not None:
+                    raise RuntimeError(message)
             if action == 'close' and phase in {'codex.close', 'owned-child-exit', 'engine.stop'} and failure in {'timeout', 'rejected', 'not-exited'} and isinstance(result.get('childExited'), bool):
                 report['ownedChildExitConfirmed'] = result['childExited']
                 raise RuntimeError(f'Managed fixture cleanup {failure} during {phase}')

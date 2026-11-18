@@ -1,5 +1,29 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+test('reports only allowlisted operations from a synthetic managed wait RED', () => {
+  const python = [
+    'import json, sys',
+    "sys.path.insert(0, 'scripts')",
+    'from managed_probe_report import managed_wait_failure',
+    'report = {}',
+    "result = {'phase': 'engine.pump', 'failure': 'timeout', 'pendingOperations': ['dispatch.slackSync.drain', 'rpc.thread/inject_items', 'rpc.thread/inject_items', 'synthetic-private-provider-detail', {'private': 'payload'}]}",
+    'error = managed_wait_failure(result, report)',
+    "print(json.dumps({'error': error, 'report': report}, sort_keys=True))",
+  ].join('\n');
+  const output = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-c', python], {
+    cwd: fileURLToPath(new URL('..', import.meta.url)), encoding: 'utf8',
+  });
+  assert.equal(output.status, 0, output.stderr);
+  assert.deepEqual(JSON.parse(output.stdout), {
+    error: 'Managed fixture wait timeout during engine.pump',
+    report: { pendingOperations: ['dispatch.slackSync.drain', 'rpc.thread/inject_items'] },
+  });
+  assert.doesNotMatch(output.stdout, /synthetic-private-provider-detail|payload/);
+});
 import { waitManagedQueue } from '../scripts/managed-probe-wait.mjs';
 
 const never = () => new Promise(() => {});
