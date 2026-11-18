@@ -460,6 +460,28 @@ it('proves a direct owned Windows stdio child without controller or TCP evidence
   expect(commands.every(command => command.endsWith('powershell.exe'))).toBe(true);
 });
 
+it('uses one process identity sample for a Windows stdio generation proof', async () => {
+  const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
+  const home = 'C:\\Users\\Owner\\fixture', executable = 'C:\\native\\codex.exe';
+  const proof = { pid:10944, birth:'2026-11-03T10:00:00.1234567Z', boot:'2026-11-01T01:02:03.0000000Z', executable,
+    sha256:'a'.repeat(64), owner:'S-1-5-21-1001', gatewayOwner:'S-1-5-21-1001', codexHome:home,
+    peerVerified:true, parentPid:process.pid, gatewayId:process.pid };
+  let script = '';
+  const run = async (_command:string, args:string[]) => {
+    script = Buffer.from(args[args.indexOf('-EncodedCommand') + 1]!, 'base64').toString('utf16le');
+    return { stdout:JSON.stringify(proof), code:0 };
+  };
+  const peer = { kind:'stdio' as const, pid:10944, codexHome:home, executable };
+  const generation = await Reflect.apply(codexNativeGeneration, undefined, [peer, 10944, home, { platform:'win32', run }]);
+  expect(generation).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
+  const start = script.indexOf("Mark-Stage 'identity-stdio'");
+  expect(start).toBeGreaterThanOrEqual(0);
+  const end = script.indexOf('  } else {', start);
+  const directProof = script.slice(start, end);
+  expect(directProof.match(/\bIdentity\b/gu)).toHaveLength(1);
+  expect(directProof).not.toContain('Peer');
+});
+
 it.each([
   { pid:10945 }, { parentPid:999 }, { gatewayId:999 }, { peerVerified:false },
   { owner:'S-1-5-21-1002' }, { gatewayOwner:null }, { sha256:'bad' }, { boot:null },
