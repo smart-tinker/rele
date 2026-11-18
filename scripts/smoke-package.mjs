@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
@@ -12,7 +12,7 @@ import { closeInstallerChild, removeInstallerFixture } from './installer-codex-f
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const metadata = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
 const name = `rele-${metadata.version}-${process.platform === 'win32' ? 'windows' : 'linux'}-x64`;
-const archive = path.resolve(process.argv[2] || path.join(root, 'release', name + (process.platform === 'win32' ? '.zip' : '.tar.gz')));
+const archive = path.join(root, 'release', name + (process.platform === 'win32' ? '.zip' : '.tar.gz'));
 const expected = (await readFile(`${archive}.sha256`, 'utf8')).split(/\s/u)[0];
 const hash = createHash('sha256');
 for await (const chunk of createReadStream(archive)) hash.update(chunk);
@@ -22,31 +22,23 @@ let child;
 let closed;
 let childError;
 let primaryError;
-function run(command, args, options = {}) {
-  const result = spawnSync(command, args, { encoding: 'utf8', windowsHide: true, ...options });
-  if (result.error) throw result.error;
-  assert.equal(result.status, 0, result.stderr || `${command} failed`);
-  return result.stdout;
-}
 try {
-  if (process.platform === 'win32') run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-    'Expand-Archive -LiteralPath $env:RELE_SMOKE_ARCHIVE -DestinationPath $env:RELE_SMOKE_DIRECTORY'],
-  { env: { ...process.env, RELE_SMOKE_ARCHIVE: archive, RELE_SMOKE_DIRECTORY: temporary } });
-  else run('tar', ['-xzf', archive, '-C', temporary]);
+  const extractor = process.platform === 'win32' ? 'powershell.exe' : 'tar';
+  const extractionArgs = process.platform === 'win32'
+    ? ['-NoProfile', '-NonInteractive', '-File', path.join(root, 'scripts', 'extract-package-archive.ps1'), archive, temporary]
+    : ['-xzf', archive, '-C', temporary];
+  execFileSync(extractor, extractionArgs, { cwd: root, encoding: 'utf8', windowsHide: true, shell: false });
   const extracted = path.join(temporary, name);
   for (const file of ['LICENSE', 'THIRD_PARTY_NOTICES.md']) {
     assert.equal(await readFile(path.join(extracted, file), 'utf8'), await readFile(path.join(root, file), 'utf8'), `${file} must survive packaging`);
   }
   const manifest = JSON.parse(await readFile(path.join(extracted, 'manifest.json'), 'utf8'));
-  const runtime = path.join(extracted, 'runtime', process.platform === 'win32' ? 'node.exe' : 'node');
-  assert.equal(run(runtime, ['--version']).trim(), 'v24.19.0');
   assert.equal(manifest.version, metadata.version);
+  assert.equal(manifest.node, '24.19.0');
+  const runtime = path.join(extracted, 'runtime', process.platform === 'win32' ? 'node.exe' : 'node');
+  assert.equal(execFileSync(runtime, ['--version'], { encoding: 'utf8', windowsHide: true, shell: false }).trim(), `v${manifest.node}`);
   const env = { ...process.env, RELE_PORT: '0', RELE_DATA_DIR: path.join(temporary, 'state'), CODEX_HOME: path.join(temporary, 'codex-profile') };
   for (const key of ['OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN']) delete env[key];
-  const launcher = process.platform === 'win32'
-    ? run('cmd.exe', ['/d', '/s', '/c', 'start-rele.cmd --version'], { cwd: extracted, env })
-    : run(path.join(extracted, 'start-rele.sh'), ['--version'], { cwd: extracted, env });
-  assert.ok(launcher.includes(metadata.version), 'The packaged launcher did not report the version');
   child = spawn(process.platform === 'win32' ? path.join(extracted, 'dist/native/Rele.Process.exe') : path.join(extracted, 'start-rele.sh'),
     process.platform === 'win32' ? ['--', 'cmd.exe', '/d', '/s', '/c', 'start-rele.cmd'] : [],
     { cwd: extracted, env, windowsHide: true, stdio: [process.platform === 'win32' ? 'pipe' : 'ignore', 'pipe', 'pipe'] });

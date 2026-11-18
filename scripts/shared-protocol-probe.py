@@ -62,7 +62,34 @@ def safe_engine_driver_stage(value):
                               'windows-owner-status', 'windows-desktop-discovery', 'windows-desktop-selection',
                               'windows-package-preparation', 'windows-package-verification',
                               'windows-version-command', 'windows-owner-start', 'windows-owner-receipt',
-                              'windows-owner-executable', 'windows-socket-verification') else None
+                              'windows-owner-executable', 'windows-socket-verification',
+                              'engine-close-request', 'engine-close-ack') else None
+
+
+def safe_failure_location(error):
+    source = Path(__file__).resolve()
+    frame = error.__traceback__
+    location = None
+    while frame is not None:
+        code = frame.tb_frame.f_code
+        if Path(code.co_filename).resolve() == source:
+            function = code.co_name
+            line = frame.tb_lineno
+            if isinstance(line, int) and 1 <= line <= 100000:
+                location = {'function': function if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,63}', function) else 'other', 'line': line}
+        frame = frame.tb_next
+    return location
+
+
+def public_failure_location(value):
+    if not isinstance(value, dict):
+        return None
+    function = value.get('function')
+    line = value.get('line')
+    if isinstance(function, str) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,63}', function) \
+            and isinstance(line, int) and not isinstance(line, bool) and 1 <= line <= 100000:
+        return {'function': function, 'line': line}
+    return None
 
 
 async def record_cleanup_error(errors, operation, resource, action, process_pid=None, owner_pid=None):
@@ -72,6 +99,7 @@ async def record_cleanup_error(errors, operation, resource, action, process_pid=
     except Exception as error:
         failure_code = safe_failure_code(error)
         driver_stage = safe_engine_driver_stage(getattr(error, 'engine_driver_stage', None))
+        failure_location = safe_failure_location(error)
         exit_code = getattr(error, 'engine_driver_exit_code', None)
         errors.append({
             'operation': operation if operation in ('engine.close', 'observer.close', 'peer.close', 'native.stop') else 'other',
@@ -80,6 +108,7 @@ async def record_cleanup_error(errors, operation, resource, action, process_pid=
             'resource': resource if resource in ('engine-driver-process', 'desktop-shim-process', 'direct-websocket', 'native-owner', 'native-daemon') else 'other',
             **({'failureCode': failure_code} if failure_code else {}),
             **({'engineDriverStage': driver_stage} if driver_stage else {}),
+            **({'failureLocation': failure_location} if failure_location else {}),
             **({'engineDriverExitCode': max(-(2**31), min(2**32 - 1, exit_code))}
                if isinstance(exit_code, int) and not isinstance(exit_code, bool) else {}),
             **({'processPid': process_pid} if isinstance(process_pid, int) and not isinstance(process_pid, bool) and process_pid > 0 else {}),
@@ -107,6 +136,9 @@ def public_console_report(report):
     failure_type = report.get('failureType')
     if isinstance(failure_type, str) and re.fullmatch(r'[A-Za-z]{1,48}', failure_type):
         output['failureType'] = failure_type
+    failure_location = public_failure_location(report.get('failureLocation'))
+    if failure_location:
+        output['failureLocation'] = failure_location
     failure_code = report.get('failureCode')
     if failure_code in ('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty', 'engine-driver-exited-before-response'):
         output['failureCode'] = failure_code
@@ -129,6 +161,8 @@ def public_console_report(report):
             'resource': error.get('resource') if error.get('resource') in ('engine-driver-process', 'desktop-shim-process', 'direct-websocket', 'native-owner', 'native-daemon') else 'other',
             **({'failureCode': error.get('failureCode')} if error.get('failureCode') in ('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty', 'engine-driver-exited-before-response') else {}),
             **({'engineDriverStage': safe_engine_driver_stage(error.get('engineDriverStage'))} if safe_engine_driver_stage(error.get('engineDriverStage')) else {}),
+            **({'failureLocation': public_failure_location(error.get('failureLocation'))}
+               if public_failure_location(error.get('failureLocation')) else {}),
             **({'engineDriverExitCode': max(-(2**31), min(2**32 - 1, error['engineDriverExitCode']))}
                if isinstance(error.get('engineDriverExitCode'), int) and not isinstance(error.get('engineDriverExitCode'), bool) else {}),
         })
@@ -326,24 +360,18 @@ class EngineDriver:
 
     async def close(self):
         if self.process.returncode is None:
-            self.process.stdin.write((json.dumps({'action': 'close'}) + '\n').encode())
-            await self.process.stdin.drain()
-            deadline = asyncio.get_running_loop().time() + ENGINE_READ_TIMEOUT_SECONDS
-            while True:
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    raise TimeoutError('Shared Engine driver did not acknowledge close')
-                result = await self.read(remaining)
-                if isinstance(result, dict) and result.get('stopped') is True:
-                    if not isinstance(result.get('backendAlive'), bool):
-                        raise RuntimeError('Shared Engine driver returned an invalid close response')
-                    break
-                # A timed-out parent read can leave its command reply ahead of close's ACK.
-                if (not isinstance(result, dict) or
-                        result.get('action') not in ('ingest', 'wait', 'answer', 'resume', 'cancel', 'snapshot')):
-                    raise RuntimeError('Shared Engine driver returned an invalid close response')
-            assert result['backendAlive'], 'Closing Rele stopped the shared native backend'
-            await asyncio.wait_for(self.process.wait(), 15)
+            self.startup_stage = 'engine-close-request'
+            try:
+                result = await self.command('close')
+                while isinstance(result, dict) and result.get('action') == 'wait':
+                    result = await self.read()
+                self.startup_stage = 'engine-close-ack'
+                assert isinstance(result, dict) and result.get('stopped') is True, 'Shared Engine driver did not acknowledge close'
+                assert result.get('backendAlive'), 'Closing Rele stopped the shared native backend'
+                await asyncio.wait_for(self.process.wait(), 15)
+            except Exception as error:
+                error.engine_driver_stage = self.startup_stage
+                raise
         if self.process.returncode != 0:
             error = AssertionError()
             error.engine_driver_exit_code = self.process.returncode
@@ -684,13 +712,14 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
                 variants.append(flags)
         return client
 
-    async def held_request_evidence(engine, peer, thread):
+    async def held_request_evidence(engine, peer, thread, event_id=None):
         evidence = {'providerRequestCount': len(records)}
         try:
             engine_snapshot = await asyncio.wait_for(engine.command('snapshot'), 5)
+            requests = engine_snapshot.get('requests', [])
             evidence['engineRequests'] = [
                 {key: row.get(key) for key in ('eventId', 'status', 'turnId')}
-                for row in engine_snapshot.get('requests', [])[-8:]
+                for row in requests[-8:]
             ]
             evidence['engineApprovals'] = [
                 {key: row.get(key) for key in ('id', 'requestId', 'method', 'status', 'turnId')}
@@ -702,6 +731,30 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
             evidence['rpcTrace'] = engine_snapshot.get('rpcTrace', [])[-16:]
         except Exception as error:
             evidence['engineSnapshotError'] = type(error).__name__
+            requests = []
+        if event_id:
+            matches = [row for row in requests if row.get('eventId') == event_id]
+            if len(matches) == 1:
+                try:
+                    native = await asyncio.wait_for(engine.command(
+                        'findRequest', requestId=matches[0].get('id'), eventId=event_id), 8)
+                    location = native.get('nativeRequest')
+                    if isinstance(location, dict):
+                        evidence['nativeRequest'] = {
+                            'state': location.get('state') if location.get('state') in ('queued', 'running', 'completed', 'failed', 'interrupted', 'not_found') else 'unknown',
+                            'turnAssigned': location.get('turnAssigned') is True,
+                            'queuedSubmissionFound': location.get('queuedSubmissionFound') is True,
+                            'mixed': location.get('mixed') is True,
+                            'finalAnswerPresent': location.get('finalAnswerPresent') is True,
+                        }
+                    if native.get('nativeRequestErrorType'):
+                        error_type = native.get('nativeRequestErrorType')
+                        evidence['nativeRequestErrorType'] = error_type if error_type in ('ConnectionResetError', 'CodexTransportError', 'CodexRpcError', 'Error', 'UnknownError') else 'other'
+                    if native.get('nativeRequestTimedOut') is True:
+                        evidence['nativeRequestTimedOut'] = True
+                except Exception as error:
+                    error_type = type(error).__name__
+                    evidence['nativeRequestErrorType'] = error_type if error_type in ('ConnectionResetError', 'CodexTransportError', 'CodexRpcError', 'Error', 'UnknownError') else 'other'
         try:
             native_snapshot = await asyncio.wait_for(peer.call('thread/read', {'threadId': thread}), 5)
             evidence['nativeTurnStatus'] = native_snapshot.get('thread', {}).get('status', {}).get('type')
@@ -1090,7 +1143,7 @@ enabled=false
                 if shell_approvals or ready_file.is_file():
                     break
                 if asyncio.get_running_loop().time() >= deadline:
-                    report['cancellationRequestTimeout'] = await held_request_evidence(engine, peer, thread)
+                    report['cancellationRequestTimeout'] = await held_request_evidence(engine, peer, thread, event_id='cancel')
                     report['cancellationRequestTimeout']['readyFileExists'] = ready_file.is_file()
                     raise AssertionError('Shell neither started nor requested approval')
                 await asyncio.sleep(.05)
@@ -1249,6 +1302,9 @@ enabled=false
         report['result'] = 'failed'
         report['failureType'] = safe_error_type(error)
         report['failureCode'] = safe_failure_code(error)
+        failure_location = safe_failure_location(error)
+        if failure_location:
+            report['failureLocation'] = failure_location
         exit_code = getattr(error, 'engine_driver_exit_code', None)
         if isinstance(exit_code, int) and not isinstance(exit_code, bool):
             report['engineDriverExitCode'] = exit_code

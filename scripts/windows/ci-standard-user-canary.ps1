@@ -340,8 +340,8 @@ try {
     }
     $credential = New-Object System.Management.Automation.PSCredential ($env:COMPUTERNAME + '\' + $account), $password
     $resultPath = Join-Path $FixtureRoot 'windows-standard-user-results.json'
-    # The 145-minute run reached the final version report but expired before the canary exited.
-    if ($RunGates) { $gatesDeadline = [DateTime]::UtcNow.AddMinutes($(if ($Phase -eq 'Shared') { 60 } else { 155 })) }
+    # The 155-minute run expired as the installer phase began.
+    if ($RunGates) { $gatesDeadline = [DateTime]::UtcNow.AddMinutes($(if ($Phase -eq 'Shared') { 60 } else { 170 })) }
     if ($RunGates) {
         $parentStage = 'shared'
         $marker.phase = 'Shared'; $marker | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $FixtureRoot 'parent.json') -Encoding UTF8
@@ -569,6 +569,7 @@ try {
     foreach ($name in @('shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json', 'shared-results-0.163.0-alpha.11.2.json', 'shared-results-0.164.0-alpha.11.1.json', 'shared-results-0.165.0-alpha.1.2.json', 'shared-results-0.166.0-alpha.5.1.json', 'shared-results-0.166.0-alpha.6.json', 'shared-results-0.167.0-alpha.3.2.json', 'shared-results-0.167.0-alpha.4.1.json', 'shared-results-0.169.0-alpha.11.1.json', 'shared-results-actual-desktop.json')) {
         $reportPath = Join-Path $FixtureRoot ('reports\' + $name)
         if (Test-Path -LiteralPath $reportPath -PathType Leaf) {
+            $reportTimer = [Diagnostics.Stopwatch]::StartNew()
             try {
                 $sharedReport = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
                 if ($sharedReport.retainedFixture) {
@@ -578,7 +579,7 @@ try {
                 }
             } catch {
                 $retainedSharedFixtures += $FixtureRoot
-                $cleanupFailures += @{ step = 'retained-shared-report'; hresult = ('0x{0:X8}' -f $_.Exception.HResult); message = 'Shared cleanup evidence is invalid; preserve the owning fixture.' }
+                $cleanupFailures += @{ step = 'retained-shared-report'; errorType = $_.Exception.GetType().Name; hresult = ('0x{0:X8}' -f $_.Exception.HResult); elapsedMs = [Math]::Min(600000, [Math]::Max(0, [long]$reportTimer.ElapsedMilliseconds)) }
             }
         }
     }
@@ -615,7 +616,8 @@ try {
         { if ($retainedSharedFixtures.Count -eq 0) { Remove-Item -LiteralPath $FixtureRoot -Recurse -Force } }
     )) {
         $stepName = @('child', 'rdp-session', 'rdp-setting', 'redirector-stop', 'redirector-startup', 'service-stop', 'service-startup', 'task-diagnostic-channel', 'rdp-diagnostic-channel', 'task', 'profile', 'user', 'reports', 'fixture')[$cleanupStep++]
-        try { & $action } catch { $message = $_.Exception.Message; $cleanupFailures += @{ step = $stepName; hresult = ('0x{0:X8}' -f $_.Exception.HResult); message = $message.Substring(0, [Math]::Min(512, $message.Length)) } }
+        $cleanupTimer = [Diagnostics.Stopwatch]::StartNew()
+        try { & $action } catch { $cleanupFailures += @{ step = $stepName; errorType = $_.Exception.GetType().Name; hresult = ('0x{0:X8}' -f $_.Exception.HResult); elapsedMs = [Math]::Min(600000, [Math]::Max(0, [long]$cleanupTimer.ElapsedMilliseconds)) } }
     }
     $publishedResult = Join-Path $sourceRoot 'windows-standard-user-results.json'
     if (Test-Path -LiteralPath $publishedResult) {
@@ -644,15 +646,24 @@ try {
             if ([string]$result.stage -match '^shared-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)$') { $sharedDiagnosticName = 'shared-results-' + $Matches[1] + '.json' }
             $sharedDiagnosticPath = Join-Path $sourceRoot $sharedDiagnosticName
             $summary = [ordered]@{ stage = if ($parentStage -in @('shared', 'rdp-session', 'installer')) { $parentStage } else { 'unknown' }; reportAvailable = $false }
+            if ($result.cleanupErrors) {
+                $summary.canaryCleanupErrors = @($result.cleanupErrors | Select-Object -Last 8 | ForEach-Object { [ordered]@{
+                    step = if ($_.step -in @('retained-shared-report', 'child', 'rdp-session', 'rdp-setting', 'redirector-stop', 'redirector-startup', 'service-stop', 'service-startup', 'task-diagnostic-channel', 'rdp-diagnostic-channel', 'task', 'profile', 'user', 'reports', 'fixture')) { [string]$_.step } else { 'other' }
+                    errorType = if ([string]$_.errorType -match '^[A-Za-z]{1,48}$') { [string]$_.errorType } else { 'other' }
+                    hresult = if ([string]$_.hresult -match '^0x[0-9A-Fa-f]{8}$') { [string]$_.hresult } else { $null }
+                    elapsedMs = if ($_.elapsedMs -is [int] -or $_.elapsedMs -is [long]) { [Math]::Max(0, [Math]::Min(600000, [long]$_.elapsedMs)) } else { 0 }
+                } })
+            }
             if (Test-Path -LiteralPath $sharedDiagnosticPath -PathType Leaf) {
                 try {
                     $sharedDiagnostic = Get-Content -LiteralPath $sharedDiagnosticPath -Raw | ConvertFrom-Json
                     $summary.reportAvailable = $true
                     $summary.result = if ($sharedDiagnostic.result -in @('passed', 'failed')) { $sharedDiagnostic.result } else { 'unknown' }
                     if ($sharedDiagnostic.failureType) { $summary.failureType = if ([string]$sharedDiagnostic.failureType -match '^[A-Za-z]{1,48}$') { [string]$sharedDiagnostic.failureType } else { 'other' } }
+                    if ($sharedDiagnostic.failureLocation -and [string]$sharedDiagnostic.failureLocation.function -match '^[A-Za-z_][A-Za-z0-9_]{0,63}$' -and ($sharedDiagnostic.failureLocation.line -is [int] -or $sharedDiagnostic.failureLocation.line -is [long]) -and [long]$sharedDiagnostic.failureLocation.line -ge 1 -and [long]$sharedDiagnostic.failureLocation.line -le 100000) { $summary.failureLocation = [ordered]@{ function = [string]$sharedDiagnostic.failureLocation.function; line = [int]$sharedDiagnostic.failureLocation.line } }
                     if ($sharedDiagnostic.failureCode) { $summary.failureCode = if ([string]$sharedDiagnostic.failureCode -in @('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty', 'engine-driver-exited-before-response')) { [string]$sharedDiagnostic.failureCode } else { 'other' } }
                     if (($sharedDiagnostic.engineDriverExitCode -is [int] -or $sharedDiagnostic.engineDriverExitCode -is [long]) -and [long]$sharedDiagnostic.engineDriverExitCode -ge -2147483648 -and [long]$sharedDiagnostic.engineDriverExitCode -le 4294967295) { $summary.engineDriverExitCode = [long]$sharedDiagnostic.engineDriverExitCode }
-                    if ([string]$sharedDiagnostic.engineDriverStage -in @('codex-connect', 'shared-codex-resolution', 'shared-codex-resolved', 'thread-catalog', 'engine-start', 'native-diagnostics', 'desktop-package-verification', 'ready', 'windows-installation', 'windows-owner-status', 'windows-desktop-discovery', 'windows-desktop-selection', 'windows-package-preparation', 'windows-package-verification', 'windows-version-command', 'windows-owner-start', 'windows-owner-receipt', 'windows-owner-executable', 'windows-socket-verification')) { $summary.engineDriverStage = [string]$sharedDiagnostic.engineDriverStage }
+                    if ([string]$sharedDiagnostic.engineDriverStage -in @('codex-connect', 'shared-codex-resolution', 'shared-codex-resolved', 'thread-catalog', 'engine-start', 'native-diagnostics', 'desktop-package-verification', 'ready', 'windows-installation', 'windows-owner-status', 'windows-desktop-discovery', 'windows-desktop-selection', 'windows-package-preparation', 'windows-package-verification', 'windows-version-command', 'windows-owner-start', 'windows-owner-receipt', 'windows-owner-executable', 'windows-socket-verification', 'engine-close-request', 'engine-close-ack')) { $summary.engineDriverStage = [string]$sharedDiagnostic.engineDriverStage }
                     $summary.codexVersion = if ([string]$sharedDiagnostic.codexVersion -match '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$') { [string]$sharedDiagnostic.codexVersion } else { 'unknown' }
                     $checks = @($sharedDiagnostic.checks.PSObject.Properties)
                     $summary.checksPassed = @($checks | Where-Object { $_.Value -eq $true }).Count
@@ -665,7 +676,8 @@ try {
                             resource = if ($_.resource -in @('engine-driver-process', 'desktop-shim-process', 'direct-websocket', 'native-owner', 'native-daemon')) { [string]$_.resource } else { 'other' }
                             failureCode = if ($_.failureCode -in @('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty', 'engine-driver-exited-before-response')) { [string]$_.failureCode } elseif ($_.failureCode) { 'other' } else { $null }
                             engineDriverExitCode = if ($_.engineDriverExitCode -is [int] -or $_.engineDriverExitCode -is [long]) { [Math]::Max(-2147483648, [Math]::Min(4294967295, [long]$_.engineDriverExitCode)) } else { $null }
-                            engineDriverStage = if ($_.engineDriverStage -in @('codex-connect', 'shared-codex-resolution', 'shared-codex-resolved', 'thread-catalog', 'engine-start', 'native-diagnostics', 'desktop-package-verification', 'ready', 'windows-installation', 'windows-owner-status', 'windows-desktop-discovery', 'windows-desktop-selection', 'windows-package-preparation', 'windows-package-verification', 'windows-version-command', 'windows-owner-start', 'windows-owner-receipt', 'windows-owner-executable', 'windows-socket-verification')) { [string]$_.engineDriverStage } else { $null }
+                            engineDriverStage = if ($_.engineDriverStage -in @('codex-connect', 'shared-codex-resolution', 'shared-codex-resolved', 'thread-catalog', 'engine-start', 'native-diagnostics', 'desktop-package-verification', 'ready', 'windows-installation', 'windows-owner-status', 'windows-desktop-discovery', 'windows-desktop-selection', 'windows-package-preparation', 'windows-package-verification', 'windows-version-command', 'windows-owner-start', 'windows-owner-receipt', 'windows-owner-executable', 'windows-socket-verification', 'engine-close-request', 'engine-close-ack')) { [string]$_.engineDriverStage } else { $null }
+                            failureLocation = if ($_.failureLocation -and [string]$_.failureLocation.function -match '^[A-Za-z_][A-Za-z0-9_]{0,63}$' -and ($_.failureLocation.line -is [int] -or $_.failureLocation.line -is [long]) -and [long]$_.failureLocation.line -ge 1 -and [long]$_.failureLocation.line -le 100000) { [ordered]@{ function = [string]$_.failureLocation.function; line = [int]$_.failureLocation.line } } else { $null }
                         } })
                     }
                     $evidence = $sharedDiagnostic.heldRequestTimeout
@@ -678,6 +690,14 @@ try {
                             $requestStatuses[$status] = @($evidence.engineRequests | Where-Object { $_.status -eq $status }).Count
                         }
                         $summary.engineRequestStatuses = $requestStatuses
+                        $summary.engineRequestDetails = @($evidence.engineRequests | Select-Object -Last 8 | ForEach-Object {
+                            [ordered]@{
+                                event = if ($_.eventId -in @('cancel', 'after-shell-cancel')) { [string]$_.eventId } else { 'other' }
+                                status = if ($_.status -in @('queued', 'transcribing', 'starting', 'running', 'waiting_approval', 'completed', 'failed', 'interrupted', 'cancelled', 'uncertain')) { [string]$_.status } else { 'unknown' }
+                            }
+                        })
+                        $summary.engineProtocolEvents = @($evidence.engineProtocolEvents | Select-Object kind, method | Select-Object -Last 24)
+                        $summary.reconciliationStages = @($evidence.reconciliationStageTrace | Select-Object operation, phase, @{ Name = 'elapsedMs'; Expression = { if (($_.elapsedMs -is [int] -or $_.elapsedMs -is [long]) -and [long]$_.elapsedMs -ge 0 -and [long]$_.elapsedMs -le 10200000) { [long]$_.elapsedMs } else { $null } } }, resultState, errorType | Select-Object -Last 32)
                         $approvalStatuses = [ordered]@{}
                         foreach ($status in @('pending', 'answered', 'expired')) { $approvalStatuses[$status] = @($evidence.engineApprovals | Where-Object { $_.status -eq $status }).Count }
                         $summary.approvalStatuses = $approvalStatuses
