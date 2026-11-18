@@ -211,7 +211,14 @@ stream_max_retries=0
     async def command(action, **kwargs):
         bridge.stdin.write((json.dumps({'action': action, **kwargs}) + '\n').encode())
         await bridge.stdin.drain()
-        return await bridge_read()
+        result = await bridge_read()
+        if result.get('ok') is False:
+            phases = {'engine.pump', 'engine.settled', 'active-requests', 'final-settled', 'final-pump'}
+            phase = result.get('phase')
+            if action != 'wait' or phase not in phases:
+                raise RuntimeError('Managed fixture returned an invalid failure response')
+            raise RuntimeError(f'Managed fixture wait timed out during {phase}')
+        return result
 
     try:
         source = await start_source('source_a')

@@ -42,7 +42,7 @@ jobs:
         id: install
       - run: npm run typecheck
         id: types
-      - run: node --test tests/ci-contract.test.mjs
+      - run: node --test tests/ci-contract.test.mjs tests/managed-probe-wait.node.mjs
         id: ci_contract
       - name: Verify cleanup diagnostics are safe and preserve the primary error
         id: cleanup_diagnostics

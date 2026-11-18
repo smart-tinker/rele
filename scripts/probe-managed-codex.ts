@@ -6,6 +6,7 @@ import { copyFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import assert from 'node:assert/strict';
+import { waitManagedQueue } from './managed-probe-wait.mjs';
 import { CodexClient, CodexTransportError } from '../src/server/codex.js';
 import { CodexContextReceipts } from '../src/server/codex-context-receipts.js';
 import { Engine } from '../src/server/engine.js';
@@ -132,12 +133,18 @@ try {
       });
       await engine.settled();
     } else if (command.action === 'wait') {
-      const until = Date.now() + 40_000;
-      while (store.activeRequests().length && Date.now() < until) {
-        await engine.pump(); await engine.settled(); await delay(100);
+      const result = await waitManagedQueue(
+        () => store.activeRequests().length,
+        () => engine.pump(),
+        () => engine.settled(),
+        () => delay(100),
+      );
+      if (!result.ok) {
+        process.stdout.write(JSON.stringify({ action: command.action, ...result,
+          activeRequestCount: store.activeRequests().length }) + '\n');
+        process.exitCode = 1;
+        continue;
       }
-      if (store.activeRequests().length) throw new Error(`Fixture requests did not finish: ${JSON.stringify(store.listRequests())}`);
-      await engine.settled(); await engine.pump();
     } else if (command.action === 'fresh-context') {
       freshContext = await freshContextProof();
     } else if (command.action === 'restart') {
