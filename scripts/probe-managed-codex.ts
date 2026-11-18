@@ -44,7 +44,28 @@ const slackHistory: SlackTranscriptMessage[] = [{
 let codex!: CodexClient;
 let engine!: Engine;
 const diagnostics: string[] = [];
+const pendingOperations = new Map<number, string>();
+let nextPendingOperation = 0;
 let oldPid: number | undefined;
+const safeRpcMethods = new Set([
+  'server/diagnostics', 'thread/backgroundTerminals/list', 'thread/inject_items', 'thread/queue/add',
+  'thread/queue/list', 'thread/read', 'thread/resume', 'thread/turns/list', 'thread/unsubscribe',
+]);
+function observe<T>(label: string, operation: () => Promise<T>): Promise<T> {
+  const id = ++nextPendingOperation;
+  pendingOperations.set(id, label);
+  try { return operation().finally(() => pendingOperations.delete(id)); }
+  catch (error) { pendingOperations.delete(id); throw error; }
+}
+function observeMethod(target: object, method: string, label: string): void {
+  const methods = target as Record<string, unknown>;
+  const operation = methods[method];
+  if (typeof operation !== 'function') return;
+  methods[method] = function(this: unknown, ...args: unknown[]) {
+    return observe(label, () => (operation as (this: unknown, ...args: unknown[]) => Promise<unknown>).apply(this, args));
+  };
+}
+function pendingOperationLabels(): string[] { return [...new Set(pendingOperations.values())].sort(); }
 let ownedPid: number | undefined;
 let shutdown: ReturnType<typeof closeManagedFixture> | undefined;
 function processAlive(pid: number): boolean {
@@ -55,6 +76,12 @@ async function start(): Promise<void> {
   shutdown = undefined;
   ownedPid = undefined;
   codex = new CodexClient(config.codex);
+  const privateClient = codex as unknown as { call: (method: string, params: Record<string, unknown>, timeoutMs?: number, confirmHealth?: boolean) => Promise<unknown> };
+  const nativeCall = privateClient.call.bind(codex);
+  privateClient.call = (method, params, timeoutMs, confirmHealth) => observe(
+    `rpc.${safeRpcMethods.has(method) ? method : 'other'}`,
+    () => nativeCall(method, params, timeoutMs, confirmHealth),
+  );
   engine = new Engine(store, codex, { config: () => config, temporaryRoot: values.directory!, redact: value => String(value) });
   for (const platform of ['slack', 'telegram'] as const) engine.channels[platform] = {
     state: { configured: true, connected: true, name: platform, accountId: endpoints[platform].accountId },
@@ -62,6 +89,24 @@ async function start(): Promise<void> {
     start: async () => {}, stop: async () => {}, download: async () => { throw new Error('Audio not used in this fixture'); },
     deliver: async delivery => `${platform}:${delivery.id}`,
   } satisfies Channel;
+  const internalEngine = engine as unknown as Record<string, unknown>;
+  for (const [method, label] of [
+    ['deliver', 'pump.deliver'], ['flushProgress', 'pump.flushProgress'], ['flushApprovalUpdates', 'pump.flushApprovalUpdates'],
+    ['retryPendingQuestions', 'pump.retryPendingQuestions'], ['refreshAsyncQuestions', 'pump.refreshAsyncQuestions'],
+    ['provision', 'pump.provision'], ['reconcile', 'pump.reconcile'], ['dispatch', 'pump.dispatch'],
+  ] as const) observeMethod(engine, method, label);
+  for (const [owner, method, label] of [
+    ['sourceControls', 'recover', 'pump.sourceControls.recover'], ['slackSync', 'backfill', 'pump.slackSync.backfill'],
+    ['slackSync', 'drain', 'dispatch.slackSync.drain'], ['initialMessages', 'ensure', 'dispatch.initialMessages.ensure'],
+  ] as const) {
+    const target = internalEngine[owner];
+    if (target && typeof target === 'object') observeMethod(target, method, label);
+  }
+  for (const [method, label] of [
+    ['injectContext', 'dispatch.codex.injectContext'], ['subscribe', 'dispatch.codex.subscribe'],
+    ['backgroundTerminals', 'dispatch.codex.backgroundTerminals'], ['enqueue', 'dispatch.codex.enqueue'],
+    ['releaseThread', 'dispatch.codex.releaseThread'],
+  ] as const) observeMethod(codex, method, label);
   engine.on('diagnostic', message => { diagnostics.push(String(message)); });
   await codex.connect();
   const connectedHome = codex.status().codexHome;
@@ -158,7 +203,7 @@ try {
       );
       if (!result.ok) {
         process.stdout.write(JSON.stringify({ action: command.action, ...result,
-          activeRequestCount: store.activeRequests().length }) + '\n');
+          activeRequestCount: store.activeRequests().length, pendingOperations: pendingOperationLabels() }) + '\n');
         process.exitCode = 1;
         continue;
       }
