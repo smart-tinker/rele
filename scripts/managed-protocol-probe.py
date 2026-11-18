@@ -84,6 +84,9 @@ async def main(root):
     records, servers, errors = [], [], []
     bridge = None
     bridge_drain = None
+    bridge_close_requested = False
+    primary_error = None
+    report['ownedChildExitConfirmed'] = None
 
     async def provider(req):
         if req.method != 'POST' or not req.path.endswith('/responses'):
@@ -202,22 +205,31 @@ stream_max_retries=0
         result = await entry['client'].call('turn/start', {'threadId': thread, 'input': [{'type': 'text', 'text': text}]})
         await entry['client'].completed(result['turn']['id'])
 
-    async def bridge_read():
-        line = await asyncio.wait_for(bridge.stdout.readline(), 55)
+    async def bridge_read(timeout=55):
+        line = await asyncio.wait_for(bridge.stdout.readline(), timeout)
         if not line:
             raise RuntimeError('Rele fixture exited: ' + repr(errors))
         return json.loads(line)
 
-    async def command(action, **kwargs):
+    async def command(action, timeout=55, **kwargs):
+        nonlocal bridge_close_requested
+        if action == 'close':
+            bridge_close_requested = True
         bridge.stdin.write((json.dumps({'action': action, **kwargs}) + '\n').encode())
         await bridge.stdin.drain()
-        result = await bridge_read()
+        result = await bridge_read(timeout)
         if result.get('ok') is False:
-            phases = {'engine.pump', 'engine.settled', 'active-requests', 'final-settled', 'final-pump'}
-            phase = result.get('phase')
-            if action != 'wait' or phase not in phases:
-                raise RuntimeError('Managed fixture returned an invalid failure response')
-            raise RuntimeError(f'Managed fixture wait timed out during {phase}')
+            phase, failure = result.get('phase'), result.get('failure')
+            if action == 'wait' and phase in {'engine.pump', 'engine.settled', 'wait.pause', 'active-requests', 'final-settled', 'final-pump'} and failure in {'timeout', 'rejected'}:
+                raise RuntimeError(f'Managed fixture wait {failure} during {phase}')
+            if action == 'close' and phase in {'codex.close', 'owned-child-exit', 'engine.stop'} and failure in {'timeout', 'rejected', 'not-exited'} and isinstance(result.get('childExited'), bool):
+                report['ownedChildExitConfirmed'] = result['childExited']
+                raise RuntimeError(f'Managed fixture cleanup {failure} during {phase}')
+            raise RuntimeError('Managed fixture returned an invalid failure response')
+        if action == 'close':
+            report['ownedChildExitConfirmed'] = result.get('childExited') is True
+            if result.get('action') != 'close' or result.get('childExited') is not True:
+                raise RuntimeError('Managed fixture did not confirm owned Codex exit')
         return result
 
     try:
@@ -295,8 +307,8 @@ stream_max_retries=0
         report['checks']['native_name_persists_new_thread_before_release_and_first_passive_context'] = True
         report['checks']['new_managed_thread_passive_context_persists_before_first_model_or_turn'] = True
         report['checks']['first_managed_model_request_contains_new_thread_passive_context'] = True
-        stopped = await command('close')
-        assert stopped['childExited'], stopped
+        stopped = await command('close', timeout=30)
+        assert stopped['childExited'] and report['ownedChildExitConfirmed'] is True, stopped
         await asyncio.wait_for(bridge.wait(), 15)
         assert bridge.returncode == 0, errors
         report['checks']['shutdown_waits_for_owned_child_exit'] = True
@@ -304,27 +316,50 @@ stream_max_retries=0
         assert len(records) == 5, records
         report['result'] = 'passed'
     except BaseException as exc:
+        primary_error = exc
         report['result'] = 'failed'
         report['exception'] = repr(exc)
         report['stderrTail'] = errors[-20:]
         raise
     finally:
+        cleanup_error = None
+        if bridge and bridge.returncode is None and not bridge_close_requested:
+            try:
+                await command('close', timeout=30)
+            except BaseException as error:
+                cleanup_error = error
+                report['cleanupFailureType'] = type(error).__name__
         if bridge and bridge.returncode is None:
-            # Closing stdin runs the driver's finally block and closes its owned child.
             bridge.stdin.close()
             try:
                 await asyncio.wait_for(bridge.wait(), 15)
-            except TimeoutError:
+            except TimeoutError as error:
                 bridge.kill()
                 await bridge.wait()
+                report['bridgeForcedTermination'] = True
+                if cleanup_error is None:
+                    cleanup_error = error
         if bridge_drain:
-            await bridge_drain
+            try:
+                await asyncio.wait_for(bridge_drain, 8)
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
         for server in servers:
             with contextlib.suppress(Exception):
                 await stop_source(server)
-        await runner.cleanup()
+        try:
+            await runner.cleanup()
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        if cleanup_error is not None:
+            report['result'] = 'failed'
+            report['cleanupFailureType'] = type(cleanup_error).__name__
         args.report.write_text(json.dumps(report, indent=2), encoding='utf-8')
         print(json.dumps(report, indent=2))
+        if cleanup_error is not None and primary_error is None:
+            raise cleanup_error
 
 
 with tempfile.TemporaryDirectory(prefix='rele-m4-') as directory:

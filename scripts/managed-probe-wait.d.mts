@@ -1,11 +1,20 @@
 export type ManagedWaitPhase =
   | 'engine.pump'
   | 'engine.settled'
+  | 'wait.pause'
   | 'active-requests'
   | 'final-settled'
   | 'final-pump';
 
-export type ManagedWaitResult = { ok: true } | { ok: false; phase: ManagedWaitPhase };
+export type ManagedClosePhase = 'codex.close' | 'owned-child-exit' | 'engine.stop';
+export type ManagedFailure = 'timeout' | 'rejected';
+export type ManagedWaitResult = { ok: true } | { ok: false; phase: ManagedWaitPhase; failure: ManagedFailure };
+export type ManagedCloseResult = { ok: true; childExited: true } | {
+  ok: false;
+  phase: ManagedClosePhase;
+  failure: ManagedFailure | 'not-exited';
+  childExited: boolean;
+};
 
 export function waitManagedQueue(
   activeCount: () => number,
@@ -14,3 +23,10 @@ export function waitManagedQueue(
   pause: () => Promise<unknown>,
   timeoutMs?: number,
 ): Promise<ManagedWaitResult>;
+
+export function closeManagedFixture(
+  stopEngine: () => Promise<unknown>,
+  closeCodex: () => Promise<unknown>,
+  ownedChildExited: () => boolean,
+  timeoutMs?: number,
+): Promise<ManagedCloseResult>;
