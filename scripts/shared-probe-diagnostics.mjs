@@ -68,3 +68,8 @@ export function summarizeSharedNativeRequest(location) {
   finalAnswerPresent: typeof location?.text === 'string' && location.text.trim().length > 0 && location.text !== 'NOREPLY',
  };
 }
+export async function lookupSharedNativeRequest(codex, threadId, requests, requestId, eventId) {
+ const matches = requests.filter(request => request.eventId === eventId);
+ if (matches.length !== 1 || matches[0].id !== requestId) return undefined;
+ return summarizeSharedNativeRequest(await codex.findRequest(threadId, requestId, [requestId], true));
+}

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { assertSteps, writeBundle, verifyBundles } from '../scripts/ci-contract.mjs';
-import { summarizeSharedNativeRequest } from '../scripts/shared-probe-diagnostics.mjs';
+import { lookupSharedNativeRequest, summarizeSharedNativeRequest } from '../scripts/shared-probe-diagnostics.mjs';
 const sha = 'a'.repeat(40), run = '123', attempt = '1', version = '0.1.2-rc.1';
 const candidate={repository:'owner/repo',version,commit:sha,runId:run,attempt};
 async function releaseBackend(root) {
@@ -78,6 +78,27 @@ test('native request diagnostics expose state without IDs or response text',()=>
  assert.equal(summarizeSharedNativeRequest({state:'running',queuedSubmissionId:'synthetic-queue-id',text:'NOREPLY'}).queuedSubmissionFound,true);
  assert.equal(summarizeSharedNativeRequest({state:'running',queuedSubmissionId:'synthetic-queue-id',text:'NOREPLY'}).finalAnswerPresent,false);
  assert.equal(summarizeSharedNativeRequest({state:'unexpected',failureReason:'private detail'}).state,'unknown');
+});
+test('native request lookup follows the unique event request and skips ambiguous events',async()=>{
+ const requests=[
+  {id:'other-request',eventId:'other'},
+  {id:'cancel-request',eventId:'cancel'},
+  {id:'last-request',eventId:'last'},
+ ];
+ const calls=[];
+ const codex={findRequest:async(...args)=>{
+  calls.push(args);
+  return {state:'queued',queuedSubmissionId:'private-queue-id',text:'private fixture content'};
+ }};
+ const summary=await lookupSharedNativeRequest(codex,'fixture-thread',requests,'cancel-request','cancel');
+ assert.deepEqual(calls,[['fixture-thread','cancel-request',['cancel-request'],true]]);
+ assert.deepEqual(summary,{state:'queued',turnAssigned:false,queuedSubmissionFound:true,mixed:false,finalAnswerPresent:true});
+ assert.doesNotMatch(JSON.stringify(summary),/private-queue-id|private fixture content/u);
+ const ambiguous=await lookupSharedNativeRequest(codex,'fixture-thread',[
+  ...requests,{id:'duplicate-cancel',eventId:'cancel'},
+ ],'cancel-request','cancel');
+ assert.equal(ambiguous,undefined);
+ assert.equal(calls.length,1);
 });
 test('unlisted file is rejected',()=>fixture(async root=>{
  await writeFile(path.join(root,'linux','extra'),'extra');await assert.rejects(verifyBundles(root,version,sha,run,attempt));
@@ -420,6 +441,11 @@ test('Windows canary timeout reports bounded native RPC and driver stages', asyn
  assert.match(evidence,/evidence\['rpcTrace'\] = engine_snapshot\.get\('rpcTrace', \[\]\)\[-16:\]/u,'capture the latest native RPC stages');
  assert.match(summary,/\$summary\.rpcTrace = @\(\$evidence\.rpcTrace \| Select-Object -Last 16\)/u,'print only the latest bounded RPC trace');
  assert.match(summary,/\$summary\.driverOperations = @\(\$evidence\.driverOperations \| Select-Object -Last 16\)/u,'print only the latest bounded driver operation stages');
+ assert.match(summary,/\$summary\.engineRequestDetails = @\([\s\S]*?event = [\s\S]*?status = [\s\S]*?Select-Object -Last 8\)/u,'identify the timed-out synthetic request without its opaque IDs');
+ assert.match(summary,/\$summary\.engineProtocolEvents = @\(\$evidence\.engineProtocolEvents \| Select-Object kind, method \| Select-Object -Last 24\)/u,'print only safe protocol method names');
+ assert.match(summary,/\$summary\.reconciliationStages = @\(\$evidence\.reconciliationStageTrace \| Select-Object operation, phase, @\{ Name = 'elapsedMs'; Expression = \{/u,'project only reconciliation stage metadata and sanitize elapsed time');
+ assert.match(summary,/resultState, errorType \| Select-Object -Last 32\)/u,'print only the latest bounded reconciliation stage metadata');
+ assert.match(summary,/Expression = \{ if \(\(\$_.elapsedMs -is \[int\] -or \$_.elapsedMs -is \[long\]\) -and \[long\]\$_.elapsedMs -ge 0 -and \[long\]\$_.elapsedMs -le 10200000\) \{ \[long\]\$_.elapsedMs \} else \{ \$null \} \}/u,'omit invalid durations and durations beyond the 170-minute Windows gate bound');
  assert.doesNotMatch(summary,/payload|\.input\b|\.text\b|stdout\.log|stderr\.log/u,'timeout diagnostics must exclude request content and raw logs');
 });
 test('shared-gate failures expose only a bounded probe function and line', async()=>{
@@ -460,8 +486,18 @@ test('Windows canary summary exposes bounded cleanup failure categories', async(
  const end=canary.indexOf("Write-Output ('Windows canary bounded diagnostic:",start);
  const summary=canary.slice(start,end);
  assert.ok(start>=0&&end>start,'Windows canary must emit a bounded timeout summary');
+ assert.match(summary,/\$summary\.canaryCleanupErrors\s*=\s*@\(\$result\.cleanupErrors\s*\|\s*Select-Object -Last 8/u,
+  'report the parent canary cleanup failures that decide the gate result');
  assert.match(summary,/\$summary\.cleanupErrors\s*=\s*@\(\$sharedDiagnostic\.cleanupErrors\s*\|\s*Select-Object -Last 8/u,
-  'emit only the latest cleanup failures');
+  'preserve the existing nested shared-probe cleanup field');
+ assert.match(summary,/step = if \(\$_\.step -in @\('retained-shared-report'.*'fixture'\)\) \{ \[string\]\$_.step \}/u,
+  'allow only known parent cleanup step names');
+ assert.match(summary,/errorType = if \(\[string\]\$_.errorType -match '\^\[A-Za-z\]\{1,48\}\$'/u,
+  'allow only short parent cleanup exception type names');
+ assert.match(summary,/hresult = if \(\[string\]\$_.hresult -match '\^0x\[0-9A-Fa-f\]\{8\}\$'/u,
+  'forward only a formatted HRESULT');
+ assert.match(summary,/elapsedMs = if \(\$_.elapsedMs -is \[int\] -or \$_.elapsedMs -is \[long\]\) \{ \[Math\]::Max\(0, \[Math\]::Min\(600000/u,
+  'bound parent cleanup elapsed times before logging');
  assert.match(summary,/operation = if \(\$_.operation -in @\('engine\.close', 'observer\.close', 'peer\.close', 'native\.stop'\)\)/u,
   'allow only known cleanup operations');
  assert.match(summary,/errorType = if \(\[string\]\$_.errorType -match '\^\[A-Za-z\]\{1,48\}\$'/u,'allow only short exception type names');
@@ -599,7 +635,7 @@ test('shared native gate records bounded request state without payloads on timeo
  const cancel=probe.indexOf("await engine.command('ingest', platform='telegram', eventId='cancel'");
  const afterCancel=probe.indexOf('await asyncio.wait_for(wait_records(before + 2), 25)',cancel);
  assert.ok(cancel>=0 && afterCancel>cancel,'bounded shell probe must wait for the request result');
- assert.match(probe.slice(cancel,afterCancel),/report\['cancellationRequestTimeout'\] = await held_request_evidence\(engine, peer, thread\)/u,'capture queue and request state before failing the shell timeout');
+ assert.match(probe.slice(cancel,afterCancel),/report\['cancellationRequestTimeout'\] = await held_request_evidence\(engine, peer, thread, event_id='cancel'\)/u,'capture queue and request state before failing the shell timeout');
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
  assert.match(canary,/if \(\$null -ne \$timeoutReport\.cancellationRequestTimeout\) \{\s*\$result \| Add-Member -Force -NotePropertyName cancellationRequestTimeout -NotePropertyValue \$timeoutReport\.cancellationRequestTimeout\s*\}/u,'forward the cancellation timeout snapshot into the Windows job failure report');
 });

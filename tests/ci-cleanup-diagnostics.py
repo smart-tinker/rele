@@ -389,6 +389,62 @@ class CleanupDiagnostics(unittest.TestCase):
         report['failureCode'] = 'private path and conversation text'
         self.assertNotIn('failureCode', helpers['public_console_report'](report))
 
+    def test_cancel_timeout_native_lookup_uses_exact_event_request(self):
+        module = ast.parse(PROBE.read_text(encoding='utf-8'))
+        function = next(node for node in ast.walk(module)
+                        if isinstance(node, ast.AsyncFunctionDef) and node.name == 'held_request_evidence')
+        scope = {'asyncio': asyncio, 'records': [], 'provider_trace': [], 'actions': []}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(PROBE), 'exec'), scope)
+        held_request_evidence = scope['held_request_evidence']
+
+        class Engine:
+            def __init__(self, requests):
+                self.requests = requests
+                self.calls = []
+
+            async def command(self, action, **fields):
+                self.calls.append((action, fields))
+                if action == 'snapshot':
+                    return {'requests': self.requests, 'approvals': []}
+                if action == 'findRequest':
+                    if fields != {'requestId': 'cancel-request', 'eventId': 'cancel'}:
+                        raise AssertionError('native lookup did not use the exact cancel request')
+                    return {'nativeRequest': {
+                        'state': 'not_found', 'turnAssigned': False, 'queuedSubmissionFound': False,
+                        'mixed': False, 'finalAnswerPresent': False, 'requestId': 'private-id',
+                        'text': 'private fixture content',
+                    }}
+                raise AssertionError(f'unexpected engine command: {action}')
+
+        class Peer:
+            events = []
+
+            async def call(self, method, params):
+                return {'thread': {'status': {'type': 'idle'}}}
+
+        async def read(requests):
+            engine = Engine(requests)
+            evidence = await held_request_evidence(engine, Peer(), 'fixture-thread', event_id='cancel')
+            return evidence, engine.calls
+
+        requests = [
+            {'id': 'other-request', 'eventId': 'other', 'status': 'completed', 'turnId': None},
+            {'id': 'cancel-request', 'eventId': 'cancel', 'status': 'starting', 'turnId': None},
+            {'id': 'last-request', 'eventId': 'last', 'status': 'completed', 'turnId': None},
+        ]
+        evidence, calls = asyncio.run(read(requests))
+        self.assertEqual(calls, [('snapshot', {}), ('findRequest', {'requestId': 'cancel-request', 'eventId': 'cancel'})])
+        self.assertEqual(evidence['nativeRequest'], {
+            'state': 'not_found', 'turnAssigned': False, 'queuedSubmissionFound': False,
+            'mixed': False, 'finalAnswerPresent': False,
+        })
+        self.assertNotIn('private-id', json.dumps(evidence))
+        self.assertNotIn('private fixture content', json.dumps(evidence))
+
+        duplicated = requests + [{'id': 'duplicate-cancel', 'eventId': 'cancel', 'status': 'starting', 'turnId': None}]
+        evidence, calls = asyncio.run(read(duplicated))
+        self.assertEqual(calls, [('snapshot', {})])
+        self.assertNotIn('nativeRequest', evidence)
 
 if __name__ == '__main__':
     unittest.main()

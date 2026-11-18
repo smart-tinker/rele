@@ -712,13 +712,14 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
                 variants.append(flags)
         return client
 
-    async def held_request_evidence(engine, peer, thread):
+    async def held_request_evidence(engine, peer, thread, event_id=None):
         evidence = {'providerRequestCount': len(records)}
         try:
             engine_snapshot = await asyncio.wait_for(engine.command('snapshot'), 5)
+            requests = engine_snapshot.get('requests', [])
             evidence['engineRequests'] = [
                 {key: row.get(key) for key in ('eventId', 'status', 'turnId')}
-                for row in engine_snapshot.get('requests', [])[-8:]
+                for row in requests[-8:]
             ]
             evidence['engineApprovals'] = [
                 {key: row.get(key) for key in ('id', 'requestId', 'method', 'status', 'turnId')}
@@ -730,6 +731,30 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
             evidence['rpcTrace'] = engine_snapshot.get('rpcTrace', [])[-16:]
         except Exception as error:
             evidence['engineSnapshotError'] = type(error).__name__
+            requests = []
+        if event_id:
+            matches = [row for row in requests if row.get('eventId') == event_id]
+            if len(matches) == 1:
+                try:
+                    native = await asyncio.wait_for(engine.command(
+                        'findRequest', requestId=matches[0].get('id'), eventId=event_id), 8)
+                    location = native.get('nativeRequest')
+                    if isinstance(location, dict):
+                        evidence['nativeRequest'] = {
+                            'state': location.get('state') if location.get('state') in ('queued', 'running', 'completed', 'failed', 'interrupted', 'not_found') else 'unknown',
+                            'turnAssigned': location.get('turnAssigned') is True,
+                            'queuedSubmissionFound': location.get('queuedSubmissionFound') is True,
+                            'mixed': location.get('mixed') is True,
+                            'finalAnswerPresent': location.get('finalAnswerPresent') is True,
+                        }
+                    if native.get('nativeRequestErrorType'):
+                        error_type = native.get('nativeRequestErrorType')
+                        evidence['nativeRequestErrorType'] = error_type if error_type in ('ConnectionResetError', 'CodexTransportError', 'CodexRpcError', 'Error', 'UnknownError') else 'other'
+                    if native.get('nativeRequestTimedOut') is True:
+                        evidence['nativeRequestTimedOut'] = True
+                except Exception as error:
+                    error_type = type(error).__name__
+                    evidence['nativeRequestErrorType'] = error_type if error_type in ('ConnectionResetError', 'CodexTransportError', 'CodexRpcError', 'Error', 'UnknownError') else 'other'
         try:
             native_snapshot = await asyncio.wait_for(peer.call('thread/read', {'threadId': thread}), 5)
             evidence['nativeTurnStatus'] = native_snapshot.get('thread', {}).get('status', {}).get('type')
@@ -1118,7 +1143,7 @@ enabled=false
                 if shell_approvals or ready_file.is_file():
                     break
                 if asyncio.get_running_loop().time() >= deadline:
-                    report['cancellationRequestTimeout'] = await held_request_evidence(engine, peer, thread)
+                    report['cancellationRequestTimeout'] = await held_request_evidence(engine, peer, thread, event_id='cancel')
                     report['cancellationRequestTimeout']['readyFileExists'] = ready_file.is_file()
                     raise AssertionError('Shell neither started nor requested approval')
                 await asyncio.sleep(.05)
