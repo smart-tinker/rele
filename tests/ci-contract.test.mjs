@@ -731,6 +731,8 @@ test('shared Windows startup failure reports only an allowlisted driver stage', 
  const resolver=await readFile(new URL('../src/server/codex-shared.ts',import.meta.url),'utf8');
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ assert.ok(driver.includes('JSON.stringify({ action: command.action, stopped: true, runtimeProcessId: pid, backendAlive: alive(pid) })'),
+  'the close ACK must identify its command so a stale reply cannot be accepted');
  for(const stage of ['codex-connect','shared-codex-resolution','shared-codex-resolved','thread-catalog','engine-start','native-diagnostics','desktop-package-verification','ready'])
   assert.ok(driver.includes(`emitProbeStage('${stage}')`),`the shared driver must mark ${stage}`);
  assert.match(probe,/def safe_engine_driver_stage\(value\):[\s\S]{0,300}'codex-connect'[\s\S]*'shared-codex-resolution'[\s\S]*'shared-codex-resolved'[\s\S]*'native-diagnostics'[\s\S]*'desktop-package-verification'/u,
