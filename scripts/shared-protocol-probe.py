@@ -362,11 +362,26 @@ class EngineDriver:
         if self.process.returncode is None:
             self.startup_stage = 'engine-close-request'
             try:
-                result = await self.command('close')
-                while isinstance(result, dict) and result.get('action') == 'wait':
-                    result = await self.read()
-                self.startup_stage = 'engine-close-ack'
-                assert isinstance(result, dict) and result.get('stopped') is True, 'Shared Engine driver did not acknowledge close'
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + ENGINE_READ_TIMEOUT_SECONDS
+                self.process.stdin.write((json.dumps({'action': 'close'}) + '\n').encode())
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise TimeoutError('Shared Engine driver did not acknowledge close')
+                await asyncio.wait_for(self.process.stdin.drain(), remaining)
+                while True:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise TimeoutError('Shared Engine driver did not acknowledge close')
+                    result = await self.read(remaining)
+                    if isinstance(result, dict) and result.get('action') == 'close':
+                        if result.get('stopped') is not True or not isinstance(result.get('backendAlive'), bool):
+                            raise RuntimeError('Shared Engine driver returned an invalid close response')
+                        self.startup_stage = 'engine-close-ack'
+                        break
+                    if not isinstance(result, dict) or result.get('action') not in (
+                            'ingest', 'wait', 'answer', 'resume', 'cancel', 'snapshot', 'findRequest'):
+                        raise RuntimeError('Shared Engine driver returned an invalid close response')
                 assert result.get('backendAlive'), 'Closing Rele stopped the shared native backend'
                 await asyncio.wait_for(self.process.wait(), 15)
             except Exception as error:
