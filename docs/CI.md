@@ -26,7 +26,7 @@ flowchart TD
 
 | Режим | Runner-ы на событие | Что выполняется |
 |---|---|---|
-| Draft PR | 2 matrix + 1 CodeQL + 1 dependency review; затем CI gate на Ubuntu | npm ci, типы, контракт CI, unit, build, Chromium E2E, production UI/API smoke; независимые security checks |
+| Draft PR | 2 matrix + 1 CodeQL + 1 dependency review; затем CI gate на Ubuntu | npm ci, Python cleanup diagnostics, типы, контракт CI, unit, build, Chromium E2E, production UI/API smoke; независимые security checks |
 | Ready PR | те же, до 4 одновременно | Всё выше + сборка пакетов, установка/удаление, protocol и managed для всех поддерживаемых версий Codex, native Goal lifecycle на последней поддерживаемой версии, CPU voice |
 | `main` | 2 matrix + 1 CodeQL; затем CI gate на Ubuntu | Полный набор проверок и CodeQL |
 | Ручной dispatch с `release: false` | 2 matrix, затем CI gate на Ubuntu | Полный набор без передачи пакетов и публикации |

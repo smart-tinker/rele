@@ -256,16 +256,22 @@ try {
     $client=@($rows | Where-Object { $_.LocalAddress -eq '127.0.0.1' -and $_.LocalPort -eq $p.localPort -and $_.RemoteAddress -eq '127.0.0.1' -and $_.RemotePort -eq $p.remotePort })
     Require ($server.Count -eq 1 -and $server[0].OwningProcess -eq $r.processId -and $client.Count -eq 1 -and $client[0].OwningProcess -eq $inputProof.gatewayId)
   }
-  Mark-Stage 'peer-before'
-  Peer
-  Mark-Stage 'identity-before'
-  $before=Identity
-  Mark-Stage 'peer-after'
-  Peer
-  Mark-Stage 'identity-after'
-  $after=Identity
-  Mark-Stage 'identity-compare'
-  Require (($before | ConvertTo-Json -Compress) -ceq ($after | ConvertTo-Json -Compress))
+  if ($stdio) {
+    # The caller brackets native list with generations; stdio has no peer query to bracket here.
+    Mark-Stage 'identity-stdio'
+    $before=Identity
+  } else {
+    Mark-Stage 'peer-before'
+    Peer
+    Mark-Stage 'identity-before'
+    $before=Identity
+    Mark-Stage 'peer-after'
+    Peer
+    Mark-Stage 'identity-after'
+    $after=Identity
+    Mark-Stage 'identity-compare'
+    Require (($before | ConvertTo-Json -Compress) -ceq ($after | ConvertTo-Json -Compress))
+  }
   $before.peerVerified=$true; $before.gatewayId=$inputProof.gatewayId
   if (-not $stdio) { $before.localPort=$p.localPort; $before.remotePort=$p.remotePort }
   Mark-Stage 'proof-output'

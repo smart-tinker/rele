@@ -18,6 +18,11 @@ import { asyncQuestions, encodeAsyncAnswers } from '../src/server/async-question
 import type { Endpoint } from '../src/shared/types.js';
 import { promisify } from 'node:util';
 
+vi.mock('../src/server/codex-native-generation.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/server/codex-native-generation.js')>();
+  return { ...actual, codexNativeGeneration: vi.fn(actual.codexNativeGeneration) };
+});
+
 const execute = promisify(execFile);
 
 interface Rpc { id?: string | number; method?: string; params: Record<string, unknown>; result?: unknown; error?: { code: number; message: string } }
@@ -1022,6 +1027,9 @@ describe('Codex shared-runtime adapter', () => {
 
   it('exposes nullable canonical command IDs and terminates only a revalidated native terminal pair', async () => {
     const clientId = randomUUID();
+    const generation = 'a'.repeat(64), proof = vi.mocked(codexNativeGeneration);
+    proof.mockClear();
+    for (let index = 0; index < 7; index++) proof.mockResolvedValueOnce(generation);
     const terminals = [{ itemId: 'own-command', processId: '1234', command: 'never-export-this-command' },
       { itemId: 'foreign-command', processId: '5678', command: 'foreign-command-body' }];
     const f = await fixture({
@@ -1034,17 +1042,18 @@ describe('Codex shared-runtime adapter', () => {
     });
     await f.client.connect();
     expect(await f.client.findRequest(threadId, clientId)).toMatchObject({ turnId: 'own-turn', commandItems: [{ id: 'own-command', processId: null }] });
-    expect(await f.client.backgroundTerminals(threadId)).toEqual({ serverId: 42, terminals: [
+    expect(await f.client.backgroundTerminals(threadId)).toEqual({ serverId: 42, serverGeneration: generation, terminals: [
       { itemId: 'own-command', processId: '1234' }, { itemId: 'foreign-command', processId: '5678' },
     ] });
-    await f.client.terminateBackgroundTerminal(threadId, { serverId: 42, itemId: 'own-command', processId: '1234' });
+    const target = { serverId: 42, serverGeneration: generation, itemId: 'own-command', processId: '1234' };
+    await f.client.terminateBackgroundTerminal(threadId, target);
     expect(f.calls.filter(call => call.method === 'thread/backgroundTerminals/terminate').map(call => call.params))
       .toEqual([{ threadId, processId: '1234' }]);
     terminals[0].processId = '9999';
-    await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, itemId: 'own-command', processId: '1234' }))
+    await expect(f.client.terminateBackgroundTerminal(threadId, target))
       .rejects.toMatchObject({ identityFailure: 'terminal-process-changed' });
     terminals.push({ itemId: 'own-command', processId: '1111', command: 'duplicate-command-body' });
-    await expect(f.client.terminateBackgroundTerminal(threadId, { serverId: 42, itemId: 'own-command', processId: '1234' }))
+    await expect(f.client.terminateBackgroundTerminal(threadId, target))
       .rejects.toMatchObject({ identityFailure: 'terminal-ambiguous' });
     expect(f.calls.filter(call => call.method === 'thread/backgroundTerminals/terminate')).toHaveLength(1);
   });
@@ -1435,6 +1444,58 @@ describe('Codex shared passive context receipts', () => {
 });
 
 describe('Codex managed runtime', () => {
+  it('proves the terminal-list server generation once after the native RPC', async () => {
+    const f = await fixture({
+      'server/diagnostics': () => ({ process: { id: 42 }, gauges: [] }),
+      'thread/backgroundTerminals/list': () => ({ data: [{ itemId: 'own-command', processId: '1234' }], nextCursor: null }),
+    });
+    await f.client.connect();
+    const proof = vi.mocked(codexNativeGeneration);
+    proof.mockClear();
+    proof.mockImplementationOnce(async () => {
+      expect(f.calls.at(-1)?.method).toBe('thread/backgroundTerminals/list');
+      return 'a'.repeat(64);
+    });
+
+    await expect(f.client.backgroundTerminals(threadId)).resolves.toEqual({
+      serverId: 42, serverGeneration: 'a'.repeat(64), terminals: [{ itemId: 'own-command', processId: '1234' }],
+    });
+    expect(proof).toHaveBeenCalledOnce();
+  });
+
+  it('withholds cancellation proof when the backend generation changes during the terminal-list RPC', async () => {
+    let generation = 'a'.repeat(64), startList!: () => void, finishList!: (value: unknown) => void;
+    const listStarted = new Promise<void>(resolve => { startList = resolve; });
+    const listResponse = new Promise<unknown>(resolve => { finishList = resolve; });
+    const f = await fixture({
+      'server/diagnostics': () => ({ process: { id: 42 }, gauges: [] }),
+      'thread/backgroundTerminals/list': async () => { startList(); return listResponse; },
+    });
+    await f.client.connect();
+    const runtime = Reflect.get(f.client, 'runtime');
+    const peer = { kind: 'windows-shared', endpoint: f.endpoint, localPort: 55001, remotePort: 62662 };
+    Reflect.set(f.client, 'nativePeer', peer);
+    const proof = vi.mocked(codexNativeGeneration);
+    proof.mockClear();
+    proof.mockImplementationOnce(async () => generation).mockImplementationOnce(async () => generation);
+
+    const snapshot = f.client.backgroundTerminals(threadId, { verifyStableGeneration: true });
+    await listStarted;
+    generation = 'b'.repeat(64);
+    finishList({ data: [{ itemId: 'own-command', processId: '1234' }], nextCursor: null });
+    const result = await snapshot;
+
+    expect(Reflect.get(f.client, 'runtime')).toBe(runtime);
+    expect(Reflect.get(f.client, 'nativePeer')).toBe(peer);
+    expect(f.client.status().connected).toBe(true);
+    expect(proof).toHaveBeenCalledTimes(2);
+    expect(result).not.toHaveProperty('serverGeneration');
+    await expect(f.client.terminateBackgroundTerminal(threadId, {
+      ...result.terminals[0], serverId: result.serverId, serverGeneration: result.serverGeneration,
+    })).rejects.toMatchObject({ code: 'terminal-identity-changed', identityFailure: 'server-generation-unconfirmed' });
+    expect(f.calls.some(call => call.method === 'thread/backgroundTerminals/terminate')).toBe(false);
+  });
+
   it('never sends terminal termination with an unproven or malformed target generation', async () => {
     const f = await fixture({
       'server/diagnostics': () => ({ process: { id: 42 }, gauges: [] }),

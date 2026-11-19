@@ -6,6 +6,7 @@ import { copyFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import assert from 'node:assert/strict';
+import { closeManagedFixture, createManagedOperationTrace, waitManagedQueue } from './managed-probe-wait.mjs';
 import { CodexClient, CodexTransportError } from '../src/server/codex.js';
 import { CodexContextReceipts } from '../src/server/codex-context-receipts.js';
 import { Engine } from '../src/server/engine.js';
@@ -43,10 +44,39 @@ const slackHistory: SlackTranscriptMessage[] = [{
 let codex!: CodexClient;
 let engine!: Engine;
 const diagnostics: string[] = [];
+const operationTrace = createManagedOperationTrace();
 let oldPid: number | undefined;
-function processAlive(pid: number): boolean { try { process.kill(pid, 0); return true; } catch { return false; } }
+const safeRpcMethods = new Set([
+  'server/diagnostics', 'thread/backgroundTerminals/list', 'thread/inject_items', 'thread/queue/add',
+  'thread/queue/list', 'thread/read', 'thread/resume', 'thread/turns/list', 'thread/unsubscribe',
+]);
+function observe<T>(label: string, operation: () => Promise<T>): Promise<T> {
+  return operationTrace.observe(label, operation);
+}
+function observeMethod(target: object, method: string, label: string): void {
+  const methods = target as Record<string, unknown>;
+  const operation = methods[method];
+  if (typeof operation !== 'function') return;
+  methods[method] = function(this: unknown, ...args: unknown[]) {
+    return observe(label, () => (operation as (this: unknown, ...args: unknown[]) => Promise<unknown>).apply(this, args));
+  };
+}
+let ownedPid: number | undefined;
+let shutdown: ReturnType<typeof closeManagedFixture> | undefined;
+function processAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
+}
 async function start(): Promise<void> {
+  shutdown = undefined;
+  ownedPid = undefined;
   codex = new CodexClient(config.codex);
+  const privateClient = codex as unknown as { call: (method: string, params: Record<string, unknown>, timeoutMs?: number, confirmHealth?: boolean) => Promise<unknown> };
+  const nativeCall = privateClient.call.bind(codex);
+  privateClient.call = (method, params, timeoutMs, confirmHealth) => observe(
+    `rpc.${safeRpcMethods.has(method) ? method : 'other'}`,
+    () => nativeCall(method, params, timeoutMs, confirmHealth),
+  );
   engine = new Engine(store, codex, { config: () => config, temporaryRoot: values.directory!, redact: value => String(value) });
   for (const platform of ['slack', 'telegram'] as const) engine.channels[platform] = {
     state: { configured: true, connected: true, name: platform, accountId: endpoints[platform].accountId },
@@ -54,6 +84,24 @@ async function start(): Promise<void> {
     start: async () => {}, stop: async () => {}, download: async () => { throw new Error('Audio not used in this fixture'); },
     deliver: async delivery => `${platform}:${delivery.id}`,
   } satisfies Channel;
+  const internalEngine = engine as unknown as Record<string, unknown>;
+  for (const [method, label] of [
+    ['deliver', 'pump.deliver'], ['flushProgress', 'pump.flushProgress'], ['flushApprovalUpdates', 'pump.flushApprovalUpdates'],
+    ['retryPendingQuestions', 'pump.retryPendingQuestions'], ['refreshAsyncQuestions', 'pump.refreshAsyncQuestions'],
+    ['provision', 'pump.provision'], ['reconcile', 'pump.reconcile'], ['dispatch', 'pump.dispatch'],
+  ] as const) observeMethod(engine, method, label);
+  for (const [owner, method, label] of [
+    ['sourceControls', 'recover', 'pump.sourceControls.recover'], ['slackSync', 'backfill', 'pump.slackSync.backfill'],
+    ['slackSync', 'drain', 'dispatch.slackSync.drain'], ['initialMessages', 'ensure', 'dispatch.initialMessages.ensure'],
+  ] as const) {
+    const target = internalEngine[owner];
+    if (target && typeof target === 'object') observeMethod(target, method, label);
+  }
+  for (const [method, label] of [
+    ['injectContext', 'dispatch.codex.injectContext'], ['subscribe', 'dispatch.codex.subscribe'],
+    ['backgroundTerminals', 'dispatch.codex.backgroundTerminals'], ['enqueue', 'dispatch.codex.enqueue'],
+    ['releaseThread', 'dispatch.codex.releaseThread'],
+  ] as const) observeMethod(codex, method, label);
   engine.on('diagnostic', message => { diagnostics.push(String(message)); });
   await codex.connect();
   const connectedHome = codex.status().codexHome;
@@ -62,9 +110,18 @@ async function start(): Promise<void> {
   engine.start();
 }
 async function snapshot() {
-  return { status: codex.status(), runtime: codex.runtimeInfo(), runtimeProcessId: (await codex.diagnostics()).process.id,
+  const runtimeProcessId = (await codex.diagnostics()).process.id;
+  ownedPid = runtimeProcessId;
+  return { status: codex.status(), runtime: codex.runtimeInfo(), runtimeProcessId,
     requests: store.listRequests(), deliveries: store.listDeliveries(), diagnostics,
   };
+}
+function closeFixture() {
+  return shutdown ??= closeManagedFixture(
+    () => engine.stop(),
+    () => codex.close(),
+    () => ownedPid !== undefined && !processAlive(ownedPid),
+  );
 }
 async function freshContextProof() {
   const home = join(values.home!, '..', 'f');
@@ -113,7 +170,8 @@ async function freshContextProof() {
 const lines = createInterface({ input: process.stdin });
 try {
   await start();
-  process.stdout.write(JSON.stringify({ ready: true, catalog: await codex.listThreads(), ...(await snapshot()) }) + '\n');
+  const initial = await snapshot();
+  process.stdout.write(JSON.stringify({ ready: true, catalog: await codex.listThreads(), ...initial }) + '\n');
   for await (const line of lines) {
     const command = JSON.parse(line) as { action: string; platform?: Platform; text?: string; eventId?: string };
     let freshContext;
@@ -132,30 +190,40 @@ try {
       });
       await engine.settled();
     } else if (command.action === 'wait') {
-      const until = Date.now() + 40_000;
-      while (store.activeRequests().length && Date.now() < until) {
-        await engine.pump(); await engine.settled(); await delay(100);
+      const result = await waitManagedQueue(
+        () => store.activeRequests().length,
+        () => engine.pump(),
+        () => engine.settled(),
+        () => delay(100),
+      );
+      if (!result.ok) {
+        process.stdout.write(JSON.stringify({ action: command.action, ...result,
+          activeRequestCount: store.activeRequests().length, pendingOperations: operationTrace.pendingOperations(),
+          rejectedOperations: operationTrace.rejectedOperations() }) + '\n');
+        process.exitCode = 1;
+        continue;
       }
-      if (store.activeRequests().length) throw new Error(`Fixture requests did not finish: ${JSON.stringify(store.listRequests())}`);
-      await engine.settled(); await engine.pump();
+      operationTrace.clearRejected();
     } else if (command.action === 'fresh-context') {
       freshContext = await freshContextProof();
     } else if (command.action === 'restart') {
-      oldPid = (await codex.diagnostics()).process.id;
-      await engine.stop(); await codex.close();
-      if (processAlive(oldPid)) throw new Error('Owned Codex process survived an awaited close');
+      oldPid = ownedPid ?? (await codex.diagnostics()).process.id;
+      const stopped = await closeFixture();
+      if (!stopped.ok || !stopped.childExited) throw new Error('Owned Codex cleanup was not confirmed');
       await start();
     } else if (command.action === 'close') {
-      const pid = (await codex.diagnostics()).process.id;
-      await engine.stop(); await codex.close();
-      process.stdout.write(JSON.stringify({ stopped: true, childExited: !processAlive(pid) }) + '\n');
+      const stopped = await closeFixture();
+      process.stdout.write(JSON.stringify({ action: command.action, ...stopped }) + '\n');
+      if (!stopped.ok) process.exitCode = 1;
       break;
     } else if (command.action !== 'snapshot') throw new Error('Unknown fixture action');
     process.stdout.write(JSON.stringify({ action: command.action, ...(freshContext ? { freshContext } : {}), ...(oldPid ? { previousProcessId: oldPid } : {}), ...(await snapshot()) }) + '\n');
   }
 } finally {
   lines.close();
-  if (engine) await engine.stop();
-  if (codex) await codex.close();
+  if (codex) {
+    const stopped = await closeFixture();
+    if (!stopped.ok) process.exitCode = 1;
+  }
   store.close();
 }

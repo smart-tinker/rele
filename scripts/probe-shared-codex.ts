@@ -445,7 +445,7 @@ if (values['expect-error']) {
       } else if (command.action === 'close') {
         const pid = (await codex!.diagnostics()).process.id;
         await engine!.stop(); await codex!.close();
-        process.stdout.write(JSON.stringify({ stopped: true, runtimeProcessId: pid, backendAlive: alive(pid) }) + '\n');
+        process.stdout.write(JSON.stringify({ action: command.action, stopped: true, runtimeProcessId: pid, backendAlive: alive(pid) }) + '\n');
         break;
       } else if (command.action !== 'snapshot') throw new Error('Unknown shared fixture command');
       process.stdout.write(JSON.stringify({ action: command.action, ...(await snapshot(command.processId)) }) + '\n');
