@@ -1444,6 +1444,58 @@ describe('Codex shared passive context receipts', () => {
 });
 
 describe('Codex managed runtime', () => {
+  it('dispatches the same origin-bound request before a held native identity proof settles', async () => {
+    let releaseProof!: (generation: string | undefined) => void;
+    const heldProof = new Promise<string | undefined>(resolve => { releaseProof = resolve; });
+    const proof = vi.mocked(codexNativeGeneration), originalProof = proof.getMockImplementation();
+    proof.mockClear();
+    proof.mockImplementation(() => heldProof);
+    const home = await mkdtemp(path.join(tmpdir(), 'rele-held-proof-home-'));
+    cleanup.push(() => rm(home, { recursive:true, force:true }));
+    const f = await managedFixture({ terminals:true, codexHome:home });
+    const store = new Store(':memory:');
+    cleanup.push(() => store.close());
+    const endpoint: Endpoint = { id:'held-proof-origin', platform:'telegram', accountId:'999', chatId:'-100123', threadId:'17',
+      title:'Synthetic origin', subtitle:'', people:[{ id:'123', name:'Fixture' }], updatedAt:new Date().toISOString() };
+    store.upsertEndpoint(endpoint);
+    store.createConversation({ name:'Original', threadId, cwd:home,
+      bindings:[{ platform:'telegram', endpointId:endpoint.id, allowedSenderIds:['123'] }] });
+    store.setMeta(initialMessageKey(home, threadId), JSON.stringify({ applied:true }));
+    const config = { ...structuredClone(defaultConfig), codex:{ transport:'managed' as const, executable:f.executable, endpoint:'', codexHome:home },
+      telegram:{ ...defaultConfig.telegram, enabled:true } };
+    const engine = new Engine(store, f.client, { config:() => config, temporaryRoot:f.directory, redact:() => 'Fixture error' });
+    engine.channels.telegram = { state:{ configured:true, connected:true, accountId:'999' }, start:async () => {}, stop:async () => {}, download:async () => {}, deliver:async () => 'receipt' };
+    cleanup.push(() => engine.stop());
+    try {
+      await f.client.connect();
+      Reflect.set(f.client, 'runtime', { codexHome:home });
+      Reflect.set(f.client, 'nativePeer', { kind:'stdio', pid:process.pid, codexHome:home, executable:f.executable });
+      await engine.receive({ eventId:'held-proof-request', endpoint, sender:endpoint.people[0], messageId:'1', text:'Synthetic request' });
+      const deadline = Date.now() + 2_000;
+      let calls = await f.calls();
+      const reachesOrigin = () => calls.some(call => call.method === 'thread/queue/add'
+        && JSON.stringify(call.params.input).includes('Synthetic request'));
+      while (!reachesOrigin()) {
+        if (Date.now() >= deadline) {
+          throw new Error(`The origin-bound request did not reach the native queue before the deadline. proofCalls=${proof.mock.calls.length}; methods=${calls.map(call => call.method).filter(Boolean).join(',')}`);
+        }
+        await new Promise(resolve => setTimeout(resolve, 10));
+        calls = await f.calls();
+      }
+      const request = store.listRequests().find(row => row.eventId === 'held-proof-request')!;
+      const queued = calls.find(call => call.method === 'thread/queue/add' && JSON.stringify(call.params.input).includes('Synthetic request'));
+      expect(queued?.params).toMatchObject({ threadId, clientUserMessageId:request.id });
+      expect(request.origin).toMatchObject({ platform:'telegram', accountId:'999', endpointId:endpoint.id, chatId:'-100123', threadId:'17', senderId:'123', messageId:'1' });
+      expect(JSON.parse(store.getMeta(`request-terminal-baseline:${request.id}`)!)).toMatchObject({ serverId:expect.any(Number),
+        terminals:[{ itemId:'fixture-command', processId:'1234' }] });
+      expect(JSON.parse(store.getMeta(`request-terminal-baseline:${request.id}`)!)).not.toHaveProperty('serverGeneration');
+      expect(proof).not.toHaveBeenCalled();
+    } finally {
+      releaseProof('a'.repeat(64));
+      if (originalProof) proof.mockImplementation(originalProof);
+    }
+  });
+
   it('proves the terminal-list server generation once after the native RPC', async () => {
     const f = await fixture({
       'server/diagnostics': () => ({ process: { id: 42 }, gauges: [] }),
