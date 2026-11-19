@@ -1511,6 +1511,39 @@ describe('Codex managed runtime', () => {
     expect(proof).not.toHaveBeenCalled();
   });
 
+  it('carries only the confirmed generation of the same managed stdio peer into a fast terminal baseline', async () => {
+    const home = await mkdtemp(path.join(tmpdir(), 'Rele stdio baseline identity '));
+    cleanup.push(() => rm(home, { recursive:true, force:true }));
+    const f = await managedFixture({ terminals:true, codexHome:home });
+    await f.client.connect();
+    const proof = vi.mocked(codexNativeGeneration), originalProof = proof.getMockImplementation();
+    let generation = 'a'.repeat(64);
+    proof.mockClear();
+    proof.mockImplementation(async () => generation);
+    try {
+      const first = await f.client.backgroundTerminals(threadId, { verifyStableGeneration:true });
+      const peer = Reflect.get(f.client, 'nativePeer') as CodexNativePeer;
+      expect(peer.kind).toBe('stdio');
+      expect(first.terminals).toEqual([{ itemId:'fixture-command', processId:'1234' }]);
+      expect(await f.client.backgroundTerminals(threadId)).toEqual(first);
+
+      Reflect.set(f.client, 'nativePeer', { ...peer });
+      const unconfirmed = await f.client.backgroundTerminals(threadId);
+      expect(unconfirmed.serverId).toBe(first.serverId);
+      expect(unconfirmed.terminals).toEqual(first.terminals);
+      expect(unconfirmed).not.toHaveProperty('serverGeneration');
+
+      generation = 'b'.repeat(64);
+      const replacement = await f.client.backgroundTerminals(threadId, { verifyStableGeneration:true });
+      expect(replacement.serverId).toBe(first.serverId);
+      expect(replacement.serverGeneration).toBe(generation);
+      expect(replacement.terminals).toEqual(first.terminals);
+      expect(await f.client.backgroundTerminals(threadId)).toEqual(replacement);
+    } finally {
+      if (originalProof) proof.mockImplementation(originalProof);
+    }
+  });
+
   it('withholds cancellation proof when the backend generation changes during the terminal-list RPC', async () => {
     let generation = 'a'.repeat(64), startList!: () => void, finishList!: (value: unknown) => void;
     const listStarted = new Promise<void>(resolve => { startList = resolve; });

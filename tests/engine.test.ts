@@ -2073,18 +2073,23 @@ describe('Engine scoped shell cancellation', () => {
       expect(f.store.listDeliveries().some(row => row.requestId === request.id && row.key === 'terminal:error')).toBe(false);
     });
 
-  it('binds a fast terminal baseline to a generation only after the stable cancellation proof', async () => {
+  it('refuses addressed Stop when a fast baseline has no generation and the same PID now names another backend', async () => {
     const f = fixture(), request = await shell(f);
     const key = `request-terminal-baseline:${request.id}`, baseline = JSON.parse(f.store.getMeta(key)!);
     delete baseline.serverGeneration;
+    baseline.terminals = [{ itemId:'pre-existing-command', processId:'9876' }];
     f.store.setMeta(key, JSON.stringify(baseline));
+    f.codex.serverGeneration = 'b'.repeat(64);
     f.codex.backgroundTerminals.mockClear();
 
-    await expect(f.engine.cancel(request.id)).resolves.toBeUndefined();
+    const outcome = await f.engine.cancel(request.id).then(() => 'completed', () => 'rejected');
 
+    expect(f.codex.terminateBackgroundTerminal).not.toHaveBeenCalled();
+    expect(outcome).toBe('rejected');
     expect(f.codex.backgroundTerminals).toHaveBeenNthCalledWith(1, THREAD, { verifyStableGeneration:true });
-    expect(JSON.parse(f.store.getMeta(key)!)).toMatchObject({ serverId:42, serverGeneration:'a'.repeat(64), terminals:[] });
-    expect(f.codex.terminateBackgroundTerminal).toHaveBeenCalledOnce();
+    await expect(f.codex.backgroundTerminals.mock.results[0]?.value).resolves.toMatchObject({ serverId:42, serverGeneration:'b'.repeat(64) });
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+    expect(JSON.parse(f.store.getMeta(key)!)).not.toHaveProperty('serverGeneration');
   });
 
   type BaselineCase = { failure: string; after: (f: ReturnType<typeof fixture>, request: ReleRequest) => void };
