@@ -2073,7 +2073,7 @@ describe('Engine scoped shell cancellation', () => {
       expect(f.store.listDeliveries().some(row => row.requestId === request.id && row.key === 'terminal:error')).toBe(false);
     });
 
-  it('refuses addressed Stop when a fast baseline has no generation and the same PID now names another backend', async () => {
+  it('refuses addressed Stop when a nonempty fast baseline lacks a generation despite an unchanged PID', async () => {
     const f = fixture(), request = await shell(f);
     const key = `request-terminal-baseline:${request.id}`, baseline = JSON.parse(f.store.getMeta(key)!);
     delete baseline.serverGeneration;
@@ -2086,9 +2086,9 @@ describe('Engine scoped shell cancellation', () => {
 
     expect(f.codex.terminateBackgroundTerminal).not.toHaveBeenCalled();
     expect(outcome).toBe('rejected');
-    expect(f.codex.backgroundTerminals).toHaveBeenNthCalledWith(1, THREAD, { verifyStableGeneration:true });
-    await expect(f.codex.backgroundTerminals.mock.results[0]?.value).resolves.toMatchObject({ serverId:42, serverGeneration:'b'.repeat(64) });
+    expect(f.codex.backgroundTerminals).not.toHaveBeenCalled();
     expect(f.codex.interrupt).not.toHaveBeenCalled();
+    expect(f.codex.serverId).toBe(42);
     expect(JSON.parse(f.store.getMeta(key)!)).not.toHaveProperty('serverGeneration');
   });
 

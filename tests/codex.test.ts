@@ -1468,8 +1468,7 @@ describe('Codex managed runtime', () => {
     cleanup.push(() => engine.stop());
     try {
       await f.client.connect();
-      Reflect.set(f.client, 'runtime', { codexHome:home });
-      Reflect.set(f.client, 'nativePeer', { kind:'stdio', pid:process.pid, codexHome:home, executable:f.executable });
+      await vi.waitFor(() => expect(proof).toHaveBeenCalledOnce());
       await engine.receive({ eventId:'held-proof-request', endpoint, sender:endpoint.people[0], messageId:'1', text:'Synthetic request' });
       const deadline = Date.now() + 2_000;
       let calls = await f.calls();
@@ -1489,7 +1488,7 @@ describe('Codex managed runtime', () => {
       expect(JSON.parse(store.getMeta(`request-terminal-baseline:${request.id}`)!)).toMatchObject({ serverId:expect.any(Number),
         terminals:[{ itemId:'fixture-command', processId:'1234' }] });
       expect(JSON.parse(store.getMeta(`request-terminal-baseline:${request.id}`)!)).not.toHaveProperty('serverGeneration');
-      expect(proof).not.toHaveBeenCalled();
+      expect(proof).toHaveBeenCalledOnce();
     } finally {
       releaseProof('a'.repeat(64));
       if (originalProof) proof.mockImplementation(originalProof);
@@ -1497,16 +1496,15 @@ describe('Codex managed runtime', () => {
   });
 
   it('returns the terminal baseline without waiting for native generation proof', async () => {
-    const f = await fixture({
-      'server/diagnostics': () => ({ process: { id: 42 }, gauges: [] }),
-      'thread/backgroundTerminals/list': () => ({ data: [{ itemId: 'own-command', processId: '1234' }], nextCursor: null }),
-    });
+    const home = await mkdtemp(path.join(tmpdir(), 'Rele fast stdio baseline '));
+    cleanup.push(() => rm(home, { recursive:true, force:true }));
+    const f = await managedFixture({ terminals:true, codexHome:home });
     await f.client.connect();
     const proof = vi.mocked(codexNativeGeneration);
     proof.mockClear();
 
-    await expect(f.client.backgroundTerminals(threadId)).resolves.toEqual({
-      serverId: 42, terminals: [{ itemId: 'own-command', processId: '1234' }],
+    await expect(f.client.backgroundTerminals(threadId)).resolves.toMatchObject({
+      serverId: expect.any(Number), terminals: [{ itemId: 'fixture-command', processId: '1234' }],
     });
     expect(proof).not.toHaveBeenCalled();
   });
@@ -1521,11 +1519,14 @@ describe('Codex managed runtime', () => {
     proof.mockClear();
     proof.mockImplementation(async () => generation);
     try {
-      const first = await f.client.backgroundTerminals(threadId, { verifyStableGeneration:true });
+      f.client.primeNativeGeneration();
+      await vi.waitFor(() => expect(Reflect.get(f.client, 'nativeGeneration')).toMatchObject({ generation }));
+      const first = await f.client.backgroundTerminals(threadId);
       const peer = Reflect.get(f.client, 'nativePeer') as CodexNativePeer;
       expect(peer.kind).toBe('stdio');
       expect(first.terminals).toEqual([{ itemId:'fixture-command', processId:'1234' }]);
       expect(await f.client.backgroundTerminals(threadId)).toEqual(first);
+      expect(proof).toHaveBeenCalledOnce();
 
       Reflect.set(f.client, 'nativePeer', { ...peer });
       const unconfirmed = await f.client.backgroundTerminals(threadId);

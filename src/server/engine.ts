@@ -17,7 +17,7 @@ import { ASYNC_QUESTION_METHOD, asyncQuestions, encodeAsyncAnswers, matchAsyncAn
 import { SourceControls, type ControlContext, type ControlView } from './source-control.js';
 import type { ControlCommand } from './channels/slack-control.js';
 
-export type CodexGateway = Pick<CodexClient, 'status' | 'isVerifiedVersion' | 'createThread' | 'setThreadName' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'steer' | 'findSteerReceipt' | 'interrupt' | 'backgroundTerminals' | 'terminateBackgroundTerminal' | 'findRequest' | 'retryOverloaded' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Partial<Pick<CodexClient, 'hasPendingRequest' | 'asyncQuestionState' | 'controlSnapshot' | 'controlModels' | 'readControlGoal' | 'updateControlGoal' | 'updateControlModel' | 'controlTurns' | 'controlTurnLocation' | 'controlTurnIndex'>> & Pick<EventEmitter, 'on' | 'off'>;
+export type CodexGateway = Pick<CodexClient, 'status' | 'isVerifiedVersion' | 'createThread' | 'setThreadName' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'steer' | 'findSteerReceipt' | 'interrupt' | 'backgroundTerminals' | 'terminateBackgroundTerminal' | 'findRequest' | 'retryOverloaded' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Partial<Pick<CodexClient, 'hasPendingRequest' | 'asyncQuestionState' | 'primeNativeGeneration' | 'controlSnapshot' | 'controlModels' | 'readControlGoal' | 'updateControlGoal' | 'updateControlModel' | 'controlTurns' | 'controlTurnLocation' | 'controlTurnIndex'>> & Pick<EventEmitter, 'on' | 'off'>;
 export interface EngineOptions {
   config: () => AppConfig;
   temporaryRoot: string;
@@ -614,7 +614,8 @@ export class Engine extends EventEmitter {
     const baseline = rawBaseline ? JSON.parse(rawBaseline) as TerminalBaseline : undefined;
     const baselineFailure = !baseline ? 'missing'
       : baseline.target !== state.target ? 'target-changed'
-        : baseline.serverGeneration !== undefined && (typeof baseline.serverGeneration !== 'string' || !/^[a-f0-9]{64}$/u.test(baseline.serverGeneration)) ? 'generation-invalid'
+        : typeof baseline.serverGeneration !== 'string' ? 'generation-missing'
+          : !/^[a-f0-9]{64}$/u.test(baseline.serverGeneration) ? 'generation-invalid'
           : !Array.isArray(baseline.terminals) || baseline.terminals.some(entry => !terminalPair(entry)) ? 'terminals-invalid' : undefined;
     if (!baseline || baselineFailure) throw Object.assign(new Error('Исходный сервер или снимок команд не подтверждён. Отсутствие терминалов не доказывает завершение прежних процессов.'), {
       code: `terminal-baseline-${baselineFailure ?? 'missing'}`,
@@ -622,14 +623,8 @@ export class Engine extends EventEmitter {
     const verifyServer = (snapshot: CodexTerminalSnapshot) => {
       current();
       if (this.isMixed(id)) throw new Error('В ход добавлено сообщение другого клиента Codex. Автоматическая отмена смешанного хода недоступна.');
-      if (snapshot.serverId !== baseline.serverId || typeof snapshot.serverGeneration !== 'string' || !/^[a-f0-9]{64}$/u.test(snapshot.serverGeneration)
-        || baseline.serverGeneration !== undefined && snapshot.serverGeneration !== baseline.serverGeneration) {
+      if (snapshot.serverId !== baseline.serverId || snapshot.serverGeneration !== baseline.serverGeneration) {
         throw new Error('Сервер Codex изменился или его поколение не подтверждено. Завершение прежних процессов не подтверждено.');
-      }
-      if (baseline.serverGeneration === undefined) {
-        // The dispatch baseline is fast; pin its identity only after the two-sided stop preflight.
-        baseline.serverGeneration = snapshot.serverGeneration;
-        this.store.setMeta(`request-terminal-baseline:${id}`, JSON.stringify(baseline));
       }
     };
     verifyServer(await client.backgroundTerminals(conversation.threadId, { verifyStableGeneration: true }));
@@ -1971,6 +1966,7 @@ export class Engine extends EventEmitter {
   private connectionChanged(): void {
     if (this.stopped) return;
     const connected = this.codex.status().connected;
+    if (connected) this.codex.primeNativeGeneration?.();
     if (!connected && this.connected) {
       this.epoch = randomUUID(); this.completionRechecks.clear(); this.expireApprovals();
       this.ownedThreads.clear(); this.retryThreadAfter.clear(); this.progressReads.clear();

@@ -159,6 +159,8 @@ export class CodexClient extends EventEmitter {
   private retry = 0;
   private runtime?: CodexRuntime;
   private nativePeer?: CodexNativePeer;
+  private nativeGeneration?: { runtime: CodexRuntime; peer: CodexNativePeer; stdio: CodexStdioTransport; serverId: number; generation: string };
+  private nativeGenerationAttempt?: { runtime: CodexRuntime; peer: CodexNativePeer; stdio: CodexStdioTransport };
   private contextReceipts = new CodexContextReceipts();
   private version?: string;
   private state: CodexConnectionState;
@@ -599,9 +601,10 @@ export class CodexClient extends EventEmitter {
 
   async backgroundTerminals(threadId: string, options: { verifyStableGeneration?: boolean } = {}): Promise<CodexTerminalSnapshot> {
     this.requireQueue();
-    const runtime = this.runtime, peer = this.nativePeer;
+    const runtime = this.runtime, peer = this.nativePeer, stdio = this.stdio, identity = this.nativeGeneration;
     const diagnostic = await this.diagnostics();
-    const current = () => runtime === this.runtime && peer === this.nativePeer && this.state.connected;
+    const current = () => runtime === this.runtime && peer === this.nativePeer && stdio === this.stdio && this.state.connected
+      && (peer?.kind !== 'stdio' || stdio?.pid === peer.pid);
     const serverId = diagnostic?.process?.id;
     const unconfirmed = () => new CodexTransportError('Codex не подтвердил идентичность фоновых команд. Отмена команды требует сверки.', 'terminal-identity-unconfirmed');
     if (!current() || !Number.isSafeInteger(serverId) || serverId <= 0) throw unconfirmed();
@@ -618,8 +621,33 @@ export class CodexClient extends EventEmitter {
     if (!current() || !validEntries) throw unconfirmed();
     const after = options.verifyStableGeneration && before ? await prove() : undefined;
     if (!current()) throw unconfirmed();
-    const generation = before && before === after ? before : undefined;
+    const proven = before && before === after ? before : undefined;
+    if (proven && runtime && peer?.kind === 'stdio' && stdio) this.nativeGeneration = { runtime, peer, stdio, serverId, generation: proven };
+    let generation = proven;
+    if (!options.verifyStableGeneration) {
+      generation = peer?.kind === 'stdio'
+        ? identity && this.nativeGeneration === identity && identity.runtime === runtime && identity.peer === peer && identity.stdio === stdio && identity.serverId === serverId ? identity.generation : undefined
+        : await prove();
+    }
     return { serverId: diagnostic.process.id, ...(generation ? { serverGeneration: generation } : {}), terminals: entries.map(({ itemId, processId }) => ({ itemId, processId })) };
+  }
+
+  /** Cache identity before dispatch; managed stdio owns one child lifetime. */
+  primeNativeGeneration(): void {
+    const runtime = this.runtime, peer = this.nativePeer, stdio = this.stdio;
+    if (!runtime || peer?.kind !== 'stdio' || !stdio || stdio.pid !== peer.pid || !this.state.connected
+      || this.nativeGeneration?.runtime === runtime && this.nativeGeneration.peer === peer && this.nativeGeneration.stdio === stdio
+      || this.nativeGenerationAttempt?.runtime === runtime && this.nativeGenerationAttempt.peer === peer && this.nativeGenerationAttempt.stdio === stdio) return;
+    this.nativeGenerationAttempt = { runtime, peer, stdio };
+    const current = () => runtime === this.runtime && peer === this.nativePeer && stdio === this.stdio && this.state.connected && stdio.pid === peer.pid;
+    void (async () => {
+      try {
+        const diagnostic = await this.diagnostics(), serverId = diagnostic?.process?.id;
+        if (!current() || typeof serverId !== 'number' || !Number.isSafeInteger(serverId) || serverId <= 1) return;
+        const generation = await codexNativeGeneration(peer, serverId, runtime.codexHome);
+        if (generation && current()) this.nativeGeneration = { runtime, peer, stdio, serverId, generation };
+      } catch { /* Missing startup proof leaves addressable cleanup fail-closed. */ }
+    })();
   }
 
   async terminateBackgroundTerminal(threadId: string, target: CodexTerminal & { serverId: number; serverGeneration?: string }): Promise<void> {
@@ -896,6 +924,8 @@ export class CodexClient extends EventEmitter {
     await this.cleanup;
     this.runtime = undefined;
     this.nativePeer = undefined;
+    this.nativeGeneration = undefined;
+    this.nativeGenerationAttempt = undefined;
     this.version = undefined;
     this.setState({ connected: false, queueSupported: false, codexHome: undefined });
     let target: CodexConnectionTarget = { executable: this.config.executable, transport: this.config.transport, endpoint: this.config.endpoint ?? '', ...(this.config.codexHome ? { codexHome: this.config.codexHome } : {}) };
@@ -1220,6 +1250,8 @@ export class CodexClient extends EventEmitter {
     this.subscribed.clear();
     this.runtime = undefined;
     this.version = undefined;
+    this.nativeGeneration = undefined;
+    this.nativeGenerationAttempt = undefined;
     this.contextReceipts.clear();
     this.serverRequests.clear();
     for (const waiter of this.closedWaiters.values()) waiter.reject(new CodexTransportError(message, errorCode));
