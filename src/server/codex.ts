@@ -616,9 +616,9 @@ export class CodexClient extends EventEmitter {
     const entries = await this.pages<CodexTerminal>('thread/backgroundTerminals/list', { threadId, limit: 100 });
     const validEntries = !entries.some(entry => !entry || typeof entry.itemId !== 'string' || !entry.itemId || !nativeProcessId(entry.processId));
     if (!current() || !validEntries) throw unconfirmed();
-    const after = options.verifyStableGeneration ? before ? await prove() : undefined : await prove();
+    const after = options.verifyStableGeneration && before ? await prove() : undefined;
     if (!current()) throw unconfirmed();
-    const generation = options.verifyStableGeneration ? before && before === after ? before : undefined : after;
+    const generation = before && before === after ? before : undefined;
     return { serverId: diagnostic.process.id, ...(generation ? { serverGeneration: generation } : {}), terminals: entries.map(({ itemId, processId }) => ({ itemId, processId })) };
   }
 

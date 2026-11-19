@@ -2055,15 +2055,11 @@ describe('Engine scoped shell cancellation', () => {
     expect(restarted.store.listRequests()).toHaveLength(1);
   });
 
-  it.each(['different-generation', 'missing-generation', 'invalid-generation', 'legacy-baseline'] as const)(
+  it.each(['different-generation', 'missing-generation', 'invalid-generation'] as const)(
     'refuses Stop before interrupt when native identity is %s', async identity => {
       const f = fixture(), request = await shell(f);
       const backgroundTerminalCalls = f.codex.backgroundTerminals.mock.calls.length;
-      if (identity === 'legacy-baseline') {
-        const baseline = JSON.parse(f.store.getMeta(`request-terminal-baseline:${request.id}`)!);
-        delete baseline.serverGeneration;
-        f.store.setMeta(`request-terminal-baseline:${request.id}`, JSON.stringify(baseline));
-      } else f.codex.serverGeneration = identity === 'different-generation' ? 'b'.repeat(64)
+      f.codex.serverGeneration = identity === 'different-generation' ? 'b'.repeat(64)
         : identity === 'invalid-generation' ? 'A'.repeat(64) : undefined;
 
       await expect(f.engine.cancel(request.id)).rejects.toThrow();
@@ -2077,6 +2073,20 @@ describe('Engine scoped shell cancellation', () => {
       expect(f.store.listDeliveries().some(row => row.requestId === request.id && row.key === 'terminal:error')).toBe(false);
     });
 
+  it('binds a fast terminal baseline to a generation only after the stable cancellation proof', async () => {
+    const f = fixture(), request = await shell(f);
+    const key = `request-terminal-baseline:${request.id}`, baseline = JSON.parse(f.store.getMeta(key)!);
+    delete baseline.serverGeneration;
+    f.store.setMeta(key, JSON.stringify(baseline));
+    f.codex.backgroundTerminals.mockClear();
+
+    await expect(f.engine.cancel(request.id)).resolves.toBeUndefined();
+
+    expect(f.codex.backgroundTerminals).toHaveBeenNthCalledWith(1, THREAD, { verifyStableGeneration:true });
+    expect(JSON.parse(f.store.getMeta(key)!)).toMatchObject({ serverId:42, serverGeneration:'a'.repeat(64), terminals:[] });
+    expect(f.codex.terminateBackgroundTerminal).toHaveBeenCalledOnce();
+  });
+
   type BaselineCase = { failure: string; after: (f: ReturnType<typeof fixture>, request: ReleRequest) => void };
   it.each([
     { failure: 'missing', after: (f, request) => {
@@ -2086,10 +2096,6 @@ describe('Engine scoped shell cancellation', () => {
     { failure: 'target-changed', after: (f, request) => {
       const key = `request-terminal-baseline:${request.id}`, baseline = JSON.parse(f.store.getMeta(key)!);
       f.store.setMeta(key, JSON.stringify({ ...baseline, target: 'changed-target' }));
-    } },
-    { failure: 'generation-missing', after: (f, request) => {
-      const key = `request-terminal-baseline:${request.id}`, baseline = JSON.parse(f.store.getMeta(key)!);
-      delete baseline.serverGeneration; f.store.setMeta(key, JSON.stringify(baseline));
     } },
     { failure: 'generation-invalid', after: (f, request) => {
       const key = `request-terminal-baseline:${request.id}`, baseline = JSON.parse(f.store.getMeta(key)!);

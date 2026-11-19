@@ -614,17 +614,22 @@ export class Engine extends EventEmitter {
     const baseline = rawBaseline ? JSON.parse(rawBaseline) as TerminalBaseline : undefined;
     const baselineFailure = !baseline ? 'missing'
       : baseline.target !== state.target ? 'target-changed'
-        : typeof baseline.serverGeneration !== 'string' ? 'generation-missing'
-          : !/^[a-f0-9]{64}$/u.test(baseline.serverGeneration) ? 'generation-invalid'
-            : !Array.isArray(baseline.terminals) || baseline.terminals.some(entry => !terminalPair(entry)) ? 'terminals-invalid' : undefined;
+        : baseline.serverGeneration !== undefined && (typeof baseline.serverGeneration !== 'string' || !/^[a-f0-9]{64}$/u.test(baseline.serverGeneration)) ? 'generation-invalid'
+          : !Array.isArray(baseline.terminals) || baseline.terminals.some(entry => !terminalPair(entry)) ? 'terminals-invalid' : undefined;
     if (!baseline || baselineFailure) throw Object.assign(new Error('Исходный сервер или снимок команд не подтверждён. Отсутствие терминалов не доказывает завершение прежних процессов.'), {
       code: `terminal-baseline-${baselineFailure ?? 'missing'}`,
     });
     const verifyServer = (snapshot: CodexTerminalSnapshot) => {
       current();
       if (this.isMixed(id)) throw new Error('В ход добавлено сообщение другого клиента Codex. Автоматическая отмена смешанного хода недоступна.');
-      if (snapshot.serverId !== baseline.serverId || snapshot.serverGeneration !== baseline.serverGeneration) {
+      if (snapshot.serverId !== baseline.serverId || typeof snapshot.serverGeneration !== 'string' || !/^[a-f0-9]{64}$/u.test(snapshot.serverGeneration)
+        || baseline.serverGeneration !== undefined && snapshot.serverGeneration !== baseline.serverGeneration) {
         throw new Error('Сервер Codex изменился или его поколение не подтверждено. Завершение прежних процессов не подтверждено.');
+      }
+      if (baseline.serverGeneration === undefined) {
+        // The dispatch baseline is fast; pin its identity only after the two-sided stop preflight.
+        baseline.serverGeneration = snapshot.serverGeneration;
+        this.store.setMeta(`request-terminal-baseline:${id}`, JSON.stringify(baseline));
       }
     };
     verifyServer(await client.backgroundTerminals(conversation.threadId, { verifyStableGeneration: true }));

@@ -1029,7 +1029,7 @@ describe('Codex shared-runtime adapter', () => {
     const clientId = randomUUID();
     const generation = 'a'.repeat(64), proof = vi.mocked(codexNativeGeneration);
     proof.mockClear();
-    for (let index = 0; index < 7; index++) proof.mockResolvedValueOnce(generation);
+    for (let index = 0; index < 8; index++) proof.mockResolvedValueOnce(generation);
     const terminals = [{ itemId: 'own-command', processId: '1234', command: 'never-export-this-command' },
       { itemId: 'foreign-command', processId: '5678', command: 'foreign-command-body' }];
     const f = await fixture({
@@ -1042,7 +1042,7 @@ describe('Codex shared-runtime adapter', () => {
     });
     await f.client.connect();
     expect(await f.client.findRequest(threadId, clientId)).toMatchObject({ turnId: 'own-turn', commandItems: [{ id: 'own-command', processId: null }] });
-    expect(await f.client.backgroundTerminals(threadId)).toEqual({ serverId: 42, serverGeneration: generation, terminals: [
+    expect(await f.client.backgroundTerminals(threadId, { verifyStableGeneration:true })).toEqual({ serverId: 42, serverGeneration: generation, terminals: [
       { itemId: 'own-command', processId: '1234' }, { itemId: 'foreign-command', processId: '5678' },
     ] });
     const target = { serverId: 42, serverGeneration: generation, itemId: 'own-command', processId: '1234' };
@@ -1496,7 +1496,7 @@ describe('Codex managed runtime', () => {
     }
   });
 
-  it('proves the terminal-list server generation once after the native RPC', async () => {
+  it('returns the terminal baseline without waiting for native generation proof', async () => {
     const f = await fixture({
       'server/diagnostics': () => ({ process: { id: 42 }, gauges: [] }),
       'thread/backgroundTerminals/list': () => ({ data: [{ itemId: 'own-command', processId: '1234' }], nextCursor: null }),
@@ -1504,15 +1504,11 @@ describe('Codex managed runtime', () => {
     await f.client.connect();
     const proof = vi.mocked(codexNativeGeneration);
     proof.mockClear();
-    proof.mockImplementationOnce(async () => {
-      expect(f.calls.at(-1)?.method).toBe('thread/backgroundTerminals/list');
-      return 'a'.repeat(64);
-    });
 
     await expect(f.client.backgroundTerminals(threadId)).resolves.toEqual({
-      serverId: 42, serverGeneration: 'a'.repeat(64), terminals: [{ itemId: 'own-command', processId: '1234' }],
+      serverId: 42, terminals: [{ itemId: 'own-command', processId: '1234' }],
     });
-    expect(proof).toHaveBeenCalledOnce();
+    expect(proof).not.toHaveBeenCalled();
   });
 
   it('withholds cancellation proof when the backend generation changes during the terminal-list RPC', async () => {
@@ -1596,7 +1592,7 @@ describe('Codex managed runtime', () => {
     cleanup.push(() => rm(home, { recursive: true, force: true }));
     const f = await managedFixture({ codexHome: home, terminals:true });
     await f.client.connect();
-    const first = await f.client.backgroundTerminals(threadId);
+    const first = await f.client.backgroundTerminals(threadId, { verifyStableGeneration:true });
     expect(first.serverId).toBe((await f.records())[0].pid);
     let proofFailure = 'preflight';
     if (process.platform === 'win32' && !first.serverGeneration) {
@@ -1639,14 +1635,14 @@ describe('Codex managed runtime', () => {
       await codexNativeGeneration(peer, first.serverId, home, { platform:'win32', run });
     }
     expect(first, `Windows native proof returned no generation (${proofFailure})`).toHaveProperty('serverGeneration', expect.stringMatching(/^[a-f0-9]{64}$/u));
-    expect(await f.client.backgroundTerminals(threadId)).toEqual(first);
+    expect(await f.client.backgroundTerminals(threadId, { verifyStableGeneration:true })).toEqual(first);
     await expect(f.client.terminateBackgroundTerminal(threadId, { serverId:first.serverId, serverGeneration:'0'.repeat(64), itemId:'fixture-command', processId:'1234' })).rejects.toMatchObject({ code:'terminal-identity-changed' });
     expect((await f.calls()).filter(call => call.method === 'thread/backgroundTerminals/terminate')).toHaveLength(0);
     await f.client.terminateBackgroundTerminal(threadId, { serverId:first.serverId, serverGeneration:first.serverGeneration, itemId:'fixture-command', processId:'1234' });
     expect((await f.calls()).filter(call => call.method === 'thread/backgroundTerminals/terminate').map(call => call.params)).toEqual([{ threadId, processId:'1234' }]);
     await f.client.close();
     await f.client.connect();
-    const replacement = await f.client.backgroundTerminals(threadId);
+    const replacement = await f.client.backgroundTerminals(threadId, { verifyStableGeneration:true });
     expect(replacement).toHaveProperty('serverGeneration', expect.stringMatching(/^[a-f0-9]{64}$/u));
     expect(replacement.serverId).not.toBe(first.serverId);
     expect(replacement).not.toHaveProperty('serverGeneration', Reflect.get(first, 'serverGeneration'));
@@ -1657,7 +1653,7 @@ describe('Codex managed runtime', () => {
     cleanup.push(() => rm(home, { recursive: true, force: true }));
     const f = await managedFixture({ codexHome: home, diagnosticPid: 'parent' });
     await f.client.connect();
-    expect(await f.client.backgroundTerminals(threadId)).not.toHaveProperty('serverGeneration');
+    expect(await f.client.backgroundTerminals(threadId, { verifyStableGeneration:true })).not.toHaveProperty('serverGeneration');
   });
 
   it('owns an NDJSON child, preserves the inherited profile and safely closes that process', async () => {
