@@ -441,8 +441,10 @@ describe('Engine asynchronous Desktop questions', () => {
     const { approval, questions } = await asyncQuestion(f, request);
     f.codex.locations.set(request.id, { state: 'completed', turnId: 'turn-1', text: 'NOREPLY', asyncQuestions: questions });
     await f.engine.reconcile(request.id); await f.engine.settled();
-    f.codex.asyncQuestionState.mockResolvedValueOnce(f.codex.asyncStates.get(questions[0].question.id));
-    f.codex.asyncQuestionState.mockRejectedValueOnce(new Error('question lookup unavailable'));
+    f.codex.asyncQuestionState.mockImplementation(async (_threadId, questionId) => {
+      if (f.store.getRequest(approval.id)?.status === 'starting') throw new Error('question lookup unavailable');
+      return f.codex.asyncStates.get(questionId);
+    });
     await f.engine.action(asyncAction(f, approval)); await f.engine.settled();
     expect(f.store.getRequest(approval.id)).toMatchObject({ status: 'queued', error: 'question lookup unavailable' });
     expect(f.store.getApproval(approval.id)).toMatchObject({ status: 'answered', decision: 'queued' });
