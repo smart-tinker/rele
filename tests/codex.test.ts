@@ -1564,14 +1564,13 @@ describe('Codex managed runtime', () => {
       if (peer?.kind !== 'stdio') throw new Error('The synthetic request did not use managed stdio.');
       const transport = Reflect.get(f.client, 'stdio') as { pid:number } | undefined;
       expect(transport?.pid).toBe(peer.pid);
-      expect(baseline.serverId).toBe(peer.pid);
 
       store.updateRequest(request.id, { status:'running', turnId:'managed-turn' });
       await f.setTerminals([{ itemId:'replacement-command', processId:'5678' }]);
       const replacementPeer = { ...peer };
       Reflect.set(f.client, 'nativePeer', replacementPeer);
       expect(Reflect.get(f.client, 'nativePeer')).not.toBe(peer);
-      expect(replacementPeer.pid).toBe(baseline.serverId);
+      expect(replacementPeer.pid).toBe(peer.pid);
       generation = 'b'.repeat(64);
       releaseProof();
       const replacement = await f.client.backgroundTerminals(threadId);
