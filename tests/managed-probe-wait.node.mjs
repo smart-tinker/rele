@@ -120,3 +120,33 @@ test('cleanup fails closed when the owned Codex is still alive', async () => {
   const result = await closeManagedFixture(async () => {}, async () => {}, () => false, 50);
   assert.deepEqual(result, { ok: false, phase: 'owned-child-exit', failure: 'not-exited', childExited: false });
 });
+
+test('closes managed bridge stdin before waiting for child exit', { timeout: 5000 }, () => {
+  const python = [
+    'import asyncio, json, sys',
+    "sys.path.insert(0, 'scripts')",
+    'from managed_probe_bridge import wait_for_bridge_exit',
+    'async def main():',
+    "    child_code = \"import sys; sys.stdin.buffer.readline(); print('ACK', flush=True); sys.stdin.buffer.read()\"",
+    "    child = await asyncio.create_subprocess_exec(sys.executable, '-c', child_code, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)",
+    "    child.stdin.write(b'close' + bytes([10]))",
+    '    await child.stdin.drain()',
+    "    assert await child.stdout.readline() == b'ACK' + bytes([10])",
+    '    try:',
+    '        await wait_for_bridge_exit(child, 0.2)',
+    "        outcome = 'exited'",
+    '    except TimeoutError:',
+    "        outcome = 'timeout'",
+    '    finally:',
+    '        if child.returncode is None:',
+    '            child.stdin.close()',
+    '            await asyncio.wait_for(child.wait(), 2)',
+    "    print(json.dumps({'outcome': outcome, 'returncode': child.returncode}, sort_keys=True))",
+    'asyncio.run(main())',
+  ].join('\n');
+  const output = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-B', '-c', python], {
+    cwd: fileURLToPath(new URL('..', import.meta.url)), encoding: 'utf8', timeout: 3000,
+  });
+  assert.equal(output.status, 0, output.stderr);
+  assert.deepEqual(JSON.parse(output.stdout), { outcome: 'exited', returncode: 0 });
+});

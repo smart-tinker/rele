@@ -15,6 +15,7 @@ import socket
 import tempfile
 import uuid
 from managed_probe_report import managed_wait_failure
+from managed_probe_bridge import wait_for_bridge_exit
 from aiohttp import web
 import websockets
 
@@ -312,7 +313,7 @@ stream_max_retries=0
         report['checks']['first_managed_model_request_contains_new_thread_passive_context'] = True
         stopped = await command('close', timeout=30)
         assert stopped['childExited'] and report['ownedChildExitConfirmed'] is True, stopped
-        await asyncio.wait_for(bridge.wait(), 15)
+        await wait_for_bridge_exit(bridge, 15)
         assert bridge.returncode == 0, errors
         report['checks']['shutdown_waits_for_owned_child_exit'] = True
         report['syntheticProviderRequests'] = len(records)
