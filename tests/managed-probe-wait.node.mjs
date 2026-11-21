@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 
 test('reports only allowlisted operations from a synthetic managed wait RED', () => {
@@ -119,6 +120,52 @@ test('cleanup fails closed when the owned Codex is still alive', async () => {
   const { closeManagedFixture } = await import('../scripts/managed-probe-wait.mjs');
   const result = await closeManagedFixture(async () => {}, async () => {}, () => false, 50);
   assert.deepEqual(result, { ok: false, phase: 'owned-child-exit', failure: 'not-exited', childExited: false });
+});
+
+test('destroys managed bridge stdin before exit, before fallback cleanup', { timeout: 5000 }, async () => {
+  const helperUrl = new URL('../scripts/managed-probe-wait.mjs', import.meta.url).href;
+  const bridgeSource = [
+    "import { createInterface } from 'node:readline';",
+    "import { closeManagedBridgeInput } from " + JSON.stringify(helperUrl) + ";",
+    "const input = process.stdin;",
+    "const lines = createInterface({ input });",
+    "for await (const line of lines) {",
+    "  if (line !== 'close') continue;",
+    "  process.stdout.write('ACK\\n');",
+    "  closeManagedBridgeInput(lines, input);",
+    "  process.stdout.write(JSON.stringify({ inputDestroyed: input.destroyed }) + '\\n');",
+    "  break;",
+    "}",
+  ].join('\n');
+  const bridge = spawn(process.execPath, ['--input-type=module', '-e', bridgeSource], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let output = '';
+  let stderr = '';
+  bridge.stdout.setEncoding('utf8').on('data', chunk => { output += chunk; });
+  bridge.stderr.setEncoding('utf8').on('data', chunk => { stderr += chunk; });
+  let timer;
+  try {
+    bridge.stdin.write('close\n');
+    const [code, signal] = await Promise.race([
+      once(bridge, 'close'),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('synthetic bridge did not exit before fallback cleanup')), 1500);
+      }),
+    ]);
+    assert.equal(signal, null, stderr);
+    assert.equal(code, 0, stderr);
+    const [ack, result, ...extra] = output.trim().split(/\r?\n/);
+    assert.equal(ack, 'ACK');
+    assert.deepEqual(JSON.parse(result), { inputDestroyed: true });
+    assert.deepEqual(extra, []);
+  } finally {
+    clearTimeout(timer);
+    if (bridge.exitCode === null && bridge.signalCode === null) bridge.kill();
+    bridge.stdin.destroy();
+    bridge.stdout.destroy();
+    bridge.stderr.destroy();
+  }
 });
 
 test('closes managed bridge stdin before waiting for child exit', { timeout: 5000 }, () => {

@@ -74,3 +74,8 @@ export function createManagedOperationTrace() {
     clearRejected() { rejected.clear(); },
   };
 }
+
+export function closeManagedBridgeInput(lines, input) {
+  lines.close();
+  input.destroy();
+}
