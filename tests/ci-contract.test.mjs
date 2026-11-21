@@ -228,6 +228,18 @@ test('workflow requirement lists tolerate empty conditional groups', async()=>{
   assert.equal(result.status,0,result.stderr);
  }
 });
+test('shared connect failure diagnostics expose only allowlisted class and code', async()=>{
+ const {summarizeSharedConnectFailure:summarize}=await import('../scripts/shared-probe-diagnostics.mjs');
+ assert.equal(typeof summarize,'function','shared startup failures need a safe diagnostic summary');
+ const known=Object.assign(new Error('private startup message'),{name:'SharedCodexError',code:'shared-cli-unavailable',path:'C:\\private'});
+ assert.deepEqual(summarize(known),{
+  kind:'codex-connect-error',errorClass:'SharedCodexError',errorCode:'shared-cli-unavailable',
+ });
+ const unknown=Object.assign(new Error('private startup message'),{name:'PrivateType',code:'C:\\private'});
+ const safe=summarize(unknown);
+ assert.deepEqual(safe,{kind:'codex-connect-error',errorClass:'other',errorCode:'other'});
+ assert.doesNotMatch(JSON.stringify(safe),/private|message|path/u);
+});
 test('package smoke uses a fixed extractor and verifies the bundled runtime by serving', async()=>{
  const source=await readFile(new URL('../scripts/smoke-package.mjs',import.meta.url),'utf8');
  assert.doesNotMatch(source,/function run\(command,/u);
@@ -725,6 +737,41 @@ test('Windows parent failure prints only bounded shared-gate counts and states',
   assert.ok(summary.includes(field),`print the bounded timeout field ${field}`);
  }
  assert.doesNotMatch(summary,/stderrTail|exception|payload|requestId|turnId|sharedReport/u,'never print raw errors, payloads, IDs, or the complete report');
+});
+test('Windows canary forwards only bounded shared startup diagnostics', async t=>{
+ const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ assert.ok(canary.includes(". (Join-Path $PSScriptRoot 'shared-engine-diagnostics.ps1')"),
+  'load the testable allowlist used by the Windows summary wrapper');
+ assert.match(canary,/\$summary\.engineDriverDiagnostics\s*=\s*@\(Get-SafeEngineDriverDiagnostics -Diagnostics \$sharedDiagnostic\.engineDriverDiagnostics\)/u,
+  'forward only sanitized EngineDriver startup diagnostics from the bounded report');
+ const helper=await readFile(new URL('../scripts/windows/shared-engine-diagnostics.ps1',import.meta.url),'utf8');
+ for(const field of ['codex-connect-error','windows-desktop-candidates','SharedCodexError','shared-cli-unavailable','desktop-install','candidate-resolution-failed'])
+  assert.ok(helper.includes(field),`the wrapper allowlist must retain ${field}`);
+ assert.doesNotMatch(helper,/\.message|\.path|stderrTail|exception/u,'the wrapper must not read raw exception or path fields');
+ if(process.platform!=='win32') { t.skip('PowerShell behavior is exercised by the Windows unit job'); return; }
+ const {spawnSync}=await import('node:child_process');
+ const rows=[
+  {kind:'codex-connect-error',errorClass:'SharedCodexError',errorCode:'shared-cli-unavailable',message:'private failure',path:'C:\\private'},
+  {kind:'windows-desktop-candidates',candidates:[
+   {source:'desktop-install',version:'0.166.0-alpha.6',result:'candidate-resolution-failed',message:'private failure',path:'C:\\private'},
+   {source:'private-host',version:'0.1.2',result:'private result'},
+   {source:'path',version:'C:\\private',result:'shared-cli-unavailable'},
+  ],message:'private failure'},
+ ];
+ const input=JSON.stringify(rows);
+ const helperPath=path.resolve(import.meta.dirname,'../scripts/windows/shared-engine-diagnostics.ps1').replace(/'/gu,"''");
+ const script=`. '${helperPath}'\n$rows = ConvertFrom-Json -InputObject '${input}'\nGet-SafeEngineDriverDiagnostics -Diagnostics $rows | ConvertTo-Json -Compress -Depth 5`;
+ const result=spawnSync('powershell.exe',['-NoProfile','-NonInteractive','-Command',script],{encoding:'utf8'});
+ assert.equal(result.status,0,result.stderr);
+ const output=JSON.parse(result.stdout.trim());
+ assert.deepEqual(output,[
+  {kind:'codex-connect-error',errorClass:'SharedCodexError',errorCode:'shared-cli-unavailable'},
+  {kind:'windows-desktop-candidates',candidates:[
+   {source:'desktop-install',version:'0.166.0-alpha.6',result:'candidate-resolution-failed'},
+   {source:'path',result:'shared-cli-unavailable'},
+  ]},
+ ]);
+ assert.doesNotMatch(result.stdout,/private|message|stderrTail|exception/u);
 });
 test('shared Windows startup failure reports only an allowlisted driver stage', async()=>{
  const driver=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');

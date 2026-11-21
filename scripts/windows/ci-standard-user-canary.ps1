@@ -5,6 +5,7 @@ if ($StandaloneShared -and $Phase -eq 'Installer' -and ([string]::IsNullOrWhiteS
 if ($Phase -eq 'Shared' -and -not $RunGates) { throw 'Shared-only mode requires -RunGates.' }
 if (($DesktopBundle -or $DesktopInventory -or $DesktopPackage) -and ($Mode -ne 'Parent' -or -not $RunGates -or -not $DesktopBundle -or -not $DesktopInventory -or -not $DesktopPackage)) { throw 'Actual Desktop inputs require Parent -RunGates and payload, inventory, and signed MSIX paths.' }
 $sourceRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
+. (Join-Path $PSScriptRoot 'shared-engine-diagnostics.ps1')
 $shell = if ($PowerShell7Path) { $PowerShell7Path } else { Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'PowerShell\7\pwsh.exe' }
 if (-not [IO.Path]::IsPathFullyQualified($shell) -or [IO.Path]::GetFileName($shell) -ine 'pwsh.exe' -or -not (Test-Path -LiteralPath $shell -PathType Leaf) -or [Diagnostics.FileVersionInfo]::GetVersionInfo($shell).FileMajorPart -ne 7) { throw 'A fully qualified PowerShell 7 executable is required for this canary.' }
 if ($PowerShell7Path -and (Get-AuthenticodeSignature -LiteralPath $shell).Status -ne 'Valid') { throw 'The portable PowerShell 7 executable must have a valid Authenticode signature.' }
@@ -664,6 +665,7 @@ try {
                     if ($sharedDiagnostic.failureCode) { $summary.failureCode = if ([string]$sharedDiagnostic.failureCode -in @('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty', 'engine-driver-exited-before-response')) { [string]$sharedDiagnostic.failureCode } else { 'other' } }
                     if (($sharedDiagnostic.engineDriverExitCode -is [int] -or $sharedDiagnostic.engineDriverExitCode -is [long]) -and [long]$sharedDiagnostic.engineDriverExitCode -ge -2147483648 -and [long]$sharedDiagnostic.engineDriverExitCode -le 4294967295) { $summary.engineDriverExitCode = [long]$sharedDiagnostic.engineDriverExitCode }
                     if ([string]$sharedDiagnostic.engineDriverStage -in @('codex-connect', 'shared-codex-resolution', 'shared-codex-resolved', 'thread-catalog', 'engine-start', 'native-diagnostics', 'desktop-package-verification', 'ready', 'windows-installation', 'windows-owner-status', 'windows-desktop-discovery', 'windows-desktop-selection', 'windows-package-preparation', 'windows-package-verification', 'windows-version-command', 'windows-owner-start', 'windows-owner-receipt', 'windows-owner-executable', 'windows-socket-verification', 'engine-close-request', 'engine-close-ack')) { $summary.engineDriverStage = [string]$sharedDiagnostic.engineDriverStage }
+                    if ($sharedDiagnostic.engineDriverDiagnostics) { $summary.engineDriverDiagnostics = @(Get-SafeEngineDriverDiagnostics -Diagnostics $sharedDiagnostic.engineDriverDiagnostics) }
                     $summary.codexVersion = if ([string]$sharedDiagnostic.codexVersion -match '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$') { [string]$sharedDiagnostic.codexVersion } else { 'unknown' }
                     $checks = @($sharedDiagnostic.checks.PSObject.Properties)
                     $summary.checksPassed = @($checks | Where-Object { $_.Value -eq $true }).Count

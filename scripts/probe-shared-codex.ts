@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { lookupSharedNativeRequest, summarizeSharedNativeRequest, summarizeSharedWaitFailure } from './shared-probe-diagnostics.mjs';
+import { lookupSharedNativeRequest, summarizeSharedNativeRequest, summarizeSharedWaitFailure, summarizeSharedConnectFailure } from './shared-probe-diagnostics.mjs';
 import { ConfigStore, defaultConfig, defaultDataDirectory } from '../src/server/config.js';
 import { CodexClient as SourceCodexClient, type CodexServerRequest } from '../src/server/codex.js';
 import { Engine as SourceEngine } from '../src/server/engine.js';
@@ -189,7 +189,12 @@ if (values['expect-error']) {
       }
     };
     emitProbeStage('codex-connect');
-    await codex.connect();
+    try { await codex.connect(); } catch (error) {
+      if (reportStartupStages && process.platform === 'win32' && process.env.RELE_CI_SHARED_DIAGNOSTICS === '1') {
+        process.stdout.write(JSON.stringify({ probeDiagnostic: summarizeSharedConnectFailure(error) }) + '\n');
+      }
+      throw error;
+    }
     // Snapshot polling would evict the dispatch stages from this bounded trace.
     codex.subscribe = observe('subscribe', traceReconciliationStage('subscribe', codex.subscribe.bind(codex)));
     codex.releaseThread = observe('releaseThread', traceReconciliationStage('releaseThread', codex.releaseThread.bind(codex)));

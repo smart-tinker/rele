@@ -1,3 +1,12 @@
+export function summarizeSharedConnectFailure(error: unknown): {
+ kind: 'codex-connect-error';
+ errorClass: 'AbortError' | 'CodexTransportError' | 'Error' | 'RangeError' | 'SharedCodexError' | 'TimeoutError' | 'TypeError' | 'other';
+ errorCode: 'invalid-shared-profile' | 'invalid-shared-target' | 'shared-cli-unavailable' | 'shared-cli-unverified'
+  | 'shared-control-migration-required' | 'shared-daemon-invalid' | 'shared-daemon-unavailable'
+  | 'shared-desktop-conflict' | 'shared-desktop-package-invalid' | 'shared-owner-unknown'
+  | 'shared-package-incomplete' | 'shared-profile-mismatch' | 'other';
+};
+
 export function summarizeSharedWaitFailure(expectedStatus: string, state: {
  requests: Array<{id: string; eventId: string; status: string; turnId?: string; queuedSubmissionId?: string}>;
  approvals: Array<{id: string; requestId: string; method: string; status: string; turnId: string}>;

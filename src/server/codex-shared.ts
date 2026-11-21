@@ -517,13 +517,9 @@ export async function ensureWindowsSharedCodex(target: CodexConnectionTarget, op
       }
       if (!resolved) {
         if (environmentValue(env, 'RELE_CI_SHARED_DIAGNOSTICS') === '1') {
-          const installations = discovery.installations.map(item => ({
-            source: item.source,
-            ...(item.version && item.version.length <= 96 && /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/u.test(item.version) ? { version: item.version } : {}),
-            running: item.running === true,
-          }));
-          const issues = [...new Set(discovery.issues.map(item => item.code).filter(code => /^[a-z][a-z0-9-]{0,63}$/u.test(code)))];
-          console.error(`RELE_CI_WINDOWS_DESKTOP_DISCOVERY=${JSON.stringify({ installations, issues, candidates: candidateResults })}`);
+          process.stdout.write(JSON.stringify({ probeDiagnostic: {
+            kind: 'windows-desktop-candidates', candidates: candidateResults.slice(0, 8),
+          } }) + '\n');
         }
         throw new SharedCodexError('Не найден проверенный установленный Codex Desktop.', 'shared-cli-unavailable');
       }
