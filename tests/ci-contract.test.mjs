@@ -427,7 +427,7 @@ test('one required CI gate waits for every OS matrix job', async()=>{
 });
 test('Windows job timeout leaves room for its bounded standard-user native gate', async()=>{
  const workflow=await readFile(new URL('../.github/workflows/verify.yml',import.meta.url),'utf8');
- const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ const canary=(await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8')).replace(/\r\n/gu,'\n');
  const verify=workflow.slice(workflow.indexOf('\n  verify:\n'));
  const jobTimeout=verify.match(/^\s+timeout-minutes:\s*\$\{\{\s*matrix\.os\s*==\s*'windows-2025'\s*&&\s*(\d+)\s*\|\|\s*(\d+)\s*\}\}\s*$/mu);
  const gateTimeout=canary.match(/AddMinutes\(\$\(if \(\$Phase -eq 'Shared'\) \{ (\d+) \} else \{ (\d+) \}\)\)/u);
@@ -445,22 +445,67 @@ test('shared protocol completion wait fits within its driver response budget', a
  assert.ok(/ENGINE_WAIT_READ_TIMEOUT_SECONDS = 120/u.test(harness),'keep the harness listening beyond its turn wait');
  assert.ok(/timeout = ENGINE_CANCEL_READ_TIMEOUT_SECONDS if action == 'cancel' else ENGINE_WAIT_READ_TIMEOUT_SECONDS if action == 'wait' else ENGINE_READ_TIMEOUT_SECONDS/u.test(harness));
 });
-test('Windows canary timeout reports only bounded installer progress', async()=>{
+test('Windows canary failure keeps child progress when shared report is absent', async t=>{
+ const canary=(await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8')).replace(/\r\n/gu,'\n');
+ const blockStart=canary.indexOf("        if ($RunGates -and $result.result -ne 'passed') {");
+ const blockEnd=canary.indexOf('\n    if ($cleanupFailures.Count -ne 0)',blockStart);
+ assert.ok(blockStart>=0&&blockEnd>blockStart,'isolate the production summary block');
+ const report=canary.indexOf('if (Test-Path -LiteralPath $sharedDiagnosticPath -PathType Leaf)',blockStart);
+ assert.ok(report>=0&&canary.indexOf('\n            }\n            if ($result.installerProgress)',report)>report,
+  'append child progress after the optional shared-report branch');
+ if(process.platform!=='win32') { t.skip('execute the production PowerShell summary block on Windows'); return; }
+ const {spawnSync}=await import('node:child_process');
+ const input=JSON.stringify({result:'failed',stage:'installer',installerProgress:['RELE_CI_STAGE=owner-control']});
+ const script=[
+  '$RunGates = $true',
+  "$parentStage = 'installer'",
+  "$sourceRoot = Join-Path $env:TEMP ('rele-canary-summary-' + [guid]::NewGuid().ToString('N'))",
+  "$result = ConvertFrom-Json -InputObject '" + input + "'",
+  canary.slice(blockStart,blockEnd),
+ ].join('\n');
+ const run=spawnSync('powershell.exe',['-NoProfile','-NonInteractive','-Command',script],{encoding:'utf8'});
+ assert.equal(run.status,0,run.stderr);
+ const outputLine=run.stdout.trim(), prefix='Windows canary bounded diagnostic: ';
+ assert.ok(outputLine.startsWith(prefix),outputLine);
+ assert.deepEqual(JSON.parse(outputLine.slice(prefix.length)),{
+  stage:'installer',parentStage:'installer',childReceiptAvailable:false,childStage:'unknown',
+  reportAvailable:false,sharedReportAvailable:false,installerProgress:['RELE_CI_STAGE=owner-control'],
+ });
+});
+test('Windows canary forwards only bounded shared startup diagnostics', async t=>{
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
- const installer=await readFile(new URL('../scripts/smoke-windows-installer.mjs',import.meta.url),'utf8');
- const start=canary.indexOf('$summary = [ordered]@{ stage =');
- const end=canary.indexOf("Write-Output ('Windows canary bounded diagnostic:",start);
- assert.ok(start>=0 && end>start,'Windows canary must emit a bounded timeout summary');
- assert.match(canary,/WaitForExit\(\[Math\]::Min\(\$remaining, 30000\)\)/u,'poll the bounded fixture process so active progress can be reported');
- assert.ok(/Write-Host \('Windows canary progress: '/u.test(canary),'send progress outside the captured Boolean return value');
- assert.match(canary,/RELE_CI_STAGE=\[a-z0-9.-\]\{1,96\}/u,'accept only fixed-format stage labels from the fixture log');
- assert.match(installer,/RELE_CI_STAGE=installer-reinstall/u,'identify the installer re-adoption phase');
- const summary=canary.slice(start,end);
- assert.ok(/Get-Content -LiteralPath \$stdout -Tail 64(?: -ErrorAction SilentlyContinue)?\s*\|\s*Where-Object \{ \$_ -cmatch/u.test(canary),
-  'retain only bounded installer stage labels');
- assert.match(summary,/\$summary\.installerProgress = @\(\$result\.installerProgress \| Select-Object -Last 8\)/u,
-  'include the latest bounded installer progress labels in the timeout summary');
- assert.doesNotMatch(summary,/stdout\.log|stderr\.log/u,'never print raw installer logs');
+ assert.ok(canary.includes(". (Join-Path $PSScriptRoot 'shared-engine-diagnostics.ps1')"),
+  'load the testable allowlist used by the Windows summary wrapper');
+ assert.match(canary,/\$summary\.engineDriverDiagnostics\s*=\s*@\(Get-SafeEngineDriverDiagnostics -Diagnostics \$sharedDiagnostic\.engineDriverDiagnostics\)/u,
+  'forward only sanitized EngineDriver startup diagnostics from the bounded report');
+ const helper=await readFile(new URL('../scripts/windows/shared-engine-diagnostics.ps1',import.meta.url),'utf8');
+ for(const field of ['codex-connect-error','windows-desktop-candidates','SharedCodexError','shared-cli-unavailable','desktop-install','candidate-resolution-failed'])
+  assert.ok(helper.includes(field),`the wrapper allowlist must retain ${field}`);
+ assert.doesNotMatch(helper,/\.message|\.path|stderrTail|exception/u,'the wrapper must not read raw exception or path fields');
+ if(process.platform!=='win32') { t.skip('PowerShell behavior is exercised by the Windows unit job'); return; }
+ const {spawnSync}=await import('node:child_process');
+ const rows=[
+  {kind:'codex-connect-error',errorClass:'SharedCodexError',errorCode:'shared-cli-unavailable',message:'private failure',path:'C:\\private'},
+  {kind:'windows-desktop-candidates',candidates:[
+   {source:'desktop-install',version:'0.166.0-alpha.6',result:'candidate-resolution-failed',message:'private failure',path:'C:\\private'},
+   {source:'private-host',version:'0.1.2',result:'private result'},
+   {source:'path',version:'C:\\private',result:'shared-cli-unavailable'},
+  ],message:'private failure'},
+ ];
+ const input=JSON.stringify(rows);
+ const helperPath=path.resolve(import.meta.dirname,'../scripts/windows/shared-engine-diagnostics.ps1').replace(/'/gu,"''");
+ const script=`. '${helperPath}'\n$rows = ConvertFrom-Json -InputObject '${input}'\nGet-SafeEngineDriverDiagnostics -Diagnostics $rows | ConvertTo-Json -Compress -Depth 5`;
+ const result=spawnSync('powershell.exe',['-NoProfile','-NonInteractive','-Command',script],{encoding:'utf8'});
+ assert.equal(result.status,0,result.stderr);
+ const output=JSON.parse(result.stdout.trim());
+ assert.deepEqual(output,[
+  {kind:'codex-connect-error',errorClass:'SharedCodexError',errorCode:'shared-cli-unavailable'},
+  {kind:'windows-desktop-candidates',candidates:[
+   {source:'desktop-install',version:'0.166.0-alpha.6',result:'candidate-resolution-failed'},
+   {source:'path',result:'shared-cli-unavailable'},
+  ]},
+ ]);
+ assert.doesNotMatch(result.stdout,/private|message|stderrTail|exception/u);
 });
 test('Windows canary timeout reports bounded native RPC and driver stages', async()=>{
  const harness=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
@@ -736,42 +781,7 @@ test('Windows parent failure prints only bounded shared-gate counts and states',
   'observedTurnStarts','observedTurnCompletions','Write-Output']) {
   assert.ok(summary.includes(field),`print the bounded timeout field ${field}`);
  }
- assert.doesNotMatch(summary,/stderrTail|exception|payload|requestId|turnId|sharedReport/u,'never print raw errors, payloads, IDs, or the complete report');
-});
-test('Windows canary forwards only bounded shared startup diagnostics', async t=>{
- const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
- assert.ok(canary.includes(". (Join-Path $PSScriptRoot 'shared-engine-diagnostics.ps1')"),
-  'load the testable allowlist used by the Windows summary wrapper');
- assert.match(canary,/\$summary\.engineDriverDiagnostics\s*=\s*@\(Get-SafeEngineDriverDiagnostics -Diagnostics \$sharedDiagnostic\.engineDriverDiagnostics\)/u,
-  'forward only sanitized EngineDriver startup diagnostics from the bounded report');
- const helper=await readFile(new URL('../scripts/windows/shared-engine-diagnostics.ps1',import.meta.url),'utf8');
- for(const field of ['codex-connect-error','windows-desktop-candidates','SharedCodexError','shared-cli-unavailable','desktop-install','candidate-resolution-failed'])
-  assert.ok(helper.includes(field),`the wrapper allowlist must retain ${field}`);
- assert.doesNotMatch(helper,/\.message|\.path|stderrTail|exception/u,'the wrapper must not read raw exception or path fields');
- if(process.platform!=='win32') { t.skip('PowerShell behavior is exercised by the Windows unit job'); return; }
- const {spawnSync}=await import('node:child_process');
- const rows=[
-  {kind:'codex-connect-error',errorClass:'SharedCodexError',errorCode:'shared-cli-unavailable',message:'private failure',path:'C:\\private'},
-  {kind:'windows-desktop-candidates',candidates:[
-   {source:'desktop-install',version:'0.166.0-alpha.6',result:'candidate-resolution-failed',message:'private failure',path:'C:\\private'},
-   {source:'private-host',version:'0.1.2',result:'private result'},
-   {source:'path',version:'C:\\private',result:'shared-cli-unavailable'},
-  ],message:'private failure'},
- ];
- const input=JSON.stringify(rows);
- const helperPath=path.resolve(import.meta.dirname,'../scripts/windows/shared-engine-diagnostics.ps1').replace(/'/gu,"''");
- const script=`. '${helperPath}'\n$rows = ConvertFrom-Json -InputObject '${input}'\nGet-SafeEngineDriverDiagnostics -Diagnostics $rows | ConvertTo-Json -Compress -Depth 5`;
- const result=spawnSync('powershell.exe',['-NoProfile','-NonInteractive','-Command',script],{encoding:'utf8'});
- assert.equal(result.status,0,result.stderr);
- const output=JSON.parse(result.stdout.trim());
- assert.deepEqual(output,[
-  {kind:'codex-connect-error',errorClass:'SharedCodexError',errorCode:'shared-cli-unavailable'},
-  {kind:'windows-desktop-candidates',candidates:[
-   {source:'desktop-install',version:'0.166.0-alpha.6',result:'candidate-resolution-failed'},
-   {source:'path',result:'shared-cli-unavailable'},
-  ]},
- ]);
- assert.doesNotMatch(result.stdout,/private|message|stderrTail|exception/u);
+ assert.doesNotMatch(summary,/stderrTail|exception|payload|requestId|turnId|sharedReport(?!Available)/u,'never print raw errors, payloads, IDs, or the complete report');
 });
 test('shared Windows startup failure reports only an allowlisted driver stage', async()=>{
  const driver=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');

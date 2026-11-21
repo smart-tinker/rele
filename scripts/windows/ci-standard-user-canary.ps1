@@ -646,7 +646,10 @@ try {
             $sharedDiagnosticName = 'shared-results-actual-desktop.json'
             if ([string]$result.stage -match '^shared-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)$') { $sharedDiagnosticName = 'shared-results-' + $Matches[1] + '.json' }
             $sharedDiagnosticPath = Join-Path $sourceRoot $sharedDiagnosticName
-            $summary = [ordered]@{ stage = if ($parentStage -in @('shared', 'rdp-session', 'installer')) { $parentStage } else { 'unknown' }; reportAvailable = $false }
+            $childStage = 'unknown'
+            if ($result.phase -eq 'Installer' -and ($result.stage -in @('token', 'interactive-token', 'owner-control', 'owner-primitive', 'native-cleanup', 'desktop-appx-registration', 'shared-actual-desktop', 'installer', 'complete') -or [string]$result.stage -match '^shared-\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$')) { $childStage = [string]$result.stage }
+            $parentStage = if ($parentStage -in @('shared', 'rdp-session', 'installer')) { $parentStage } else { 'unknown' }
+            $summary = [ordered]@{ stage = $parentStage; parentStage = $parentStage; childReceiptAvailable = $result.phase -eq 'Installer'; childStage = $childStage; reportAvailable = $false; sharedReportAvailable = $false }
             if ($result.cleanupErrors) {
                 $summary.canaryCleanupErrors = @($result.cleanupErrors | Select-Object -Last 8 | ForEach-Object { [ordered]@{
                     step = if ($_.step -in @('retained-shared-report', 'child', 'rdp-session', 'rdp-setting', 'redirector-stop', 'redirector-startup', 'service-stop', 'service-startup', 'task-diagnostic-channel', 'rdp-diagnostic-channel', 'task', 'profile', 'user', 'reports', 'fixture')) { [string]$_.step } else { 'other' }
@@ -659,6 +662,7 @@ try {
                 try {
                     $sharedDiagnostic = Get-Content -LiteralPath $sharedDiagnosticPath -Raw | ConvertFrom-Json
                     $summary.reportAvailable = $true
+                    $summary.sharedReportAvailable = $true
                     $summary.result = if ($sharedDiagnostic.result -in @('passed', 'failed')) { $sharedDiagnostic.result } else { 'unknown' }
                     if ($sharedDiagnostic.failureType) { $summary.failureType = if ([string]$sharedDiagnostic.failureType -match '^[A-Za-z]{1,48}$') { [string]$sharedDiagnostic.failureType } else { 'other' } }
                     if ($sharedDiagnostic.failureLocation -and [string]$sharedDiagnostic.failureLocation.function -match '^[A-Za-z_][A-Za-z0-9_]{0,63}$' -and ($sharedDiagnostic.failureLocation.line -is [int] -or $sharedDiagnostic.failureLocation.line -is [long]) -and [long]$sharedDiagnostic.failureLocation.line -ge 1 -and [long]$sharedDiagnostic.failureLocation.line -le 100000) { $summary.failureLocation = [ordered]@{ function = [string]$sharedDiagnostic.failureLocation.function; line = [int]$sharedDiagnostic.failureLocation.line } }
@@ -723,9 +727,9 @@ try {
                         $summary.driverOperations = @($evidence.driverOperations | Select-Object -Last 16)
                         $summary.rpcTrace = @($evidence.rpcTrace | Select-Object -Last 16)
                     }
-                    if ($result.installerProgress) { $summary.installerProgress = @($result.installerProgress | Select-Object -Last 8) }
                 } catch { $summary.reportAvailable = $false }
             }
+            if ($result.installerProgress) { $summary.installerProgress = @($result.installerProgress | Select-Object -Last 8) }
             Write-Output ('Windows canary bounded diagnostic: ' + ($summary | ConvertTo-Json -Compress -Depth 4))
         }
     }
