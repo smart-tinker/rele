@@ -448,8 +448,9 @@ test('shared protocol completion wait fits within its driver response budget', a
 test('Windows canary failure keeps child progress when shared report is absent', async t=>{
  const canary=(await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8')).replace(/\r\n/gu,'\n');
  const blockStart=canary.indexOf("        if ($RunGates -and $result.result -ne 'passed') {");
- const blockEnd=canary.indexOf('\n    if ($cleanupFailures.Count -ne 0)',blockStart);
+ const blockEnd=canary.indexOf('\n    }\n    if ($cleanupFailures.Count -ne 0)',blockStart);
  assert.ok(blockStart>=0&&blockEnd>blockStart,'isolate the production summary block');
+ assert.ok(canary.slice(blockStart,blockEnd).endsWith('        }'),'exclude the enclosing finally close');
  const report=canary.indexOf('if (Test-Path -LiteralPath $sharedDiagnosticPath -PathType Leaf)',blockStart);
  assert.ok(report>=0&&canary.indexOf('\n            }\n            if ($result.installerProgress)',report)>report,
   'append child progress after the optional shared-report branch');
