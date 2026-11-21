@@ -1526,7 +1526,7 @@ describe('Codex managed runtime', () => {
     proof.mockImplementation(async () => { await heldProof; return generation; });
     const home = await mkdtemp(path.join(tmpdir(), 'Rele reused stdio PID '));
     cleanup.push(() => rm(home, { recursive:true, force:true }));
-    const f = await managedFixture({ terminals:true, mutableTerminals:true, codexHome:home });
+    const f = await managedFixture({ terminals:true, mutableTerminals:true, codexHome:home, diagnosticPid:'parent' });
     const store = new Store(':memory:');
     cleanup.push(() => store.close());
     const endpoint: Endpoint = { id:'reused-pid-origin', platform:'telegram', accountId:'999', chatId:'-100123', threadId:'17',
@@ -1560,8 +1560,11 @@ describe('Codex managed runtime', () => {
       const baseline = JSON.parse(store.getMeta(`request-terminal-baseline:${request.id}`)!);
       expect(baseline).toMatchObject({ terminals:[{ itemId:'fixture-command', processId:'1234' }] });
       expect(baseline).not.toHaveProperty('serverGeneration');
-      expect(baseline.serverId).toBe((await f.records()).find(row => row.event === 'start')?.pid);
-      expect(Reflect.get(f.client, 'nativePeer')).toMatchObject({ kind:'stdio', pid:baseline.serverId });
+      const childPid = (await f.records()).find(row => row.event === 'start')?.pid;
+      expect(childPid).toEqual(expect.any(Number));
+      expect(baseline.serverId).not.toBe(childPid);
+      const peer = Reflect.get(f.client, 'nativePeer');
+      expect(peer).toMatchObject({ kind:'stdio' });
 
       store.updateRequest(request.id, { status:'running', turnId:'managed-turn' });
       await f.setTerminals([{ itemId:'replacement-command', processId:'5678' }]);
@@ -1570,8 +1573,11 @@ describe('Codex managed runtime', () => {
       const replacement = await f.client.backgroundTerminals(threadId, { verifyStableGeneration:true });
       expect(replacement).toMatchObject({ serverId:baseline.serverId, serverGeneration:generation,
         terminals:[{ itemId:'replacement-command', processId:'5678' }] });
+      expect(Reflect.get(f.client, 'nativePeer')).toBe(peer);
 
       const outcome = await engine.cancel(request.id).then(() => 'completed', () => 'rejected');
+      expect(Reflect.get(f.client, 'nativePeer')).toBe(peer);
+      expect(replacement.serverId).toBe(baseline.serverId);
       expect(terminate).not.toHaveBeenCalled();
       expect(interrupt).not.toHaveBeenCalled();
       expect(outcome).toBe('rejected');
