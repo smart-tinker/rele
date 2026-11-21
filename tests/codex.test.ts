@@ -49,6 +49,7 @@ async function managedFixture(options: {
   malformed?: boolean;
   diagnosticPid?: 'parent';
   terminals?: boolean;
+  mutableTerminals?: boolean;
   codexHome?: string;
   auto?: boolean;
   releaseTimeoutMs?: number;
@@ -57,13 +58,17 @@ async function managedFixture(options: {
   cleanup.push(() => rm(directory, { recursive: true, force: true }));
   const executable = path.join(directory, 'codex.mjs');
   const log = path.join(directory, 'wire.jsonl');
+  const backendPath = path.join(directory, 'backend.json');
   await writeFile(log, '');
+  if (options.mutableTerminals) await writeFile(backendPath, JSON.stringify({ terminals: options.terminals ? [{ itemId:'fixture-command', processId:'1234' }] : [] }));
   await writeFile(executable, `
-    import { appendFileSync, writeSync } from 'node:fs';
+    import { appendFileSync, readFileSync, writeSync } from 'node:fs';
     import { createInterface } from 'node:readline';
-    const log = ${JSON.stringify(log)}, options = ${JSON.stringify(options)}, thread = ${JSON.stringify(rawThread)};
+    const log = ${JSON.stringify(log)}, options = ${JSON.stringify(options)}, thread = ${JSON.stringify(rawThread)}, backendPath = ${JSON.stringify(backendPath)};
     const record = value => appendFileSync(log, JSON.stringify(value) + '\\n');
     const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
+    const terminals = () => options.mutableTerminals ? JSON.parse(readFileSync(backendPath, 'utf8')).terminals
+      : options.terminals ? [{ itemId:'fixture-command', processId:'1234' }] : [];
     record({ event: 'start', pid: process.pid, argv: process.argv.slice(2), home: process.env.CODEX_HOME, marker: process.env.RELE_CODEX_TEST_MARKER });
     let released, resumed = false;
     for await (const line of createInterface({ input: process.stdin })) {
@@ -77,7 +82,7 @@ async function managedFixture(options: {
           reply({ userAgent: 'rele/' + (options.version || '0.163.0') + ' (Fixture)', codexHome: process.env.CODEX_HOME || ${JSON.stringify(directory)}, platformFamily: 'fixture', platformOs: process.platform });
           break;
         case 'server/diagnostics': reply({ process: { id: options.diagnosticPid === 'parent' ? process.ppid : process.pid }, gauges: [] }); break;
-        case 'thread/backgroundTerminals/list': reply({ data: options.terminals ? [{ itemId:'fixture-command', processId:'1234' }] : [], nextCursor: null }); break;
+        case 'thread/backgroundTerminals/list': reply({ data: terminals(), nextCursor: null }); break;
         case 'thread/backgroundTerminals/terminate': reply({ terminated:true }); break;
         case 'thread/list': reply({ data: [thread], nextCursor: null }); break;
         case 'thread/queue/list':
@@ -122,7 +127,11 @@ async function managedFixture(options: {
   cleanup.push(() => client.close());
   const records = async () => (await readFile(log, 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as Rpc & { event?: string; argv?: string[]; home?: string; marker?: string; pid?: number });
   const calls = async () => (await records()).filter(row => row.method);
-  return { client, executable, directory, discover, records, calls };
+  const setTerminals = async (terminals: { itemId: string; processId: string }[]) => {
+    if (!options.mutableTerminals) throw new Error('This managed fixture has immutable terminals.');
+    await writeFile(backendPath, JSON.stringify({ terminals }));
+  };
+  return { client, executable, directory, discover, records, calls, setTerminals };
 }
 
 async function fixture(handlers: Record<string, Handler> = {}, codexHome?: string, options: NonNullable<ConstructorParameters<typeof CodexClient>[1]> = {}, autoPong = true) {
@@ -1507,6 +1516,71 @@ describe('Codex managed runtime', () => {
       serverId: expect.any(Number), terminals: [{ itemId: 'fixture-command', processId: '1234' }],
     });
     expect(proof).not.toHaveBeenCalled();
+  });
+
+  it('refuses Stop after a fast managed-stdio baseline when the backend changes but its PID repeats', async () => {
+    let generation = 'a'.repeat(64), releaseProof!: () => void;
+    const heldProof = new Promise<void>(resolve => { releaseProof = resolve; });
+    const proof = vi.mocked(codexNativeGeneration), originalProof = proof.getMockImplementation();
+    proof.mockClear();
+    proof.mockImplementation(async () => { await heldProof; return generation; });
+    const home = await mkdtemp(path.join(tmpdir(), 'Rele reused stdio PID '));
+    cleanup.push(() => rm(home, { recursive:true, force:true }));
+    const f = await managedFixture({ terminals:true, mutableTerminals:true, codexHome:home });
+    const store = new Store(':memory:');
+    cleanup.push(() => store.close());
+    const endpoint: Endpoint = { id:'reused-pid-origin', platform:'telegram', accountId:'999', chatId:'-100123', threadId:'17',
+      title:'Synthetic origin', subtitle:'', people:[{ id:'123', name:'Fixture' }], updatedAt:new Date().toISOString() };
+    store.upsertEndpoint(endpoint);
+    store.createConversation({ name:'Original', threadId, cwd:home,
+      bindings:[{ platform:'telegram', endpointId:endpoint.id, allowedSenderIds:['123'] }] });
+    store.setMeta(initialMessageKey(home, threadId), JSON.stringify({ applied:true }));
+    const config = { ...structuredClone(defaultConfig), codex:{ transport:'managed' as const, executable:f.executable, endpoint:'', codexHome:home },
+      telegram:{ ...defaultConfig.telegram, enabled:true } };
+    const engine = new Engine(store, f.client, { config:() => config, temporaryRoot:f.directory, redact:() => 'Fixture error' });
+    engine.channels.telegram = { state:{ configured:true, connected:true, accountId:'999' }, start:async () => {}, stop:async () => {}, download:async () => {}, deliver:async () => 'receipt' };
+    cleanup.push(() => engine.stop());
+    let turnState: 'running' | 'interrupted' = 'running';
+    const interrupt = vi.spyOn(f.client, 'interrupt').mockImplementation(async () => { turnState = 'interrupted'; });
+    const terminate = vi.spyOn(f.client, 'terminateBackgroundTerminal').mockImplementation(async () => { await f.setTerminals([]); });
+    vi.spyOn(f.client, 'findRequest').mockImplementation(async () => ({ state:turnState, turnId:'managed-turn',
+      commandItems:[{ id:'replacement-command', processId:'5678', completed:true }] }));
+    try {
+      await f.client.connect();
+      await vi.waitFor(() => expect(proof).toHaveBeenCalledOnce());
+      await engine.receive({ eventId:'reused-pid-request', endpoint, sender:endpoint.people[0], messageId:'1', text:'Synthetic request' });
+      const deadline = Date.now() + 2_000;
+      let calls = await f.calls();
+      while (!calls.some(call => call.method === 'thread/queue/add')) {
+        if (Date.now() >= deadline) throw new Error('The managed request did not reach its native queue.');
+        await new Promise(resolve => setTimeout(resolve, 10));
+        calls = await f.calls();
+      }
+      const request = store.listRequests().find(row => row.eventId === 'reused-pid-request')!;
+      const baseline = JSON.parse(store.getMeta(`request-terminal-baseline:${request.id}`)!);
+      expect(baseline).toMatchObject({ terminals:[{ itemId:'fixture-command', processId:'1234' }] });
+      expect(baseline).not.toHaveProperty('serverGeneration');
+      expect(baseline.serverId).toBe((await f.records()).find(row => row.event === 'start')?.pid);
+      expect(Reflect.get(f.client, 'nativePeer')).toMatchObject({ kind:'stdio', pid:baseline.serverId });
+
+      store.updateRequest(request.id, { status:'running', turnId:'managed-turn' });
+      await f.setTerminals([{ itemId:'replacement-command', processId:'5678' }]);
+      generation = 'b'.repeat(64);
+      releaseProof();
+      const replacement = await f.client.backgroundTerminals(threadId, { verifyStableGeneration:true });
+      expect(replacement).toMatchObject({ serverId:baseline.serverId, serverGeneration:generation,
+        terminals:[{ itemId:'replacement-command', processId:'5678' }] });
+
+      const outcome = await engine.cancel(request.id).then(() => 'completed', () => 'rejected');
+      expect(terminate).not.toHaveBeenCalled();
+      expect(interrupt).not.toHaveBeenCalled();
+      expect(outcome).toBe('rejected');
+      expect((await f.calls()).some(call => call.method === 'thread/backgroundTerminals/terminate')).toBe(false);
+      expect(store.getRequest(request.id)?.origin).toMatchObject({ platform:'telegram', accountId:'999', endpointId:endpoint.id });
+    } finally {
+      releaseProof();
+      if (originalProof) proof.mockImplementation(originalProof);
+    }
   });
 
   it('carries only the confirmed generation of the same managed stdio peer into a fast terminal baseline', async () => {
