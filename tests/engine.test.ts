@@ -441,8 +441,10 @@ describe('Engine asynchronous Desktop questions', () => {
     const { approval, questions } = await asyncQuestion(f, request);
     f.codex.locations.set(request.id, { state: 'completed', turnId: 'turn-1', text: 'NOREPLY', asyncQuestions: questions });
     await f.engine.reconcile(request.id); await f.engine.settled();
-    f.codex.asyncQuestionState.mockResolvedValueOnce(f.codex.asyncStates.get(questions[0].question.id));
-    f.codex.asyncQuestionState.mockRejectedValueOnce(new Error('question lookup unavailable'));
+    f.codex.asyncQuestionState.mockImplementation(async (_threadId, questionId) => {
+      if (f.store.getRequest(approval.id)?.status === 'starting') throw new Error('question lookup unavailable');
+      return f.codex.asyncStates.get(questionId);
+    });
     await f.engine.action(asyncAction(f, approval)); await f.engine.settled();
     expect(f.store.getRequest(approval.id)).toMatchObject({ status: 'queued', error: 'question lookup unavailable' });
     expect(f.store.getApproval(approval.id)).toMatchObject({ status: 'answered', decision: 'queued' });
@@ -2055,15 +2057,11 @@ describe('Engine scoped shell cancellation', () => {
     expect(restarted.store.listRequests()).toHaveLength(1);
   });
 
-  it.each(['different-generation', 'missing-generation', 'invalid-generation', 'legacy-baseline'] as const)(
+  it.each(['different-generation', 'missing-generation', 'invalid-generation'] as const)(
     'refuses Stop before interrupt when native identity is %s', async identity => {
       const f = fixture(), request = await shell(f);
       const backgroundTerminalCalls = f.codex.backgroundTerminals.mock.calls.length;
-      if (identity === 'legacy-baseline') {
-        const baseline = JSON.parse(f.store.getMeta(`request-terminal-baseline:${request.id}`)!);
-        delete baseline.serverGeneration;
-        f.store.setMeta(`request-terminal-baseline:${request.id}`, JSON.stringify(baseline));
-      } else f.codex.serverGeneration = identity === 'different-generation' ? 'b'.repeat(64)
+      f.codex.serverGeneration = identity === 'different-generation' ? 'b'.repeat(64)
         : identity === 'invalid-generation' ? 'A'.repeat(64) : undefined;
 
       await expect(f.engine.cancel(request.id)).rejects.toThrow();
@@ -2077,6 +2075,25 @@ describe('Engine scoped shell cancellation', () => {
       expect(f.store.listDeliveries().some(row => row.requestId === request.id && row.key === 'terminal:error')).toBe(false);
     });
 
+  it('refuses addressed Stop when a nonempty fast baseline lacks a generation despite an unchanged PID', async () => {
+    const f = fixture(), request = await shell(f);
+    const key = `request-terminal-baseline:${request.id}`, baseline = JSON.parse(f.store.getMeta(key)!);
+    delete baseline.serverGeneration;
+    baseline.terminals = [{ itemId:'pre-existing-command', processId:'9876' }];
+    f.store.setMeta(key, JSON.stringify(baseline));
+    f.codex.serverGeneration = 'b'.repeat(64);
+    f.codex.backgroundTerminals.mockClear();
+
+    const outcome = await f.engine.cancel(request.id).then(() => 'completed', () => 'rejected');
+
+    expect(f.codex.terminateBackgroundTerminal).not.toHaveBeenCalled();
+    expect(outcome).toBe('rejected');
+    expect(f.codex.backgroundTerminals).not.toHaveBeenCalled();
+    expect(f.codex.interrupt).not.toHaveBeenCalled();
+    expect(f.codex.serverId).toBe(42);
+    expect(JSON.parse(f.store.getMeta(key)!)).not.toHaveProperty('serverGeneration');
+  });
+
   type BaselineCase = { failure: string; after: (f: ReturnType<typeof fixture>, request: ReleRequest) => void };
   it.each([
     { failure: 'missing', after: (f, request) => {
@@ -2086,10 +2103,6 @@ describe('Engine scoped shell cancellation', () => {
     { failure: 'target-changed', after: (f, request) => {
       const key = `request-terminal-baseline:${request.id}`, baseline = JSON.parse(f.store.getMeta(key)!);
       f.store.setMeta(key, JSON.stringify({ ...baseline, target: 'changed-target' }));
-    } },
-    { failure: 'generation-missing', after: (f, request) => {
-      const key = `request-terminal-baseline:${request.id}`, baseline = JSON.parse(f.store.getMeta(key)!);
-      delete baseline.serverGeneration; f.store.setMeta(key, JSON.stringify(baseline));
     } },
     { failure: 'generation-invalid', after: (f, request) => {
       const key = `request-terminal-baseline:${request.id}`, baseline = JSON.parse(f.store.getMeta(key)!);

@@ -1,3 +1,18 @@
+const sharedConnectErrorClasses = new Set([
+ 'AbortError','CodexTransportError','Error','RangeError','SharedCodexError','TimeoutError','TypeError',
+]);
+const sharedConnectErrorCodes = new Set([
+ 'invalid-shared-profile','invalid-shared-target','shared-cli-unavailable','shared-cli-unverified',
+ 'shared-control-migration-required','shared-daemon-invalid','shared-daemon-unavailable',
+ 'shared-desktop-conflict','shared-desktop-package-invalid',
+ 'shared-owner-unknown','shared-package-incomplete','shared-profile-mismatch',
+]);
+export function summarizeSharedConnectFailure(error) {
+ const errorClass=error instanceof Error&&sharedConnectErrorClasses.has(error.name)?error.name:'other';
+ const errorCode=error&&typeof error==='object'&&typeof error.code==='string'&&sharedConnectErrorCodes.has(error.code)?error.code:'other';
+ return {kind:'codex-connect-error',errorClass,errorCode};
+}
+
 export function summarizeSharedWaitFailure(expectedStatus, state) {
  return {
   expectedStatus,

@@ -8,7 +8,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PROBE = ROOT / 'scripts/shared-protocol-probe.py'
-HELPERS = {'safe_error_type', 'safe_failure_code', 'safe_engine_driver_stage', 'safe_failure_location', 'public_failure_location', 'record_cleanup_error', 'cleanup_failure_message', 'public_console_report', 'EngineDriver'}
+HELPERS = {'safe_error_type', 'safe_failure_code', 'safe_engine_driver_stage', 'safe_engine_driver_diagnostic', 'safe_failure_location', 'public_failure_location', 'record_cleanup_error', 'cleanup_failure_message', 'public_console_report', 'EngineDriver'}
 
 
 def load_helpers(test):
@@ -81,6 +81,46 @@ class CleanupDiagnostics(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, '^Shared Engine driver exited before responding$') as raised:
                 await driver.read()
             self.assertEqual(getattr(raised.exception, 'engine_driver_exit_code', None), 23)
+
+        asyncio.run(read_eof())
+
+    def test_startup_eof_reports_only_allowlisted_connect_and_candidate_diagnostics(self):
+        helpers = load_helpers(self)
+
+        class Process:
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data((
+                    '{"probeStage":"codex-connect"}\n'
+                    '{"probeDiagnostic":{"kind":"codex-connect-error","errorClass":"SharedCodexError","errorCode":"shared-cli-unavailable","message":"private failure"}}\n'
+                    '{"probeDiagnostic":{"kind":"windows-desktop-candidates","candidates":[{"source":"desktop-install","version":"0.166.0-alpha.6","result":"candidate-resolution-failed","path":"C:\\\\private","message":"private failure"},{"source":"private-host","version":"C:\\\\private","result":"private result"}]}}\n'
+                ).encode())
+                self.stdout.feed_eof()
+                self.returncode = 1
+
+        async def read_eof():
+            driver = helpers['EngineDriver'](Process())
+            with self.assertRaises(RuntimeError) as raised:
+                await driver.read()
+            report = helpers['public_console_report']({
+                'result': 'failed',
+                'failureType': 'RuntimeError',
+                'failureCode': 'engine-driver-exited-before-response',
+                'engineDriverStage': getattr(raised.exception, 'engine_driver_stage', None),
+                'engineDriverDiagnostics': getattr(raised.exception, 'engine_driver_diagnostics', []),
+                'exception': 'private failure',
+                'stderrTail': ['C:\\\\private and private failure'],
+            })
+            self.assertEqual(report['engineDriverStage'], 'codex-connect')
+            self.assertEqual(report['engineDriverDiagnostics'], [
+                {'kind': 'codex-connect-error', 'errorClass': 'SharedCodexError', 'errorCode': 'shared-cli-unavailable'},
+                {'kind': 'windows-desktop-candidates', 'candidates': [
+                    {'source': 'desktop-install', 'version': '0.166.0-alpha.6', 'result': 'candidate-resolution-failed'},
+                ]},
+            ])
+            serialized = json.dumps(report)
+            for private in ('private failure', 'private-host', 'C:\\\\private', 'message', 'path', 'exception', 'stderrTail'):
+                self.assertNotIn(private, serialized)
 
         asyncio.run(read_eof())
 

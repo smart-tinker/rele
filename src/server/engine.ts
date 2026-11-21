@@ -17,7 +17,7 @@ import { ASYNC_QUESTION_METHOD, asyncQuestions, encodeAsyncAnswers, matchAsyncAn
 import { SourceControls, type ControlContext, type ControlView } from './source-control.js';
 import type { ControlCommand } from './channels/slack-control.js';
 
-export type CodexGateway = Pick<CodexClient, 'status' | 'isVerifiedVersion' | 'createThread' | 'setThreadName' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'steer' | 'findSteerReceipt' | 'interrupt' | 'backgroundTerminals' | 'terminateBackgroundTerminal' | 'findRequest' | 'retryOverloaded' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Partial<Pick<CodexClient, 'hasPendingRequest' | 'asyncQuestionState' | 'controlSnapshot' | 'controlModels' | 'readControlGoal' | 'updateControlGoal' | 'updateControlModel' | 'controlTurns' | 'controlTurnLocation' | 'controlTurnIndex'>> & Pick<EventEmitter, 'on' | 'off'>;
+export type CodexGateway = Pick<CodexClient, 'status' | 'isVerifiedVersion' | 'createThread' | 'setThreadName' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'steer' | 'findSteerReceipt' | 'interrupt' | 'backgroundTerminals' | 'terminateBackgroundTerminal' | 'findRequest' | 'retryOverloaded' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Partial<Pick<CodexClient, 'hasPendingRequest' | 'asyncQuestionState' | 'primeNativeGeneration' | 'controlSnapshot' | 'controlModels' | 'readControlGoal' | 'updateControlGoal' | 'updateControlModel' | 'controlTurns' | 'controlTurnLocation' | 'controlTurnIndex'>> & Pick<EventEmitter, 'on' | 'off'>;
 export interface EngineOptions {
   config: () => AppConfig;
   temporaryRoot: string;
@@ -616,7 +616,7 @@ export class Engine extends EventEmitter {
       : baseline.target !== state.target ? 'target-changed'
         : typeof baseline.serverGeneration !== 'string' ? 'generation-missing'
           : !/^[a-f0-9]{64}$/u.test(baseline.serverGeneration) ? 'generation-invalid'
-            : !Array.isArray(baseline.terminals) || baseline.terminals.some(entry => !terminalPair(entry)) ? 'terminals-invalid' : undefined;
+          : !Array.isArray(baseline.terminals) || baseline.terminals.some(entry => !terminalPair(entry)) ? 'terminals-invalid' : undefined;
     if (!baseline || baselineFailure) throw Object.assign(new Error('Исходный сервер или снимок команд не подтверждён. Отсутствие терминалов не доказывает завершение прежних процессов.'), {
       code: `terminal-baseline-${baselineFailure ?? 'missing'}`,
     });
@@ -1966,6 +1966,7 @@ export class Engine extends EventEmitter {
   private connectionChanged(): void {
     if (this.stopped) return;
     const connected = this.codex.status().connected;
+    if (connected) this.codex.primeNativeGeneration?.();
     if (!connected && this.connected) {
       this.epoch = randomUUID(); this.completionRechecks.clear(); this.expireApprovals();
       this.ownedThreads.clear(); this.retryThreadAfter.clear(); this.progressReads.clear();

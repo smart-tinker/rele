@@ -156,23 +156,23 @@ async function proxyFixture(churn = false, coldExecutable = false, symlinkEndpoi
 it.skipIf(process.platform !== 'linux')('keeps a daemon generation across replacement of the actual owned Unix proxy connection', async () => {
   const f = await proxyFixture();
   await f.client.connect();
-  const first = await f.client.backgroundTerminals('fixture');
+  const first = await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true });
   expect(first.serverId).toBe(f.server.pid);
   expect(first).toHaveProperty('serverGeneration', expect.stringMatching(/^[a-f0-9]{64}$/u));
   await f.client.close();
   await f.client.connect();
-  expect(await f.client.backgroundTerminals('fixture')).toEqual(first);
+  expect(await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true })).toEqual(first);
 });
 
 it.skipIf(process.platform !== 'linux')('does not attest a replacement listener and claimed PID while the transport is still connected to the old daemon', async () => {
   const f = await proxyFixture();
   await f.client.connect();
-  const first = await f.client.backgroundTerminals('fixture');
+  const first = await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true });
   expect(first).toHaveProperty('serverGeneration', expect.stringMatching(/^[a-f0-9]{64}$/u));
   await rename(f.endpoint, f.endpoint + '.old');
   const replacement = await f.native();
   await writeFile(f.claimed, String(replacement.pid));
-  const after = await f.client.backgroundTerminals('fixture');
+  const after = await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true });
   expect(after.serverId).toBe(replacement.pid);
   expect(after).not.toHaveProperty('serverGeneration');
 });
@@ -182,7 +182,7 @@ it.skipIf(process.platform !== 'linux')('keeps the proven Unix peer generation w
   await f.client.connect();
   let generation: string | undefined;
   for (let i = 0; i < 3; i++) {
-    const snapshot = await f.client.backgroundTerminals('fixture');
+    const snapshot = await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true });
     expect(snapshot.serverId).toBe(f.server.pid);
     expect(snapshot.serverGeneration).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
     if (generation) expect(snapshot.serverGeneration).toBe(generation);
@@ -195,7 +195,7 @@ it.skipIf(process.platform !== 'linux')('proves a cold native executable when re
   await f.client.connect();
   const executable = await stat(f.nativeExecutable);
   await utimes(f.nativeExecutable, new Date('2000-01-01T00:00:00Z'), executable.mtime);
-  const snapshot = await f.client.backgroundTerminals('fixture');
+  const snapshot = await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true });
   expect(snapshot.serverId).toBe(f.server.pid);
   expect(snapshot.serverGeneration).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
 }, 15000);
@@ -206,21 +206,21 @@ it.skipIf(process.platform !== 'linux')('proves a symlink native endpoint when r
   const endpoint = await lstat(f.endpoint);
   expect(endpoint.isSymbolicLink()).toBe(true);
   await lutimes(f.endpoint, new Date('2000-01-01T00:00:00Z'), endpoint.mtime);
-  const snapshot = await f.client.backgroundTerminals('fixture');
+  const snapshot = await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true });
   expect(snapshot.serverId).toBe(f.server.pid);
   expect(snapshot.serverGeneration).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
-  expect(await f.client.backgroundTerminals('fixture')).toEqual(snapshot);
+  expect(await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true })).toEqual(snapshot);
 }, 15000);
 
 it.skipIf(process.platform !== 'linux')('proves a legacy Unix daemon without pid-records across proxy reconnects', async () => {
   const f = await proxyFixture(false, false, true, false);
   await f.client.connect();
-  const first = await f.client.backgroundTerminals('fixture');
+  const first = await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true });
   expect(first.serverId).toBe(f.server.pid);
   expect(first.serverGeneration).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
   await f.client.close();
   await f.client.connect();
-  expect(await f.client.backgroundTerminals('fixture')).toEqual(first);
+  expect(await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true })).toEqual(first);
 }, 15000);
 
 it.skipIf(process.platform !== 'linux').each(['malformed', 'wrong-pid', 'wrong-birth', 'multiple', 'directory'] as const)('refuses an existing %s Unix pid-record', async invalid => {
@@ -233,7 +233,7 @@ it.skipIf(process.platform !== 'linux').each(['malformed', 'wrong-pid', 'wrong-b
   if (invalid === 'multiple') await writeFile(path.join(f.home, 'app-server-daemon', 'app-server.pid'), valid);
   if (invalid === 'directory') { await unlink(record); await mkdir(record); }
   await f.client.connect();
-  const snapshot = await f.client.backgroundTerminals('fixture');
+  const snapshot = await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true });
   expect(snapshot.serverId).toBe(f.server.pid);
   expect(snapshot).not.toHaveProperty('serverGeneration');
 });
@@ -247,7 +247,7 @@ it.skipIf(process.platform !== 'linux').each(['appeared', 'disappeared', 'rewrit
   const executable = await stat(f.nativeExecutable);
   const oldAccess = new Date('2000-01-01T00:00:00Z');
   await utimes(f.nativeExecutable, oldAccess, executable.mtime);
-  const pending = f.client.backgroundTerminals('fixture');
+  const pending = f.client.backgroundTerminals('fixture', { verifyStableGeneration:true });
   // A copied executable belongs only to this fixture. Its first hash read signals
   // that physical proof has begun, without hooks in the production proof code.
   const deadline = Date.now() + 5000;
