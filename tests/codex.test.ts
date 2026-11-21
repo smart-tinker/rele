@@ -1518,7 +1518,7 @@ describe('Codex managed runtime', () => {
     expect(proof).not.toHaveBeenCalled();
   });
 
-  it('refuses Stop after a fast managed-stdio baseline when the backend changes but its PID repeats', async () => {
+  it('refuses Stop when managed stdio reuses its PID after a fast nonempty baseline', async () => {
     let generation = 'a'.repeat(64), releaseProof!: () => void;
     const heldProof = new Promise<void>(resolve => { releaseProof = resolve; });
     const proof = vi.mocked(codexNativeGeneration), originalProof = proof.getMockImplementation();
@@ -1526,7 +1526,7 @@ describe('Codex managed runtime', () => {
     proof.mockImplementation(async () => { await heldProof; return generation; });
     const home = await mkdtemp(path.join(tmpdir(), 'Rele reused stdio PID '));
     cleanup.push(() => rm(home, { recursive:true, force:true }));
-    const f = await managedFixture({ terminals:true, mutableTerminals:true, codexHome:home, diagnosticPid:'parent' });
+    const f = await managedFixture({ terminals:true, mutableTerminals:true, codexHome:home });
     const store = new Store(':memory:');
     cleanup.push(() => store.close());
     const endpoint: Endpoint = { id:'reused-pid-origin', platform:'telegram', accountId:'999', chatId:'-100123', threadId:'17',
@@ -1560,23 +1560,27 @@ describe('Codex managed runtime', () => {
       const baseline = JSON.parse(store.getMeta(`request-terminal-baseline:${request.id}`)!);
       expect(baseline).toMatchObject({ terminals:[{ itemId:'fixture-command', processId:'1234' }] });
       expect(baseline).not.toHaveProperty('serverGeneration');
-      const childPid = (await f.records()).find(row => row.event === 'start')?.pid;
-      expect(childPid).toEqual(expect.any(Number));
-      expect(baseline.serverId).not.toBe(childPid);
-      const peer = Reflect.get(f.client, 'nativePeer');
-      expect(peer).toMatchObject({ kind:'stdio' });
+      const peer = Reflect.get(f.client, 'nativePeer') as CodexNativePeer | undefined;
+      if (peer?.kind !== 'stdio') throw new Error('The synthetic request did not use managed stdio.');
+      const transport = Reflect.get(f.client, 'stdio') as { pid:number } | undefined;
+      expect(transport?.pid).toBe(peer.pid);
+      expect(baseline.serverId).toBe(peer.pid);
 
       store.updateRequest(request.id, { status:'running', turnId:'managed-turn' });
       await f.setTerminals([{ itemId:'replacement-command', processId:'5678' }]);
+      const replacementPeer = { ...peer };
+      Reflect.set(f.client, 'nativePeer', replacementPeer);
+      expect(Reflect.get(f.client, 'nativePeer')).not.toBe(peer);
+      expect(replacementPeer.pid).toBe(baseline.serverId);
       generation = 'b'.repeat(64);
       releaseProof();
-      const replacement = await f.client.backgroundTerminals(threadId, { verifyStableGeneration:true });
-      expect(replacement).toMatchObject({ serverId:baseline.serverId, serverGeneration:generation,
+      const replacement = await f.client.backgroundTerminals(threadId);
+      expect(replacement).toMatchObject({ serverId:baseline.serverId,
         terminals:[{ itemId:'replacement-command', processId:'5678' }] });
-      expect(Reflect.get(f.client, 'nativePeer')).toBe(peer);
+      expect(replacement).not.toHaveProperty('serverGeneration');
+      expect(Reflect.get(f.client, 'nativePeer')).toBe(replacementPeer);
 
       const outcome = await engine.cancel(request.id).then(() => 'completed', () => 'rejected');
-      expect(Reflect.get(f.client, 'nativePeer')).toBe(peer);
       expect(replacement.serverId).toBe(baseline.serverId);
       expect(terminate).not.toHaveBeenCalled();
       expect(interrupt).not.toHaveBeenCalled();
