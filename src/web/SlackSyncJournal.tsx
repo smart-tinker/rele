@@ -9,6 +9,12 @@ const entryLabels: Record<SlackSyncEntryState, string> = {
   applied: 'В контексте Codex',
   uncertain: 'Передача не подтверждена',
 };
+const slackEntryLabels: Record<SlackSyncEntryState, string> = {
+  pending: 'Сохранено в журнале; не передаётся как пассивный контекст',
+  applying: 'Передача начата ранее',
+  applied: 'Передано ранее в Codex',
+  uncertain: 'Прежняя передача не подтверждена',
+};
 
 export function SlackSyncJournal({ api, conversationId, platform }: { api: ReleApi; conversationId: string; platform: Platform }) {
   const titleId = useId();
@@ -59,10 +65,15 @@ export function SlackSyncJournal({ api, conversationId, platform }: { api: ReleA
   if (data && !data.streams.length && !current.error) return null;
   const stream = data?.streams.find(item => item.id === data.streamId);
   const messenger = (stream?.platform ?? platform) === 'telegram' ? 'Telegram' : 'Slack';
+  const journalPlatform = stream?.platform ?? platform;
   const received = stream ? Object.values(stream.counts).reduce((total, count) => total + count, 0) : 0;
   const applied = stream ? stream.counts.applied : 0;
   const pending = stream ? stream.counts.pending + stream.counts.applying + stream.counts.uncertain : 0;
-  const phase = stream && !stream.active && stream.state === 'backfill'
+  const notSent = stream ? stream.counts.pending + stream.counts.applying : 0;
+  const uncertain = stream?.counts.uncertain ?? 0;
+  const phase = journalPlatform === 'slack'
+    ? 'Пассивные записи Slack остаются в журнале и не передаются в Codex.'
+    : stream && !stream.active && stream.state === 'backfill'
     ? pending ? 'Полученные сообщения отвязанного источника ожидают передачи в Codex.' : 'Полученные сообщения отвязанного источника переданы в контекст Codex.'
     : stream?.state === 'backfill' ? 'Загружается история треда.'
     : stream?.state === 'blocked' ? 'Синхронизация заблокирована.'
@@ -71,10 +82,12 @@ export function SlackSyncJournal({ api, conversationId, platform }: { api: ReleA
 
   return (
     <section className="form-section form-stack" aria-labelledby={titleId}>
-      <h3 id={titleId}>Журнал контекста {messenger}</h3>
-      <p className="muted">Здесь хранится контекст модели Codex, включая сообщения ботов. Пассивные записи не создают отдельные сообщения в Desktop и не запускают ответ. Запуск разрешён выбранным выше отправителям.</p>
+      <h3 id={titleId}>Журнал {journalPlatform === 'slack' ? 'сообщений' : 'контекста'} {messenger}</h3>
+      <p className="muted">{journalPlatform === 'slack'
+        ? 'Пассивные сообщения Slack сохраняются в Rele как записи журнала. В Codex передаются только новые сообщения, принятые по выбранному режиму.'
+        : 'Здесь хранится контекст модели Codex, включая сообщения ботов. Пассивные записи не создают отдельные сообщения в Desktop и не запускают ответ. Запуск разрешён выбранным выше отправителям.'}</p>
       <div className="catalog-controls">
-        <Button icon="refresh" busy={current.loading} aria-label="Обновить журнал контекста" onClick={() => void load()}>Обновить</Button>
+        <Button icon="refresh" busy={current.loading} aria-label={`Обновить журнал ${journalPlatform === 'slack' ? 'сообщений' : 'контекста'}`} onClick={() => void load()}>Обновить</Button>
       </div>
       {current.loading && !data ? <p className="field-hint" role="status">Загружаем журнал…</p> : null}
       {current.error ? <Notice>{current.error}</Notice> : null}
@@ -86,12 +99,14 @@ export function SlackSyncJournal({ api, conversationId, platform }: { api: ReleA
         </Field>
       ) : null}
       {stream ? <>
-        <p className="field-hint">{stream.title}{stream.active ? '' : ' · Источник отвязан; ранее полученный контекст остаётся в журнале.'}</p>
+        <p className="field-hint">{stream.title}{stream.active ? '' : ' · Источник отвязан; ранее полученные сообщения остаются в журнале.'}</p>
         {stream.platform === 'telegram' ? <p className="field-hint">В Telegram сохраняются сообщения, полученные Rele. История до подключения не загружается.</p> : null}
-        <Notice tone={stream.state === 'blocked' || stream.paused ? 'warning' : stream.state === 'ready' && !pending ? 'success' : 'info'}>{phase}</Notice>
-        {stream.paused ? <p className="field-hint">Связка приостановлена: передача ожидает возобновления.</p> : null}
-        {stream.error ? <Notice tone="warning">{stream.error}</Notice> : null}
-        <p className="field-hint" aria-live="polite">Получено: {received} · В контексте Codex: {applied} · Ожидают: {pending}</p>
+        <Notice tone={journalPlatform === 'slack' ? 'info' : stream.state === 'blocked' || stream.paused ? 'warning' : stream.state === 'ready' && !pending ? 'success' : 'info'}>{phase}</Notice>
+        {stream.paused ? <p className="field-hint">{journalPlatform === 'slack' ? 'Связка приостановлена; журнал сохраняется без передачи пассивных записей.' : 'Связка приостановлена: передача ожидает возобновления.'}</p> : null}
+        {stream.error && journalPlatform === 'telegram' ? <Notice tone="warning">{stream.error}</Notice> : null}
+        <p className="field-hint" aria-live="polite">{journalPlatform === 'slack'
+          ? `Получено: ${received} · Передано ранее в Codex: ${applied} · Пассивно не передаётся: ${notSent} · Прежняя передача не подтверждена: ${uncertain}`
+          : `Получено: ${received} · В контексте Codex: ${applied} · Ожидают: ${pending}`}</p>
       </> : null}
       {data ? <div className="form-stack">
         {data.entries.map(entry => {
@@ -100,7 +115,7 @@ export function SlackSyncJournal({ api, conversationId, platform }: { api: ReleA
           return <article className="catalog-instruction" key={entry.id} aria-label={`Сообщение ${entry.message.sender.name}`}>
             <div className="cell-copy">
               <strong>{entry.message.sender.name}{entry.message.sender.isBot ? ' · Бот' : ''}</strong>
-              <small><time dateTime={timestamp}>{formatDate(timestamp)}</time> · {entryLabels[entry.state]}{entry.message.kind === 'edit' ? ' · Изменено' : entry.message.kind === 'deleted' ? ' · Удалено' : ''}</small>
+              <small><time dateTime={timestamp}>{formatDate(timestamp)}</time> · {(journalPlatform === 'slack' ? slackEntryLabels : entryLabels)[entry.state]}{entry.message.kind === 'edit' ? ' · Изменено' : entry.message.kind === 'deleted' ? ' · Удалено' : ''}</small>
             </div>
             <div className="message-details"><p>{entry.message.text || 'Сообщение без текстового поля. Полные данные доступны ниже.'}</p></div>
             {entry.error ? <Notice tone="warning">{entry.error}</Notice> : null}

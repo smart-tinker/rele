@@ -34,6 +34,7 @@ for (const endpoint of Object.values(endpoints)) store.upsertEndpoint(endpoint);
 const conversation = store.createConversation({ name: 'Managed fixture', threadId: values.thread, cwd: values.directory,
   bindings: Object.values(endpoints).map(endpoint => ({ platform: endpoint.platform, endpointId: endpoint.id, allowedSenderIds: ['fixture-user'] })),
 });
+store.setSourceAccess(endpoints.slack.id, { mode: 'mention', allowedSenderIds: ['fixture-user'] });
 // This ownership/history fixture starts with an initialized existing conversation.
 const slackHistory: SlackTranscriptMessage[] = [{
   endpointId: endpoints.slack.id, accountId: endpoints.slack.accountId, chatId: endpoints.slack.chatId,
@@ -173,7 +174,7 @@ try {
   const initial = await snapshot();
   process.stdout.write(JSON.stringify({ ready: true, catalog: await codex.listThreads(), ...initial }) + '\n');
   for await (const line of lines) {
-    const command = JSON.parse(line) as { action: string; platform?: Platform; text?: string; eventId?: string };
+    const command = JSON.parse(line) as { action: string; platform?: Platform; text?: string; eventId?: string; directMention?: boolean };
     let freshContext;
     if (command.action === 'ingest') {
       const platform = command.platform!;
@@ -186,7 +187,7 @@ try {
       } : undefined;
       if (slack) slackHistory.push(slack);
       await engine.receive({ eventId: command.eventId!, endpoint: endpoints[platform], sender: endpoints[platform].people[0],
-        messageId, text: command.text!, ...(slack ? { slack } : {}),
+        messageId, text: command.text!, ...(command.directMention ? { directMention: true } : {}), ...(slack ? { slack } : {}),
       });
       await engine.settled();
     } else if (command.action === 'wait') {

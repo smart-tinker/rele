@@ -257,28 +257,34 @@ stream_max_retries=0
         assert any(row['id'] == thread and row['name'] == name for row in ready['catalog'])
         report['checks']['managed_child_lists_original_id_and_name_without_resuming'] = True
         report['checks']['explicit_shared_profile_overrides_inherited_home'] = True
-        waiting = await command('ingest', platform='slack', eventId='slack-1', text='slack-context-B')
-        assert waiting['requests'][0]['status'] == 'queued', waiting
-        assert waiting['requests'][0].get('error'), waiting
-        assert not waiting['deliveries'] and len(records) == 1, waiting
+        passive_a = await command('ingest', platform='slack', eventId='slack-passive-a', text='ISSUE40_PASSIVE_A')
+        assert not passive_a['requests'] and len(records) == 1, passive_a
+        report['checks']['unmentioned_slack_message_creates_no_request_or_model_input'] = True
+        waiting = await command('ingest', platform='slack', eventId='slack-1', text='ISSUE40_ACCEPTED_B', directMention=True)
+        assert len(waiting['requests']) == 1 and waiting['requests'][0]['origin']['messageId'] == '1700000001.000002', waiting
         request_id = waiting['requests'][0]['id']
-        report['checks']['foreign_writer_keeps_original_request_in_rele_queue'] = True
+        passive_c = await command('ingest', platform='slack', eventId='slack-passive-c', text='ISSUE40_PASSIVE_C')
+        assert len(passive_c['requests']) == 1 and passive_c['requests'][0]['id'] == request_id, passive_c
+        assert all('ISSUE40_PASSIVE_C' not in json.dumps(record) for record in records), records
+        report['checks']['passive_slack_message_while_request_exists_is_not_replayed'] = True
         await stop_source(source)
         completed = await command('wait')
         assert completed['requests'][0]['id'] == request_id and completed['requests'][0]['status'] == 'completed'
         assert len(completed['deliveries']) == 1 and completed['deliveries'][0]['origin']['platform'] == 'slack'
         assert completed['deliveries'][0]['status'] == 'sent'
-        assert 'source-context-A' in json.dumps(records[1]) and 'managed-answer-1' in json.dumps(records[1])
+        first_rele_input = json.dumps(records[1])
+        assert all(marker in first_rele_input for marker in ('source-context-A', 'ISSUE40_ACCEPTED_B', 'managed-answer-1'))
+        assert first_rele_input.count('ISSUE40_ACCEPTED_B') == 1
         assert completed['runtimeProcessId'] == ready['runtimeProcessId']
-        assert 'passive-peer-agent-context' in json.dumps(records[1])
-        report['checks']['all_author_slack_context_precedes_authorized_task'] = True
+        assert all(marker not in first_rele_input for marker in ('passive-peer-agent-context', 'ISSUE40_PASSIVE_A', 'ISSUE40_PASSIVE_C'))
+        report['checks']['only_accepted_slack_message_joins_preserved_native_history'] = True
         report['checks']['released_source_resumes_same_request_with_prior_exchange'] = True
         report['checks']['slack_result_delivered_only_to_its_origin'] = True
         source2 = await start_source('source_a_reopened')
         resumed = await source2['client'].call('thread/resume', {'threadId': thread, 'excludeTurns': True})
         assert resumed['thread']['id'] == thread
         await source_turn(source2, thread, 'source-return-context-C')
-        assert 'slack-context-B' in json.dumps(records[2]) and 'managed-answer-2' in json.dumps(records[2])
+        assert 'ISSUE40_ACCEPTED_B' in json.dumps(records[2]) and 'managed-answer-2' in json.dumps(records[2])
         report['checks']['managed_thread_released_while_own_server_stays_alive'] = True
         report['checks']['second_process_resumes_original_id_with_rele_exchange'] = True
         await stop_source(source2)
@@ -292,7 +298,9 @@ stream_max_retries=0
         assert sorted(d['origin']['platform'] for d in final['deliveries']) == ['slack', 'telegram']
         telegram = next(d for d in final['deliveries'] if d['origin']['platform'] == 'telegram')
         assert telegram['body'] == 'managed-answer-4' and telegram['status'] == 'sent'
-        assert all(marker in json.dumps(records[3]) for marker in ('source-context-A', 'slack-context-B', 'source-return-context-C'))
+        telegram_input = json.dumps(records[3])
+        assert all(marker in telegram_input for marker in ('source-context-A', 'ISSUE40_ACCEPTED_B', 'source-return-context-C'))
+        assert all(marker not in telegram_input for marker in ('passive-peer-agent-context', 'ISSUE40_PASSIVE_A', 'ISSUE40_PASSIVE_C'))
         report['checks']['telegram_continuation_has_complete_prior_shared_context'] = True
         report['checks']['telegram_result_delivered_only_to_its_origin'] = True
         assert (home / 'config.toml').read_text(encoding='utf-8') == config

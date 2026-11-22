@@ -882,7 +882,6 @@ export class Engine extends EventEmitter {
     const work: Promise<unknown>[] = [this.deliver(), this.flushProgress(), this.flushApprovalUpdates(), this.retryPendingQuestions(), this.refreshAsyncQuestions(), this.sourceControls.recover()];
     if (!this.suspended) {
       await Promise.allSettled(this.store.listAutoLinkIntents().filter(intent => intent.status !== 'completed').map(intent => this.provision(intent)));
-      await this.slackSync.backfill();
     }
     if (this.stopped) { await Promise.allSettled(work); return; }
     if (this.codex.status().connected) {
@@ -1061,7 +1060,7 @@ export class Engine extends EventEmitter {
     try {
       for (const input of this.store.steeringInputs(parent.id)) if (input.state === 'sending' || input.state === 'uncertain') await this.reconcileSteering(input);
       if (this.store.steeringInputs(parent.id).some(input => input.state === 'sending' || input.state === 'uncertain')) return;
-      const stream = this.store.listSlackSyncStreams().find(row => row.conversationId === conversation.id && row.endpointId === parent.origin.endpointId && row.active && !row.paused);
+      const stream = this.store.listSlackSyncStreams().find(row => row.platform === 'telegram' && row.conversationId === conversation.id && row.endpointId === parent.origin.endpointId && row.active && !row.paused);
       const channel = this.channels[parent.origin.platform];
       const self = channel && this.ownIdentity(channel, parent.origin.platform).id;
       const entry = stream && this.store.listSlackSyncEntries(stream.id, { pending: true, limit: 100 }).find(row => {
@@ -1109,7 +1108,7 @@ export class Engine extends EventEmitter {
     try {
       const conversation = this.store.getConversation(conversationId)!;
       const queued = this.store.listPendingRequests().filter(row => row.conversationId === conversationId);
-      const blockedReason = 'Источник выключен. Включите его для проверки полного контекста или отмените принятый запрос.';
+      const blockedReason = 'Источник выключен. Включите его, чтобы продолжить принятый запрос, или отмените его.';
       const imageBlockedReason = 'Ожидается исходное разрешённое подключение Slack для передачи изображения.';
       for (const row of queued) {
         const channel = this.channels.slack;
@@ -1121,17 +1120,17 @@ export class Engine extends EventEmitter {
       const active = this.store.activeRequests().find(row => row.conversationId === conversationId && row.status !== 'queued' && !row.steeredInto);
       if (active) { await this.steerPending(active); return; }
       if (this.store.listAutoLinkIntents().some(intent => intent.status !== 'completed' && this.store.bindingForEndpoint(intent.endpointId)?.conversationId === conversationId)) return;
-      const hasContext = this.store.listSlackSyncStreams().some(stream => stream.conversationId === conversationId && stream.active && !stream.paused
+      const hasContext = this.store.listSlackSyncStreams().some(stream => stream.platform === 'telegram' && stream.conversationId === conversationId && stream.active && !stream.paused
         && this.store.hasPendingSlackSyncEntries(stream.id));
       if (!waiting && !hasContext && !this.initialMessages.hasPending(conversationId)) return;
       if (!await this.initialMessages.ensure(conversationId)) return;
       const client = this.codex;
       const cutoff = waiting ? waiting.origin.platform === 'slack' ? waiting.origin.messageId
         : `${Math.floor(Date.parse(waiting.createdAt) / 1000)}.${String(Date.parse(waiting.createdAt) % 1000).padStart(3, '0')}000` : undefined;
-      if (!await this.slackSync.drain(conversationId, cutoff)) {
-        const error = this.store.listSlackSyncStreams().find(stream => stream.conversationId === conversationId &&
+      if (!await this.slackSync.drain(conversationId, cutoff, 'telegram')) {
+        const error = this.store.listSlackSyncStreams().find(stream => stream.platform === 'telegram' && stream.conversationId === conversationId &&
           (stream.active || this.store.hasPendingSlackSyncEntries(stream.id, cutoff)) && stream.error)?.error
-          ?? 'Ожидается синхронизация полного контекста Slack. Запрос остаётся в очереди Rele.';
+          ?? 'Ожидается синхронизация контекста Telegram. Запрос остаётся в очереди Rele.';
         const current = waiting && this.store.getRequest(waiting.id);
         if (current?.status === 'queued' && current.error !== error) this.store.updateRequest(current.id, { error });
         return;
