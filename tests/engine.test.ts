@@ -3073,6 +3073,38 @@ describe('Engine Slack transcript and authorized task boundary', () => {
     expect(f.codex.injectContext.mock.invocationCallOrder[contextIndex]).toBeLessThan(f.codex.enqueue.mock.invocationCallOrder[1]);
   });
 
+  it('sends only the accepted mention from a linked Slack thread, excluding passive messages at idle and during a turn', async () => {
+    const f = fixture({ start: false });
+    f.store.setSourceAccess(f.eps.slack.id, { mode: 'mention', allowedSenderIds: ['U1'] });
+
+    await f.engine.receive(slackInbound(f, 'mention-a', '170010.000001', 'ISSUE40_PASSIVE_A'));
+    await f.engine.settled();
+    const accepted = slackInbound(f, 'mention-b', '170010.000002', 'ISSUE40_ACCEPTED_B', { directMention: true });
+    await f.engine.receive(accepted);
+    await f.engine.settled();
+    const [request] = f.store.listRequests();
+    expect(request.origin.messageId).toBe(accepted.messageId);
+    expect(f.codex.enqueue).toHaveBeenCalledExactlyOnceWith(THREAD, requestInput(request), request.id);
+
+    f.codex.running(request.id);
+    await f.engine.settled();
+    await f.engine.receive(slackInbound(f, 'mention-c', '170010.000003', 'ISSUE40_PASSIVE_C'));
+    await f.engine.settled();
+
+    const modelInput = [
+      ...f.codex.enqueue.mock.calls.map(([, text]) => text),
+      ...f.codex.injectContext.mock.calls.map(([, , text]) => text),
+      ...f.codex.steer.mock.calls.map(([, text]) => text),
+    ].join('\n');
+    expect(modelInput).toContain('ISSUE40_ACCEPTED_B');
+    expect(modelInput).not.toContain('ISSUE40_PASSIVE_A');
+    expect(modelInput).not.toContain('ISSUE40_PASSIVE_C');
+    expect(f.codex.injectContext).not.toHaveBeenCalled();
+    expect(f.codex.steer).not.toHaveBeenCalled();
+    expect(f.slack.readThreadPage).not.toHaveBeenCalled();
+    expect(f.store.listRequests()).toHaveLength(1);
+  });
+
   it('projects every history page and the triggering source before enqueueing the authorized task', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     const f = fixture();
