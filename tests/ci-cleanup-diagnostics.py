@@ -353,6 +353,90 @@ class CleanupDiagnostics(unittest.TestCase):
 
         asyncio.run(close())
 
+    def test_read_timeout_then_close_ack_failure_preserves_primary_and_records_cleanup(self):
+        helpers = load_helpers(self)
+        helpers['ENGINE_READ_TIMEOUT_SECONDS'] = .01
+
+        class Stdout:
+            def __init__(self):
+                self.first = True
+
+            async def readline(self):
+                if self.first:
+                    self.first = False
+                    await asyncio.sleep(.02)
+                return b'{"action":"close","stopped":false,"backendAlive":true}\n'
+
+        class Stdin:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, value):
+                self.writes.append(value)
+
+            async def drain(self):
+                return None
+
+        class Process:
+            def __init__(self):
+                self.stdout = Stdout()
+                self.stdin = Stdin()
+                self.returncode = None
+                self.wait_calls = 0
+
+            async def wait(self):
+                self.wait_calls += 1
+                self.returncode = 0
+                return self.returncode
+
+        async def run():
+            process = Process()
+            driver = helpers['EngineDriver'](process)
+            try:
+                await driver.read(.01)
+            except TimeoutError as error:
+                primary = error
+                primary_location = helpers['safe_failure_location'](error)
+            else:
+                self.fail('the primary read timeout must occur before cleanup')
+
+            errors = []
+            await helpers['record_cleanup_error'](
+                errors, 'engine.close', 'engine-driver-process', driver.close, 101, 202)
+
+            self.assertIs(type(primary), TimeoutError)
+            self.assertEqual(primary_location['function'], 'read')
+            self.assertEqual(len(errors), 1)
+            cleanup = errors[0]
+            self.assertEqual(cleanup['operation'], 'engine.close')
+            self.assertEqual(cleanup['resource'], 'engine-driver-process')
+            self.assertEqual(cleanup['engineDriverStage'], 'engine-close-ack')
+            self.assertEqual(cleanup['failureLocation']['function'], 'close')
+            self.assertGreaterEqual(cleanup['elapsedMs'], 0)
+            self.assertLessEqual(cleanup['elapsedMs'], 600000)
+            self.assertEqual((cleanup['processPid'], cleanup['ownerPid']), (101, 202))
+            self.assertIsNone(helpers['cleanup_failure_message'](primary, errors))
+            self.assertEqual(
+                helpers['cleanup_failure_message'](None, errors),
+                'Isolated fixture cleanup failed: engine.close',
+            )
+            self.assertEqual([json.loads(value)['action'] for value in process.stdin.writes], ['close'])
+            self.assertEqual(process.wait_calls, 0)
+
+            report = helpers['public_console_report']({
+                'result': 'failed',
+                'failureType': type(primary).__name__,
+                'failureLocation': primary_location,
+                'cleanupErrors': errors,
+            })
+            self.assertEqual(report['failureType'], 'TimeoutError')
+            self.assertEqual(report['failureLocation']['function'], 'read')
+            self.assertEqual(report['cleanupErrors'][0]['engineDriverStage'], 'engine-close-ack')
+            self.assertNotIn('processPid', json.dumps(report))
+            self.assertNotIn('ownerPid', json.dumps(report))
+
+        asyncio.run(run())
+
     def test_engine_close_fails_closed_without_a_close_ack(self):
         helpers = load_helpers(self)
 
@@ -386,7 +470,8 @@ class CleanupDiagnostics(unittest.TestCase):
                     process = Process(response)
                     with self.assertRaisesRegex(RuntimeError, 'invalid close response') as raised:
                         await helpers['EngineDriver'](process).close()
-                    self.assertEqual(raised.exception.engine_driver_stage, 'engine-close-request')
+                    expected_stage = 'engine-close-ack' if response.get('action') == 'close' else 'engine-close-request'
+                    self.assertEqual(raised.exception.engine_driver_stage, expected_stage)
                     self.assertEqual(process.wait_calls, 0)
 
         asyncio.run(close())
