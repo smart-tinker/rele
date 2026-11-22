@@ -821,7 +821,7 @@ describe('Engine initial instruction and same-source steering', () => {
     const f = fixture({ initialized: false });
     const request = await acceptRequest(f);
     expect(f.codex.enqueue.mock.calls.map(call => call[1])).toEqual([INITIAL_RELE_MESSAGE, requestInput(request)]);
-    expect(f.codex.injectContext.mock.invocationCallOrder[0]).toBeGreaterThan(f.codex.enqueue.mock.invocationCallOrder[0]);
+    expect(f.codex.injectContext).not.toHaveBeenCalled();
     await running(f, request); f.codex.complete(request.id, 'Answer');
     await f.engine.settled(); await f.engine.pump(); await f.engine.stop();
     const second = fixture({ path: f.path, initialized: false });
@@ -889,54 +889,18 @@ describe('Engine initial instruction and same-source steering', () => {
     expect(f.codex.injectContext).toHaveBeenCalledTimes(contextCount);
   });
 
-  it.each([false, true])('reconciles backfill steering with late real ingress and releases the queue once (legacy restart=%s)', async legacyRestart => {
+  it('steers a late accepted Slack request once without replaying its legacy journal receipt', async () => {
     const f = fixture(), root = await acceptRequest(f); await running(f, root);
     const late = f.message('slack', 'late-real-ingress');
     const source = { endpointId: late.endpoint.id, accountId: late.endpoint.accountId, chatId: late.endpoint.chatId,
       threadId: late.endpoint.threadId, messageId: late.messageId, sender: late.sender, text: late.text,
       payload: { text: late.text }, kind: 'message' as const };
     const entry = f.store.recordSlackMessage(source)!;
-    f.codex.steer.mockImplementationOnce(async (_thread, _text, id, turnId) => {
-      await f.engine.receive({ ...late, slack: source });
-      f.codex.locations.set(id, { state: 'running', turnId });
-      if (legacyRestart) throw new CodexTransportError('Lost ACK after late ingress');
-      return { turnId };
-    });
-    await f.engine.pump(); await f.engine.settled();
-    const child = f.store.listRequests().find(value => value.eventId === late.eventId)!;
-    expect(f.codex.steer.mock.calls.map(call => call[2])).toEqual([entry.id]);
-    let active = f;
-    if (legacyRestart) {
-      await f.engine.stop();
-      const oldInput = { ...f.store.getSteeringInput(entry.id)!, state: 'sending' as const };
-      delete oldInput.requestId;
-      f.store.setMeta(`steering-input:${entry.id}`, JSON.stringify(oldInput));
-      f.store.close();
-      const old = new DatabaseSync(f.path);
-      old.prepare("UPDATE requests SET status='queued',turn_id=NULL WHERE id=?").run(child.id);
-      old.close();
-      active = fixture({ path: f.path, start: false });
-      active.codex.locations.set(entry.id, { state: 'completed', turnId: 'turn-1' });
-      active.codex.locations.set(root.id, { state: 'completed', turnId: 'turn-1', text: 'One combined final' });
-      active.engine.start();
-      await active.engine.pump(); await active.engine.settled();
-      expect(active.codex.steer).not.toHaveBeenCalled();
-      expect(active.codex.injectContext).not.toHaveBeenCalled();
-    } else {
-      f.codex.complete(root.id, 'One combined final');
-      await f.engine.settled(); await f.engine.pump();
-    }
-    await active.engine.pump(); await active.engine.settled();
-    expect(active.store.getSteeringInput(entry.id)).toMatchObject({ id: entry.id, requestId: child.id, state: 'applied' });
-    expect(active.store.getRequest(child.id)).toMatchObject({ status: 'completed', steeredInto: root.id, turnId: 'turn-1' });
-    expect(active.store.getRequest(root.id)?.status).toBe('completed');
-    expect(active.store.listDeliveries().filter(value => value.requestId === child.id)).toEqual([]);
-    expect(active.slack.deliver.mock.calls.filter(([value]) => value.kind === 'answer')).toHaveLength(1);
-    await active.engine.pump(); await active.engine.settled();
-    expect(active.slack.deliver.mock.calls.filter(([value]) => value.kind === 'answer')).toHaveLength(1);
-    const next = await acceptRequest(active, 'slack', 'after-late-ingress');
-    expect(active.codex.enqueue.mock.calls.filter(call => call[2] === next.id)).toHaveLength(1);
-    expect(active.codex.enqueue.mock.calls.some(call => call[2] === child.id)).toBe(false);
+    const child = await acceptRequest(f, 'slack', late.eventId);
+    expect(f.codex.steer).toHaveBeenCalledExactlyOnceWith(THREAD, requestInput(child), child.id, 'turn-1');
+    expect(f.codex.injectContext).not.toHaveBeenCalled();
+    expect(f.store.getSlackSyncEntry(entry.id)).toMatchObject({ requestId: child.id });
+    expect(f.store.listRequests()).toHaveLength(2);
   });
 
   it('waits for the persisted steering receipt even after an ACK before delivering the combined final', async () => {
@@ -978,24 +942,20 @@ describe('Engine initial instruction and same-source steering', () => {
 });
 
 describe('Engine public Slack progress', () => {
-  it('does not delay verified progress behind a Slack backfill read', async () => {
+  it('delivers verified progress without initiating a Slack history read', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     const f = fixture({ start: false }), request = await acceptRequest(f); await running(f, request);
     f.codex.notification({ method: 'item/completed', params: { threadId: THREAD, turnId: 'turn-1',
       item: { id: 'unblocked-comment', type: 'agentMessage', phase: 'commentary', text: 'Verified public step' } } });
     await f.engine.settled();
-    const page = deferred<{ messages: [] }>();
-    f.slack.readThreadPage.mockClear(); f.slack.readThreadPage.mockReturnValueOnce(page.promise);
+    f.slack.readThreadPage.mockClear();
     vi.setSystemTime(Date.now() + 2000);
     const pump = f.engine.pump();
-    try {
-      await vi.waitFor(() => expect(f.slack.readThreadPage).toHaveBeenCalled());
-      await vi.waitFor(() => expect(f.slack.updateProgress).toHaveBeenCalledExactlyOnceWith(request.id, request.origin, {
-        commentary: 'Verified public step', steps: [{ id: 'turn-1:unblocked-comment', text: 'Verified public step' }],
-      }));
-    } finally {
-      page.resolve({ messages: [] }); await pump; await f.engine.settled();
-    }
+    await pump; await f.engine.settled();
+    expect(f.slack.readThreadPage).not.toHaveBeenCalled();
+    expect(f.slack.updateProgress).toHaveBeenCalledExactlyOnceWith(request.id, request.origin, {
+      commentary: 'Verified public step', steps: [{ id: 'turn-1:unblocked-comment', text: 'Verified public step' }],
+    });
   });
 
   it('does not overlap pending progress and periodic ownership scans for the same request', async () => {
@@ -3229,17 +3189,30 @@ describe('automatic native thread creation', () => {
     expect(f.codex.createThread).not.toHaveBeenCalled();
     f.store.setSourceAccess(endpoint.id, { mode: 'mention', allowedSenderIds: [] });
     const sender = { id: 'UAGENT', name: 'Agent', isBot: true };
-    await f.engine.receive(slackInbound(f, 'plain-source', '170010.000003', 'not a trigger', { endpoint, sender })); await f.engine.settled();
+    await f.engine.receive(slackInbound(f, 'plain-source', '170010.000003', 'ISSUE40_PASSIVE_A', { endpoint, sender })); await f.engine.settled();
     expect(f.codex.createThread).not.toHaveBeenCalled();
-    await f.engine.receive(slackInbound(f, 'called-source', '170010.000004', 'authorized task', { endpoint, sender, directMention: true })); await f.engine.settled();
+    await f.engine.receive(slackInbound(f, 'called-source', '170010.000004', 'ISSUE40_ACCEPTED_B', { endpoint, sender, directMention: true })); await f.engine.settled();
     for (let scan = 0; scan < 4 && !f.store.listRequests()[0]?.queuedSubmissionId; scan++) {
       vi.setSystemTime(Date.now() + 2000); await f.engine.pump(); await f.engine.settled();
     }
     expect(f.codex.createThread).toHaveBeenCalledExactlyOnceWith('/source/project');
     expect(f.store.listRequests()).toHaveLength(1);
     const request = f.store.listRequests()[0];
-    expect(request).toMatchObject({ text: 'authorized task', origin: { endpointId: endpoint.id, senderId: sender.id } });
+    expect(request).toMatchObject({ text: 'ISSUE40_ACCEPTED_B', origin: { endpointId: endpoint.id, senderId: sender.id } });
     expectInitialThenTask(f, 'auto-created-thread', request);
+    f.codex.locations.set(request.id, { state: 'running', turnId: 'new-chat-turn' });
+    f.codex.notification({ method: 'item/started', params: { threadId: 'auto-created-thread', turnId: 'new-chat-turn', item: { type: 'userMessage', clientId: request.id } } });
+    await f.engine.settled();
+    await f.engine.receive(slackInbound(f, 'passive-source', '170010.000005', 'ISSUE40_PASSIVE_C', { endpoint, sender })); await f.engine.settled();
+    const input = [...f.codex.enqueue.mock.calls.map(([, text]) => text), ...f.codex.injectContext.mock.calls.map(([, , text]) => text),
+      ...f.codex.steer.mock.calls.map(([, text]) => text)].join('\n');
+    expect(input).toContain('ISSUE40_ACCEPTED_B');
+    expect(input).not.toContain('ISSUE40_PASSIVE_A');
+    expect(input).not.toContain('ISSUE40_PASSIVE_C');
+    expect(f.codex.injectContext).not.toHaveBeenCalled();
+    expect(f.codex.steer).not.toHaveBeenCalled();
+    expect(f.slack.readThreadPage).not.toHaveBeenCalled();
+    expect(f.store.listRequests()).toHaveLength(1);
     expect(f.config.autoLinkRules).toEqual([]);
     expect(f.store.getSourceRoute(f.eps.slack.id).mode).toBe('manual');
   });
@@ -3386,8 +3359,8 @@ describe('automatic native thread creation', () => {
     expect(f.store.listRequests()).toHaveLength(1);
     expect(request).toMatchObject({ conversationId: conversation.id, text: incoming.text, origin });
     expectInitialThenTask(f, nativeId, request);
-    expect(f.codex.injectContext.mock.calls.some(([threadId, , text]) => threadId === nativeId && text.includes(incoming.text))).toBe(true);
-    expect(f.codex.injectContext.mock.invocationCallOrder.at(-1)!).toBeLessThan(f.codex.enqueue.mock.invocationCallOrder[1]);
+    expect(f.codex.injectContext).not.toHaveBeenCalled();
+    expect(f.slack.readThreadPage).not.toHaveBeenCalled();
     f.codex.locations.set(request.id, { state: 'running', turnId: 'dm-turn' });
     f.codex.notification({ method: 'item/started', params: { threadId: nativeId, turnId: 'dm-turn', item: { type: 'userMessage', clientId: request.id } } });
     await f.engine.settled();
