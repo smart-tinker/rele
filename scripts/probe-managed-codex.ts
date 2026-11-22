@@ -28,13 +28,13 @@ const store = new Store(join(values.directory, 'rele.sqlite'));
 const endpoints = Object.fromEntries((['slack', 'telegram'] as const).map(platform => [platform, {
   id: `fixture-${platform}`, platform, accountId: 'synthetic-account', chatId: `synthetic-${platform}`,
   threadId: platform === 'slack' ? '1700000000.000000' : 'synthetic-topic', title: `Fixture ${platform}`, subtitle: 'Synthetic origin',
-  people: [{ id: 'fixture-user', name: 'Fixture user' }], updatedAt: new Date().toISOString(),
+  people: [{ id: platform === 'slack' ? 'U00000001' : 'fixture-user', name: 'Fixture user' }], updatedAt: new Date().toISOString(),
 } satisfies Endpoint])) as Record<Platform, Endpoint>;
 for (const endpoint of Object.values(endpoints)) store.upsertEndpoint(endpoint);
 const conversation = store.createConversation({ name: 'Managed fixture', threadId: values.thread, cwd: values.directory,
-  bindings: Object.values(endpoints).map(endpoint => ({ platform: endpoint.platform, endpointId: endpoint.id, allowedSenderIds: ['fixture-user'] })),
+  bindings: Object.values(endpoints).map(endpoint => ({ platform: endpoint.platform, endpointId: endpoint.id, allowedSenderIds: [endpoint.people[0].id] })),
 });
-store.setSourceAccess(endpoints.slack.id, { mode: 'mention', allowedSenderIds: ['fixture-user'] });
+store.setSourceAccess(endpoints.slack.id, { mode: 'mention', allowedSenderIds: [endpoints.slack.people[0].id] });
 // This ownership/history fixture starts with an initialized existing conversation.
 const slackHistory: SlackTranscriptMessage[] = [{
   endpointId: endpoints.slack.id, accountId: endpoints.slack.accountId, chatId: endpoints.slack.chatId,
