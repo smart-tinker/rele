@@ -420,9 +420,9 @@ class EngineDriver:
                         raise TimeoutError('Shared Engine driver did not acknowledge close')
                     result = await self.read(remaining)
                     if isinstance(result, dict) and result.get('action') == 'close':
+                        self.startup_stage = 'engine-close-ack'
                         if result.get('stopped') is not True or not isinstance(result.get('backendAlive'), bool):
                             raise RuntimeError('Shared Engine driver returned an invalid close response')
-                        self.startup_stage = 'engine-close-ack'
                         break
                     if not isinstance(result, dict) or result.get('action') not in (
                             'ingest', 'wait', 'answer', 'resume', 'cancel', 'snapshot', 'findRequest'):
