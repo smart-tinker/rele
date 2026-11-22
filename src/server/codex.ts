@@ -81,12 +81,14 @@ function isBindableThread(thread: RawThread): boolean {
   return !thread.ephemeral && !thread.parentThreadId
     && (thread.source === undefined || typeof thread.source === 'string' && THREAD_SOURCES.includes(thread.source));
 }
-interface NativeGenerationAttempt {
+interface NativeGenerationProof {
+  controller: AbortController;
+  done: Promise<void>;
+}
+interface NativeGenerationAttempt extends NativeGenerationProof {
   runtime: CodexRuntime;
   peer: CodexNativePeer;
   stdio: CodexStdioTransport;
-  controller: AbortController;
-  done: Promise<void>;
 }
 interface PendingCall {
   resolve: (value: unknown) => void;
@@ -168,6 +170,7 @@ export class CodexClient extends EventEmitter {
   private nativePeer?: CodexNativePeer;
   private nativeGeneration?: { runtime: CodexRuntime; peer: CodexNativePeer; stdio: CodexStdioTransport; serverId: number; generation: string };
   private nativeGenerationAttempt?: NativeGenerationAttempt;
+  private nativeGenerationProofs = new Set<NativeGenerationProof>();
   private contextReceipts = new CodexContextReceipts();
   private version?: string;
   private state: CodexConnectionState;
@@ -620,7 +623,7 @@ export class CodexClient extends EventEmitter {
           process.stderr.write(`${JSON.stringify({ event:'codex-native-proof-failure', ...failure })}\n`);
         } }
       : undefined;
-    const prove = () => runtime ? codexNativeGeneration(peer, serverId, runtime.codexHome, proofDiagnostics) : undefined;
+    const prove = () => runtime ? this.proveNativeGeneration(peer, serverId, runtime, proofDiagnostics) : undefined;
     const before = options.verifyStableGeneration ? await prove() : undefined;
     if (!current()) throw unconfirmed();
     const entries = await this.pages<CodexTerminal>('thread/backgroundTerminals/list', { threadId, limit: 100 });
@@ -647,6 +650,7 @@ export class CodexClient extends EventEmitter {
       || this.nativeGenerationAttempt) return;
     const attempt: NativeGenerationAttempt = { runtime, peer, stdio, controller: new AbortController(), done: Promise.resolve() };
     this.nativeGenerationAttempt = attempt;
+    this.nativeGenerationProofs.add(attempt);
     const current = () => !attempt.controller.signal.aborted && runtime === this.runtime && peer === this.nativePeer
       && stdio === this.stdio && this.state.connected && stdio.pid === peer.pid;
     attempt.done = (async () => {
@@ -656,15 +660,27 @@ export class CodexClient extends EventEmitter {
         const generation = await codexNativeGeneration(peer, serverId, runtime.codexHome, { signal:attempt.controller.signal });
         if (generation && current()) this.nativeGeneration = { runtime, peer, stdio, serverId, generation };
       } catch { /* Missing startup proof leaves addressable cleanup fail-closed. */ }
-      finally { if (this.nativeGenerationAttempt === attempt) this.nativeGenerationAttempt = undefined; }
+      finally {
+        this.nativeGenerationProofs.delete(attempt);
+        if (this.nativeGenerationAttempt === attempt) this.nativeGenerationAttempt = undefined;
+      }
     })();
   }
 
-  private abortNativeGenerationAttempt(): NativeGenerationAttempt | undefined {
-    const attempt = this.nativeGenerationAttempt;
+  private proveNativeGeneration(peer: CodexNativePeer | undefined, serverId: number, runtime: CodexRuntime,
+    options?: Parameters<typeof codexNativeGeneration>[3]): Promise<string | undefined> {
+    const attempt: NativeGenerationProof = { controller: new AbortController(), done: Promise.resolve() };
+    this.nativeGenerationProofs.add(attempt);
+    const proof = codexNativeGeneration(peer, serverId, runtime.codexHome, { ...options, signal:attempt.controller.signal });
+    attempt.done = proof.then(() => {}, () => {}).finally(() => this.nativeGenerationProofs.delete(attempt));
+    return proof;
+  }
+
+  private abortNativeGenerationProofs(): NativeGenerationProof[] {
+    const attempts = [...this.nativeGenerationProofs];
     this.nativeGenerationAttempt = undefined;
-    attempt?.controller.abort();
-    return attempt;
+    for (const attempt of attempts) attempt.controller.abort();
+    return attempts;
   }
 
   async terminateBackgroundTerminal(threadId: string, target: CodexTerminal & { serverId: number; serverGeneration?: string }): Promise<void> {
@@ -938,8 +954,8 @@ export class CodexClient extends EventEmitter {
 
   private async open(): Promise<void> {
     // Reconnect must not overlap two owned runtimes, even after an uncertain shutdown.
-    const generationAttempt = this.abortNativeGenerationAttempt();
-    await Promise.all([this.cleanup, ...(generationAttempt ? [generationAttempt.done] : [])]);
+    const generationProofs = this.abortNativeGenerationProofs();
+    await Promise.all([this.cleanup, ...generationProofs.map(attempt => attempt.done)]);
     this.runtime = undefined;
     this.nativePeer = undefined;
     this.nativeGeneration = undefined;
@@ -1248,7 +1264,7 @@ export class CodexClient extends EventEmitter {
   }
 
   private disconnect(message: string, errorCode?: string): Promise<void> {
-    const generationAttempt = this.abortNativeGenerationAttempt();
+    const generationProofs = this.abortNativeGenerationProofs();
     clearTimeout(this.heartbeatTimer);
     this.heartbeatTimer = undefined;
     this.healthCheck = undefined;
@@ -1259,8 +1275,8 @@ export class CodexClient extends EventEmitter {
     this.proxy = undefined;
     const stdio = this.stdio;
     this.stdio = undefined;
-    if (stdio || generationAttempt) {
-      this.cleanup = Promise.all([this.cleanup, ...(stdio ? [stdio.close()] : []), ...(generationAttempt ? [generationAttempt.done] : [])]).then(() => {});
+    if (stdio || generationProofs.length) {
+      this.cleanup = Promise.all([this.cleanup, ...(stdio ? [stdio.close()] : []), ...generationProofs.map(attempt => attempt.done)]).then(() => {});
       void this.cleanup.catch(error => {
         this.setState({ connected: false, queueSupported: false, error: this.safeMessage(error), errorCode: error instanceof CodexStdioError ? error.code : 'shutdown-timeout' });
       });

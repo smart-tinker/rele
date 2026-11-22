@@ -1630,6 +1630,80 @@ describe('Codex managed runtime', () => {
     }
   });
 
+  it('aborts and awaits a strict native proof before closing during addressed cancellation', async () => {
+    const generation = 'a'.repeat(64);
+    let strict = false, proofSignal: AbortSignal | undefined, proofSettled = false;
+    let strictProofStarted!: () => void, releaseProof: () => void = () => {};
+    const started = new Promise<void>(resolve => { strictProofStarted = resolve; });
+    const proof = vi.mocked(codexNativeGeneration), originalProof = proof.getMockImplementation();
+    proof.mockClear();
+    proof.mockImplementation(async (_peer, _serverId, _home, options) => {
+      if (!strict) return generation;
+      proofSignal = options && Reflect.get(options, 'signal') as AbortSignal | undefined;
+      strictProofStarted();
+      await new Promise<void>(resolve => {
+        releaseProof = resolve;
+        if (proofSignal?.aborted) resolve();
+        else proofSignal?.addEventListener('abort', () => resolve(), { once:true });
+      });
+      proofSettled = true;
+      return undefined;
+    });
+    const home = await mkdtemp(path.join(tmpdir(), 'Rele cancel strict proof '));
+    cleanup.push(() => rm(home, { recursive:true, force:true }));
+    const f = await managedFixture({ terminals:true, codexHome:home });
+    const store = new Store(':memory:');
+    cleanup.push(() => store.close());
+    const endpoint: Endpoint = { id:'strict-proof-origin', platform:'telegram', accountId:'999', chatId:'-100123', threadId:'17',
+      title:'Synthetic origin', subtitle:'', people:[{ id:'123', name:'Fixture' }], updatedAt:new Date().toISOString() };
+    store.upsertEndpoint(endpoint);
+    store.createConversation({ name:'Original', threadId, cwd:home,
+      bindings:[{ platform:'telegram', endpointId:endpoint.id, allowedSenderIds:['123'] }] });
+    store.setMeta(initialMessageKey(home, threadId), JSON.stringify({ applied:true }));
+    const config = { ...structuredClone(defaultConfig), codex:{ transport:'managed' as const, executable:f.executable, endpoint:'', codexHome:home },
+      telegram:{ ...defaultConfig.telegram, enabled:true } };
+    const engine = new Engine(store, f.client, { config:() => config, temporaryRoot:f.directory, redact:() => 'Fixture error' });
+    engine.channels.telegram = { state:{ configured:true, connected:true, accountId:'999' }, start:async () => {}, stop:async () => {}, download:async () => {}, deliver:async () => 'receipt' };
+    cleanup.push(() => engine.stop());
+    let cancellation: Promise<'completed' | 'rejected'> | undefined;
+    try {
+      await f.client.connect();
+      f.client.primeNativeGeneration();
+      await vi.waitFor(() => expect(Reflect.get(f.client, 'nativeGeneration')).toMatchObject({ generation }));
+      await engine.receive({ eventId:'strict-proof-request', endpoint, sender:endpoint.people[0], messageId:'1', text:'Synthetic request' });
+      const deadline = Date.now() + 2_000;
+      let calls = await f.calls();
+      while (!calls.some(call => call.method === 'thread/queue/add')) {
+        if (Date.now() >= deadline) throw new Error('The managed request did not reach its native queue.');
+        await new Promise(resolve => setTimeout(resolve, 10));
+        calls = await f.calls();
+      }
+      const request = store.listRequests().find(row => row.eventId === 'strict-proof-request')!;
+      const baseline = JSON.parse(store.getMeta(`request-terminal-baseline:${request.id}`)!);
+      expect(baseline).toMatchObject({ serverGeneration:generation, terminals:[{ itemId:'fixture-command', processId:'1234' }] });
+      store.updateRequest(request.id, { status:'running', turnId:'managed-turn' });
+      vi.spyOn(f.client, 'findRequest').mockResolvedValue({ state:'running', turnId:'managed-turn', commandItems:[{ id:'fixture-command', processId:'1234' }] });
+
+      strict = true;
+      cancellation = engine.cancel(request.id).then(() => 'completed', () => 'rejected');
+      await started;
+      await f.client.close();
+
+      expect(proofSignal).toBeInstanceOf(AbortSignal);
+      expect(proofSignal?.aborted).toBe(true);
+      expect(proofSettled).toBe(true);
+      expect(await cancellation).toBe('rejected');
+      calls = await f.calls();
+      expect(calls.some(call => call.method === 'turn/interrupt')).toBe(false);
+      expect(calls.some(call => call.method === 'thread/backgroundTerminals/terminate')).toBe(false);
+      expect(store.getRequest(request.id)?.origin).toMatchObject({ platform:'telegram', accountId:'999', endpointId:endpoint.id });
+    } finally {
+      releaseProof();
+      await cancellation;
+      if (originalProof) proof.mockImplementation(originalProof);
+    }
+  });
+
   it('carries only the confirmed generation of the same managed stdio peer into a fast terminal baseline', async () => {
     const home = await mkdtemp(path.join(tmpdir(), 'Rele stdio baseline identity '));
     cleanup.push(() => rm(home, { recursive:true, force:true }));
