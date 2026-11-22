@@ -25,12 +25,12 @@ async function openJournal(page: Page) {
   await openPanel(page);
   await page.getByRole('tab', { name: 'Slack', exact: true }).click();
   await page.getByRole('button', { name: 'Настройки источника #alpha-dev', exact: true }).click();
-  return page.getByRole('region', { name: 'Журнал контекста Slack' });
+  return page.getByRole('region', { name: 'Журнал сообщений Slack' });
 }
 
 const journalRoute = /\/api\/conversations\/[^/]+\/slack-sync(?:\?|$)/;
 
-test('shows source backfill, pending/applied/uncertain bot context and full payload without claiming full synchronization', async ({ page }) => {
+test('shows retained Slack receipts without claiming passive entries are sent to Codex', async ({ page }) => {
   const api = await installApi(page);
   const entries = [entry(0, 'pending'), entry(1), entry(2), entry(3, 'uncertain')];
   entries[0].message.text = '<img src=x onerror="window.journalUnsafe=true">';
@@ -47,12 +47,14 @@ test('shows source backfill, pending/applied/uncertain bot context and full payl
     await route.fulfill({ json: data });
   });
   const journal = await openJournal(page);
-  await expect(journal.getByText('Загружается история треда.', { exact: true })).toBeVisible();
-  await expect(journal).toContainText('Получено: 4 · В контексте Codex: 2 · Ожидают: 2');
+  await expect(journal.getByText('Пассивные записи Slack остаются в журнале и не передаются в Codex.', { exact: true })).toBeVisible();
+  await expect(journal).toContainText('Получено: 4 · Передано ранее в Codex: 2 · Пассивно не передаётся: 1 · Прежняя передача не подтверждена: 1');
   await expect(journal.getByText('Другой агент · Бот', { exact: true })).toBeVisible();
-  await expect(journal).toContainText('Передача не подтверждена');
+  await expect(journal).toContainText('Прежняя передача не подтверждена');
+  await expect(journal).toContainText('Сохранено в журнале; не передаётся как пассивный контекст');
+  await expect(journal).toContainText('Передано ранее в Codex');
   await expect(journal).toContainText('Подтверждение записи ещё не получено');
-  await expect(journal.getByText('Полученные сообщения переданы в контекст Codex.', { exact: true })).toHaveCount(0);
+  await expect(journal.getByText('В контексте Codex', { exact: true })).toHaveCount(0);
   await expect(journal.getByRole('article').first()).toContainText('<img src=x');
   await expect(journal.locator('img')).toHaveCount(0);
   await journal.getByRole('article').first().getByText('Данные Slack (JSON)', { exact: true }).click();
@@ -64,7 +66,7 @@ test('shows source backfill, pending/applied/uncertain bot context and full payl
   expect(api.mutations).toEqual([]);
 });
 
-test('paginates source messages and opens blocked detached streams using escaped identifiers and GET only', async ({ page }) => {
+test('paginates retained Slack messages and opens detached streams using escaped identifiers and GET only', async ({ page }) => {
   const state = fixtureState();
   const conversationId = 'conversation/with ?#&';
   state.conversations[0].id = conversationId;
@@ -92,16 +94,17 @@ test('paginates source messages and opens blocked detached streams using escaped
   expect(reads.some(read => read.url.searchParams.get('offset') === '50')).toBe(true);
   await journal.getByLabel('Источник журнала').selectOption(oldStreamId);
   await expect(journal.getByRole('article')).toHaveCount(1);
-  await expect(journal).toContainText('Синхронизация заблокирована.');
-  await expect(journal).toContainText('Нет доступа к старому треду');
+  await expect(journal).toContainText('Пассивные записи Slack остаются в журнале и не передаются в Codex.');
   await expect(journal).toContainText('Источник отвязан');
+  await expect(journal).toContainText('Сохранено в журнале; не передаётся как пассивный контекст');
+  await expect(journal).not.toContainText('Нет доступа к старому треду');
   await expect(journal.getByText('Полученные сообщения переданы в контекст Codex.', { exact: true })).toHaveCount(0);
   expect(reads.every(read => read.method === 'GET' && read.url.pathname === `/api/conversations/${encodeURIComponent(conversationId)}/slack-sync`)).toBe(true);
   expect(reads.at(-1)?.url.searchParams.get('streamId')).toBe(oldStreamId);
   expect(api.mutations).toEqual([]);
 });
 
-test('polls pending entries to applied and stops journal polling when its dialog closes', async ({ page }) => {
+test('polls retained Slack receipts without treating pending rows as future Codex input', async ({ page }) => {
   await page.clock.install();
   const api = await installApi(page);
   let applied = false;
@@ -114,12 +117,12 @@ test('polls pending entries to applied and stops journal polling when its dialog
     } satisfies SlackSyncJournal });
   });
   const journal = await openJournal(page);
-  await expect(journal).toContainText('Контекст ожидает передачи в Codex.');
-  await expect(journal.getByText('Полученные сообщения переданы в контекст Codex.', { exact: true })).toHaveCount(0);
+  await expect(journal).toContainText('Пассивные записи Slack остаются в журнале и не передаются в Codex.');
+  await expect(journal).toContainText('Сохранено в журнале; не передаётся как пассивный контекст');
   applied = true;
   await page.clock.fastForward(5000);
-  await expect(journal).toContainText('Полученные сообщения переданы в контекст Codex.');
-  await expect(journal).toContainText('Получено: 1 · В контексте Codex: 1 · Ожидают: 0');
+  await expect(journal).toContainText('Передано ранее в Codex');
+  await expect(journal).toContainText('Получено: 1 · Передано ранее в Codex: 1 · Пассивно не передаётся: 0 · Прежняя передача не подтверждена: 0');
   expect(reads).toBeGreaterThan(1);
   await page.getByRole('dialog').getByRole('button', { name: 'Закрыть', exact: true }).click();
   const atClose = reads;
@@ -128,7 +131,7 @@ test('polls pending entries to applied and stops journal polling when its dialog
   expect(api.mutations).toEqual([]);
 });
 
-test('shows read errors, refreshes explicitly and keeps block-only payloads bounded on mobile', async ({ page }) => {
+test('shows Slack journal read errors and keeps block-only payloads bounded on mobile', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   const api = await installApi(page);
   let failed = true;
@@ -142,7 +145,7 @@ test('shows read errors, refreshes explicitly and keeps block-only payloads boun
   const journal = await openJournal(page);
   await expect(journal.getByRole('alert')).toContainText('Журнал временно недоступен');
   failed = false;
-  await journal.getByRole('button', { name: 'Обновить журнал контекста' }).click();
+  await journal.getByRole('button', { name: 'Обновить журнал сообщений' }).click();
   await expect(journal.getByRole('alert')).toHaveCount(0);
   await expect(journal).toContainText('Сообщение без текстового поля. Полные данные доступны ниже.');
   await journal.getByText('Данные Slack (JSON)', { exact: true }).click();
@@ -160,11 +163,11 @@ test('keeps empty journals out of existing conversation forms', async ({ page })
   await page.getByRole('tab', { name: 'Slack', exact: true }).click();
   await page.getByRole('button', { name: 'Настройки источника #alpha-dev', exact: true }).click();
   await expect.poll(() => api.reads.some(path => path.startsWith('/api/conversations/conversation-0/slack-sync?'))).toBe(true);
-  await expect(page.getByRole('heading', { name: 'Журнал контекста Slack' })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'Журнал сообщений Slack' })).toHaveCount(0);
   expect(api.mutations).toEqual([]);
 });
 
-test('shows captured detached context without claiming its unfinished history scan is still running', async ({ page }) => {
+test('shows detached Slack receipts without claiming a history scan or Codex context', async ({ page }) => {
   const api = await installApi(page);
   const reads: string[] = [];
   await page.route(journalRoute, async route => {
@@ -177,11 +180,10 @@ test('shows captured detached context without claiming its unfinished history sc
     } satisfies SlackSyncJournal });
   });
   const journal = await openJournal(page);
-  await expect(journal).toContainText('Полученные сообщения отвязанного источника ожидают передачи в Codex.');
-  await expect(journal.getByText('Загружается история треда.', { exact: true })).toHaveCount(0);
-  await expect(journal).toContainText('Источник отвязан');
-  await expect(journal).toContainText('Получено: 2 · В контексте Codex: 1 · Ожидают: 1');
-  await expect(journal).toContainText('История не была загружена полностью до отвязки.');
+  await expect(journal).toContainText('Пассивные записи Slack остаются в журнале и не передаются в Codex.');
+  await expect(journal).toContainText('Источник отвязан; ранее полученные сообщения остаются в журнале.');
+  await expect(journal).toContainText('Получено: 2 · Передано ранее в Codex: 1 · Пассивно не передаётся: 1 · Прежняя передача не подтверждена: 0');
+  await expect(journal).toContainText('Сохранено в журнале; не передаётся как пассивный контекст');
   expect(reads.length).toBeGreaterThan(0);
   expect(api.mutations).toEqual([]);
 });

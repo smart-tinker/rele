@@ -662,7 +662,7 @@ export class Store {
         (id,endpoint_id,conversation_id,codex_thread_id,account_id,chat_id,thread_id) VALUES (?,?,?,?,?,?,?)`)
         .run(id, row.endpoint_id, row.conversation_id, row.codex_thread_id, row.account_id, row.chat_id, row.thread_id);
       if (!inserted.changes) continue;
-      // Existing receipts remain useful when upgrading, even before Slack backfill succeeds.
+      // Retain previously observed messages as journal entries without replaying them as model input.
       for (const receipt of this.db.prepare('SELECT payload,request_id,created_at FROM inbound_events WHERE endpoint_id=? ORDER BY rowid').all(row.endpoint_id)) {
         const inbound = json<InboundMessage>(receipt.payload);
         if (inbound.control) continue;

@@ -901,8 +901,10 @@ else { console.log(JSON.stringify(stopInstallerCodex(target))); }
             turn = started['params']['turn']['id']
             await peer.completed(turn)
             assert len(records) == before_records + 1
-            assert all(text in json.dumps(records[-1]) for text in
-                ('rele-first-desktop-prior-context', 'rele-first-slack-request', 'shared-passive-agent-context', marker))
+            record = json.dumps(records[-1])
+            assert all(text in record for text in
+                ('rele-first-desktop-prior-context', 'rele-first-slack-request', marker))
+            assert 'shared-passive-agent-context' not in record
             after = await engine.command('wait', turnId=turn)
             assert after['threadId'] == thread and after['runtimeProcessId'] == pid
             assert all(any(event == {'method': method, 'threadId': thread, 'turnId': turn} for event in after['observedTurns'])
@@ -1071,8 +1073,9 @@ enabled=false
             assert len(done['requests']) == 1 and done['requests'][0]['status'] == 'completed'
             assert len(done['deliveries']) == 1 and done['deliveries'][0]['origin']['platform'] == 'slack'
             assert done['deliveries'][0]['status'] == 'sent'
-            assert all(marker in json.dumps(records[-1]) for marker in
-                       (f'{order}-desktop-prior-context', 'shared-passive-agent-context', f'{order}-slack-request'))
+            record = json.dumps(records[-1])
+            assert all(marker in record for marker in (f'{order}-desktop-prior-context', f'{order}-slack-request'))
+            assert 'shared-passive-agent-context' not in record
             report['checks'][f'{order}_slack_full_context_and_exact_origin'] = True
             if sys.platform == 'linux' and order == 'rele-first':
                 await ordinary_linux_cli(env, workspace, thread, peer, engine, pid, scenario_config)
