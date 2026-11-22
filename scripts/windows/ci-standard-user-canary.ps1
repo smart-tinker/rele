@@ -5,6 +5,7 @@ if ($StandaloneShared -and $Phase -eq 'Installer' -and ([string]::IsNullOrWhiteS
 if ($Phase -eq 'Shared' -and -not $RunGates) { throw 'Shared-only mode requires -RunGates.' }
 if (($DesktopBundle -or $DesktopInventory -or $DesktopPackage) -and ($Mode -ne 'Parent' -or -not $RunGates -or -not $DesktopBundle -or -not $DesktopInventory -or -not $DesktopPackage)) { throw 'Actual Desktop inputs require Parent -RunGates and payload, inventory, and signed MSIX paths.' }
 $sourceRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
+. (Join-Path $PSScriptRoot 'shared-engine-diagnostics.ps1')
 $shell = if ($PowerShell7Path) { $PowerShell7Path } else { Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'PowerShell\7\pwsh.exe' }
 if (-not [IO.Path]::IsPathFullyQualified($shell) -or [IO.Path]::GetFileName($shell) -ine 'pwsh.exe' -or -not (Test-Path -LiteralPath $shell -PathType Leaf) -or [Diagnostics.FileVersionInfo]::GetVersionInfo($shell).FileMajorPart -ne 7) { throw 'A fully qualified PowerShell 7 executable is required for this canary.' }
 if ($PowerShell7Path -and (Get-AuthenticodeSignature -LiteralPath $shell).Status -ne 'Valid') { throw 'The portable PowerShell 7 executable must have a valid Authenticode signature.' }
@@ -164,7 +165,7 @@ if ($packages.Count -ne 1 -or $packages[0].Version.ToString() -ne $env:RELE_CI_D
                 $evidence.gates += 'shared-actual-desktop'
                 $evidence.actualDesktopGui = $false
             }
-            $versions = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1', '0.169.0-alpha.11.1')
+            $versions = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1', '0.169.0-alpha.11.1', '0.171.0-alpha.13')
             for ($index = 0; $index -lt $versions.Count; $index++) {
                 $version = $versions[$index]; $evidence.stage = 'shared-' + $version
                 Write-Output ('RELE_CI_STAGE=' + $evidence.stage)
@@ -312,7 +313,7 @@ try {
         foreach ($executable in @($marker.node, $marker.python)) {
             if ($executable -isnot [string] -or -not [IO.Path]::IsPathFullyQualified($executable) -or [IO.Path]::GetExtension($executable) -ne '.exe' -or -not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw 'An isolated gate runtime must resolve to one fully qualified executable.' }
         }
-        $marker.prefixes = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1', '0.169.0-alpha.11.1') | ForEach-Object { Join-Path $env:RUNNER_TEMP ('codex-probe-' + $_) }
+        $marker.prefixes = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1', '0.169.0-alpha.11.1', '0.171.0-alpha.13') | ForEach-Object { Join-Path $env:RUNNER_TEMP ('codex-probe-' + $_) }
         $desktopReadPaths = @()
         if ($DesktopBundle) {
             $marker.desktopBundle = [IO.Path]::GetFullPath($DesktopBundle)
@@ -566,7 +567,7 @@ try {
     # A timeout can end Python before its retainedFixture JSON is written. The
     # matching successful child receipt is the only destructive-cleanup permit.
     if ($installerChildStarted -and -not $installerCleanupConfirmed) { $retainedSharedFixtures += $FixtureRoot }
-    foreach ($name in @('shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json', 'shared-results-0.163.0-alpha.11.2.json', 'shared-results-0.164.0-alpha.11.1.json', 'shared-results-0.165.0-alpha.1.2.json', 'shared-results-0.166.0-alpha.5.1.json', 'shared-results-0.166.0-alpha.6.json', 'shared-results-0.167.0-alpha.3.2.json', 'shared-results-0.167.0-alpha.4.1.json', 'shared-results-0.169.0-alpha.11.1.json', 'shared-results-actual-desktop.json')) {
+    foreach ($name in @('shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json', 'shared-results-0.163.0-alpha.11.2.json', 'shared-results-0.164.0-alpha.11.1.json', 'shared-results-0.165.0-alpha.1.2.json', 'shared-results-0.166.0-alpha.5.1.json', 'shared-results-0.166.0-alpha.6.json', 'shared-results-0.167.0-alpha.3.2.json', 'shared-results-0.167.0-alpha.4.1.json', 'shared-results-0.169.0-alpha.11.1.json', 'shared-results-0.171.0-alpha.13.json', 'shared-results-actual-desktop.json')) {
         $reportPath = Join-Path $FixtureRoot ('reports\' + $name)
         if (Test-Path -LiteralPath $reportPath -PathType Leaf) {
             $reportTimer = [Diagnostics.Stopwatch]::StartNew()
@@ -606,7 +607,7 @@ try {
         { if ($user -and $retainedSharedFixtures.Count -eq 0) { Remove-FixtureProfile $user.SID.Value $profileCleanupFacts } },
         { if ($user -and $retainedSharedFixtures.Count -eq 0) { Remove-LocalUser -SID $user.SID } },
         { if ($RunGates) {
-            foreach ($name in @('installer-results.json', 'installer-failure-results.json', 'installer-native-cleanup-results.json', 'shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json', 'shared-results-0.163.0-alpha.11.2.json', 'shared-results-0.164.0-alpha.11.1.json', 'shared-results-0.165.0-alpha.1.2.json', 'shared-results-0.166.0-alpha.5.1.json', 'shared-results-0.166.0-alpha.6.json', 'shared-results-0.167.0-alpha.3.2.json', 'shared-results-0.167.0-alpha.4.1.json', 'shared-results-0.169.0-alpha.11.1.json', 'shared-results-actual-desktop.json')) { $report = Join-Path $FixtureRoot ('reports\' + $name); if (Test-Path -LiteralPath $report) { Copy-Item -LiteralPath $report -Destination (Join-Path $sourceRoot $name) } }
+            foreach ($name in @('installer-results.json', 'installer-failure-results.json', 'installer-native-cleanup-results.json', 'shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json', 'shared-results-0.163.0-alpha.11.2.json', 'shared-results-0.164.0-alpha.11.1.json', 'shared-results-0.165.0-alpha.1.2.json', 'shared-results-0.166.0-alpha.5.1.json', 'shared-results-0.166.0-alpha.6.json', 'shared-results-0.167.0-alpha.3.2.json', 'shared-results-0.167.0-alpha.4.1.json', 'shared-results-0.169.0-alpha.11.1.json', 'shared-results-0.171.0-alpha.13.json', 'shared-results-actual-desktop.json')) { $report = Join-Path $FixtureRoot ('reports\' + $name); if (Test-Path -LiteralPath $report) { Copy-Item -LiteralPath $report -Destination (Join-Path $sourceRoot $name) } }
             $stdout = Join-Path $FixtureRoot 'stdout.log'
             if (Test-Path -LiteralPath $stdout) {
                 $allowed = @('Windows installer smoke: an unknown startup script is preserved', 'Windows installer smoke: a previous portable process is not killed', 'Windows installer smoke: foreign Desktop settings are preserved without blocking installation', 'Windows installer smoke: the Codex wrapper preserves argv, profile, data and raw bytes', 'Windows installer smoke: launcher restart', 'Windows installer smoke: same-version upgrade with backup', 'Windows installer smoke: owned Desktop settings restore and later foreign changes survive uninstall', 'Windows installer smoke: uninstall preserves data', 'Windows installer cleanup: desktop-environment', 'Windows installer cleanup: held-adapter', 'Windows installer cleanup: native-daemon', 'Windows installer cleanup: files', 'Windows installer cleanup: complete')
@@ -645,7 +646,10 @@ try {
             $sharedDiagnosticName = 'shared-results-actual-desktop.json'
             if ([string]$result.stage -match '^shared-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)$') { $sharedDiagnosticName = 'shared-results-' + $Matches[1] + '.json' }
             $sharedDiagnosticPath = Join-Path $sourceRoot $sharedDiagnosticName
-            $summary = [ordered]@{ stage = if ($parentStage -in @('shared', 'rdp-session', 'installer')) { $parentStage } else { 'unknown' }; reportAvailable = $false }
+            $childStage = 'unknown'
+            if ($result.phase -eq 'Installer' -and ($result.stage -in @('token', 'interactive-token', 'owner-control', 'owner-primitive', 'native-cleanup', 'desktop-appx-registration', 'shared-actual-desktop', 'installer', 'complete') -or [string]$result.stage -match '^shared-\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$')) { $childStage = [string]$result.stage }
+            $parentStage = if ($parentStage -in @('shared', 'rdp-session', 'installer')) { $parentStage } else { 'unknown' }
+            $summary = [ordered]@{ stage = $parentStage; parentStage = $parentStage; childReceiptAvailable = $result.phase -eq 'Installer'; childStage = $childStage; reportAvailable = $false; sharedReportAvailable = $false }
             if ($result.cleanupErrors) {
                 $summary.canaryCleanupErrors = @($result.cleanupErrors | Select-Object -Last 8 | ForEach-Object { [ordered]@{
                     step = if ($_.step -in @('retained-shared-report', 'child', 'rdp-session', 'rdp-setting', 'redirector-stop', 'redirector-startup', 'service-stop', 'service-startup', 'task-diagnostic-channel', 'rdp-diagnostic-channel', 'task', 'profile', 'user', 'reports', 'fixture')) { [string]$_.step } else { 'other' }
@@ -658,12 +662,14 @@ try {
                 try {
                     $sharedDiagnostic = Get-Content -LiteralPath $sharedDiagnosticPath -Raw | ConvertFrom-Json
                     $summary.reportAvailable = $true
+                    $summary.sharedReportAvailable = $true
                     $summary.result = if ($sharedDiagnostic.result -in @('passed', 'failed')) { $sharedDiagnostic.result } else { 'unknown' }
                     if ($sharedDiagnostic.failureType) { $summary.failureType = if ([string]$sharedDiagnostic.failureType -match '^[A-Za-z]{1,48}$') { [string]$sharedDiagnostic.failureType } else { 'other' } }
                     if ($sharedDiagnostic.failureLocation -and [string]$sharedDiagnostic.failureLocation.function -match '^[A-Za-z_][A-Za-z0-9_]{0,63}$' -and ($sharedDiagnostic.failureLocation.line -is [int] -or $sharedDiagnostic.failureLocation.line -is [long]) -and [long]$sharedDiagnostic.failureLocation.line -ge 1 -and [long]$sharedDiagnostic.failureLocation.line -le 100000) { $summary.failureLocation = [ordered]@{ function = [string]$sharedDiagnostic.failureLocation.function; line = [int]$sharedDiagnostic.failureLocation.line } }
                     if ($sharedDiagnostic.failureCode) { $summary.failureCode = if ([string]$sharedDiagnostic.failureCode -in @('native-background-terminals-not-empty', 'native-cancellation-queue-not-empty', 'engine-driver-exited-before-response')) { [string]$sharedDiagnostic.failureCode } else { 'other' } }
                     if (($sharedDiagnostic.engineDriverExitCode -is [int] -or $sharedDiagnostic.engineDriverExitCode -is [long]) -and [long]$sharedDiagnostic.engineDriverExitCode -ge -2147483648 -and [long]$sharedDiagnostic.engineDriverExitCode -le 4294967295) { $summary.engineDriverExitCode = [long]$sharedDiagnostic.engineDriverExitCode }
                     if ([string]$sharedDiagnostic.engineDriverStage -in @('codex-connect', 'shared-codex-resolution', 'shared-codex-resolved', 'thread-catalog', 'engine-start', 'native-diagnostics', 'desktop-package-verification', 'ready', 'windows-installation', 'windows-owner-status', 'windows-desktop-discovery', 'windows-desktop-selection', 'windows-package-preparation', 'windows-package-verification', 'windows-version-command', 'windows-owner-start', 'windows-owner-receipt', 'windows-owner-executable', 'windows-socket-verification', 'engine-close-request', 'engine-close-ack')) { $summary.engineDriverStage = [string]$sharedDiagnostic.engineDriverStage }
+                    if ($sharedDiagnostic.engineDriverDiagnostics) { $summary.engineDriverDiagnostics = @(Get-SafeEngineDriverDiagnostics -Diagnostics $sharedDiagnostic.engineDriverDiagnostics) }
                     $summary.codexVersion = if ([string]$sharedDiagnostic.codexVersion -match '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$') { [string]$sharedDiagnostic.codexVersion } else { 'unknown' }
                     $checks = @($sharedDiagnostic.checks.PSObject.Properties)
                     $summary.checksPassed = @($checks | Where-Object { $_.Value -eq $true }).Count
@@ -721,9 +727,9 @@ try {
                         $summary.driverOperations = @($evidence.driverOperations | Select-Object -Last 16)
                         $summary.rpcTrace = @($evidence.rpcTrace | Select-Object -Last 16)
                     }
-                    if ($result.installerProgress) { $summary.installerProgress = @($result.installerProgress | Select-Object -Last 8) }
                 } catch { $summary.reportAvailable = $false }
             }
+            if ($result.installerProgress) { $summary.installerProgress = @($result.installerProgress | Select-Object -Last 8) }
             Write-Output ('Windows canary bounded diagnostic: ' + ($summary | ConvertTo-Json -Compress -Depth 4))
         }
     }

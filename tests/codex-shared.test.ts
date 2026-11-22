@@ -115,7 +115,7 @@ describe('Windows direct shared Codex', () => {
     } finally { output.mockRestore(); }
   });
 
-  it('prints bounded Desktop discovery codes on a CI bootstrap failure without publishing paths or messages', async () => {
+  it('emits only bounded Desktop candidate rows on a CI bootstrap failure', async () => {
     const f = await windowsFixture(), privateMarker = 'private-codex-ci-diagnostic';
     Object.assign(f.env, { RELE_CI_SHARED_DIAGNOSTICS: '1' });
     const executable = path.join(f.home, privateMarker, 'codex.exe');
@@ -127,15 +127,17 @@ describe('Windows direct shared Codex', () => {
     const output = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
     try {
       await expect(ensureWindowsSharedCodex(f.target, f.options, f.installationDirectory)).rejects.toMatchObject({ code: 'shared-cli-unavailable' });
-      expect(diagnostic).toHaveBeenCalledTimes(1);
-      const line = String(diagnostic.mock.calls[0][0]);
-      expect(line).toMatch(/^RELE_CI_WINDOWS_DESKTOP_DISCOVERY=/u);
-      expect(JSON.parse(line.slice(line.indexOf('=') + 1))).toEqual({
-        installations: [{ source: 'desktop-install', version: '0.166.0-alpha.6', running: false }],
-        issues: ['cli-probe-failed'],
-        candidates: [{ source: 'desktop-install', version: '0.166.0-alpha.6', result: 'candidate-resolution-failed' }],
+      expect(diagnostic).not.toHaveBeenCalled();
+      const rows = output.mock.calls.flatMap(([chunk]) => {
+        if (typeof chunk !== 'string') return [];
+        try { return [JSON.parse(chunk)]; } catch { return []; }
       });
-      expect(line).not.toContain(privateMarker);
+      const row = rows.find(value => value.probeDiagnostic?.kind === 'windows-desktop-candidates');
+      expect(row).toEqual({ probeDiagnostic: {
+        kind: 'windows-desktop-candidates',
+        candidates: [{ source: 'desktop-install', version: '0.166.0-alpha.6', result: 'candidate-resolution-failed' }],
+      } });
+      expect(JSON.stringify(row)).not.toContain(privateMarker);
     } finally { diagnostic.mockRestore(); output.mockRestore(); }
   });
 
@@ -334,7 +336,7 @@ describe('Windows direct shared Codex', () => {
     expect(f.run.mock.calls.find(([, args]) => args[0] === 'codex-start')?.[1]).toContain(f.receipt.executable);
   });
 
-  it.each(['0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.169.0-alpha.11.1'])('automatically chooses supported %s while ignoring a newer unsupported installation', async version => {
+  it.each(['0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.169.0-alpha.11.1', '0.171.0-alpha.13'])('automatically chooses supported %s while ignoring a newer unsupported installation', async version => {
     const f = await windowsFixture(), newer = await desktopFixture(path.join(f.home, 'newer')), unsupported = await desktopFixture(path.join(f.home, 'unsupported'));
     f.discovery.installations.unshift(
       { executable: unsupported, name: 'Unverified Desktop', source: 'desktop-install', version: '9.0.0', running: false },

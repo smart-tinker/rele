@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 
 test('reports only allowlisted operations from a synthetic managed wait RED', () => {
@@ -119,4 +120,84 @@ test('cleanup fails closed when the owned Codex is still alive', async () => {
   const { closeManagedFixture } = await import('../scripts/managed-probe-wait.mjs');
   const result = await closeManagedFixture(async () => {}, async () => {}, () => false, 50);
   assert.deepEqual(result, { ok: false, phase: 'owned-child-exit', failure: 'not-exited', childExited: false });
+});
+
+test('destroys managed bridge stdin before exit, before fallback cleanup', { timeout: 5000 }, async () => {
+  const helperUrl = new URL('../scripts/managed-probe-wait.mjs', import.meta.url).href;
+  const bridgeSource = [
+    "import { createInterface } from 'node:readline';",
+    "import { closeManagedBridgeInput } from " + JSON.stringify(helperUrl) + ";",
+    "const input = process.stdin;",
+    "const lines = createInterface({ input });",
+    "for await (const line of lines) {",
+    "  if (line !== 'close') continue;",
+    "  process.stdout.write('ACK\\n');",
+    "  closeManagedBridgeInput(lines, input);",
+    "  process.stdout.write(JSON.stringify({ inputDestroyed: input.destroyed }) + '\\n');",
+    "  break;",
+    "}",
+  ].join('\n');
+  const bridge = spawn(process.execPath, ['--input-type=module', '-e', bridgeSource], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let output = '';
+  let stderr = '';
+  bridge.stdout.setEncoding('utf8').on('data', chunk => { output += chunk; });
+  bridge.stderr.setEncoding('utf8').on('data', chunk => { stderr += chunk; });
+  let timer;
+  try {
+    bridge.stdin.write('close\n');
+    const [code, signal] = await Promise.race([
+      once(bridge, 'close'),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('synthetic bridge did not exit before fallback cleanup')), 1500);
+      }),
+    ]);
+    assert.equal(signal, null, stderr);
+    assert.equal(code, 0, stderr);
+    const [ack, result, ...extra] = output.trim().split(/\r?\n/);
+    assert.equal(ack, 'ACK');
+    assert.deepEqual(JSON.parse(result), { inputDestroyed: true });
+    assert.deepEqual(extra, []);
+  } finally {
+    clearTimeout(timer);
+    if (bridge.exitCode === null && bridge.signalCode === null) bridge.kill();
+    bridge.stdin.destroy();
+    bridge.stdout.destroy();
+    bridge.stderr.destroy();
+  }
+});
+
+test('closes managed bridge stdin before waiting for child exit', { timeout: 5000 }, () => {
+  const python = [
+    'import asyncio, json, sys',
+    "sys.path.insert(0, 'scripts')",
+    'from managed_probe_bridge import wait_for_bridge_exit',
+    'async def main():',
+    "    child_code = \"import sys; sys.stdin.buffer.readline(); print('ACK', flush=True); sys.stdin.buffer.read()\"",
+    "    child = await asyncio.create_subprocess_exec(sys.executable, '-c', child_code, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)",
+    "    outcome = 'timeout'",
+    '    try:',
+    "        child.stdin.write(b'close' + bytes([10]))",
+    '        await child.stdin.drain()',
+    '        ack = await asyncio.wait_for(child.stdout.readline(), 2)',
+    "        assert ack.rstrip(bytes([13, 10])) == b'ACK'",
+    '        try:',
+    '            await wait_for_bridge_exit(child, 0.2)',
+    '        except TimeoutError:',
+    '            pass',
+    '        else:',
+    "            outcome = 'exited'",
+    '    finally:',
+    '        if child.returncode is None:',
+    '            child.stdin.close()',
+    '            await asyncio.wait_for(child.wait(), 2)',
+    "    print(json.dumps({'outcome': outcome, 'returncode': child.returncode}, sort_keys=True))",
+    'asyncio.run(main())',
+  ].join('\n');
+  const output = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-B', '-c', python], {
+    cwd: fileURLToPath(new URL('..', import.meta.url)), encoding: 'utf8', timeout: 3000,
+  });
+  assert.equal(output.status, 0, output.stderr);
+  assert.deepEqual(JSON.parse(output.stdout), { outcome: 'exited', returncode: 0 });
 });

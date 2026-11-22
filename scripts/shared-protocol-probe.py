@@ -27,7 +27,7 @@ import websockets
 from websockets.exceptions import ConnectionClosedError
 from websockets.protocol import State
 
-VERSIONS = ['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1', '0.169.0-alpha.11.1']
+VERSIONS = ['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1', '0.169.0-alpha.11.1', '0.171.0-alpha.13']
 REPO = Path(__file__).resolve().parent.parent
 NODE = shutil.which('node')
 DRIVER = REPO / 'scripts/probe-shared-codex.ts'
@@ -92,6 +92,38 @@ def public_failure_location(value):
     return None
 
 
+def safe_engine_driver_diagnostic(value):
+    if not isinstance(value, dict):
+        return None
+    if value.get('kind') == 'codex-connect-error':
+        return {
+            'kind': 'codex-connect-error',
+            'errorClass': value.get('errorClass') if value.get('errorClass') in (
+                'AbortError', 'CodexTransportError', 'Error', 'RangeError', 'SharedCodexError', 'TimeoutError', 'TypeError') else 'other',
+            'errorCode': value.get('errorCode') if value.get('errorCode') in (
+                'invalid-shared-profile', 'invalid-shared-target', 'shared-cli-unavailable', 'shared-cli-unverified',
+                'shared-control-migration-required', 'shared-daemon-invalid', 'shared-daemon-unavailable',
+                'shared-desktop-conflict', 'shared-desktop-package-invalid',
+                'shared-owner-unknown', 'shared-package-incomplete', 'shared-profile-mismatch') else 'other',
+        }
+    if value.get('kind') == 'windows-desktop-candidates':
+        candidates = []
+        rows = value.get('candidates')
+        for candidate in rows[:8] if isinstance(rows, list) else []:
+            if not isinstance(candidate, dict) or candidate.get('source') not in (
+                'desktop-process', 'desktop-install', 'path', 'standard') or candidate.get('result') not in (
+                    'native-entrypoint-rejected', 'candidate-resolution-failed', 'shared-cli-unavailable',
+                    'shared-cli-unverified', 'shared-desktop-package-invalid'):
+                continue
+            row = {'source': candidate['source'], 'result': candidate['result']}
+            version = candidate.get('version')
+            if isinstance(version, str) and len(version) <= 96 and re.fullmatch(r'\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?', version):
+                row['version'] = version
+            candidates.append(row)
+        return {'kind': 'windows-desktop-candidates', 'candidates': candidates}
+    return None
+
+
 async def record_cleanup_error(errors, operation, resource, action, process_pid=None, owner_pid=None):
     started = time.monotonic()
     try:
@@ -145,6 +177,10 @@ def public_console_report(report):
     driver_stage = safe_engine_driver_stage(report.get('engineDriverStage'))
     if driver_stage:
         output['engineDriverStage'] = driver_stage
+    diagnostics = report.get('engineDriverDiagnostics')
+    if isinstance(diagnostics, list):
+        safe_diagnostics = [safe_engine_driver_diagnostic(item) for item in diagnostics[-4:]]
+        output['engineDriverDiagnostics'] = [item for item in safe_diagnostics if item]
     exit_code = report.get('engineDriverExitCode')
     if isinstance(exit_code, int) and not isinstance(exit_code, bool):
         output['engineDriverExitCode'] = max(-(2**31), min(2**32 - 1, exit_code))
@@ -325,6 +361,7 @@ class EngineDriver:
     def __init__(self, process):
         self.process = process
         self.startup_stage = None
+        self.startup_diagnostics = []
 
     async def read(self, timeout=ENGINE_READ_TIMEOUT_SECONDS):
         while True:
@@ -341,8 +378,16 @@ class EngineDriver:
                     error.engine_driver_exit_code = exit_code
                 if self.startup_stage:
                     error.engine_driver_stage = self.startup_stage
+                if self.startup_diagnostics:
+                    error.engine_driver_diagnostics = self.startup_diagnostics
                 raise error
             value = json.loads(line)
+            if isinstance(value, dict) and 'probeDiagnostic' in value:
+                diagnostic = safe_engine_driver_diagnostic(value['probeDiagnostic'])
+                if diagnostic:
+                    self.startup_diagnostics.append(diagnostic)
+                    del self.startup_diagnostics[:-4]
+                continue
             stage = safe_engine_driver_stage(value.get('probeStage')) if isinstance(value, dict) else None
             if stage:
                 self.startup_stage = stage
@@ -1326,6 +1371,9 @@ enabled=false
         driver_stage = safe_engine_driver_stage(getattr(error, 'engine_driver_stage', None))
         if driver_stage:
             report['engineDriverStage'] = driver_stage
+        diagnostics = getattr(error, 'engine_driver_diagnostics', None)
+        if isinstance(diagnostics, list):
+            report['engineDriverDiagnostics'] = diagnostics
         report['exception'] = repr(error)
         report['stderrTail'] = errors[-20:]
         raise

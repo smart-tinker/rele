@@ -49,6 +49,7 @@ async function managedFixture(options: {
   malformed?: boolean;
   diagnosticPid?: 'parent';
   terminals?: boolean;
+  mutableTerminals?: boolean;
   codexHome?: string;
   auto?: boolean;
   releaseTimeoutMs?: number;
@@ -57,13 +58,17 @@ async function managedFixture(options: {
   cleanup.push(() => rm(directory, { recursive: true, force: true }));
   const executable = path.join(directory, 'codex.mjs');
   const log = path.join(directory, 'wire.jsonl');
+  const backendPath = path.join(directory, 'backend.json');
   await writeFile(log, '');
+  if (options.mutableTerminals) await writeFile(backendPath, JSON.stringify({ terminals: options.terminals ? [{ itemId:'fixture-command', processId:'1234' }] : [] }));
   await writeFile(executable, `
-    import { appendFileSync, writeSync } from 'node:fs';
+    import { appendFileSync, readFileSync, writeSync } from 'node:fs';
     import { createInterface } from 'node:readline';
-    const log = ${JSON.stringify(log)}, options = ${JSON.stringify(options)}, thread = ${JSON.stringify(rawThread)};
+    const log = ${JSON.stringify(log)}, options = ${JSON.stringify(options)}, thread = ${JSON.stringify(rawThread)}, backendPath = ${JSON.stringify(backendPath)};
     const record = value => appendFileSync(log, JSON.stringify(value) + '\\n');
     const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
+    const terminals = () => options.mutableTerminals ? JSON.parse(readFileSync(backendPath, 'utf8')).terminals
+      : options.terminals ? [{ itemId:'fixture-command', processId:'1234' }] : [];
     record({ event: 'start', pid: process.pid, argv: process.argv.slice(2), home: process.env.CODEX_HOME, marker: process.env.RELE_CODEX_TEST_MARKER });
     let released, resumed = false;
     for await (const line of createInterface({ input: process.stdin })) {
@@ -77,7 +82,7 @@ async function managedFixture(options: {
           reply({ userAgent: 'rele/' + (options.version || '0.163.0') + ' (Fixture)', codexHome: process.env.CODEX_HOME || ${JSON.stringify(directory)}, platformFamily: 'fixture', platformOs: process.platform });
           break;
         case 'server/diagnostics': reply({ process: { id: options.diagnosticPid === 'parent' ? process.ppid : process.pid }, gauges: [] }); break;
-        case 'thread/backgroundTerminals/list': reply({ data: options.terminals ? [{ itemId:'fixture-command', processId:'1234' }] : [], nextCursor: null }); break;
+        case 'thread/backgroundTerminals/list': reply({ data: terminals(), nextCursor: null }); break;
         case 'thread/backgroundTerminals/terminate': reply({ terminated:true }); break;
         case 'thread/list': reply({ data: [thread], nextCursor: null }); break;
         case 'thread/queue/list':
@@ -122,7 +127,11 @@ async function managedFixture(options: {
   cleanup.push(() => client.close());
   const records = async () => (await readFile(log, 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as Rpc & { event?: string; argv?: string[]; home?: string; marker?: string; pid?: number });
   const calls = async () => (await records()).filter(row => row.method);
-  return { client, executable, directory, discover, records, calls };
+  const setTerminals = async (terminals: { itemId: string; processId: string }[]) => {
+    if (!options.mutableTerminals) throw new Error('This managed fixture has immutable terminals.');
+    await writeFile(backendPath, JSON.stringify({ terminals }));
+  };
+  return { client, executable, directory, discover, records, calls, setTerminals };
 }
 
 async function fixture(handlers: Record<string, Handler> = {}, codexHome?: string, options: NonNullable<ConstructorParameters<typeof CodexClient>[1]> = {}, autoPong = true) {
@@ -1029,7 +1038,7 @@ describe('Codex shared-runtime adapter', () => {
     const clientId = randomUUID();
     const generation = 'a'.repeat(64), proof = vi.mocked(codexNativeGeneration);
     proof.mockClear();
-    for (let index = 0; index < 7; index++) proof.mockResolvedValueOnce(generation);
+    for (let index = 0; index < 8; index++) proof.mockResolvedValueOnce(generation);
     const terminals = [{ itemId: 'own-command', processId: '1234', command: 'never-export-this-command' },
       { itemId: 'foreign-command', processId: '5678', command: 'foreign-command-body' }];
     const f = await fixture({
@@ -1042,7 +1051,7 @@ describe('Codex shared-runtime adapter', () => {
     });
     await f.client.connect();
     expect(await f.client.findRequest(threadId, clientId)).toMatchObject({ turnId: 'own-turn', commandItems: [{ id: 'own-command', processId: null }] });
-    expect(await f.client.backgroundTerminals(threadId)).toEqual({ serverId: 42, serverGeneration: generation, terminals: [
+    expect(await f.client.backgroundTerminals(threadId, { verifyStableGeneration:true })).toEqual({ serverId: 42, serverGeneration: generation, terminals: [
       { itemId: 'own-command', processId: '1234' }, { itemId: 'foreign-command', processId: '5678' },
     ] });
     const target = { serverId: 42, serverGeneration: generation, itemId: 'own-command', processId: '1234' };
@@ -1444,23 +1453,291 @@ describe('Codex shared passive context receipts', () => {
 });
 
 describe('Codex managed runtime', () => {
-  it('proves the terminal-list server generation once after the native RPC', async () => {
-    const f = await fixture({
-      'server/diagnostics': () => ({ process: { id: 42 }, gauges: [] }),
-      'thread/backgroundTerminals/list': () => ({ data: [{ itemId: 'own-command', processId: '1234' }], nextCursor: null }),
-    });
+  it('dispatches the same origin-bound request before a held native identity proof settles', async () => {
+    let releaseProof!: (generation: string | undefined) => void;
+    const heldProof = new Promise<string | undefined>(resolve => { releaseProof = resolve; });
+    const proof = vi.mocked(codexNativeGeneration), originalProof = proof.getMockImplementation();
+    proof.mockClear();
+    proof.mockImplementation(() => heldProof);
+    const home = await mkdtemp(path.join(tmpdir(), 'rele-held-proof-home-'));
+    cleanup.push(() => rm(home, { recursive:true, force:true }));
+    const f = await managedFixture({ terminals:true, codexHome:home });
+    const store = new Store(':memory:');
+    cleanup.push(() => store.close());
+    const endpoint: Endpoint = { id:'held-proof-origin', platform:'telegram', accountId:'999', chatId:'-100123', threadId:'17',
+      title:'Synthetic origin', subtitle:'', people:[{ id:'123', name:'Fixture' }], updatedAt:new Date().toISOString() };
+    store.upsertEndpoint(endpoint);
+    store.createConversation({ name:'Original', threadId, cwd:home,
+      bindings:[{ platform:'telegram', endpointId:endpoint.id, allowedSenderIds:['123'] }] });
+    store.setMeta(initialMessageKey(home, threadId), JSON.stringify({ applied:true }));
+    const config = { ...structuredClone(defaultConfig), codex:{ transport:'managed' as const, executable:f.executable, endpoint:'', codexHome:home },
+      telegram:{ ...defaultConfig.telegram, enabled:true } };
+    const engine = new Engine(store, f.client, { config:() => config, temporaryRoot:f.directory, redact:() => 'Fixture error' });
+    engine.channels.telegram = { state:{ configured:true, connected:true, accountId:'999' }, start:async () => {}, stop:async () => {}, download:async () => {}, deliver:async () => 'receipt' };
+    cleanup.push(() => engine.stop());
+    try {
+      await f.client.connect();
+      await vi.waitFor(() => expect(proof).toHaveBeenCalledOnce());
+      await engine.receive({ eventId:'held-proof-request', endpoint, sender:endpoint.people[0], messageId:'1', text:'Synthetic request' });
+      const deadline = Date.now() + 2_000;
+      let calls = await f.calls();
+      const reachesOrigin = () => calls.some(call => call.method === 'thread/queue/add'
+        && JSON.stringify(call.params.input).includes('Synthetic request'));
+      while (!reachesOrigin()) {
+        if (Date.now() >= deadline) {
+          throw new Error(`The origin-bound request did not reach the native queue before the deadline. proofCalls=${proof.mock.calls.length}; methods=${calls.map(call => call.method).filter(Boolean).join(',')}`);
+        }
+        await new Promise(resolve => setTimeout(resolve, 10));
+        calls = await f.calls();
+      }
+      const request = store.listRequests().find(row => row.eventId === 'held-proof-request')!;
+      const queued = calls.find(call => call.method === 'thread/queue/add' && JSON.stringify(call.params.input).includes('Synthetic request'));
+      expect(queued?.params).toMatchObject({ threadId, clientUserMessageId:request.id });
+      expect(request.origin).toMatchObject({ platform:'telegram', accountId:'999', endpointId:endpoint.id, chatId:'-100123', threadId:'17', senderId:'123', messageId:'1' });
+      expect(JSON.parse(store.getMeta(`request-terminal-baseline:${request.id}`)!)).toMatchObject({ serverId:expect.any(Number),
+        terminals:[{ itemId:'fixture-command', processId:'1234' }] });
+      expect(JSON.parse(store.getMeta(`request-terminal-baseline:${request.id}`)!)).not.toHaveProperty('serverGeneration');
+      expect(proof).toHaveBeenCalledOnce();
+    } finally {
+      releaseProof('a'.repeat(64));
+      if (originalProof) proof.mockImplementation(originalProof);
+    }
+  });
+
+  it('returns the terminal baseline without waiting for native generation proof', async () => {
+    const home = await mkdtemp(path.join(tmpdir(), 'Rele fast stdio baseline '));
+    cleanup.push(() => rm(home, { recursive:true, force:true }));
+    const f = await managedFixture({ terminals:true, codexHome:home });
     await f.client.connect();
     const proof = vi.mocked(codexNativeGeneration);
     proof.mockClear();
-    proof.mockImplementationOnce(async () => {
-      expect(f.calls.at(-1)?.method).toBe('thread/backgroundTerminals/list');
-      return 'a'.repeat(64);
-    });
 
-    await expect(f.client.backgroundTerminals(threadId)).resolves.toEqual({
-      serverId: 42, serverGeneration: 'a'.repeat(64), terminals: [{ itemId: 'own-command', processId: '1234' }],
+    await expect(f.client.backgroundTerminals(threadId)).resolves.toMatchObject({
+      serverId: expect.any(Number), terminals: [{ itemId: 'fixture-command', processId: '1234' }],
     });
-    expect(proof).toHaveBeenCalledOnce();
+    expect(proof).not.toHaveBeenCalled();
+  });
+
+  it('refuses Stop when managed stdio reuses its PID after an unproven fast baseline', async () => {
+    let generation = 'a'.repeat(64), releaseProof!: () => void;
+    const heldProof = new Promise<void>(resolve => { releaseProof = resolve; });
+    const proof = vi.mocked(codexNativeGeneration), originalProof = proof.getMockImplementation();
+    proof.mockClear();
+    proof.mockImplementation(async () => { await heldProof; return generation; });
+    const home = await mkdtemp(path.join(tmpdir(), 'Rele reused stdio PID '));
+    cleanup.push(() => rm(home, { recursive:true, force:true }));
+    const f = await managedFixture({ terminals:true, mutableTerminals:true, codexHome:home });
+    const store = new Store(':memory:');
+    cleanup.push(() => store.close());
+    const endpoint: Endpoint = { id:'reused-pid-origin', platform:'telegram', accountId:'999', chatId:'-100123', threadId:'17',
+      title:'Synthetic origin', subtitle:'', people:[{ id:'123', name:'Fixture' }], updatedAt:new Date().toISOString() };
+    store.upsertEndpoint(endpoint);
+    store.createConversation({ name:'Original', threadId, cwd:home,
+      bindings:[{ platform:'telegram', endpointId:endpoint.id, allowedSenderIds:['123'] }] });
+    store.setMeta(initialMessageKey(home, threadId), JSON.stringify({ applied:true }));
+    const config = { ...structuredClone(defaultConfig), codex:{ transport:'managed' as const, executable:f.executable, endpoint:'', codexHome:home },
+      telegram:{ ...defaultConfig.telegram, enabled:true } };
+    const engine = new Engine(store, f.client, { config:() => config, temporaryRoot:f.directory, redact:() => 'Fixture error' });
+    engine.channels.telegram = { state:{ configured:true, connected:true, accountId:'999' }, start:async () => {}, stop:async () => {}, download:async () => {}, deliver:async () => 'receipt' };
+    cleanup.push(() => engine.stop());
+    let turnState: 'running' | 'interrupted' = 'running';
+    const interrupt = vi.spyOn(f.client, 'interrupt').mockImplementation(async () => { turnState = 'interrupted'; });
+    const terminate = vi.spyOn(f.client, 'terminateBackgroundTerminal').mockImplementation(async () => { await f.setTerminals([]); });
+    vi.spyOn(f.client, 'findRequest').mockImplementation(async () => ({ state:turnState, turnId:'managed-turn',
+      commandItems:[{ id:'replacement-command', processId:'5678', completed:true }] }));
+    try {
+      await f.client.connect();
+      const prime = Reflect.get(f.client, 'primeNativeGeneration');
+      if (typeof prime === 'function') {
+        prime.call(f.client);
+        await vi.waitFor(() => expect(proof).toHaveBeenCalledOnce());
+      }
+      const peer = Reflect.get(f.client, 'nativePeer') as CodexNativePeer | undefined;
+      if (peer?.kind !== 'stdio') throw new Error('The synthetic request did not use managed stdio.');
+      const transport = Reflect.get(f.client, 'stdio') as { pid:number } | undefined;
+      expect(transport?.pid).toBe(peer.pid);
+
+      await engine.receive({ eventId:'reused-pid-request', endpoint, sender:endpoint.people[0], messageId:'1', text:'Synthetic request' });
+      const deadline = Date.now() + 2_000;
+      let calls = await f.calls();
+      while (!calls.some(call => call.method === 'thread/queue/add')) {
+        if (Date.now() >= deadline) throw new Error('The managed request did not reach its native queue.');
+        await new Promise(resolve => setTimeout(resolve, 10));
+        calls = await f.calls();
+      }
+      const request = store.listRequests().find(row => row.eventId === 'reused-pid-request')!;
+      const baseline = JSON.parse(store.getMeta(`request-terminal-baseline:${request.id}`)!);
+      expect(baseline.serverId).toEqual(expect.any(Number));
+      expect(baseline.serverId).toBeGreaterThan(0);
+      expect(baseline.terminals).toEqual([{ itemId:'fixture-command', processId:'1234' }]);
+      expect(baseline).not.toHaveProperty('serverGeneration');
+
+      store.updateRequest(request.id, { status:'running', turnId:'managed-turn' });
+      await f.setTerminals([{ itemId:'replacement-command', processId:'5678' }]);
+      generation = 'b'.repeat(64);
+      releaseProof();
+      const replacement = await f.client.backgroundTerminals(threadId);
+      expect(replacement).toMatchObject({ serverId:baseline.serverId,
+        terminals:[{ itemId:'replacement-command', processId:'5678' }] });
+      expect(Reflect.get(f.client, 'nativePeer')).toBe(peer);
+      expect(Reflect.get(f.client, 'stdio')).toBe(transport);
+      expect(transport?.pid).toBe(peer.pid);
+
+      const outcome = await engine.cancel(request.id).then(() => 'completed', () => 'rejected');
+      expect(terminate).not.toHaveBeenCalled();
+      expect(interrupt).not.toHaveBeenCalled();
+      expect(outcome).toBe('rejected');
+      expect((await f.calls()).some(call => call.method === 'thread/backgroundTerminals/terminate')).toBe(false);
+      expect(store.getRequest(request.id)?.origin).toMatchObject({ platform:'telegram', accountId:'999', endpointId:endpoint.id });
+    } finally {
+      releaseProof();
+      if (originalProof) proof.mockImplementation(originalProof);
+    }
+  });
+
+  it('aborts and awaits a managed native generation proof when closing its child', async () => {
+    let proofStarted!: () => void, releaseProof: () => void = () => {}, settled = false;
+    const started = new Promise<void>(resolve => { proofStarted = resolve; });
+    const proof = vi.mocked(codexNativeGeneration), originalProof = proof.getMockImplementation();
+    proof.mockClear();
+    proof.mockImplementation(async (_peer, _serverId, _home, options) => {
+      proofStarted();
+      await new Promise<void>(resolve => {
+        releaseProof = resolve;
+        const signal = options && Reflect.get(options, 'signal') as AbortSignal | undefined;
+        signal?.addEventListener('abort', () => resolve(), { once:true });
+      });
+      settled = true;
+      return undefined;
+    });
+    const home = await mkdtemp(path.join(tmpdir(), 'Rele pending native proof '));
+    cleanup.push(() => rm(home, { recursive:true, force:true }));
+    const f = await managedFixture({ terminals:true, codexHome:home });
+    cleanup.push(() => f.client.close());
+    try {
+      await f.client.connect();
+      f.client.primeNativeGeneration();
+      await started;
+      await f.client.close();
+      const options = proof.mock.calls[0]?.[3];
+      const signal = options && Reflect.get(options, 'signal') as AbortSignal | undefined;
+      expect(signal).toBeInstanceOf(AbortSignal);
+      expect(signal?.aborted).toBe(true);
+      expect(settled).toBe(true);
+    } finally {
+      releaseProof();
+      if (originalProof) proof.mockImplementation(originalProof);
+    }
+  });
+
+  it('aborts and awaits a strict native proof before closing during addressed cancellation', async () => {
+    const generation = 'a'.repeat(64);
+    let strict = false, proofSignal: AbortSignal | undefined, proofSettled = false;
+    let strictProofStarted!: () => void, releaseProof: () => void = () => {};
+    const started = new Promise<void>(resolve => { strictProofStarted = resolve; });
+    const proof = vi.mocked(codexNativeGeneration), originalProof = proof.getMockImplementation();
+    proof.mockClear();
+    proof.mockImplementation(async (_peer, _serverId, _home, options) => {
+      if (!strict) return generation;
+      proofSignal = options && Reflect.get(options, 'signal') as AbortSignal | undefined;
+      strictProofStarted();
+      await new Promise<void>(resolve => {
+        releaseProof = resolve;
+        if (proofSignal?.aborted) resolve();
+        else proofSignal?.addEventListener('abort', () => resolve(), { once:true });
+      });
+      proofSettled = true;
+      return undefined;
+    });
+    const home = await mkdtemp(path.join(tmpdir(), 'Rele cancel strict proof '));
+    cleanup.push(() => rm(home, { recursive:true, force:true }));
+    const f = await managedFixture({ terminals:true, codexHome:home });
+    const store = new Store(':memory:');
+    cleanup.push(() => store.close());
+    const endpoint: Endpoint = { id:'strict-proof-origin', platform:'telegram', accountId:'999', chatId:'-100123', threadId:'17',
+      title:'Synthetic origin', subtitle:'', people:[{ id:'123', name:'Fixture' }], updatedAt:new Date().toISOString() };
+    store.upsertEndpoint(endpoint);
+    store.createConversation({ name:'Original', threadId, cwd:home,
+      bindings:[{ platform:'telegram', endpointId:endpoint.id, allowedSenderIds:['123'] }] });
+    store.setMeta(initialMessageKey(home, threadId), JSON.stringify({ applied:true }));
+    const config = { ...structuredClone(defaultConfig), codex:{ transport:'managed' as const, executable:f.executable, endpoint:'', codexHome:home },
+      telegram:{ ...defaultConfig.telegram, enabled:true } };
+    const engine = new Engine(store, f.client, { config:() => config, temporaryRoot:f.directory, redact:() => 'Fixture error' });
+    engine.channels.telegram = { state:{ configured:true, connected:true, accountId:'999' }, start:async () => {}, stop:async () => {}, download:async () => {}, deliver:async () => 'receipt' };
+    cleanup.push(() => engine.stop());
+    let cancellation: Promise<'completed' | 'rejected'> | undefined;
+    try {
+      await f.client.connect();
+      f.client.primeNativeGeneration();
+      await vi.waitFor(() => expect(Reflect.get(f.client, 'nativeGeneration')).toMatchObject({ generation }));
+      await engine.receive({ eventId:'strict-proof-request', endpoint, sender:endpoint.people[0], messageId:'1', text:'Synthetic request' });
+      const deadline = Date.now() + 2_000;
+      let calls = await f.calls();
+      while (!calls.some(call => call.method === 'thread/queue/add')) {
+        if (Date.now() >= deadline) throw new Error('The managed request did not reach its native queue.');
+        await new Promise(resolve => setTimeout(resolve, 10));
+        calls = await f.calls();
+      }
+      const request = store.listRequests().find(row => row.eventId === 'strict-proof-request')!;
+      const baseline = JSON.parse(store.getMeta(`request-terminal-baseline:${request.id}`)!);
+      expect(baseline).toMatchObject({ serverGeneration:generation, terminals:[{ itemId:'fixture-command', processId:'1234' }] });
+      store.updateRequest(request.id, { status:'running', turnId:'managed-turn' });
+      vi.spyOn(f.client, 'findRequest').mockResolvedValue({ state:'running', turnId:'managed-turn', commandItems:[{ id:'fixture-command', processId:'1234' }] });
+
+      strict = true;
+      cancellation = engine.cancel(request.id).then(() => 'completed', () => 'rejected');
+      await started;
+      await f.client.close();
+
+      expect(proofSignal).toBeInstanceOf(AbortSignal);
+      expect(proofSignal?.aborted).toBe(true);
+      expect(proofSettled).toBe(true);
+      expect(await cancellation).toBe('rejected');
+      calls = await f.calls();
+      expect(calls.some(call => call.method === 'turn/interrupt')).toBe(false);
+      expect(calls.some(call => call.method === 'thread/backgroundTerminals/terminate')).toBe(false);
+      expect(store.getRequest(request.id)?.origin).toMatchObject({ platform:'telegram', accountId:'999', endpointId:endpoint.id });
+    } finally {
+      releaseProof();
+      await cancellation;
+      if (originalProof) proof.mockImplementation(originalProof);
+    }
+  });
+
+  it('carries only the confirmed generation of the same managed stdio peer into a fast terminal baseline', async () => {
+    const home = await mkdtemp(path.join(tmpdir(), 'Rele stdio baseline identity '));
+    cleanup.push(() => rm(home, { recursive:true, force:true }));
+    const f = await managedFixture({ terminals:true, codexHome:home });
+    await f.client.connect();
+    const proof = vi.mocked(codexNativeGeneration), originalProof = proof.getMockImplementation();
+    let generation = 'a'.repeat(64);
+    proof.mockClear();
+    proof.mockImplementation(async () => generation);
+    try {
+      f.client.primeNativeGeneration();
+      await vi.waitFor(() => expect(Reflect.get(f.client, 'nativeGeneration')).toMatchObject({ generation }));
+      const first = await f.client.backgroundTerminals(threadId);
+      const peer = Reflect.get(f.client, 'nativePeer') as CodexNativePeer;
+      expect(peer.kind).toBe('stdio');
+      expect(first.terminals).toEqual([{ itemId:'fixture-command', processId:'1234' }]);
+      expect(await f.client.backgroundTerminals(threadId)).toEqual(first);
+      expect(proof).toHaveBeenCalledOnce();
+
+      Reflect.set(f.client, 'nativePeer', { ...peer });
+      const unconfirmed = await f.client.backgroundTerminals(threadId);
+      expect(unconfirmed.serverId).toBe(first.serverId);
+      expect(unconfirmed.terminals).toEqual(first.terminals);
+      expect(unconfirmed).not.toHaveProperty('serverGeneration');
+
+      generation = 'b'.repeat(64);
+      const replacement = await f.client.backgroundTerminals(threadId, { verifyStableGeneration:true });
+      expect(replacement.serverId).toBe(first.serverId);
+      expect(replacement.serverGeneration).toBe(generation);
+      expect(replacement.terminals).toEqual(first.terminals);
+      expect(await f.client.backgroundTerminals(threadId)).toEqual(replacement);
+    } finally {
+      if (originalProof) proof.mockImplementation(originalProof);
+    }
   });
 
   it('withholds cancellation proof when the backend generation changes during the terminal-list RPC', async () => {
@@ -1544,7 +1821,7 @@ describe('Codex managed runtime', () => {
     cleanup.push(() => rm(home, { recursive: true, force: true }));
     const f = await managedFixture({ codexHome: home, terminals:true });
     await f.client.connect();
-    const first = await f.client.backgroundTerminals(threadId);
+    const first = await f.client.backgroundTerminals(threadId, { verifyStableGeneration:true });
     expect(first.serverId).toBe((await f.records())[0].pid);
     let proofFailure = 'preflight';
     if (process.platform === 'win32' && !first.serverGeneration) {
@@ -1587,14 +1864,14 @@ describe('Codex managed runtime', () => {
       await codexNativeGeneration(peer, first.serverId, home, { platform:'win32', run });
     }
     expect(first, `Windows native proof returned no generation (${proofFailure})`).toHaveProperty('serverGeneration', expect.stringMatching(/^[a-f0-9]{64}$/u));
-    expect(await f.client.backgroundTerminals(threadId)).toEqual(first);
+    expect(await f.client.backgroundTerminals(threadId, { verifyStableGeneration:true })).toEqual(first);
     await expect(f.client.terminateBackgroundTerminal(threadId, { serverId:first.serverId, serverGeneration:'0'.repeat(64), itemId:'fixture-command', processId:'1234' })).rejects.toMatchObject({ code:'terminal-identity-changed' });
     expect((await f.calls()).filter(call => call.method === 'thread/backgroundTerminals/terminate')).toHaveLength(0);
     await f.client.terminateBackgroundTerminal(threadId, { serverId:first.serverId, serverGeneration:first.serverGeneration, itemId:'fixture-command', processId:'1234' });
     expect((await f.calls()).filter(call => call.method === 'thread/backgroundTerminals/terminate').map(call => call.params)).toEqual([{ threadId, processId:'1234' }]);
     await f.client.close();
     await f.client.connect();
-    const replacement = await f.client.backgroundTerminals(threadId);
+    const replacement = await f.client.backgroundTerminals(threadId, { verifyStableGeneration:true });
     expect(replacement).toHaveProperty('serverGeneration', expect.stringMatching(/^[a-f0-9]{64}$/u));
     expect(replacement.serverId).not.toBe(first.serverId);
     expect(replacement).not.toHaveProperty('serverGeneration', Reflect.get(first, 'serverGeneration'));
@@ -1605,7 +1882,7 @@ describe('Codex managed runtime', () => {
     cleanup.push(() => rm(home, { recursive: true, force: true }));
     const f = await managedFixture({ codexHome: home, diagnosticPid: 'parent' });
     await f.client.connect();
-    expect(await f.client.backgroundTerminals(threadId)).not.toHaveProperty('serverGeneration');
+    expect(await f.client.backgroundTerminals(threadId, { verifyStableGeneration:true })).not.toHaveProperty('serverGeneration');
   });
 
   it('owns an NDJSON child, preserves the inherited profile and safely closes that process', async () => {

@@ -39,3 +39,8 @@ export function closeManagedFixture(
   ownedChildExited: () => boolean,
   timeoutMs?: number,
 ): Promise<ManagedCloseResult>;
+
+export function closeManagedBridgeInput(
+  lines: { close(): void },
+  input: { destroy(): unknown },
+): void;

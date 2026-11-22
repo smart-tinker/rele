@@ -6,7 +6,7 @@ import { copyFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import assert from 'node:assert/strict';
-import { closeManagedFixture, createManagedOperationTrace, waitManagedQueue } from './managed-probe-wait.mjs';
+import { closeManagedBridgeInput, closeManagedFixture, createManagedOperationTrace, waitManagedQueue } from './managed-probe-wait.mjs';
 import { CodexClient, CodexTransportError } from '../src/server/codex.js';
 import { CodexContextReceipts } from '../src/server/codex-context-receipts.js';
 import { Engine } from '../src/server/engine.js';
@@ -220,7 +220,7 @@ try {
     process.stdout.write(JSON.stringify({ action: command.action, ...(freshContext ? { freshContext } : {}), ...(oldPid ? { previousProcessId: oldPid } : {}), ...(await snapshot()) }) + '\n');
   }
 } finally {
-  lines.close();
+  closeManagedBridgeInput(lines, process.stdin);
   if (codex) {
     const stopped = await closeFixture();
     if (!stopped.ok) process.exitCode = 1;

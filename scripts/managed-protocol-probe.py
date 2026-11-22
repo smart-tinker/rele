@@ -15,6 +15,7 @@ import socket
 import tempfile
 import uuid
 from managed_probe_report import managed_wait_failure
+from managed_probe_bridge import wait_for_bridge_exit
 from aiohttp import web
 import websockets
 
@@ -22,7 +23,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 source = parser.add_mutually_exclusive_group(required=True)
 source.add_argument('--codex-prefix')
 source.add_argument('--codex', help='Native executable inside a complete extracted Codex package.')
-parser.add_argument('--expected-version', required=True, choices=['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1', '0.169.0-alpha.11.1'])
+parser.add_argument('--expected-version', required=True, choices=['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1', '0.169.0-alpha.11.1', '0.171.0-alpha.13'])
 parser.add_argument('--report', type=Path, required=True)
 args = parser.parse_args()
 binary = 'codex.exe' if os.name == 'nt' else 'codex'
@@ -312,7 +313,7 @@ stream_max_retries=0
         report['checks']['first_managed_model_request_contains_new_thread_passive_context'] = True
         stopped = await command('close', timeout=30)
         assert stopped['childExited'] and report['ownedChildExitConfirmed'] is True, stopped
-        await asyncio.wait_for(bridge.wait(), 15)
+        await wait_for_bridge_exit(bridge, 15)
         assert bridge.returncode == 0, errors
         report['checks']['shutdown_waits_for_owned_child_exit'] = True
         report['syntheticProviderRequests'] = len(records)
