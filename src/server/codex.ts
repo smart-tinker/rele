@@ -81,6 +81,13 @@ function isBindableThread(thread: RawThread): boolean {
   return !thread.ephemeral && !thread.parentThreadId
     && (thread.source === undefined || typeof thread.source === 'string' && THREAD_SOURCES.includes(thread.source));
 }
+interface NativeGenerationAttempt {
+  runtime: CodexRuntime;
+  peer: CodexNativePeer;
+  stdio: CodexStdioTransport;
+  controller: AbortController;
+  done: Promise<void>;
+}
 interface PendingCall {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
@@ -160,7 +167,7 @@ export class CodexClient extends EventEmitter {
   private runtime?: CodexRuntime;
   private nativePeer?: CodexNativePeer;
   private nativeGeneration?: { runtime: CodexRuntime; peer: CodexNativePeer; stdio: CodexStdioTransport; serverId: number; generation: string };
-  private nativeGenerationAttempt?: { runtime: CodexRuntime; peer: CodexNativePeer; stdio: CodexStdioTransport };
+  private nativeGenerationAttempt?: NativeGenerationAttempt;
   private contextReceipts = new CodexContextReceipts();
   private version?: string;
   private state: CodexConnectionState;
@@ -637,17 +644,27 @@ export class CodexClient extends EventEmitter {
     const runtime = this.runtime, peer = this.nativePeer, stdio = this.stdio;
     if (!runtime || peer?.kind !== 'stdio' || !stdio || stdio.pid !== peer.pid || !this.state.connected
       || this.nativeGeneration?.runtime === runtime && this.nativeGeneration.peer === peer && this.nativeGeneration.stdio === stdio
-      || this.nativeGenerationAttempt?.runtime === runtime && this.nativeGenerationAttempt.peer === peer && this.nativeGenerationAttempt.stdio === stdio) return;
-    this.nativeGenerationAttempt = { runtime, peer, stdio };
-    const current = () => runtime === this.runtime && peer === this.nativePeer && stdio === this.stdio && this.state.connected && stdio.pid === peer.pid;
-    void (async () => {
+      || this.nativeGenerationAttempt) return;
+    const attempt: NativeGenerationAttempt = { runtime, peer, stdio, controller: new AbortController(), done: Promise.resolve() };
+    this.nativeGenerationAttempt = attempt;
+    const current = () => !attempt.controller.signal.aborted && runtime === this.runtime && peer === this.nativePeer
+      && stdio === this.stdio && this.state.connected && stdio.pid === peer.pid;
+    attempt.done = (async () => {
       try {
         const diagnostic = await this.diagnostics(), serverId = diagnostic?.process?.id;
         if (!current() || typeof serverId !== 'number' || !Number.isSafeInteger(serverId) || serverId <= 1) return;
-        const generation = await codexNativeGeneration(peer, serverId, runtime.codexHome);
+        const generation = await codexNativeGeneration(peer, serverId, runtime.codexHome, { signal:attempt.controller.signal });
         if (generation && current()) this.nativeGeneration = { runtime, peer, stdio, serverId, generation };
       } catch { /* Missing startup proof leaves addressable cleanup fail-closed. */ }
+      finally { if (this.nativeGenerationAttempt === attempt) this.nativeGenerationAttempt = undefined; }
     })();
+  }
+
+  private abortNativeGenerationAttempt(): NativeGenerationAttempt | undefined {
+    const attempt = this.nativeGenerationAttempt;
+    this.nativeGenerationAttempt = undefined;
+    attempt?.controller.abort();
+    return attempt;
   }
 
   async terminateBackgroundTerminal(threadId: string, target: CodexTerminal & { serverId: number; serverGeneration?: string }): Promise<void> {
@@ -921,11 +938,11 @@ export class CodexClient extends EventEmitter {
 
   private async open(): Promise<void> {
     // Reconnect must not overlap two owned runtimes, even after an uncertain shutdown.
-    await this.cleanup;
+    const generationAttempt = this.abortNativeGenerationAttempt();
+    await Promise.all([this.cleanup, ...(generationAttempt ? [generationAttempt.done] : [])]);
     this.runtime = undefined;
     this.nativePeer = undefined;
     this.nativeGeneration = undefined;
-    this.nativeGenerationAttempt = undefined;
     this.version = undefined;
     this.setState({ connected: false, queueSupported: false, codexHome: undefined });
     let target: CodexConnectionTarget = { executable: this.config.executable, transport: this.config.transport, endpoint: this.config.endpoint ?? '', ...(this.config.codexHome ? { codexHome: this.config.codexHome } : {}) };
@@ -1231,6 +1248,7 @@ export class CodexClient extends EventEmitter {
   }
 
   private disconnect(message: string, errorCode?: string): Promise<void> {
+    const generationAttempt = this.abortNativeGenerationAttempt();
     clearTimeout(this.heartbeatTimer);
     this.heartbeatTimer = undefined;
     this.healthCheck = undefined;
@@ -1241,8 +1259,8 @@ export class CodexClient extends EventEmitter {
     this.proxy = undefined;
     const stdio = this.stdio;
     this.stdio = undefined;
-    if (stdio) {
-      this.cleanup = Promise.all([this.cleanup, stdio.close()]).then(() => {});
+    if (stdio || generationAttempt) {
+      this.cleanup = Promise.all([this.cleanup, ...(stdio ? [stdio.close()] : []), ...(generationAttempt ? [generationAttempt.done] : [])]).then(() => {});
       void this.cleanup.catch(error => {
         this.setState({ connected: false, queueSupported: false, error: this.safeMessage(error), errorCode: error instanceof CodexStdioError ? error.code : 'shutdown-timeout' });
       });
@@ -1251,7 +1269,6 @@ export class CodexClient extends EventEmitter {
     this.runtime = undefined;
     this.version = undefined;
     this.nativeGeneration = undefined;
-    this.nativeGenerationAttempt = undefined;
     this.contextReceipts.clear();
     this.serverRequests.clear();
     for (const waiter of this.closedWaiters.values()) waiter.reject(new CodexTransportError(message, errorCode));

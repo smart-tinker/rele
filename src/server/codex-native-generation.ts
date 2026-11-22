@@ -290,7 +290,8 @@ try {
 interface CommandResult { stdout: string; code: number | null }
 export interface CodexNativeGenerationOptions {
   platform?: NodeJS.Platform;
-  run?: (command: string, args: string[], timeoutMs?: number) => Promise<CommandResult>;
+  run?: (command: string, args: string[], timeoutMs?: number, signal?: AbortSignal) => Promise<CommandResult>;
+  signal?: AbortSignal;
   installationDirectory?: string;
   onProofFailure?: (failure: { stage: string; category: string; failureType: string }) => void;
 }
@@ -313,7 +314,9 @@ async function windowsGeneration(peer: Exclude<CodexNativePeer, { kind: 'proxy' 
     return undefined;
   };
   if (!windowsPath(home)) return fail('input', 'codex-home', 'invalid-contract');
-  const run = options.run ?? (async (command: string, args: string[], timeoutMs = 30_000) => ({ ...(await execute(command, args, { timeout: timeoutMs, maxBuffer: 128 * 1024, windowsHide: true })), code: 0 }));
+  const run = options.run ?? (async (command: string, args: string[], timeoutMs = 30_000, signal?: AbortSignal) => ({
+    ...(await execute(command, args, { timeout: timeoutMs, maxBuffer: 128 * 1024, windowsHide: true, signal })), code: 0,
+  }));
   const directory = options.installationDirectory ?? fileURLToPath(new URL('../../', import.meta.url));
   let receipt: any;
   if (peer.kind === 'stdio') {
@@ -331,8 +334,9 @@ async function windowsGeneration(peer: Exclude<CodexNativePeer, { kind: 'proxy' 
       return fail('peer-input', 'shared-peer', 'invalid-contract');
     }
     let status: CommandResult;
-    try { status = await run(path.win32.join(directory, 'Rele.exe'), ['codex-status', '--quiet', '--codex-home', home]); }
-    catch { return fail('status-probe', 'command-error', 'execution-error'); }
+    try { status = await run(path.win32.join(directory, 'Rele.exe'), ['codex-status', '--quiet', '--codex-home', home], undefined, options.signal); }
+    catch { if (options.signal?.aborted) return; return fail('status-probe', 'command-error', 'execution-error'); }
+    if (options.signal?.aborted) return;
     if (status.code !== 0) return fail('status-probe', 'nonzero-exit', 'execution-error');
     try { receipt = JSON.parse(status.stdout); }
     catch { return fail('status-probe', 'invalid-json', 'parse-error'); }
@@ -347,8 +351,9 @@ async function windowsGeneration(peer: Exclude<CodexNativePeer, { kind: 'proxy' 
   const source = WINDOWS_PROOF.replace('__INPUT__', input);
   const systemRoot = process.env.SystemRoot || 'C:\\Windows';
   let result: CommandResult;
-  try { result = await run(path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(source, 'utf16le').toString('base64')], 120_000); }
+  try { result = await run(path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(source, 'utf16le').toString('base64')], 120_000, options.signal); }
   catch (error) {
+    if (options.signal?.aborted) return;
     const stderr = (error as { stderr?: unknown })?.stderr;
     const failure = typeof stderr === 'string' && /^rele-native-proof:([a-z-]{1,64}):[^:\r\n]{1,96}:([A-Za-z]{1,64}):([A-Za-z0-9-]{1,64})$/mu.exec(stderr);
     if (failure) {
@@ -362,6 +367,7 @@ async function windowsGeneration(peer: Exclude<CodexNativePeer, { kind: 'proxy' 
     }
     return fail('powershell', 'unclassified-error', 'execution-error');
   }
+  if (options.signal?.aborted) return;
   if (result.code !== 0) return fail('powershell', 'nonzero-exit', 'execution-error');
   let proof: any;
   try { proof = JSON.parse(result.stdout); }
@@ -400,12 +406,13 @@ async function windowsGeneration(peer: Exclude<CodexNativePeer, { kind: 'proxy' 
 export async function codexNativeGeneration(peer: CodexNativePeer | undefined, serverId: number, codexHome: string, options: CodexNativeGenerationOptions = {}): Promise<string | undefined> {
   try {
     const platform = options.platform ?? process.platform;
-    if (!peer || !Number.isSafeInteger(serverId) || serverId <= 1) return;
+    if (options.signal?.aborted || !peer || !Number.isSafeInteger(serverId) || serverId <= 1) return;
     if (platform === 'win32' && peer.kind !== 'proxy') return await windowsGeneration(peer, serverId, codexHome, options);
     if (platform !== 'linux' || peer.kind === 'windows-shared'
       || !Number.isSafeInteger(peer.pid) || peer.pid <= 1) return;
     const home = await realpath(codexHome);
-    const result = await execute('/usr/bin/python3', ['-I', '-c', LINUX_PROOF, peer.kind, String(peer.pid), String(serverId), home, peer.kind === 'proxy' ? peer.endpoint : ''], { timeout: 5_000, maxBuffer: 16 * 1024, windowsHide: true });
+    const result = await execute('/usr/bin/python3', ['-I', '-c', LINUX_PROOF, peer.kind, String(peer.pid), String(serverId), home, peer.kind === 'proxy' ? peer.endpoint : ''], { timeout: 5_000, maxBuffer: 16 * 1024, windowsHide: true, signal: options.signal });
+    if (options.signal?.aborted) return;
     const proof = JSON.parse(result.stdout);
     if (proof?.pid !== serverId || proof.codexHome !== home || typeof proof.birth !== 'string' || !/^\d+$/u.test(proof.birth)
       || typeof proof.boot !== 'string' || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u.test(proof.boot)

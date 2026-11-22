@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { CodexClient } from '../src/server/codex.js';
+import type { CodexNativeGenerationOptions } from '../src/server/codex-native-generation.js';
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -30,6 +31,34 @@ it('matches filesystem aliases for an owned Windows stdio profile', async () => 
   const peer = { kind:'stdio' as const, pid:process.pid, executable, codexHome:aliasHome };
   const run = async () => ({ stdout:JSON.stringify(proof), code:0 });
   expect(await codexNativeGeneration(peer, process.pid, home, { platform:'win32', run })).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
+});
+
+it('passes cancellation to an in-flight Windows identity proof', async () => {
+  const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
+  const controller = new AbortController();
+  let proofStarted!: () => void, releaseProof: (() => void) | undefined, receivedSignal: AbortSignal | undefined;
+  const started = new Promise<void>(resolve => { proofStarted = resolve; });
+  const home = 'C:\\Users\\Owner\\fixture';
+  const peer = { kind:'stdio' as const, pid:process.pid, executable:'C:\\native\\codex.exe', codexHome:home };
+  const options = {
+    platform:'win32' as const, signal:controller.signal,
+    run: async (_command:string, _args:string[], _timeoutMs?:number, signal?:AbortSignal) => {
+      receivedSignal = signal;
+      proofStarted();
+      return new Promise<{ stdout:string; code:number | null }>(resolve => {
+        const finish = () => resolve({ stdout:'', code:1 });
+        releaseProof = finish;
+        if (signal?.aborted) finish();
+        else signal?.addEventListener('abort', finish, { once:true });
+      });
+    },
+  } satisfies CodexNativeGenerationOptions;
+  const proof = codexNativeGeneration(peer, process.pid, home, options);
+  await started;
+  controller.abort();
+  if (!receivedSignal) releaseProof?.();
+  await expect(proof).resolves.toBeUndefined();
+  expect(receivedSignal).toBe(controller.signal);
 });
 
 it('accepts a short executable alias only when Windows proof confirms matching bytes', async () => {

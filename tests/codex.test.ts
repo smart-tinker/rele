@@ -1595,6 +1595,41 @@ describe('Codex managed runtime', () => {
     }
   });
 
+  it('aborts and awaits a managed native generation proof when closing its child', async () => {
+    let proofStarted!: () => void, releaseProof: () => void = () => {}, settled = false;
+    const started = new Promise<void>(resolve => { proofStarted = resolve; });
+    const proof = vi.mocked(codexNativeGeneration), originalProof = proof.getMockImplementation();
+    proof.mockClear();
+    proof.mockImplementation(async (_peer, _serverId, _home, options) => {
+      proofStarted();
+      await new Promise<void>(resolve => {
+        releaseProof = resolve;
+        const signal = options && Reflect.get(options, 'signal') as AbortSignal | undefined;
+        signal?.addEventListener('abort', () => resolve(), { once:true });
+      });
+      settled = true;
+      return undefined;
+    });
+    const home = await mkdtemp(path.join(tmpdir(), 'Rele pending native proof '));
+    cleanup.push(() => rm(home, { recursive:true, force:true }));
+    const f = await managedFixture({ terminals:true, codexHome:home });
+    cleanup.push(() => f.client.close());
+    try {
+      await f.client.connect();
+      f.client.primeNativeGeneration();
+      await started;
+      await f.client.close();
+      const options = proof.mock.calls[0]?.[3];
+      const signal = options && Reflect.get(options, 'signal') as AbortSignal | undefined;
+      expect(signal).toBeInstanceOf(AbortSignal);
+      expect(signal?.aborted).toBe(true);
+      expect(settled).toBe(true);
+    } finally {
+      releaseProof();
+      if (originalProof) proof.mockImplementation(originalProof);
+    }
+  });
+
   it('carries only the confirmed generation of the same managed stdio peer into a fast terminal baseline', async () => {
     const home = await mkdtemp(path.join(tmpdir(), 'Rele stdio baseline identity '));
     cleanup.push(() => rm(home, { recursive:true, force:true }));
