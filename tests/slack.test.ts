@@ -251,14 +251,14 @@ describe('Slack message shortcut controls', () => {
       await new Promise(resolve => setTimeout(resolve, 3100));
       controlFinishedAt = Date.now();
       return view;
-    }, api: (method, body) => {
+    }, api: method => {
       if (method === 'views.open') {
         openAttempts++; openedAt ||= Date.now();
         return Date.now() - startedAt >= 3000 ? Response.json({ ok: false, error: 'trigger_expired' })
           : Response.json({ ok: true, view: { id: 'VMODAL', hash: openedHash } });
       }
       if (method === 'views.update') return Response.json({ ok: true, view: { id: 'VMODAL' } });
-      return api(method, body);
+      return api(method);
     } });
     startedAt = Date.now();
     f.socket.receive(shortcut('slow-native-snapshot'));
