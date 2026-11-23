@@ -233,7 +233,8 @@ describe('Slack message shortcut controls', () => {
     const targets: unknown[] = [];
     const f = await makeChannel({ control: async (context, command) => { targets.push({ context, command }); return view; }, api });
     f.socket.receive(shortcut('root')); f.socket.receive(shortcut('reply', '1000.1000'));
-    await vi.waitFor(() => expect(f.calls.filter(call => call.url.endsWith('/views.open'))).toHaveLength(2));
+    await vi.waitFor(() => expect(f.calls.filter(call => call.url.endsWith('/views.update'))).toHaveLength(2));
+    expect(f.calls.filter(call => call.url.endsWith('/views.open'))).toHaveLength(2);
     expect(targets).toMatchObject([{ context: { accountId: 'TEXAMPLE:UBOT', chatId: 'CEXAMPLE', threadId: '1000.1000', messageId: '1000.1000', senderIsBot: false }, command: { kind: 'open' } },
       { context: { threadId: '1000.1000', messageId: '1000.2000' } }]);
     expect(f.socket.sent.map(value => JSON.parse(value).envelope_id)).toEqual(['root', 'reply']);
@@ -241,6 +242,32 @@ describe('Slack message shortcut controls', () => {
     const modal = JSON.parse(String(f.calls.find(call => call.url.endsWith('/views.open'))!.init!.body)).view;
     expect(modal.callback_id).toBe('rele_source_control');
     expect(JSON.stringify(modal)).not.toContain('selected address, never a prompt');
+  });
+
+  it('opens the shortcut modal before a slow native snapshot outlives its trigger', async () => {
+    let startedAt = 0, openedAt = 0, controlFinishedAt = 0, openAttempts = 0;
+    const f = await makeChannel({ control: async () => {
+      await new Promise(resolve => setTimeout(resolve, 3100));
+      controlFinishedAt = Date.now();
+      return view;
+    }, api: (method, body) => {
+      if (method === 'views.open') {
+        openAttempts++; openedAt ||= Date.now();
+        return Date.now() - startedAt >= 3000 ? Response.json({ ok: false, error: 'trigger_expired' })
+          : Response.json({ ok: true, view: { id: 'VMODAL' } });
+      }
+      if (method === 'views.update') return Response.json({ ok: true, view: { id: 'VMODAL' } });
+      return api(method, body);
+    } });
+    startedAt = Date.now();
+    f.socket.receive(shortcut('slow-native-snapshot'));
+    await vi.waitFor(() => expect(controlFinishedAt).toBeGreaterThan(0), { timeout: 5000 });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(controlFinishedAt - startedAt).toBeGreaterThanOrEqual(3000);
+    expect(openedAt).toBeLessThan(controlFinishedAt);
+    expect(openAttempts).toBe(1);
+    expect(f.calls.filter(call => call.url.endsWith('/views.update'))).toHaveLength(1);
   });
 
   it('preserves the current effort when the model changes again', async () => {
@@ -251,8 +278,8 @@ describe('Slack message shortcut controls', () => {
     ] };
     const f = await makeChannel({ control: async () => modelView, api });
     f.socket.receive(shortcut('open'));
-    await vi.waitFor(() => expect(f.calls.some(call => call.url.endsWith('/views.open'))).toBe(true));
-    const opened = JSON.parse(String(f.calls.find(call => call.url.endsWith('/views.open'))!.init!.body)).view;
+    await vi.waitFor(() => expect(f.calls.some(call => call.url.endsWith('/views.update'))).toBe(true));
+    const opened = JSON.parse(String(f.calls.find(call => call.url.endsWith('/views.update'))!.init!.body)).view;
     const metadata = opened.private_metadata;
     const interaction = (id: string, hash: string, model: string, action: Record<string, unknown>, effort: string) => ({ envelope_id: id, type: 'interactive', payload: {
       type: 'block_actions', team: { id: 'TEXAMPLE' }, user: { id: 'UANNA' }, channel: { id: 'CEXAMPLE' }, message: { ts: '1000.1000' },
@@ -262,20 +289,20 @@ describe('Slack message shortcut controls', () => {
       } } }, actions: [action],
     } });
     f.socket.receive(interaction('model-two', 'hash-one', 'model-two', { action_id: 'model', selected_option: { value: 'model-two' } }, 'high'));
-    await vi.waitFor(() => expect(f.calls.filter(call => call.url.endsWith('/views.update'))).toHaveLength(1));
+    await vi.waitFor(() => expect(f.calls.filter(call => call.url.endsWith('/views.update'))).toHaveLength(2));
     // Selecting effort does not dispatch a Slack block action. It is included in the next model action's current view state.
     f.socket.receive(interaction('model-three', 'hash-two', 'model-three', { action_id: 'model', selected_option: { value: 'model-three' } }, 'xhigh'));
-    await vi.waitFor(() => expect(f.calls.filter(call => call.url.endsWith('/views.update'))).toHaveLength(2));
+    await vi.waitFor(() => expect(f.calls.filter(call => call.url.endsWith('/views.update'))).toHaveLength(3));
 
-    const updated = JSON.parse(String(f.calls.filter(call => call.url.endsWith('/views.update'))[1]!.init!.body)).view;
+    const updated = JSON.parse(String(f.calls.filter(call => call.url.endsWith('/views.update'))[2]!.init!.body)).view;
     expect(updated.blocks.find((block: { block_id?: string }) => block.block_id === 'model')?.element?.initial_option?.value).toBe('model-three');
     expect(updated.blocks.find((block: { block_id?: string }) => block.block_id === 'effort')?.element?.initial_option?.value).toBe('xhigh');
   });
 
   it('does not replace a newer control modal after Slack rejects a stale view hash', async () => {
-    let currentHash = 'newer-hash', currentView: unknown = { newerSelection: true };
+    let currentHash = 'initial-hash', currentView: unknown = { loading: true };
     const f = await makeChannel({ control: async () => view, api: (method, body) => {
-      if (method === 'views.open') return Response.json({ ok: true, view: { id: 'VMODAL' } });
+      if (method === 'views.open') return Response.json({ ok: true, view: { id: 'VMODAL', hash: currentHash } });
       if (method === 'views.update') {
         if (body.hash && body.hash !== currentHash) return Response.json({ ok: false, error: 'hash_conflict' });
         currentView = body.view; currentHash = 'next-hash'; return Response.json({ ok: true, view: { id: 'VMODAL' } });
@@ -283,12 +310,13 @@ describe('Slack message shortcut controls', () => {
       return api(method);
     } });
     f.socket.receive(shortcut('open'));
-    await vi.waitFor(() => expect(f.calls.some(call => call.url.endsWith('/views.open'))).toBe(true));
-    const modal = JSON.parse(String(f.calls.find(call => call.url.endsWith('/views.open'))!.init!.body)).view;
+    await vi.waitFor(() => expect(f.calls.filter(call => call.url.endsWith('/views.update'))).toHaveLength(1));
+    const modal = JSON.parse(String(f.calls.find(call => call.url.endsWith('/views.update'))!.init!.body)).view;
+    currentHash = 'newer-hash'; currentView = { newerSelection: true };
     f.socket.receive({ envelope_id: 'stale-action', type: 'interactive', payload: { type: 'block_actions', team: { id: 'TEXAMPLE' }, user: { id: 'UANNA' },
       channel: { id: 'CEXAMPLE' }, message: { ts: '1000.1000' }, view: { id: 'VMODAL', callback_id: 'rele_source_control', hash: 'stale-hash',
         private_metadata: modal.private_metadata, state: { values: {} } }, actions: [{ action_id: 'action', selected_option: { value: 'status' } }] } });
-    await vi.waitFor(() => expect(f.calls.filter(call => call.url.endsWith('/views.update'))).toHaveLength(2));
+    await vi.waitFor(() => expect(f.calls.filter(call => call.url.endsWith('/views.update'))).toHaveLength(3));
 
     expect(currentView).toEqual({ newerSelection: true });
   });
@@ -296,8 +324,8 @@ describe('Slack message shortcut controls', () => {
   it('does not expose raw diagnostics in a control error modal', async () => {
     const f = await makeChannel({ control: async () => { throw new Error('failed at /home/dadgo/.config/codex/token.json'); }, api });
     f.socket.receive(shortcut('raw-error'));
-    await vi.waitFor(() => expect(f.calls.some(call => call.url.endsWith('/views.open'))).toBe(true));
-    const modal = JSON.parse(String(f.calls.find(call => call.url.endsWith('/views.open'))!.init!.body)).view;
+    await vi.waitFor(() => expect(f.calls.some(call => call.url.endsWith('/views.update'))).toBe(true));
+    const modal = JSON.parse(String(f.calls.find(call => call.url.endsWith('/views.update'))!.init!.body)).view;
     expect(JSON.stringify(modal)).not.toContain('/home/dadgo');
     expect(JSON.stringify(modal)).toContain('Не удалось открыть управление Rele.');
   });
@@ -309,13 +337,13 @@ describe('Slack message shortcut controls', () => {
       return view;
     }, api });
     f.socket.receive(shortcut('open'));
-    await vi.waitFor(() => expect(f.calls.some(call => call.url.endsWith('/views.open'))).toBe(true));
-    metadata = JSON.parse(String(f.calls.find(call => call.url.endsWith('/views.open'))!.init!.body)).view.private_metadata;
+    await vi.waitFor(() => expect(f.calls.filter(call => call.url.endsWith('/views.update'))).toHaveLength(1));
+    metadata = JSON.parse(String(f.calls.find(call => call.url.endsWith('/views.update'))!.init!.body)).view.private_metadata;
     f.socket.receive({ envelope_id: 'submit', type: 'interactive', payload: { type: 'view_submission', team: { id: 'TEXAMPLE' }, user: { id: 'UANNA' }, view: {
       id: 'VMODAL', callback_id: 'rele_source_control', private_metadata: metadata, state: { values: { operation: { action: { selected_option: { value: 'status' } } } } } }, } });
-    await vi.waitFor(() => expect(f.calls.some(call => call.url.endsWith('/views.update'))).toBe(true));
+    await vi.waitFor(() => expect(f.calls.filter(call => call.url.endsWith('/views.update'))).toHaveLength(2));
     expect(JSON.parse(f.socket.sent.find(value => JSON.parse(value).envelope_id === 'submit')!).payload.response_action).toBe('update');
-    const update = String(f.calls.find(call => call.url.endsWith('/views.update'))!.init!.body);
+    const update = String(f.calls.filter(call => call.url.endsWith('/views.update'))[1]!.init!.body);
     expect(update).toContain('Операция не подтверждена. Проверьте Статус');
     expect(update).not.toContain('/home/dadgo');
     expect(f.message).not.toHaveBeenCalled();

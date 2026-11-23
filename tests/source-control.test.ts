@@ -165,6 +165,14 @@ describe('personal Slack source controls', () => {
     await expect(f.controls.open(context)).rejects.toThrow();
   });
 
+  it('submits Status without a native mutation or a new request', async () => {
+    const f = fixture(), form = await f.controls.open(context);
+    const result = await f.controls.submit(context, form.id, { action: 'status' });
+    expect(result.snapshot).toMatchObject({ model: 'model-one', runtimeStatus: 'idle' });
+    expect(f.mutations).toEqual([]);
+    expect(f.store.listRequests()).toEqual([]);
+  });
+
   it('does not show a settled Goal from the previous conversation after a source rebind', async () => {
     const f = fixture(), form = await f.controls.open(context);
     await f.controls.submit(context, form.id, { action: 'goal', objective: 'Finish old work', criterion: 'Done' });
