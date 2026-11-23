@@ -1518,7 +1518,7 @@ describe('Codex managed runtime', () => {
     expect(proof).not.toHaveBeenCalled();
   });
 
-  it('refuses Stop when managed stdio reuses its PID after an unproven fast baseline', async () => {
+  it('refuses Stop when managed stdio replaces its backend with the same PID after an unproven fast baseline', async () => {
     let generation = 'a'.repeat(64), releaseProof!: () => void;
     const heldProof = new Promise<void>(resolve => { releaseProof = resolve; });
     const proof = vi.mocked(codexNativeGeneration), originalProof = proof.getMockImplementation();
@@ -1572,6 +1572,10 @@ describe('Codex managed runtime', () => {
       expect(baseline.terminals).toEqual([{ itemId:'fixture-command', processId:'1234' }]);
       expect(baseline).not.toHaveProperty('serverGeneration');
 
+      const replacementPeer = { ...peer };
+      expect(Reflect.set(f.client, 'nativePeer', replacementPeer)).toBe(true);
+      expect(replacementPeer).not.toBe(peer);
+      expect(replacementPeer.pid).toBe(peer.pid);
       store.updateRequest(request.id, { status:'running', turnId:'managed-turn' });
       await f.setTerminals([{ itemId:'replacement-command', processId:'5678' }]);
       generation = 'b'.repeat(64);
@@ -1579,9 +1583,11 @@ describe('Codex managed runtime', () => {
       const replacement = await f.client.backgroundTerminals(threadId);
       expect(replacement).toMatchObject({ serverId:baseline.serverId,
         terminals:[{ itemId:'replacement-command', processId:'5678' }] });
-      expect(Reflect.get(f.client, 'nativePeer')).toBe(peer);
+      expect(replacement.serverId).toBe(baseline.serverId);
+      expect(replacement).not.toHaveProperty('serverGeneration');
+      expect(Reflect.get(f.client, 'nativePeer')).toBe(replacementPeer);
       expect(Reflect.get(f.client, 'stdio')).toBe(transport);
-      expect(transport?.pid).toBe(peer.pid);
+      expect(transport?.pid).toBe(replacementPeer.pid);
 
       const outcome = await engine.cancel(request.id).then(() => 'completed', () => 'rejected');
       expect(terminate).not.toHaveBeenCalled();
