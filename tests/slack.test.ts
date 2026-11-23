@@ -245,6 +245,7 @@ describe('Slack message shortcut controls', () => {
   });
 
   it('opens the shortcut modal before a slow native snapshot outlives its trigger', async () => {
+    const openedHash = 'shortcut-open-hash';
     let startedAt = 0, openedAt = 0, controlFinishedAt = 0, openAttempts = 0;
     const f = await makeChannel({ control: async () => {
       await new Promise(resolve => setTimeout(resolve, 3100));
@@ -254,7 +255,7 @@ describe('Slack message shortcut controls', () => {
       if (method === 'views.open') {
         openAttempts++; openedAt ||= Date.now();
         return Date.now() - startedAt >= 3000 ? Response.json({ ok: false, error: 'trigger_expired' })
-          : Response.json({ ok: true, view: { id: 'VMODAL' } });
+          : Response.json({ ok: true, view: { id: 'VMODAL', hash: openedHash } });
       }
       if (method === 'views.update') return Response.json({ ok: true, view: { id: 'VMODAL' } });
       return api(method, body);
@@ -268,6 +269,7 @@ describe('Slack message shortcut controls', () => {
     expect(openedAt).toBeLessThan(controlFinishedAt);
     expect(openAttempts).toBe(1);
     expect(f.calls.filter(call => call.url.endsWith('/views.update'))).toHaveLength(1);
+    expect(JSON.parse(String(f.calls.find(call => call.url.endsWith('/views.update'))!.init!.body))).toMatchObject({ view_id: 'VMODAL', hash: openedHash });
   });
 
   it('preserves the current effort when the model changes again', async () => {
