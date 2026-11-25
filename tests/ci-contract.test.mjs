@@ -964,3 +964,12 @@ test('fixture cleanup skips a reused host PID and still drains its exact Task', 
  assert.match(cleanup,/if \(\$task\.State -notin @\(1,3\) -or \$task\.GetInstances\(0\)\.Count -ne 0\) \{ throw/u,
   'cleanup must retain the fixture if its exact Task still has an instance');
 });
+
+test('Slack controls guide keeps current Goal write restrictions explicit', async () => {
+ const guide = await readFile(new URL('../docs/SLACK-CONTROLS.md', import.meta.url), 'utf8');
+ assert.match(guide,/Создание и остановка целей из Slack отключены во всех режимах/u);
+ assert.match(guide,/https:\/\/github\.com\/openai\/codex\/issues\/63955/u);
+ assert.doesNotMatch(guide,/Запуск поддерживается в общем подключении/u);
+ assert.doesNotMatch(guide,/чтение\/приостановка существующей цели остаются доступны/u);
+ assert.doesNotMatch(guide,/Остановка сохраняет native `paused`/u);
+});
