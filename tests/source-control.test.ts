@@ -188,11 +188,12 @@ describe('personal Slack source controls', () => {
       f.goal = null;
       const create = await engine.control(context, { kind: 'open' });
       const goalView = await engine.control(context, { kind: 'preview', id: create.id, action: 'goal' });
-      expect(goalView.goalWriteUnavailable).toContain('поддерживаемые версии Codex');
+      expect(goalView.snapshot?.goal).toBeNull();
+      const refusalReason = 'поддерживаемые версии Codex не связывают запись цели с состоянием, показанным в Slack';
       const refusedCreate = await engine.control(context, { kind: 'submit', id: create.id, input });
-      expect(refusedCreate.message).toContain(goalView.goalWriteUnavailable);
+      expect(refusedCreate.message).toContain(refusalReason);
       expect(f.mutations).toEqual([]);
-      expect(f.goal?.objective).toContain('Previously accepted');
+      expect(f.goal).toBeNull();
 
       const shown = { threadId: 'native-thread', objective: 'Goal shown in Slack', status: 'active' as const, tokenBudget: null,
         tokensUsed: 0, timeUsedSeconds: 0, createdAt: 100, updatedAt: 100 };
@@ -203,7 +204,7 @@ describe('personal Slack source controls', () => {
       const replacement = { ...shown, objective: 'Goal changed in Desktop', createdAt: 101, updatedAt: 101 };
       f.goal = replacement;
       const refusedStop = await engine.control(context, { kind: 'submit', id: stopForm.id, input: { action: 'stop' } });
-      expect(refusedStop.message).toContain(goalView.goalWriteUnavailable);
+      expect(refusedStop.message).toContain(refusalReason);
       expect(f.goal).toEqual(replacement);
       expect(f.mutations).toEqual([]);
       expect(f.store.listRequests()).toEqual([]);
