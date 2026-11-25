@@ -639,6 +639,34 @@ test('the current signed Desktop backend is covered by every supported Codex pro
   assert.ok(source.includes(version),`${file} must test the current signed Desktop backend`);
  }
 });
+test('supported Codex versions stay aligned across the Windows canary projections',async()=>{
+ const runtime=await readFile(new URL('../src/shared/codex-runtime.ts',import.meta.url),'utf8');
+ const primary=runtime.match(/export const SUPPORTED_CODEX_VERSION = '([^']+)'/u)?.[1];
+ const entries=runtime.match(/SUPPORTED_CODEX_VERSIONS: readonly string\\[\\] = \\[SUPPORTED_CODEX_VERSION, ([^\\]]+)\\]/u)?.[1];
+ assert.ok(primary&&entries,'read the exact supported version policy');
+ const versions=[primary,...Array.from(entries.matchAll(/'([^']+)'/gu),match=>match[1])];
+ const listed=text=>Array.from(text.matchAll(/'([^']+)'/gu),match=>match[1]);
+ for(const [file,pattern] of [
+  ['../scripts/protocol-probe.py',/parser\\.add_argument\\('--expected-version'[\\s\\S]*?choices=(\\[[^\\]]+\\])/u],
+  ['../scripts/managed-protocol-probe.py',/parser\\.add_argument\\('--expected-version'[\\s\\S]*?choices=(\\[[^\\]]+\\])/u],
+  ['../scripts/shared-protocol-probe.py',/^VERSIONS = (\\[[^\\]]+\\])/mu],
+ ]) {
+  const source=await readFile(new URL(file,import.meta.url),'utf8');
+  const values=source.match(pattern)?.[1];
+  assert.ok(values,`${file} must declare an exact version list`);
+  assert.deepEqual(listed(values),versions,`${file} must match the supported version policy`);
+ }
+ const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ const canonical=canary.match(/^\\$script:CodexVersions = @\\(([^)]*)\\)$/mu)?.[1];
+ assert.ok(canonical,'use one canonical Windows canary version list');
+ assert.deepEqual(listed(canonical),versions,'the Windows canary must match the supported version policy');
+ assert.match(canary,/\\$versions = \\$script:CodexVersions/u,'gate selection must use the canonical list');
+ assert.match(canary,/\\$marker\\.prefixes = @\\(\\$script:CodexVersions \\| ForEach-Object \\{ Join-Path \\$env:RUNNER_TEMP \\('codex-probe-' \\+ \\$_\\) \\}\\)/u,'ACL-provisioned native prefixes must project the canonical list');
+ assert.match(canary,/\\$script:SharedReportNames = @\\(\\$script:CodexVersions \\| ForEach-Object \\{ 'shared-results-' \\+ \\$_ \\+ '\\\\.json' \\}\\) \\+ @\\('shared-results-actual-desktop\\.json'\\)/u,'report forwarding must project the canonical list');
+ assert.equal((canary.match(/foreach \\(\\$name in \\$script:SharedReportNames\\)/gu)??[]).length,1);
+ assert.match(canary,/\\$installerReports = @\\('installer-results\\.json', 'installer-failure-results\\.json', 'installer-native-cleanup-results\\.json'\\)/u);
+ assert.match(canary,/foreach \\(\\$name in \\(\\$installerReports \\+ \\$script:SharedReportNames\\)\\)/u,'cleanup must forward every supported-version report');
+});
 test('signed Desktop fixture defines complete inert MCP transports for its enable overrides', async()=>{
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
  const start=probe.indexOf("scenario_config += f'''");
