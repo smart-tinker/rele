@@ -11,7 +11,7 @@ function context(value) {
  return `/repos/${value.repository}`;
 }
 function body(candidate, verified=false) {
- const notes=candidate.version==='0.1.1-rc.20'?`\nRC20 source notes: https://github.com/${candidate.repository}/blob/${candidate.commit}/docs/RC20.md`:'';
+ const notes=candidate.version==='0.1.1-rc.20'?`\nRC20 source notes: https://github.com/${candidate.repository}/blob/${candidate.commit}/docs/0.1.1-rc.20.md`:'';
  return `Rele candidate ${candidate.commit}; run ${candidate.runId}; attempt ${candidate.attempt}. Verification ${verified?'passed':'pending'}.${notes}\nReal Desktop and messenger acceptance is still required.`;
 }
 async function currentMain(api, candidate) {

@@ -40,7 +40,7 @@ async function releaseBackend(root) {
 test('draft body links RC notes to the candidate version and commit',()=>fixture(async root=>{
  const {prepareCandidate}=await import('../scripts/ci-publish.mjs');
  const f=await releaseBackend(root), rc=await prepareCandidate(f.api,{...candidate,version:'0.1.1-rc.20'});
- assert.ok(rc.body.includes(`https://github.com/owner/repo/blob/${sha}/docs/RC20.md`));
+ assert.ok(rc.body.includes(`https://github.com/owner/repo/blob/${sha}/docs/0.1.1-rc.20.md`));
  assert.ok(rc.body.includes(`Rele candidate ${sha}; run ${run}; attempt ${attempt}.`));
 }));
 test('missing, skipped and failed required steps cannot pass', () => {

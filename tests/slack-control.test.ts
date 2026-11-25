@@ -35,24 +35,24 @@ it('does not call a non-null thread/read model configured when its origin is unk
   expect(status).not.toMatch(/Настроенная|Сохранённая|Унаследованная|по умолчанию/u);
 });
 
-it('keeps Goal reads visible but disables create and stop controls when writes are unsafe', () => {
-  const goal = { threadId: 'native', objective: 'Goal from the current snapshot', status: 'active' as const, tokenBudget: null,
+const goal = { threadId: 'native', objective: 'Goal from the current snapshot', status: 'active' as const, tokenBudget: null,
     tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 };
-  const modal = (action: 'goal' | 'stop', currentGoal: typeof goal | null) => controlModal({
+const modal = (action: 'goal' | 'stop', currentGoal: typeof goal | null) => controlModal({
     id: '12345678-1234-1234-1234-123456789abc', sourceTitle: 'Synthetic thread', conversationTitle: 'Synthetic Codex', nativeThreadId: 'native',
     action, connected: true, ownQueued: 0, ownRunning: 0, boundSources: 1, goalWriteUnavailable,
     snapshot: { model: 'fixture-model', effort: 'high', runtimeStatus: 'idle', queued: 0, goalSupported: true, goal: currentGoal },
   } as Parameters<typeof controlModal>[0], context);
 
+it('disables unsafe Slack Goal creation and explains the missing native binding', () => {
   const create = modal('goal', null);
   expect(create).not.toHaveProperty('submit');
   expect((create.blocks as { type: string; block_id?: string }[]).filter(block => block.type === 'input').map(block => block.block_id)).toEqual(['operation']);
   expect(JSON.stringify(create)).toContain(goalWriteUnavailable);
+});
 
-  for (const action of ['goal', 'stop'] as const) {
-    const view = modal(action, goal);
-    expect(view).not.toHaveProperty('submit');
-    expect(JSON.stringify(view)).toContain(goal.objective);
-    expect(JSON.stringify(view)).toContain(goalWriteUnavailable);
-  }
+it('keeps Goal reads visible and disables unsafe Slack pause', () => {
+  const view = modal('stop', goal);
+  expect(view).not.toHaveProperty('submit');
+  expect(JSON.stringify(view)).toContain(goal.objective);
+  expect(JSON.stringify(view)).toContain(goalWriteUnavailable);
 });

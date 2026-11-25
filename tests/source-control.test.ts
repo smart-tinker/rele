@@ -173,16 +173,19 @@ describe('personal Slack source controls', () => {
     expect(f.store.listRequests()).toEqual([]);
   });
 
-  it('blocks Goal and Stop at the Engine submit boundary while preserving reads and prior outcomes', async () => {
+  it('blocks a new Goal at the Engine submit boundary and preserves prior outcomes', async () => {
     const f = fixture(), native = Object.assign(new EventEmitter(), f.native);
     const engine = new Engine(f.store, native as unknown as CodexGateway, { config: () => ({ ...defaultConfig, slack: { enabled: true } }), temporaryRoot: tmpdir(), redact: f.options.redact });
     engine.channels.slack = f.options.channel() as unknown as Channel;
     try {
-      const prior = await f.controls.open(context), input = { action: 'goal' as const, objective: 'Previously accepted', criterion: 'Done' };
-      await f.controls.submit(context, prior.id, input);
-      f.mutations.splice(0);
+      const input = { action: 'goal' as const, objective: 'Previously accepted', criterion: 'Done' };
+      const prior = await engine.control(context, { kind: 'open' });
+      const key = `source-control:${prior.id}`;
+      const receipt = JSON.parse(f.store.getMeta(key)!);
+      receipt.state = 'applied'; receipt.input = input; receipt.message = 'Native цель создана ранее.';
+      f.store.setMeta(key, JSON.stringify(receipt));
       const replay = await engine.control(context, { kind: 'submit', id: prior.id, input });
-      expect(replay.message).toContain('Native цель создана');
+      expect(replay.message).toContain('создана ранее');
       expect(f.mutations).toEqual([]);
 
       f.goal = null;
@@ -191,22 +194,31 @@ describe('personal Slack source controls', () => {
       expect(goalView.snapshot?.goal).toBeNull();
       const refusalReason = 'поддерживаемые версии Codex не связывают запись цели с состоянием, показанным в Slack';
       const refusedCreate = await engine.control(context, { kind: 'submit', id: create.id, input });
-      expect(refusedCreate.message).toContain(refusalReason);
       expect(f.mutations).toEqual([]);
       expect(f.goal).toBeNull();
+      expect(refusedCreate.message).toContain(refusalReason);
+      expect(f.store.listRequests()).toEqual([]);
+    } finally { await engine.stop(); }
+  });
 
-      const shown = { threadId: 'native-thread', objective: 'Goal shown in Slack', status: 'active' as const, tokenBudget: null,
-        tokensUsed: 0, timeUsedSeconds: 0, createdAt: 100, updatedAt: 100 };
+  it('does not pause a Goal that replaced the one shown in Slack', async () => {
+    const f = fixture(), native = Object.assign(new EventEmitter(), f.native);
+    const engine = new Engine(f.store, native as unknown as CodexGateway, { config: () => ({ ...defaultConfig, slack: { enabled: true } }), temporaryRoot: tmpdir(), redact: f.options.redact });
+    engine.channels.slack = f.options.channel() as unknown as Channel;
+    const shown = { threadId: 'native-thread', objective: 'Goal shown in Slack', status: 'active' as const, tokenBudget: null,
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 100, updatedAt: 100 };
+    const replacement = { ...shown, objective: 'Goal changed in Desktop', createdAt: 101, updatedAt: 101 };
+    const refusalReason = 'поддерживаемые версии Codex не связывают запись цели с состоянием, показанным в Slack';
+    try {
       f.goal = shown;
       const stopForm = await engine.control(context, { kind: 'open' });
       const stopView = await engine.control(context, { kind: 'preview', id: stopForm.id, action: 'stop' });
       expect(stopView.snapshot?.goal).toEqual(shown);
-      const replacement = { ...shown, objective: 'Goal changed in Desktop', createdAt: 101, updatedAt: 101 };
       f.goal = replacement;
       const refusedStop = await engine.control(context, { kind: 'submit', id: stopForm.id, input: { action: 'stop' } });
-      expect(refusedStop.message).toContain(refusalReason);
-      expect(f.goal).toEqual(replacement);
       expect(f.mutations).toEqual([]);
+      expect(f.goal).toEqual(replacement);
+      expect(refusedStop.message).toContain(refusalReason);
       expect(f.store.listRequests()).toEqual([]);
     } finally { await engine.stop(); }
   });
