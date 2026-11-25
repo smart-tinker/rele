@@ -165,7 +165,7 @@ if ($packages.Count -ne 1 -or $packages[0].Version.ToString() -ne $env:RELE_CI_D
                 $evidence.gates += 'shared-actual-desktop'
                 $evidence.actualDesktopGui = $false
             }
-            $versions = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1', '0.169.0-alpha.11.1', '0.171.0-alpha.13')
+            $versions = @('0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1', '0.169.0-alpha.11.1', '0.171.0-alpha.13', '0.171.0-alpha.13.2')
             for ($index = 0; $index -lt $versions.Count; $index++) {
                 $version = $versions[$index]; $evidence.stage = 'shared-' + $version
                 Write-Output ('RELE_CI_STAGE=' + $evidence.stage)
@@ -567,7 +567,7 @@ try {
     # A timeout can end Python before its retainedFixture JSON is written. The
     # matching successful child receipt is the only destructive-cleanup permit.
     if ($installerChildStarted -and -not $installerCleanupConfirmed) { $retainedSharedFixtures += $FixtureRoot }
-    foreach ($name in @('shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json', 'shared-results-0.163.0-alpha.11.2.json', 'shared-results-0.164.0-alpha.11.1.json', 'shared-results-0.165.0-alpha.1.2.json', 'shared-results-0.166.0-alpha.5.1.json', 'shared-results-0.166.0-alpha.6.json', 'shared-results-0.167.0-alpha.3.2.json', 'shared-results-0.167.0-alpha.4.1.json', 'shared-results-0.169.0-alpha.11.1.json', 'shared-results-0.171.0-alpha.13.json', 'shared-results-actual-desktop.json')) {
+    foreach ($name in @('shared-results-0.163.0.json', 'shared-results-0.163.0-alpha.10.2.json', 'shared-results-0.163.0-alpha.11.json', 'shared-results-0.163.0-alpha.11.2.json', 'shared-results-0.164.0-alpha.11.1.json', 'shared-results-0.165.0-alpha.1.2.json', 'shared-results-0.166.0-alpha.5.1.json', 'shared-results-0.166.0-alpha.6.json', 'shared-results-0.167.0-alpha.3.2.json', 'shared-results-0.167.0-alpha.4.1.json', 'shared-results-0.169.0-alpha.11.1.json', 'shared-results-0.171.0-alpha.13.json', 'shared-results-0.171.0-alpha.13.2.json', 'shared-results-actual-desktop.json')) {
         $reportPath = Join-Path $FixtureRoot ('reports\' + $name)
         if (Test-Path -LiteralPath $reportPath -PathType Leaf) {
             $reportTimer = [Diagnostics.Stopwatch]::StartNew()
