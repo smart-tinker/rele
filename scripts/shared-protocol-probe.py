@@ -63,7 +63,7 @@ def safe_engine_driver_stage(value):
                               'windows-package-preparation', 'windows-package-verification',
                               'windows-version-command', 'windows-owner-start', 'windows-owner-receipt',
                               'windows-owner-executable', 'windows-socket-verification',
-                              'engine-close-request', 'engine-close-ack') else None
+                              'engine-close-request', 'engine-close-ack', 'engine-close-process-exit') else None
 
 
 def safe_failure_location(error):
@@ -428,7 +428,10 @@ class EngineDriver:
                             'ingest', 'wait', 'answer', 'resume', 'cancel', 'snapshot', 'findRequest'):
                         raise RuntimeError('Shared Engine driver returned an invalid close response')
                 assert result.get('backendAlive'), 'Closing Rele stopped the shared native backend'
+                self.startup_stage = 'engine-close-process-exit'
                 await asyncio.wait_for(self.process.wait(), 15)
+                if self.process.returncode == 0:
+                    self.startup_stage = 'engine-close-ack'
             except Exception as error:
                 error.engine_driver_stage = self.startup_stage
                 raise
