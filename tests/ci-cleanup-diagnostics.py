@@ -8,7 +8,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PROBE = ROOT / 'scripts/shared-protocol-probe.py'
-HELPERS = {'safe_error_type', 'safe_failure_code', 'safe_engine_driver_stage', 'record_cleanup_error', 'cleanup_failure_message', 'public_console_report', 'EngineDriver'}
+HELPERS = {'safe_error_type', 'safe_failure_code', 'safe_engine_driver_stage', 'safe_engine_driver_diagnostic', 'safe_failure_location', 'public_failure_location', 'record_cleanup_error', 'cleanup_failure_message', 'public_console_report', 'EngineDriver'}
 
 
 def load_helpers(test):
@@ -16,34 +16,57 @@ def load_helpers(test):
     functions = [node for node in module.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in HELPERS]
     missing = HELPERS - {function.name for function in functions}
     test.assertEqual(missing, set(), f'missing testable cleanup diagnostics: {sorted(missing)}')
-    namespace = {'re': re, 'json': json, 'time': time, 'asyncio': asyncio, 'ENGINE_READ_TIMEOUT_SECONDS': 1}
+    namespace = {'Path': pathlib.Path, '__file__': str(PROBE), 're': re, 'json': json, 'time': time, 'asyncio': asyncio, 'ENGINE_READ_TIMEOUT_SECONDS': 1}
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(PROBE), 'exec'), namespace)
     return namespace
 
 
-class FakeEngineProcess:
-    def __init__(self, response=None, timeout_on_wait=False):
-        self.stdout = asyncio.StreamReader()
-        if response:
-            self.stdout.feed_data(response)
-        self.stdin = self
-        self.returncode = None
-        self.timeout_on_wait = timeout_on_wait
-
-    def write(self, value):
-        pass
-
-    async def drain(self):
-        pass
-
-    async def wait(self):
-        if self.timeout_on_wait:
-            raise TimeoutError()
-        self.returncode = 0
-        return 0
-
-
 class CleanupDiagnostics(unittest.TestCase):
+    def test_failure_location_reports_only_probe_function_and_line(self):
+        helpers = load_helpers(self)
+
+        class Stdin:
+            def write(self, value):
+                return None
+
+            async def drain(self):
+                return None
+
+        class Process:
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data(b'{"stopped":true}\n')
+                self.stdin = Stdin()
+                self.returncode = None
+
+        async def close():
+            try:
+                await helpers['EngineDriver'](Process()).close()
+            except (RuntimeError, AssertionError) as error:
+                location = helpers['safe_failure_location'](error)
+            else:
+                self.fail('EngineDriver.close must reject the incomplete close acknowledgement')
+            self.assertEqual(location['function'], 'close')
+            self.assertIsInstance(location['line'], int)
+            self.assertGreater(location['line'], 0)
+            errors = []
+            await helpers['record_cleanup_error'](
+                errors, 'engine.close', 'engine-driver-process', helpers['EngineDriver'](Process()).close, 101, 202)
+            report = helpers['public_console_report']({
+                'result': 'failed',
+                'failureLocation': {**location, 'path': 'C:\\private\\runner'},
+                'cleanupErrors': errors,
+                'exception': 'C:\\private\\runner and synthetic conversation',
+            })
+            self.assertEqual(report['failureLocation'], location)
+            self.assertEqual(report['cleanupErrors'][0]['failureLocation']['function'], 'close')
+            self.assertIsInstance(report['cleanupErrors'][0]['failureLocation']['line'], int)
+            self.assertNotIn('private', json.dumps(report))
+            self.assertNotIn('synthetic conversation', json.dumps(report))
+            self.assertNotIn(str(PROBE.parent), json.dumps(report))
+
+        asyncio.run(close())
+
     def test_engine_eof_preserves_only_the_driver_exit_code(self):
         helpers = load_helpers(self)
 
@@ -58,6 +81,46 @@ class CleanupDiagnostics(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, '^Shared Engine driver exited before responding$') as raised:
                 await driver.read()
             self.assertEqual(getattr(raised.exception, 'engine_driver_exit_code', None), 23)
+
+        asyncio.run(read_eof())
+
+    def test_startup_eof_reports_only_allowlisted_connect_and_candidate_diagnostics(self):
+        helpers = load_helpers(self)
+
+        class Process:
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data((
+                    '{"probeStage":"codex-connect"}\n'
+                    '{"probeDiagnostic":{"kind":"codex-connect-error","errorClass":"SharedCodexError","errorCode":"shared-cli-unavailable","message":"private failure"}}\n'
+                    '{"probeDiagnostic":{"kind":"windows-desktop-candidates","candidates":[{"source":"desktop-install","version":"0.166.0-alpha.6","result":"candidate-resolution-failed","path":"C:\\\\private","message":"private failure"},{"source":"private-host","version":"C:\\\\private","result":"private result"}]}}\n'
+                ).encode())
+                self.stdout.feed_eof()
+                self.returncode = 1
+
+        async def read_eof():
+            driver = helpers['EngineDriver'](Process())
+            with self.assertRaises(RuntimeError) as raised:
+                await driver.read()
+            report = helpers['public_console_report']({
+                'result': 'failed',
+                'failureType': 'RuntimeError',
+                'failureCode': 'engine-driver-exited-before-response',
+                'engineDriverStage': getattr(raised.exception, 'engine_driver_stage', None),
+                'engineDriverDiagnostics': getattr(raised.exception, 'engine_driver_diagnostics', []),
+                'exception': 'private failure',
+                'stderrTail': ['C:\\\\private and private failure'],
+            })
+            self.assertEqual(report['engineDriverStage'], 'codex-connect')
+            self.assertEqual(report['engineDriverDiagnostics'], [
+                {'kind': 'codex-connect-error', 'errorClass': 'SharedCodexError', 'errorCode': 'shared-cli-unavailable'},
+                {'kind': 'windows-desktop-candidates', 'candidates': [
+                    {'source': 'desktop-install', 'version': '0.166.0-alpha.6', 'result': 'candidate-resolution-failed'},
+                ]},
+            ])
+            serialized = json.dumps(report)
+            for private in ('private failure', 'private-host', 'C:\\\\private', 'message', 'path', 'exception', 'stderrTail'):
+                self.assertNotIn(private, serialized)
 
         asyncio.run(read_eof())
 
@@ -133,36 +196,6 @@ class CleanupDiagnostics(unittest.TestCase):
 
         asyncio.run(read_ready())
 
-    def test_engine_close_response_timeout_has_a_safe_phase(self):
-        helpers = load_helpers(self)
-
-        async def close():
-            driver = helpers['EngineDriver'](FakeEngineProcess())
-            with self.assertRaises(TimeoutError) as raised:
-                await driver.close()
-            self.assertEqual(getattr(raised.exception, 'engine_driver_stage', None), 'engine-close-response')
-
-        asyncio.run(close())
-
-    def test_engine_close_process_exit_timeout_has_a_safe_phase(self):
-        helpers = load_helpers(self)
-
-        async def close():
-            driver = helpers['EngineDriver'](FakeEngineProcess(b'{"backendAlive":true}\n', timeout_on_wait=True))
-            with self.assertRaises(TimeoutError) as raised:
-                await driver.close()
-            self.assertEqual(getattr(raised.exception, 'engine_driver_stage', None), 'engine-close-process-exit')
-
-        asyncio.run(close())
-
-    def test_engine_close_succeeds_when_process_exits_cleanly(self):
-        helpers = load_helpers(self)
-
-        async def close():
-            await helpers['EngineDriver'](FakeEngineProcess(b'{"backendAlive":true}\n')).close()
-
-        asyncio.run(close())
-
     def test_failure_code_only_maps_known_static_native_failures(self):
         helpers = load_helpers(self)
         self.assertEqual(
@@ -185,11 +218,11 @@ class CleanupDiagnostics(unittest.TestCase):
         self.assertEqual(helpers['safe_engine_driver_stage']('native-diagnostics'), 'native-diagnostics')
         self.assertEqual(helpers['safe_engine_driver_stage']('shared-codex-resolution'), 'shared-codex-resolution')
         self.assertEqual(helpers['safe_engine_driver_stage']('shared-codex-resolved'), 'shared-codex-resolved')
-        self.assertEqual(helpers['safe_engine_driver_stage']('engine-close-response'), 'engine-close-response')
-        self.assertEqual(helpers['safe_engine_driver_stage']('engine-close-process-exit'), 'engine-close-process-exit')
         self.assertIsNone(helpers['safe_engine_driver_stage']('codex-websocket-open'))
         self.assertEqual(helpers['safe_engine_driver_stage']('windows-owner-start'), 'windows-owner-start')
         self.assertEqual(helpers['safe_engine_driver_stage']('windows-socket-verification'), 'windows-socket-verification')
+        self.assertEqual(helpers['safe_engine_driver_stage']('engine-close-request'), 'engine-close-request')
+        self.assertEqual(helpers['safe_engine_driver_stage']('engine-close-ack'), 'engine-close-ack')
         self.assertIsNone(helpers['safe_engine_driver_stage']('C:\\private\\runner'))
 
     def test_successful_cleanup_leaves_no_error(self):
@@ -202,6 +235,7 @@ class CleanupDiagnostics(unittest.TestCase):
         asyncio.run(helpers['record_cleanup_error'](errors, 'engine.close', 'engine-driver-process', close, 101, 202))
         self.assertEqual(errors, [])
         self.assertIsNone(helpers['cleanup_failure_message'](None, errors))
+        self.assertIsNone(helpers['cleanup_failure_message'](TimeoutError('primary failure'), errors))
 
     def test_failed_cleanup_records_bounded_category_and_process_metadata(self):
         helpers = load_helpers(self)
@@ -222,7 +256,7 @@ class CleanupDiagnostics(unittest.TestCase):
         self.assertNotIn('private', json.dumps(errors))
         self.assertNotIn('synthetic conversation', json.dumps(errors))
         self.assertEqual(helpers['cleanup_failure_message'](None, errors), 'Isolated fixture cleanup failed: engine.close')
-        self.assertIsNone(helpers['cleanup_failure_message'](ValueError('primary failure'), errors))
+        self.assertIsNone(helpers['cleanup_failure_message'](TimeoutError('primary failure'), errors))
 
     def test_engine_close_cleanup_preserves_allowlisted_driver_failure_diagnostics(self):
         helpers = load_helpers(self)
@@ -249,6 +283,293 @@ class CleanupDiagnostics(unittest.TestCase):
         self.assertEqual(report['cleanupErrors'][0]['engineDriverStage'], 'native-diagnostics')
         self.assertNotIn('processPid', json.dumps(report))
         self.assertNotIn('ownerPid', json.dumps(report))
+
+    def test_engine_close_ignores_a_late_wait_response_before_the_close_ack(self):
+        helpers = load_helpers(self)
+
+        class Stdin:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, value):
+                self.writes.append(value)
+
+            async def drain(self):
+                return None
+
+        class Process:
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data(
+                    b'{"action":"wait","done":true}\n'
+                    b'{"action":"close","stopped":true,"runtimeProcessId":123,"backendAlive":true}\n'
+                )
+                self.stdin = Stdin()
+                self.returncode = None
+
+            async def wait(self):
+                self.returncode = 0
+                return self.returncode
+
+        async def close():
+            process = Process()
+            await helpers['EngineDriver'](process).close()
+            self.assertEqual(len(process.stdin.writes), 1)
+            self.assertEqual(json.loads(process.stdin.writes[0]), {'action': 'close'})
+            self.assertEqual(process.returncode, 0)
+
+        asyncio.run(close())
+
+    def test_engine_close_read_timeout_preserves_the_safe_close_stage(self):
+        helpers = load_helpers(self)
+
+        class Stdout:
+            def __init__(self):
+                self.first = True
+
+            async def readline(self):
+                if self.first:
+                    self.first = False
+                    return b'{"action":"snapshot"}\n'
+                raise TimeoutError()
+
+        class Stdin:
+            def write(self, value):
+                return None
+
+            async def drain(self):
+                return None
+
+        class Process:
+            def __init__(self):
+                self.stdout = Stdout()
+                self.stdin = Stdin()
+                self.returncode = None
+
+        async def close():
+            with self.assertRaises(TimeoutError) as raised:
+                await helpers['EngineDriver'](Process()).close()
+            self.assertEqual(getattr(raised.exception, 'engine_driver_stage', None), 'engine-close-request')
+
+        asyncio.run(close())
+
+    def test_read_timeout_then_close_ack_failure_preserves_primary_and_records_cleanup(self):
+        helpers = load_helpers(self)
+        helpers['ENGINE_READ_TIMEOUT_SECONDS'] = .01
+
+        class Stdout:
+            def __init__(self):
+                self.first = True
+
+            async def readline(self):
+                if self.first:
+                    self.first = False
+                    await asyncio.sleep(.02)
+                return b'{"action":"close","stopped":false,"backendAlive":true}\n'
+
+        class Stdin:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, value):
+                self.writes.append(value)
+
+            async def drain(self):
+                return None
+
+        class Process:
+            def __init__(self):
+                self.stdout = Stdout()
+                self.stdin = Stdin()
+                self.returncode = None
+                self.wait_calls = 0
+
+            async def wait(self):
+                self.wait_calls += 1
+                self.returncode = 0
+                return self.returncode
+
+        async def run():
+            process = Process()
+            driver = helpers['EngineDriver'](process)
+            try:
+                await driver.read(.01)
+            except TimeoutError as error:
+                primary = error
+                primary_location = helpers['safe_failure_location'](error)
+            else:
+                self.fail('the primary read timeout must occur before cleanup')
+
+            errors = []
+            await helpers['record_cleanup_error'](
+                errors, 'engine.close', 'engine-driver-process', driver.close, 101, 202)
+
+            self.assertIs(type(primary), TimeoutError)
+            self.assertEqual(primary_location['function'], 'read')
+            self.assertEqual(len(errors), 1)
+            cleanup = errors[0]
+            self.assertEqual(cleanup['operation'], 'engine.close')
+            self.assertEqual(cleanup['resource'], 'engine-driver-process')
+            self.assertEqual(cleanup['engineDriverStage'], 'engine-close-ack')
+            self.assertEqual(cleanup['failureLocation']['function'], 'close')
+            self.assertGreaterEqual(cleanup['elapsedMs'], 0)
+            self.assertLessEqual(cleanup['elapsedMs'], 600000)
+            self.assertEqual((cleanup['processPid'], cleanup['ownerPid']), (101, 202))
+            self.assertIsNone(helpers['cleanup_failure_message'](primary, errors))
+            self.assertEqual(
+                helpers['cleanup_failure_message'](None, errors),
+                'Isolated fixture cleanup failed: engine.close',
+            )
+            self.assertEqual([json.loads(value)['action'] for value in process.stdin.writes], ['close'])
+            self.assertEqual(process.wait_calls, 0)
+
+            report = helpers['public_console_report']({
+                'result': 'failed',
+                'failureType': type(primary).__name__,
+                'failureLocation': primary_location,
+                'cleanupErrors': errors,
+            })
+            self.assertEqual(report['failureType'], 'TimeoutError')
+            self.assertEqual(report['failureLocation']['function'], 'read')
+            self.assertEqual(report['cleanupErrors'][0]['engineDriverStage'], 'engine-close-ack')
+            self.assertNotIn('processPid', json.dumps(report))
+            self.assertNotIn('ownerPid', json.dumps(report))
+
+        asyncio.run(run())
+
+    def test_valid_engine_close_ack_then_process_exit_timeout_has_safe_phase(self):
+        helpers = load_helpers(self)
+
+        class Stdin:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, value):
+                self.writes.append(value)
+
+            async def drain(self):
+                return None
+
+        class Process:
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data(b'{"action":"close","stopped":true,"backendAlive":true}\n')
+                self.stdin = Stdin()
+                self.returncode = None
+                self.wait_calls = 0
+
+            async def wait(self):
+                self.wait_calls += 1
+                raise TimeoutError('private process wait detail')
+
+        async def run():
+            process = Process()
+            driver = helpers['EngineDriver'](process)
+            errors = []
+            await helpers['record_cleanup_error'](
+                errors, 'engine.close', 'engine-driver-process', driver.close, 101, 202)
+
+            self.assertEqual([json.loads(value)['action'] for value in process.stdin.writes], ['close'])
+            self.assertEqual(process.wait_calls, 1)
+            self.assertIsNone(process.returncode)
+            self.assertEqual(len(errors), 1)
+            cleanup = errors[0]
+            self.assertEqual(cleanup['errorType'], 'TimeoutError')
+            self.assertEqual(cleanup['engineDriverStage'], 'engine-close-process-exit')
+            self.assertLessEqual(cleanup['elapsedMs'], 600000)
+            self.assertEqual((cleanup['processPid'], cleanup['ownerPid']), (101, 202))
+            primary = RuntimeError('synthetic primary failure')
+            self.assertIsNone(helpers['cleanup_failure_message'](primary, errors))
+            report = helpers['public_console_report']({'result': 'failed', 'cleanupErrors': errors})
+            self.assertEqual(report['cleanupErrors'][0]['engineDriverStage'], 'engine-close-process-exit')
+            serialized = json.dumps(report)
+            for private in ('processPid', 'ownerPid', 'private process wait detail', 'synthetic primary failure'):
+                self.assertNotIn(private, serialized)
+
+        asyncio.run(run())
+
+    def test_engine_close_fails_closed_without_a_close_ack(self):
+        helpers = load_helpers(self)
+
+        class Stdin:
+            def write(self, value):
+                return None
+
+            async def drain(self):
+                return None
+
+        class Process:
+            def __init__(self, response):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data((json.dumps(response) + '\n').encode())
+                self.stdin = Stdin()
+                self.returncode = None
+                self.wait_calls = 0
+
+            async def wait(self):
+                self.wait_calls += 1
+                self.returncode = 0
+                return self.returncode
+
+        async def close():
+            for response in (
+                {'stopped': True, 'backendAlive': True},
+                {'action': 'close', 'stopped': False, 'backendAlive': True},
+                {'action': 'close', 'stopped': True, 'backendAlive': 'unknown'},
+            ):
+                with self.subTest(response=response):
+                    process = Process(response)
+                    with self.assertRaisesRegex(RuntimeError, 'invalid close response') as raised:
+                        await helpers['EngineDriver'](process).close()
+                    expected_stage = 'engine-close-ack' if response.get('action') == 'close' else 'engine-close-request'
+                    self.assertEqual(raised.exception.engine_driver_stage, expected_stage)
+                    self.assertEqual(process.wait_calls, 0)
+
+        asyncio.run(close())
+
+    def test_engine_close_bounds_total_wait_while_stale_replies_continue(self):
+        helpers = load_helpers(self)
+        helpers['ENGINE_READ_TIMEOUT_SECONDS'] = .01
+
+        class Stdout:
+            def __init__(self):
+                self.read_count = 0
+
+            async def readline(self):
+                self.read_count += 1
+                await asyncio.sleep(.001)
+                if self.read_count < 100:
+                    return b'{"action":"snapshot"}\n'
+                return b'{"action":"close","stopped":true,"backendAlive":true}\n'
+
+        class Stdin:
+            def write(self, _value):
+                return None
+
+            async def drain(self):
+                return None
+
+        class Process:
+            def __init__(self):
+                self.stdout = Stdout()
+                self.stdin = Stdin()
+                self.returncode = None
+                self.wait_calls = 0
+
+            async def wait(self):
+                self.wait_calls += 1
+                self.returncode = 0
+                return self.returncode
+
+        async def close():
+            process = Process()
+            with self.assertRaises(TimeoutError) as raised:
+                await helpers['EngineDriver'](process).close()
+            self.assertEqual(raised.exception.engine_driver_stage, 'engine-close-request')
+            self.assertLess(process.stdout.read_count, 100)
+            self.assertEqual(process.wait_calls, 0)
+
+        asyncio.run(close())
 
     def test_console_report_exposes_only_bounded_allowlisted_fields(self):
         helpers = load_helpers(self)
@@ -302,6 +623,128 @@ class CleanupDiagnostics(unittest.TestCase):
         report['failureCode'] = 'private path and conversation text'
         self.assertNotIn('failureCode', helpers['public_console_report'](report))
 
+    def test_starting_cancel_native_lookup_uses_exact_event_request(self):
+        module = ast.parse(PROBE.read_text(encoding='utf-8'))
+        function = next(node for node in ast.walk(module)
+                        if isinstance(node, ast.AsyncFunctionDef) and node.name == 'held_request_evidence')
+        scope = {'asyncio': asyncio, 'records': [], 'provider_trace': [], 'actions': []}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(PROBE), 'exec'), scope)
+        held_request_evidence = scope['held_request_evidence']
+
+        class Engine:
+            def __init__(self, requests):
+                self.requests = requests
+                self.calls = []
+
+            async def command(self, action, **fields):
+                self.calls.append((action, fields))
+                if action == 'snapshot':
+                    return {'requests': self.requests, 'approvals': []}
+                if action == 'findRequest':
+                    if fields != {'requestId': 'cancel-request', 'eventId': 'cancel'}:
+                        raise AssertionError('native lookup did not use the exact cancel request')
+                    return {'nativeRequest': {
+                        'state': 'not_found', 'turnAssigned': False, 'queuedSubmissionFound': False,
+                        'mixed': False, 'finalAnswerPresent': False, 'requestId': 'private-id',
+                        'text': 'private fixture content',
+                    }}
+                raise AssertionError(f'unexpected engine command: {action}')
+
+        class Peer:
+            events = []
+
+            async def call(self, method, params):
+                return {'thread': {'status': {'type': 'idle'}}}
+
+        async def read(requests):
+            engine = Engine(requests)
+            evidence = await held_request_evidence(engine, Peer(), 'fixture-thread', event_id='cancel')
+            return evidence, engine.calls
+
+        requests = [
+            {'id': 'cancel-request', 'eventId': 'cancel', 'status': 'starting', 'turnId': None},
+            {'id': 'following-request', 'eventId': 'after-shell-cancel', 'status': 'queued', 'turnId': None},
+        ]
+        evidence, calls = asyncio.run(read(requests))
+        self.assertEqual(calls, [('snapshot', {}), ('findRequest', {'requestId': 'cancel-request', 'eventId': 'cancel'})])
+        self.assertEqual(evidence['nativeRequest'], {
+            'state': 'not_found', 'turnAssigned': False, 'queuedSubmissionFound': False,
+            'mixed': False, 'finalAnswerPresent': False,
+        })
+        self.assertNotIn('private-id', json.dumps(evidence))
+        self.assertNotIn('private fixture content', json.dumps(evidence))
+
+        duplicated = requests + [{'id': 'duplicate-cancel', 'eventId': 'cancel', 'status': 'starting', 'turnId': None}]
+        evidence, calls = asyncio.run(read(duplicated))
+        self.assertEqual(calls, [('snapshot', {})])
+        self.assertNotIn('nativeRequest', evidence)
+
+    def test_stale_cancel_queue_snapshot_is_drained_before_close_ack(self):
+        helpers = load_helpers(self)
+
+        class Stdin:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, value):
+                self.writes.append(value)
+
+            async def drain(self):
+                return None
+
+        class Stdout:
+            def __init__(self):
+                self.first = True
+                self.responses = [
+                    b'{"action":"snapshot","requests":[{"id":"cancel-request","eventId":"cancel","status":"starting","turnId":null},{"id":"following-request","eventId":"after-shell-cancel","status":"queued","turnId":null}],"approvals":[]}\n',
+                    b'{"action":"close","stopped":true,"backendAlive":true}\n',
+                ]
+                self.read_actions = []
+                self.read_requests = []
+
+            async def readline(self):
+                if self.first:
+                    self.first = False
+                    raise TimeoutError()
+                response = self.responses.pop(0)
+                value = json.loads(response)
+                self.read_actions.append(value['action'])
+                self.read_requests.extend(value.get('requests', []))
+                return response
+
+        class Process:
+            def __init__(self):
+                self.stdout = Stdout()
+                self.stdin = Stdin()
+                self.returncode = None
+
+            async def wait(self):
+                self.returncode = 0
+                return self.returncode
+
+        async def close_after_snapshot_timeout():
+            process = Process()
+            driver = helpers['EngineDriver'](process)
+            with self.assertRaises(TimeoutError) as primary:
+                await driver.command('snapshot')
+
+            errors = []
+            await helpers['record_cleanup_error'](
+                errors, 'engine.close', 'engine-driver-process', driver.close)
+
+            self.assertEqual(errors, [])
+            self.assertIs(type(primary.exception), TimeoutError)
+            self.assertEqual(process.stdout.read_actions, ['snapshot', 'close'])
+            self.assertEqual([json.loads(value)['action'] for value in process.stdin.writes], ['snapshot', 'close'])
+            self.assertEqual([(row['id'], row['eventId'], row['status']) for row in process.stdout.read_requests], [
+                ('cancel-request', 'cancel', 'starting'),
+                ('following-request', 'after-shell-cancel', 'queued'),
+            ])
+            self.assertIsNone(helpers['cleanup_failure_message'](primary.exception, errors))
+            self.assertEqual(driver.startup_stage, 'engine-close-ack')
+            self.assertEqual(process.returncode, 0)
+
+        asyncio.run(close_after_snapshot_timeout())
 
 if __name__ == '__main__':
     unittest.main()

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { summarizeSharedNativeRequest, summarizeSharedWaitFailure } from './shared-probe-diagnostics.mjs';
+import { lookupSharedNativeRequest, summarizeSharedNativeRequest, summarizeSharedWaitFailure, summarizeSharedConnectFailure } from './shared-probe-diagnostics.mjs';
 import { ConfigStore, defaultConfig, defaultDataDirectory } from '../src/server/config.js';
 import { CodexClient as SourceCodexClient, type CodexServerRequest } from '../src/server/codex.js';
 import { Engine as SourceEngine } from '../src/server/engine.js';
@@ -189,7 +189,12 @@ if (values['expect-error']) {
       }
     };
     emitProbeStage('codex-connect');
-    await codex.connect();
+    try { await codex.connect(); } catch (error) {
+      if (reportStartupStages && process.platform === 'win32' && process.env.RELE_CI_SHARED_DIAGNOSTICS === '1') {
+        process.stdout.write(JSON.stringify({ probeDiagnostic: summarizeSharedConnectFailure(error) }) + '\n');
+      }
+      throw error;
+    }
     // Snapshot polling would evict the dispatch stages from this bounded trace.
     codex.subscribe = observe('subscribe', traceReconciliationStage('subscribe', codex.subscribe.bind(codex)));
     codex.releaseThread = observe('releaseThread', traceReconciliationStage('releaseThread', codex.releaseThread.bind(codex)));
@@ -402,6 +407,17 @@ if (values['expect-error']) {
           throw new Error(`Shared requests did not reach expected state: ${JSON.stringify(evidence)}`);
         }
         await engine!.pump(); await engine!.settled();
+      } else if (command.action === 'findRequest') {
+        const lookup = lookupSharedNativeRequest(codex!, threadId!, store.listRequests(), command.requestId!, command.eventId!).then(
+          nativeRequest => ({ nativeRequest }), error => ({ error }));
+        const native = await Promise.race([lookup, delay(5000).then(() => ({ timeout: true as const }))]);
+        if ('nativeRequest' in native) process.stdout.write(JSON.stringify({ action: command.action, ...(native.nativeRequest ? { nativeRequest: native.nativeRequest } : {}) }) + '\n');
+        else if ('error' in native) {
+          const errorType = native.error instanceof Error ? native.error.name : 'UnknownError';
+          const nativeRequestErrorType = ['ConnectionResetError', 'CodexTransportError', 'CodexRpcError', 'Error', 'UnknownError'].includes(errorType) ? errorType : 'other';
+          process.stdout.write(JSON.stringify({ action: command.action, nativeRequestErrorType }) + '\n');
+        } else process.stdout.write(JSON.stringify({ action: command.action, nativeRequestTimedOut: true }) + '\n');
+        continue;
       } else if (command.action === 'answer') {
         if (command.decision !== undefined && !['accept', 'decline'].includes(command.decision)) throw new Error('Invalid fixture approval decision');
         await engine!.resolveApproval(command.approvalId!, command.decision ?? 'decline');
@@ -434,7 +450,7 @@ if (values['expect-error']) {
       } else if (command.action === 'close') {
         const pid = (await codex!.diagnostics()).process.id;
         await engine!.stop(); await codex!.close();
-        process.stdout.write(JSON.stringify({ stopped: true, runtimeProcessId: pid, backendAlive: alive(pid) }) + '\n');
+        process.stdout.write(JSON.stringify({ action: command.action, stopped: true, runtimeProcessId: pid, backendAlive: alive(pid) }) + '\n');
         break;
       } else if (command.action !== 'snapshot') throw new Error('Unknown shared fixture command');
       process.stdout.write(JSON.stringify({ action: command.action, ...(await snapshot(command.processId)) }) + '\n');

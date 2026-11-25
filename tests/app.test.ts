@@ -123,6 +123,34 @@ function makeApp() {
   return { app, store, config, engine, codex, configure, endpoint, shutdown, discovery, desktopIntegration, codexUpdate, replaceCodex: () => { currentCodex = { ...codex }; } };
 }
 
+describe('request rate limits', () => {
+  it('limits unauthenticated API traffic before authorization work', async () => {
+    const f = makeApp();
+    for (let i = 0; i < 600; i++)
+      expect((await f.app.inject({ url: '/api/codex/update' })).statusCode).toBe(401);
+    const response = await f.app.inject({ url: '/api/codex/update' });
+    expect(response.statusCode).toBe(429);
+    expect(response.headers['retry-after']).toBeDefined();
+    expect(f.codexUpdate.status).not.toHaveBeenCalled();
+  });
+
+  it('limits local desktop-status reads and Codex reconnect attempts', async () => {
+    const f = makeApp();
+    for (let i = 0; i < 60; i++)
+      expect((await f.app.inject({ url: '/api/codex/desktop-integration', headers })).statusCode).toBe(200);
+    expect((await f.app.inject({ url: '/api/codex/desktop-integration', headers })).statusCode).toBe(429);
+    expect(f.desktopIntegration.status).toHaveBeenCalledTimes(60);
+
+    const g = makeApp();
+    for (let i = 0; i < 5; i++)
+      expect((await g.app.inject({ url: '/api/codex/connect', method: 'POST', headers })).statusCode).toBe(200);
+    const response = await g.app.inject({ url: '/api/codex/connect', method: 'POST', headers });
+    expect(response.statusCode).toBe(429);
+    expect(response.headers['retry-after']).toBeDefined();
+    expect(g.codex.connect).toHaveBeenCalledTimes(5);
+  });
+});
+
 describe('shared Codex update', () => {
   it('requires panel authorization and rejects executable paths supplied by the caller', async () => {
     const f = makeApp();

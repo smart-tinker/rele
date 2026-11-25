@@ -17,7 +17,17 @@ it.each(['notLoaded', 'idle'])('reports missing model and effort as unknown when
     action: 'status', connected: true, ownQueued: 0, ownRunning: 0, boundSources: 1,
     snapshot: { model: null, effort: null, runtimeStatus, queued: 0, goalSupported: false, goal: null } },
   { accountId: 'TTEST:UBOT', chatId: 'CTEST', threadId: '1000.1', messageId: '1000.2', senderId: 'UALICE', senderName: 'Alice', senderIsBot: false });
-  const status = (modal.blocks as { type: string; text?: { text: string } }[]).find(row => row.type === 'section' && row.text?.text.includes('модель:'))!.text!.text;
-  expect(status).toContain('модель: неизвестна; глубина: неизвестна.');
+  const status = (modal.blocks as { type: string; text?: { text: string } }[]).find(row => row.type === 'section' && row.text?.text.toLowerCase().includes('модель:'))!.text!.text;
+  expect(status).toContain('Модель: неизвестна; глубина: неизвестна.');
   expect(status).not.toMatch(/унаследована|по умолчанию/u);
+});
+
+it('does not call a non-null thread/read model configured when its origin is unknown', () => {
+  const modal = controlModal({ id: '12345678-1234-1234-1234-123456789abc', sourceTitle: 'Synthetic thread', conversationTitle: 'Synthetic Codex', nativeThreadId: 'native',
+    action: 'status', connected: true, ownQueued: 0, ownRunning: 0, boundSources: 1,
+    snapshot: { model: 'fixture-model', effort: 'high', runtimeStatus: 'idle', queued: 0, goalSupported: false, goal: null } },
+  { accountId: 'TTEST:UBOT', chatId: 'CTEST', threadId: '1000.1', messageId: '1000.2', senderId: 'UALICE', senderName: 'Alice', senderIsBot: false });
+  const status = (modal.blocks as { type: string; text?: { text: string } }[]).find(row => row.type === 'section' && row.text?.text.toLowerCase().includes('модель:'))!.text!.text;
+  expect(status).toContain('Модель: fixture-model; глубина: high. Происхождение значений не подтверждено.');
+  expect(status).not.toMatch(/Настроенная|Сохранённая|Унаследованная|по умолчанию/u);
 });

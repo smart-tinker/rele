@@ -26,7 +26,7 @@ flowchart TD
 
 | Режим | Runner-ы на событие | Что выполняется |
 |---|---|---|
-| Draft PR | 2 matrix + 1 CodeQL + 1 dependency review; затем CI gate на Ubuntu | npm ci, типы, контракт CI, unit, build, Chromium E2E, production UI/API smoke; независимые security checks |
+| Draft PR | 2 matrix + 1 CodeQL + 1 dependency review; затем CI gate на Ubuntu | npm ci, Python cleanup diagnostics, типы, контракт CI, unit, build, Chromium E2E, production UI/API smoke; независимые security checks |
 | Ready PR | те же, до 4 одновременно | Всё выше + сборка пакетов, установка/удаление, protocol и managed для всех поддерживаемых версий Codex, native Goal lifecycle на последней поддерживаемой версии, CPU voice |
 | `main` | 2 matrix + 1 CodeQL; затем CI gate на Ubuntu | Полный набор проверок и CodeQL |
 | Ручной dispatch с `release: false` | 2 matrix, затем CI gate на Ubuntu | Полный набор без передачи пакетов и публикации |
@@ -44,10 +44,10 @@ Dependabot отдельно открывает еженедельные PR дл�
 
 `CI gate` завершается ошибкой, если хотя бы одна ОС выбранной matrix не прошла;
 невыбранный release/обычный caller обязан быть `skipped`. Он не агрегирует CodeQL
-и dependency review. Активный ruleset защищает `main` от удаления и force-push,
-требует разрешения review threads и успешный `CI gate` от GitHub Actions на
-актуальной ветке (проверено 2026-11-12). Security workflows добавлены; включение их
-в required checks после интеграции отслеживается в issue #8.
+и dependency review: это отдельные обязательные checks. Активный ruleset защищает
+`main` от удаления и force-push, требует разрешения review threads и успешных
+`CI gate`, `CodeQL` и `Dependency review` от GitHub Actions на актуальной ветке
+(сверено с GitHub 2026-11-14).
 
 Версии Codex берутся из `SUPPORTED_CODEX_VERSIONS`, отдельного списка в YAML нет.
 Фикстуры используют изолированные профили и подменённый model endpoint; реальные

@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { CodexClient } from '../src/server/codex.js';
+import type { CodexNativeGenerationOptions } from '../src/server/codex-native-generation.js';
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -30,6 +31,34 @@ it('matches filesystem aliases for an owned Windows stdio profile', async () => 
   const peer = { kind:'stdio' as const, pid:process.pid, executable, codexHome:aliasHome };
   const run = async () => ({ stdout:JSON.stringify(proof), code:0 });
   expect(await codexNativeGeneration(peer, process.pid, home, { platform:'win32', run })).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
+});
+
+it('passes cancellation to an in-flight Windows identity proof', async () => {
+  const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
+  const controller = new AbortController();
+  let proofStarted!: () => void, releaseProof: (() => void) | undefined, receivedSignal: AbortSignal | undefined;
+  const started = new Promise<void>(resolve => { proofStarted = resolve; });
+  const home = 'C:\\Users\\Owner\\fixture';
+  const peer = { kind:'stdio' as const, pid:process.pid, executable:'C:\\native\\codex.exe', codexHome:home };
+  const options = {
+    platform:'win32' as const, signal:controller.signal,
+    run: async (_command:string, _args:string[], _timeoutMs?:number, signal?:AbortSignal) => {
+      receivedSignal = signal;
+      proofStarted();
+      return new Promise<{ stdout:string; code:number | null }>(resolve => {
+        const finish = () => resolve({ stdout:'', code:1 });
+        releaseProof = finish;
+        if (signal?.aborted) finish();
+        else signal?.addEventListener('abort', finish, { once:true });
+      });
+    },
+  } satisfies CodexNativeGenerationOptions;
+  const proof = codexNativeGeneration(peer, process.pid, home, options);
+  await started;
+  controller.abort();
+  if (!receivedSignal) releaseProof?.();
+  await expect(proof).resolves.toBeUndefined();
+  expect(receivedSignal).toBe(controller.signal);
 });
 
 it('accepts a short executable alias only when Windows proof confirms matching bytes', async () => {
@@ -156,23 +185,23 @@ async function proxyFixture(churn = false, coldExecutable = false, symlinkEndpoi
 it.skipIf(process.platform !== 'linux')('keeps a daemon generation across replacement of the actual owned Unix proxy connection', async () => {
   const f = await proxyFixture();
   await f.client.connect();
-  const first = await f.client.backgroundTerminals('fixture');
+  const first = await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true });
   expect(first.serverId).toBe(f.server.pid);
   expect(first).toHaveProperty('serverGeneration', expect.stringMatching(/^[a-f0-9]{64}$/u));
   await f.client.close();
   await f.client.connect();
-  expect(await f.client.backgroundTerminals('fixture')).toEqual(first);
+  expect(await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true })).toEqual(first);
 });
 
 it.skipIf(process.platform !== 'linux')('does not attest a replacement listener and claimed PID while the transport is still connected to the old daemon', async () => {
   const f = await proxyFixture();
   await f.client.connect();
-  const first = await f.client.backgroundTerminals('fixture');
+  const first = await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true });
   expect(first).toHaveProperty('serverGeneration', expect.stringMatching(/^[a-f0-9]{64}$/u));
   await rename(f.endpoint, f.endpoint + '.old');
   const replacement = await f.native();
   await writeFile(f.claimed, String(replacement.pid));
-  const after = await f.client.backgroundTerminals('fixture');
+  const after = await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true });
   expect(after.serverId).toBe(replacement.pid);
   expect(after).not.toHaveProperty('serverGeneration');
 });
@@ -182,7 +211,7 @@ it.skipIf(process.platform !== 'linux')('keeps the proven Unix peer generation w
   await f.client.connect();
   let generation: string | undefined;
   for (let i = 0; i < 3; i++) {
-    const snapshot = await f.client.backgroundTerminals('fixture');
+    const snapshot = await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true });
     expect(snapshot.serverId).toBe(f.server.pid);
     expect(snapshot.serverGeneration).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
     if (generation) expect(snapshot.serverGeneration).toBe(generation);
@@ -195,7 +224,7 @@ it.skipIf(process.platform !== 'linux')('proves a cold native executable when re
   await f.client.connect();
   const executable = await stat(f.nativeExecutable);
   await utimes(f.nativeExecutable, new Date('2000-01-01T00:00:00Z'), executable.mtime);
-  const snapshot = await f.client.backgroundTerminals('fixture');
+  const snapshot = await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true });
   expect(snapshot.serverId).toBe(f.server.pid);
   expect(snapshot.serverGeneration).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
 }, 15000);
@@ -206,21 +235,21 @@ it.skipIf(process.platform !== 'linux')('proves a symlink native endpoint when r
   const endpoint = await lstat(f.endpoint);
   expect(endpoint.isSymbolicLink()).toBe(true);
   await lutimes(f.endpoint, new Date('2000-01-01T00:00:00Z'), endpoint.mtime);
-  const snapshot = await f.client.backgroundTerminals('fixture');
+  const snapshot = await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true });
   expect(snapshot.serverId).toBe(f.server.pid);
   expect(snapshot.serverGeneration).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
-  expect(await f.client.backgroundTerminals('fixture')).toEqual(snapshot);
+  expect(await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true })).toEqual(snapshot);
 }, 15000);
 
 it.skipIf(process.platform !== 'linux')('proves a legacy Unix daemon without pid-records across proxy reconnects', async () => {
   const f = await proxyFixture(false, false, true, false);
   await f.client.connect();
-  const first = await f.client.backgroundTerminals('fixture');
+  const first = await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true });
   expect(first.serverId).toBe(f.server.pid);
   expect(first.serverGeneration).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
   await f.client.close();
   await f.client.connect();
-  expect(await f.client.backgroundTerminals('fixture')).toEqual(first);
+  expect(await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true })).toEqual(first);
 }, 15000);
 
 it.skipIf(process.platform !== 'linux').each(['malformed', 'wrong-pid', 'wrong-birth', 'multiple', 'directory'] as const)('refuses an existing %s Unix pid-record', async invalid => {
@@ -233,7 +262,7 @@ it.skipIf(process.platform !== 'linux').each(['malformed', 'wrong-pid', 'wrong-b
   if (invalid === 'multiple') await writeFile(path.join(f.home, 'app-server-daemon', 'app-server.pid'), valid);
   if (invalid === 'directory') { await unlink(record); await mkdir(record); }
   await f.client.connect();
-  const snapshot = await f.client.backgroundTerminals('fixture');
+  const snapshot = await f.client.backgroundTerminals('fixture', { verifyStableGeneration:true });
   expect(snapshot.serverId).toBe(f.server.pid);
   expect(snapshot).not.toHaveProperty('serverGeneration');
 });
@@ -247,7 +276,7 @@ it.skipIf(process.platform !== 'linux').each(['appeared', 'disappeared', 'rewrit
   const executable = await stat(f.nativeExecutable);
   const oldAccess = new Date('2000-01-01T00:00:00Z');
   await utimes(f.nativeExecutable, oldAccess, executable.mtime);
-  const pending = f.client.backgroundTerminals('fixture');
+  const pending = f.client.backgroundTerminals('fixture', { verifyStableGeneration:true });
   // A copied executable belongs only to this fixture. Its first hash read signals
   // that physical proof has begun, without hooks in the production proof code.
   const deadline = Date.now() + 5000;
@@ -458,6 +487,28 @@ it('proves a direct owned Windows stdio child without controller or TCP evidence
   expect(await prove()).not.toBe(first);
   expect(commands.length).toBeGreaterThan(0);
   expect(commands.every(command => command.endsWith('powershell.exe'))).toBe(true);
+});
+
+it('uses one process identity sample for a Windows stdio generation proof', async () => {
+  const { codexNativeGeneration } = await import('../src/server/codex-native-generation.js');
+  const home = 'C:\\Users\\Owner\\fixture', executable = 'C:\\native\\codex.exe';
+  const proof = { pid:10944, birth:'2026-11-03T10:00:00.1234567Z', boot:'2026-11-01T01:02:03.0000000Z', executable,
+    sha256:'a'.repeat(64), owner:'S-1-5-21-1001', gatewayOwner:'S-1-5-21-1001', codexHome:home,
+    peerVerified:true, parentPid:process.pid, gatewayId:process.pid };
+  let script = '';
+  const run = async (_command:string, args:string[]) => {
+    script = Buffer.from(args[args.indexOf('-EncodedCommand') + 1]!, 'base64').toString('utf16le');
+    return { stdout:JSON.stringify(proof), code:0 };
+  };
+  const peer = { kind:'stdio' as const, pid:10944, codexHome:home, executable };
+  const generation = await Reflect.apply(codexNativeGeneration, undefined, [peer, 10944, home, { platform:'win32', run }]);
+  expect(generation).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/u));
+  const start = script.indexOf("Mark-Stage 'identity-stdio'");
+  expect(start).toBeGreaterThanOrEqual(0);
+  const end = script.indexOf('  } else {', start);
+  const directProof = script.slice(start, end);
+  expect(directProof.match(/\bIdentity\b/gu)).toHaveLength(1);
+  expect(directProof).not.toContain('Peer');
 });
 
 it.each([

@@ -159,9 +159,9 @@ export class SlackSync {
     } finally { this.reading = false; }
   }
 
-  async drain(conversationId: string, cutoff?: string): Promise<boolean> {
+  async drain(conversationId: string, cutoff?: string, platform?: Platform): Promise<boolean> {
     if (this.draining.has(conversationId) || this.store.activeRequests().some(request => request.conversationId === conversationId && request.status !== 'queued')) return false;
-    const streams = this.store.listSlackSyncStreams().filter(stream => stream.conversationId === conversationId &&
+    const streams = this.store.listSlackSyncStreams().filter(stream => stream.conversationId === conversationId && (!platform || stream.platform === platform) &&
       (stream.active || this.store.hasPendingSlackSyncEntries(stream.id, cutoff)));
     if (!streams.length) return true;
     if (streams.some(stream => stream.paused)) return false;
@@ -179,9 +179,8 @@ export class SlackSync {
     let failed = false;
     const byId = new Map(streams.map(stream => [stream.id, stream]));
     try {
-      for (const candidate of this.store.listPendingSlackSyncEntries(conversationId, cutoff)) {
-        const stream = byId.get(candidate.streamId);
-        if (!stream) { failed = true; break; }
+      for (const candidate of this.store.listPendingSlackSyncEntries(conversationId, cutoff).filter(entry => byId.has(entry.streamId))) {
+        const stream = byId.get(candidate.streamId)!;
         const current = this.store.getSlackSyncStream(stream.id);
         if (generation !== this.generation || this.getCodex() !== codex || !current || !this.ready(current, cutoff) ||
           this.store.activeRequests().some(request => request.conversationId === conversationId && request.status !== 'queued')) { failed = true; break; }
@@ -212,7 +211,7 @@ export class SlackSync {
       }
       this.draining.delete(conversationId);
     }
-    const currentStreams = this.store.listSlackSyncStreams().filter(stream => stream.conversationId === conversationId &&
+    const currentStreams = this.store.listSlackSyncStreams().filter(stream => stream.conversationId === conversationId && (!platform || stream.platform === platform) &&
       (stream.active || this.store.hasPendingSlackSyncEntries(stream.id, cutoff)));
     return !failed && generation === this.generation && !currentStreams.some(stream =>
       !this.ready(stream, cutoff) || this.store.hasPendingSlackSyncEntries(stream.id, cutoff));

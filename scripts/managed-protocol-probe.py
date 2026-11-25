@@ -14,6 +14,8 @@ import shutil
 import socket
 import tempfile
 import uuid
+from managed_probe_report import managed_wait_failure
+from managed_probe_bridge import wait_for_bridge_exit
 from aiohttp import web
 import websockets
 
@@ -21,7 +23,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 source = parser.add_mutually_exclusive_group(required=True)
 source.add_argument('--codex-prefix')
 source.add_argument('--codex', help='Native executable inside a complete extracted Codex package.')
-parser.add_argument('--expected-version', required=True, choices=['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1', '0.169.0-alpha.11.1'])
+parser.add_argument('--expected-version', required=True, choices=['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1', '0.169.0-alpha.11.1', '0.171.0-alpha.13'])
 parser.add_argument('--report', type=Path, required=True)
 args = parser.parse_args()
 binary = 'codex.exe' if os.name == 'nt' else 'codex'
@@ -84,6 +86,9 @@ async def main(root):
     records, servers, errors = [], [], []
     bridge = None
     bridge_drain = None
+    bridge_close_requested = False
+    primary_error = None
+    report['ownedChildExitConfirmed'] = None
 
     async def provider(req):
         if req.method != 'POST' or not req.path.endswith('/responses'):
@@ -202,16 +207,34 @@ stream_max_retries=0
         result = await entry['client'].call('turn/start', {'threadId': thread, 'input': [{'type': 'text', 'text': text}]})
         await entry['client'].completed(result['turn']['id'])
 
-    async def bridge_read():
-        line = await asyncio.wait_for(bridge.stdout.readline(), 55)
+    async def bridge_read(timeout=55):
+        line = await asyncio.wait_for(bridge.stdout.readline(), timeout)
         if not line:
             raise RuntimeError('Rele fixture exited: ' + repr(errors))
         return json.loads(line)
 
-    async def command(action, **kwargs):
+    async def command(action, timeout=55, **kwargs):
+        nonlocal bridge_close_requested
+        if action == 'close':
+            bridge_close_requested = True
         bridge.stdin.write((json.dumps({'action': action, **kwargs}) + '\n').encode())
         await bridge.stdin.drain()
-        return await bridge_read()
+        result = await bridge_read(timeout)
+        if result.get('ok') is False:
+            phase, failure = result.get('phase'), result.get('failure')
+            if action == 'wait':
+                message = managed_wait_failure(result, report)
+                if message is not None:
+                    raise RuntimeError(message)
+            if action == 'close' and phase in {'codex.close', 'owned-child-exit', 'engine.stop'} and failure in {'timeout', 'rejected', 'not-exited'} and isinstance(result.get('childExited'), bool):
+                report['ownedChildExitConfirmed'] = result['childExited']
+                raise RuntimeError(f'Managed fixture cleanup {failure} during {phase}')
+            raise RuntimeError('Managed fixture returned an invalid failure response')
+        if action == 'close':
+            report['ownedChildExitConfirmed'] = result.get('childExited') is True
+            if result.get('action') != 'close' or result.get('childExited') is not True:
+                raise RuntimeError('Managed fixture did not confirm owned Codex exit')
+        return result
 
     try:
         source = await start_source('source_a')
@@ -234,28 +257,34 @@ stream_max_retries=0
         assert any(row['id'] == thread and row['name'] == name for row in ready['catalog'])
         report['checks']['managed_child_lists_original_id_and_name_without_resuming'] = True
         report['checks']['explicit_shared_profile_overrides_inherited_home'] = True
-        waiting = await command('ingest', platform='slack', eventId='slack-1', text='slack-context-B')
-        assert waiting['requests'][0]['status'] == 'queued', waiting
-        assert waiting['requests'][0].get('error'), waiting
-        assert not waiting['deliveries'] and len(records) == 1, waiting
+        passive_a = await command('ingest', platform='slack', eventId='slack-passive-a', text='ISSUE40_PASSIVE_A')
+        assert not passive_a['requests'] and len(records) == 1, passive_a
+        report['checks']['unmentioned_slack_message_creates_no_request_or_model_input'] = True
+        waiting = await command('ingest', platform='slack', eventId='slack-1', text='ISSUE40_ACCEPTED_B', directMention=True)
+        assert len(waiting['requests']) == 1 and waiting['requests'][0]['origin']['messageId'] == '1700000001.000002', waiting
         request_id = waiting['requests'][0]['id']
-        report['checks']['foreign_writer_keeps_original_request_in_rele_queue'] = True
+        passive_c = await command('ingest', platform='slack', eventId='slack-passive-c', text='ISSUE40_PASSIVE_C')
+        assert len(passive_c['requests']) == 1 and passive_c['requests'][0]['id'] == request_id, passive_c
+        assert all('ISSUE40_PASSIVE_C' not in json.dumps(record) for record in records), records
+        report['checks']['passive_slack_message_while_request_exists_is_not_replayed'] = True
         await stop_source(source)
         completed = await command('wait')
         assert completed['requests'][0]['id'] == request_id and completed['requests'][0]['status'] == 'completed'
         assert len(completed['deliveries']) == 1 and completed['deliveries'][0]['origin']['platform'] == 'slack'
         assert completed['deliveries'][0]['status'] == 'sent'
-        assert 'source-context-A' in json.dumps(records[1]) and 'managed-answer-1' in json.dumps(records[1])
+        first_rele_input = json.dumps(records[1])
+        assert all(marker in first_rele_input for marker in ('source-context-A', 'ISSUE40_ACCEPTED_B', 'managed-answer-1'))
+        assert first_rele_input.count('ISSUE40_ACCEPTED_B') == 1
         assert completed['runtimeProcessId'] == ready['runtimeProcessId']
-        assert 'passive-peer-agent-context' in json.dumps(records[1])
-        report['checks']['all_author_slack_context_precedes_authorized_task'] = True
+        assert all(marker not in first_rele_input for marker in ('passive-peer-agent-context', 'ISSUE40_PASSIVE_A', 'ISSUE40_PASSIVE_C'))
+        report['checks']['only_accepted_slack_message_joins_preserved_native_history'] = True
         report['checks']['released_source_resumes_same_request_with_prior_exchange'] = True
         report['checks']['slack_result_delivered_only_to_its_origin'] = True
         source2 = await start_source('source_a_reopened')
         resumed = await source2['client'].call('thread/resume', {'threadId': thread, 'excludeTurns': True})
         assert resumed['thread']['id'] == thread
         await source_turn(source2, thread, 'source-return-context-C')
-        assert 'slack-context-B' in json.dumps(records[2]) and 'managed-answer-2' in json.dumps(records[2])
+        assert 'ISSUE40_ACCEPTED_B' in json.dumps(records[2]) and 'managed-answer-2' in json.dumps(records[2])
         report['checks']['managed_thread_released_while_own_server_stays_alive'] = True
         report['checks']['second_process_resumes_original_id_with_rele_exchange'] = True
         await stop_source(source2)
@@ -269,7 +298,9 @@ stream_max_retries=0
         assert sorted(d['origin']['platform'] for d in final['deliveries']) == ['slack', 'telegram']
         telegram = next(d for d in final['deliveries'] if d['origin']['platform'] == 'telegram')
         assert telegram['body'] == 'managed-answer-4' and telegram['status'] == 'sent'
-        assert all(marker in json.dumps(records[3]) for marker in ('source-context-A', 'slack-context-B', 'source-return-context-C'))
+        telegram_input = json.dumps(records[3])
+        assert all(marker in telegram_input for marker in ('source-context-A', 'ISSUE40_ACCEPTED_B', 'source-return-context-C'))
+        assert all(marker not in telegram_input for marker in ('passive-peer-agent-context', 'ISSUE40_PASSIVE_A', 'ISSUE40_PASSIVE_C'))
         report['checks']['telegram_continuation_has_complete_prior_shared_context'] = True
         report['checks']['telegram_result_delivered_only_to_its_origin'] = True
         assert (home / 'config.toml').read_text(encoding='utf-8') == config
@@ -288,36 +319,59 @@ stream_max_retries=0
         report['checks']['native_name_persists_new_thread_before_release_and_first_passive_context'] = True
         report['checks']['new_managed_thread_passive_context_persists_before_first_model_or_turn'] = True
         report['checks']['first_managed_model_request_contains_new_thread_passive_context'] = True
-        stopped = await command('close')
-        assert stopped['childExited'], stopped
-        await asyncio.wait_for(bridge.wait(), 15)
+        stopped = await command('close', timeout=30)
+        assert stopped['childExited'] and report['ownedChildExitConfirmed'] is True, stopped
+        await wait_for_bridge_exit(bridge, 15)
         assert bridge.returncode == 0, errors
         report['checks']['shutdown_waits_for_owned_child_exit'] = True
         report['syntheticProviderRequests'] = len(records)
         assert len(records) == 5, records
         report['result'] = 'passed'
     except BaseException as exc:
+        primary_error = exc
         report['result'] = 'failed'
         report['exception'] = repr(exc)
         report['stderrTail'] = errors[-20:]
         raise
     finally:
+        cleanup_error = None
+        if bridge and bridge.returncode is None and not bridge_close_requested:
+            try:
+                await command('close', timeout=30)
+            except BaseException as error:
+                cleanup_error = error
+                report['cleanupFailureType'] = type(error).__name__
         if bridge and bridge.returncode is None:
-            # Closing stdin runs the driver's finally block and closes its owned child.
             bridge.stdin.close()
             try:
                 await asyncio.wait_for(bridge.wait(), 15)
-            except TimeoutError:
+            except TimeoutError as error:
                 bridge.kill()
                 await bridge.wait()
+                report['bridgeForcedTermination'] = True
+                if cleanup_error is None:
+                    cleanup_error = error
         if bridge_drain:
-            await bridge_drain
+            try:
+                await asyncio.wait_for(bridge_drain, 8)
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
         for server in servers:
             with contextlib.suppress(Exception):
                 await stop_source(server)
-        await runner.cleanup()
+        try:
+            await runner.cleanup()
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        if cleanup_error is not None:
+            report['result'] = 'failed'
+            report['cleanupFailureType'] = type(cleanup_error).__name__
         args.report.write_text(json.dumps(report, indent=2), encoding='utf-8')
         print(json.dumps(report, indent=2))
+        if cleanup_error is not None and primary_error is None:
+            raise cleanup_error
 
 
 with tempfile.TemporaryDirectory(prefix='rele-m4-') as directory:

@@ -692,10 +692,28 @@ export class SlackChannel implements Channel {
   }
 
   private async controlInteraction(payload: Json): Promise<void> {
-    let context: ControlContext | undefined;
+    let context: ControlContext | undefined, openedViewId: string | undefined, openedViewHash: string | undefined;
     try {
-      if (!this.callbacks.control) throw new Error('Управление Rele недоступно.');
+      if (!this.callbacks.control) {
+        if (payload.team?.id === this.teamId && SLACK_USER.test(payload.user?.id ?? '')
+          && typeof payload.trigger_id === 'string' && payload.trigger_id) {
+          this.requireAccount();
+          await this.api('views.open', { trigger_id: payload.trigger_id, view: controlMessage('Управление Rele недоступно.') });
+          return;
+        }
+        throw new Error('Управление Rele недоступно.');
+      }
       const saved = payload.view ? controlMetadata(payload.view.private_metadata) : undefined;
+      if (!saved) {
+        if (payload.team?.id !== this.teamId || !SLACK_USER.test(payload.user?.id ?? '')
+          || typeof payload.trigger_id !== 'string' || !payload.trigger_id) throw new Error('Shortcut actor mismatch');
+        const account = this.requireAccount();
+        const opened = await this.api('views.open', { trigger_id: payload.trigger_id, view: controlMessage('Проверяю связь и состояние Codex…') });
+        openedViewId = typeof opened.view?.id === 'string' ? opened.view.id : undefined;
+        openedViewHash = typeof opened.view?.hash === 'string' ? opened.view.hash : undefined;
+        if (!openedViewId) throw new Error('Slack не подтвердил открытие формы управления.');
+        this.requireAccount(account);
+      }
       context = await this.questionWithinDeadline(() => this.controlContext(payload, saved?.context));
       const action = payload.actions?.[0];
       const selected = action?.action_id === 'action' ? action.selected_option?.value : 'model';
@@ -704,14 +722,12 @@ export class SlackChannel implements Channel {
       const selectedModel = action?.action_id === 'model' ? action.selected_option?.value : payload.view?.state?.values?.model?.model?.selected_option?.value;
       const selectedEffort = payload.view?.state?.values?.effort?.effort?.selected_option?.value;
       if (saved) await this.api('views.update', { view_id: payload.view.id, hash: payload.view.hash, view: controlModal(view, context, selectedModel, selectedEffort) });
-      else await this.api('views.open', { trigger_id: payload.trigger_id, view: controlModal(view, context) });
+      else await this.api('views.update', { view_id: openedViewId, ...(openedViewHash ? { hash: openedViewHash } : {}), view: controlModal(view, context) });
     } catch (error) {
       const message = controlErrorMessage(error, 'Не удалось открыть управление Rele. Проверьте подключение и актуальность связи; затем откройте меню сообщения снова.');
       if (payload.view?.id) await this.api('views.update', { view_id: payload.view.id, hash: payload.view.hash, view: controlMessage(message) }).catch(() => {});
-      else if (payload.trigger_id && payload.team?.id === this.teamId) {
-        try { await this.api('views.open', { trigger_id: payload.trigger_id, view: controlMessage(message) }); }
-        catch { await this.questionFeedback(payload, context ? { ...context, platform: 'slack', approvalId: '' } : undefined); }
-      }
+      else if (openedViewId) await this.api('views.update', { view_id: openedViewId, ...(openedViewHash ? { hash: openedViewHash } : {}), view: controlMessage(message) }).catch(() => {});
+      else await this.questionFeedback(payload, context ? { ...context, platform: 'slack', approvalId: '' } : undefined);
     }
   }
 

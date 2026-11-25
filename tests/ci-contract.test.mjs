@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { assertSteps, writeBundle, verifyBundles } from '../scripts/ci-contract.mjs';
-import { summarizeSharedNativeRequest } from '../scripts/shared-probe-diagnostics.mjs';
+import { lookupSharedNativeRequest, summarizeSharedNativeRequest } from '../scripts/shared-probe-diagnostics.mjs';
 const sha = 'a'.repeat(40), run = '123', attempt = '1', version = '0.1.2-rc.1';
 const candidate={repository:'owner/repo',version,commit:sha,runId:run,attempt};
 async function releaseBackend(root) {
@@ -78,6 +78,27 @@ test('native request diagnostics expose state without IDs or response text',()=>
  assert.equal(summarizeSharedNativeRequest({state:'running',queuedSubmissionId:'synthetic-queue-id',text:'NOREPLY'}).queuedSubmissionFound,true);
  assert.equal(summarizeSharedNativeRequest({state:'running',queuedSubmissionId:'synthetic-queue-id',text:'NOREPLY'}).finalAnswerPresent,false);
  assert.equal(summarizeSharedNativeRequest({state:'unexpected',failureReason:'private detail'}).state,'unknown');
+});
+test('native request lookup follows the unique event request and skips ambiguous events',async()=>{
+ const requests=[
+  {id:'other-request',eventId:'other'},
+  {id:'cancel-request',eventId:'cancel'},
+  {id:'last-request',eventId:'last'},
+ ];
+ const calls=[];
+ const codex={findRequest:async(...args)=>{
+  calls.push(args);
+  return {state:'queued',queuedSubmissionId:'private-queue-id',text:'private fixture content'};
+ }};
+ const summary=await lookupSharedNativeRequest(codex,'fixture-thread',requests,'cancel-request','cancel');
+ assert.deepEqual(calls,[['fixture-thread','cancel-request',['cancel-request'],true]]);
+ assert.deepEqual(summary,{state:'queued',turnAssigned:false,queuedSubmissionFound:true,mixed:false,finalAnswerPresent:true});
+ assert.doesNotMatch(JSON.stringify(summary),/private-queue-id|private fixture content/u);
+ const ambiguous=await lookupSharedNativeRequest(codex,'fixture-thread',[
+  ...requests,{id:'duplicate-cancel',eventId:'cancel'},
+ ],'cancel-request','cancel');
+ assert.equal(ambiguous,undefined);
+ assert.equal(calls.length,1);
 });
 test('unlisted file is rejected',()=>fixture(async root=>{
  await writeFile(path.join(root,'linux','extra'),'extra');await assert.rejects(verifyBundles(root,version,sha,run,attempt));
@@ -206,6 +227,39 @@ test('workflow requirement lists tolerate empty conditional groups', async()=>{
   const result=spawnSync(process.execPath,['scripts/ci.mjs','steps'],{cwd:path.resolve(import.meta.dirname,'..'),env:{...process.env,STEPS:JSON.stringify(steps),REQUIRED:required},encoding:'utf8'});
   assert.equal(result.status,0,result.stderr);
  }
+});
+test('shared connect failure diagnostics expose only allowlisted class and code', async()=>{
+ const {summarizeSharedConnectFailure:summarize}=await import('../scripts/shared-probe-diagnostics.mjs');
+ assert.equal(typeof summarize,'function','shared startup failures need a safe diagnostic summary');
+ const known=Object.assign(new Error('private startup message'),{name:'SharedCodexError',code:'shared-cli-unavailable',path:'C:\\private'});
+ assert.deepEqual(summarize(known),{
+  kind:'codex-connect-error',errorClass:'SharedCodexError',errorCode:'shared-cli-unavailable',
+ });
+ const unknown=Object.assign(new Error('private startup message'),{name:'PrivateType',code:'C:\\private'});
+ const safe=summarize(unknown);
+ assert.deepEqual(safe,{kind:'codex-connect-error',errorClass:'other',errorCode:'other'});
+ assert.doesNotMatch(JSON.stringify(safe),/private|message|path/u);
+});
+test('package smoke uses a fixed extractor and verifies the bundled runtime by serving', async()=>{
+ const source=await readFile(new URL('../scripts/smoke-package.mjs',import.meta.url),'utf8');
+ assert.doesNotMatch(source,/function run\(command,/u);
+ assert.doesNotMatch(source,/process\.argv\[2\]/u);
+ assert.match(source,/const extractor = process\.platform === 'win32' \? 'powershell\.exe' : 'tar';/u);
+ assert.match(source,/execFileSync\(extractor,\s*extractionArgs,\s*\{[^}]*shell:\s*false\s*\}/u);
+ assert.match(source,/const runtime = path\.join\(extracted, 'runtime', process\.platform === 'win32' \? 'node\.exe' : 'node'\);/u);
+ assert.match(source,/execFileSync\(runtime,\s*\['--version'\],\s*\{[^}]*shell:\s*false[^}]*\}\)\.trim\(\)/u);
+ assert.match(source,/`v\$\{manifest\.node\}`/u);
+ assert.match(source,/child = spawn\(/u);
+ assert.match(source,/new URL\('api\/health'/u);
+});
+test('Windows package smoke passes ZIP paths as arguments to a static PowerShell script', async()=>{
+ const source=await readFile(new URL('../scripts/smoke-package.mjs',import.meta.url),'utf8');
+ assert.match(source,/process\.platform === 'win32'\s+\? \['-NoProfile', '-NonInteractive', '-File', path\.join\(root, 'scripts', 'extract-package-archive\.ps1'\), archive, temporary\]\s+: \['-xzf', archive, '-C', temporary\]/u);
+ assert.doesNotMatch(source,/RELE_SMOKE_/u);
+ assert.match(source,/execFileSync\(extractor,\s*extractionArgs,\s*\{[^}]*shell:\s*false\s*\}/u);
+ const extractor=await readFile(new URL('../scripts/extract-package-archive.ps1',import.meta.url),'utf8');
+ assert.match(extractor,/param\s*\(\s*\[string\]\s*\$Archive,\s*\[string\]\s*\$Destination\s*\)/u);
+ assert.match(extractor,/Expand-Archive -LiteralPath \$Archive -DestinationPath \$Destination -ErrorAction Stop/u);
 });
 test('shared wait timeout reports bounded request correlation without message bodies', async()=>{
  let summarize;
@@ -373,13 +427,13 @@ test('one required CI gate waits for every OS matrix job', async()=>{
 });
 test('Windows job timeout leaves room for its bounded standard-user native gate', async()=>{
  const workflow=await readFile(new URL('../.github/workflows/verify.yml',import.meta.url),'utf8');
- const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ const canary=(await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8')).replace(/\r\n/gu,'\n');
  const verify=workflow.slice(workflow.indexOf('\n  verify:\n'));
  const jobTimeout=verify.match(/^\s+timeout-minutes:\s*\$\{\{\s*matrix\.os\s*==\s*'windows-2025'\s*&&\s*(\d+)\s*\|\|\s*(\d+)\s*\}\}\s*$/mu);
  const gateTimeout=canary.match(/AddMinutes\(\$\(if \(\$Phase -eq 'Shared'\) \{ (\d+) \} else \{ (\d+) \}\)\)/u);
  assert.ok(jobTimeout,'give Windows its own timeout without extending Ubuntu');
  assert.ok(gateTimeout,'read the native gate deadline from the canary');
- assert.ok(Number(gateTimeout[2])>=155,'leave time beyond the observed 145-minute run that exhausted the old canary deadline');
+ assert.ok(Number(gateTimeout[2])>=170,'leave 15 minutes beyond the observed 155-minute run that expired as the installer phase began');
  assert.ok(Number(jobTimeout[1])>=Number(gateTimeout[2])+60,'leave time for runner setup, later checks, and cleanup');
  assert.equal(Number(jobTimeout[2]),60,'keep the Ubuntu timeout unchanged');
 });
@@ -391,22 +445,68 @@ test('shared protocol completion wait fits within its driver response budget', a
  assert.ok(/ENGINE_WAIT_READ_TIMEOUT_SECONDS = 120/u.test(harness),'keep the harness listening beyond its turn wait');
  assert.ok(/timeout = ENGINE_CANCEL_READ_TIMEOUT_SECONDS if action == 'cancel' else ENGINE_WAIT_READ_TIMEOUT_SECONDS if action == 'wait' else ENGINE_READ_TIMEOUT_SECONDS/u.test(harness));
 });
-test('Windows canary timeout reports only bounded installer progress', async()=>{
+test('Windows canary failure keeps child progress when shared report is absent', async t=>{
+ const canary=(await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8')).replace(/\r\n/gu,'\n');
+ const blockStart=canary.indexOf("        if ($RunGates -and $result.result -ne 'passed') {");
+ const blockEnd=canary.indexOf('\n    }\n    if ($cleanupFailures.Count -ne 0)',blockStart);
+ assert.ok(blockStart>=0&&blockEnd>blockStart,'isolate the production summary block');
+ assert.ok(canary.slice(blockStart,blockEnd).endsWith('        }'),'exclude the enclosing finally close');
+ const report=canary.indexOf('if (Test-Path -LiteralPath $sharedDiagnosticPath -PathType Leaf)',blockStart);
+ assert.ok(report>=0&&canary.indexOf('\n            }\n            if ($result.installerProgress)',report)>report,
+  'append child progress after the optional shared-report branch');
+ if(process.platform!=='win32') { t.skip('execute the production PowerShell summary block on Windows'); return; }
+ const {spawnSync}=await import('node:child_process');
+ const input=JSON.stringify({result:'failed',stage:'installer',installerProgress:['RELE_CI_STAGE=owner-control']});
+ const script=[
+  '$RunGates = $true',
+  "$parentStage = 'installer'",
+  "$sourceRoot = Join-Path $env:TEMP ('rele-canary-summary-' + [guid]::NewGuid().ToString('N'))",
+  "$result = ConvertFrom-Json -InputObject '" + input + "'",
+  canary.slice(blockStart,blockEnd),
+ ].join('\n');
+ const run=spawnSync('powershell.exe',['-NoProfile','-NonInteractive','-Command',script],{encoding:'utf8'});
+ assert.equal(run.status,0,run.stderr);
+ const outputLine=run.stdout.trim(), prefix='Windows canary bounded diagnostic: ';
+ assert.ok(outputLine.startsWith(prefix),outputLine);
+ assert.deepEqual(JSON.parse(outputLine.slice(prefix.length)),{
+  stage:'installer',parentStage:'installer',childReceiptAvailable:false,childStage:'unknown',
+  reportAvailable:false,sharedReportAvailable:false,installerProgress:['RELE_CI_STAGE=owner-control'],
+ });
+});
+test('Windows canary forwards only bounded shared startup diagnostics', async t=>{
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
- const installer=await readFile(new URL('../scripts/smoke-windows-installer.mjs',import.meta.url),'utf8');
- const start=canary.indexOf('$summary = [ordered]@{ stage =');
- const end=canary.indexOf("Write-Output ('Windows canary bounded diagnostic:",start);
- assert.ok(start>=0 && end>start,'Windows canary must emit a bounded timeout summary');
- assert.match(canary,/WaitForExit\(\[Math\]::Min\(\$remaining, 30000\)\)/u,'poll the bounded fixture process so active progress can be reported');
- assert.ok(/Write-Host \('Windows canary progress: '/u.test(canary),'send progress outside the captured Boolean return value');
- assert.match(canary,/RELE_CI_STAGE=\[a-z0-9.-\]\{1,96\}/u,'accept only fixed-format stage labels from the fixture log');
- assert.match(installer,/RELE_CI_STAGE=installer-reinstall/u,'identify the installer re-adoption phase');
- const summary=canary.slice(start,end);
- assert.ok(/Get-Content -LiteralPath \$stdout -Tail 64(?: -ErrorAction SilentlyContinue)?\s*\|\s*Where-Object \{ \$_ -cmatch/u.test(canary),
-  'retain only bounded installer stage labels');
- assert.match(summary,/\$summary\.installerProgress = @\(\$result\.installerProgress \| Select-Object -Last 8\)/u,
-  'include the latest bounded installer progress labels in the timeout summary');
- assert.doesNotMatch(summary,/stdout\.log|stderr\.log/u,'never print raw installer logs');
+ assert.ok(canary.includes(". (Join-Path $PSScriptRoot 'shared-engine-diagnostics.ps1')"),
+  'load the testable allowlist used by the Windows summary wrapper');
+ assert.match(canary,/\$summary\.engineDriverDiagnostics\s*=\s*@\(Get-SafeEngineDriverDiagnostics -Diagnostics \$sharedDiagnostic\.engineDriverDiagnostics\)/u,
+  'forward only sanitized EngineDriver startup diagnostics from the bounded report');
+ const helper=await readFile(new URL('../scripts/windows/shared-engine-diagnostics.ps1',import.meta.url),'utf8');
+ for(const field of ['codex-connect-error','windows-desktop-candidates','SharedCodexError','shared-cli-unavailable','desktop-install','candidate-resolution-failed'])
+  assert.ok(helper.includes(field),`the wrapper allowlist must retain ${field}`);
+ assert.doesNotMatch(helper,/\.message|\.path|stderrTail|exception/u,'the wrapper must not read raw exception or path fields');
+ if(process.platform!=='win32') { t.skip('PowerShell behavior is exercised by the Windows unit job'); return; }
+ const {spawnSync}=await import('node:child_process');
+ const rows=[
+  {kind:'codex-connect-error',errorClass:'SharedCodexError',errorCode:'shared-cli-unavailable',message:'private failure',path:'C:\\private'},
+  {kind:'windows-desktop-candidates',candidates:[
+   {source:'desktop-install',version:'0.166.0-alpha.6',result:'candidate-resolution-failed',message:'private failure',path:'C:\\private'},
+   {source:'private-host',version:'0.1.2',result:'private result'},
+   {source:'path',version:'C:\\private',result:'shared-cli-unavailable'},
+  ],message:'private failure'},
+ ];
+ const input=JSON.stringify(rows);
+ const helperPath=path.resolve(import.meta.dirname,'../scripts/windows/shared-engine-diagnostics.ps1').replace(/'/gu,"''");
+ const script=`. '${helperPath}'\n$rows = ConvertFrom-Json -InputObject '${input}'\nGet-SafeEngineDriverDiagnostics -Diagnostics $rows | ConvertTo-Json -Compress -Depth 5`;
+ const result=spawnSync('powershell.exe',['-NoProfile','-NonInteractive','-Command',script],{encoding:'utf8'});
+ assert.equal(result.status,0,result.stderr);
+ const output=JSON.parse(result.stdout.trim());
+ assert.deepEqual(output,[
+  {kind:'codex-connect-error',errorClass:'SharedCodexError',errorCode:'shared-cli-unavailable'},
+  {kind:'windows-desktop-candidates',candidates:[
+   {source:'desktop-install',version:'0.166.0-alpha.6',result:'candidate-resolution-failed'},
+   {source:'path',result:'shared-cli-unavailable'},
+  ]},
+ ]);
+ assert.doesNotMatch(result.stdout,/private|message|stderrTail|exception/u);
 });
 test('Windows canary timeout reports bounded native RPC and driver stages', async()=>{
  const harness=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
@@ -420,7 +520,24 @@ test('Windows canary timeout reports bounded native RPC and driver stages', asyn
  assert.match(evidence,/evidence\['rpcTrace'\] = engine_snapshot\.get\('rpcTrace', \[\]\)\[-16:\]/u,'capture the latest native RPC stages');
  assert.match(summary,/\$summary\.rpcTrace = @\(\$evidence\.rpcTrace \| Select-Object -Last 16\)/u,'print only the latest bounded RPC trace');
  assert.match(summary,/\$summary\.driverOperations = @\(\$evidence\.driverOperations \| Select-Object -Last 16\)/u,'print only the latest bounded driver operation stages');
+ assert.match(summary,/\$summary\.engineRequestDetails = @\([\s\S]*?event = [\s\S]*?status = [\s\S]*?Select-Object -Last 8\)/u,'identify the timed-out synthetic request without its opaque IDs');
+ assert.match(summary,/\$summary\.engineProtocolEvents = @\(\$evidence\.engineProtocolEvents \| Select-Object kind, method \| Select-Object -Last 24\)/u,'print only safe protocol method names');
+ assert.match(summary,/\$summary\.reconciliationStages = @\(\$evidence\.reconciliationStageTrace \| Select-Object operation, phase, @\{ Name = 'elapsedMs'; Expression = \{/u,'project only reconciliation stage metadata and sanitize elapsed time');
+ assert.match(summary,/resultState, errorType \| Select-Object -Last 32\)/u,'print only the latest bounded reconciliation stage metadata');
+ assert.match(summary,/Expression = \{ if \(\(\$_.elapsedMs -is \[int\] -or \$_.elapsedMs -is \[long\]\) -and \[long\]\$_.elapsedMs -ge 0 -and \[long\]\$_.elapsedMs -le 10200000\) \{ \[long\]\$_.elapsedMs \} else \{ \$null \} \}/u,'omit invalid durations and durations beyond the 170-minute Windows gate bound');
  assert.doesNotMatch(summary,/payload|\.input\b|\.text\b|stdout\.log|stderr\.log/u,'timeout diagnostics must exclude request content and raw logs');
+});
+test('shared-gate failures expose only a bounded probe function and line', async()=>{
+ const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
+ const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ const start=canary.indexOf('$summary = [ordered]@{ stage =');
+ const end=canary.indexOf("Write-Output ('Windows canary bounded diagnostic:",start);
+ const summary=canary.slice(start,end);
+ assert.match(probe,/def safe_failure_location\(error\):/u,'capture the last source frame from the shared probe');
+ assert.match(probe,/failure_location = safe_failure_location\(error\)[\s\S]{0,120}report\['failureLocation'\] = failure_location/u,'retain the bounded location in the local failure report');
+ assert.ok(start>=0&&end>start,'Windows canary must emit a bounded shared-gate diagnostic');
+ assert.match(summary,/failureLocation[\s\S]*function[\s\S]*line/u,'forward only the probe function and line');
+ assert.doesNotMatch(summary,/traceback|\.Exception|\.Message|\.Path/u,'do not forward raw traceback, error text or paths');
 });
 test('shared fixture cleanup identifies the timed out operation without raw error text', async()=>{
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
@@ -448,8 +565,18 @@ test('Windows canary summary exposes bounded cleanup failure categories', async(
  const end=canary.indexOf("Write-Output ('Windows canary bounded diagnostic:",start);
  const summary=canary.slice(start,end);
  assert.ok(start>=0&&end>start,'Windows canary must emit a bounded timeout summary');
+ assert.match(summary,/\$summary\.canaryCleanupErrors\s*=\s*@\(\$result\.cleanupErrors\s*\|\s*Select-Object -Last 8/u,
+  'report the parent canary cleanup failures that decide the gate result');
  assert.match(summary,/\$summary\.cleanupErrors\s*=\s*@\(\$sharedDiagnostic\.cleanupErrors\s*\|\s*Select-Object -Last 8/u,
-  'emit only the latest cleanup failures');
+  'preserve the existing nested shared-probe cleanup field');
+ assert.match(summary,/step = if \(\$_\.step -in @\('retained-shared-report'.*'fixture'\)\) \{ \[string\]\$_.step \}/u,
+  'allow only known parent cleanup step names');
+ assert.match(summary,/errorType = if \(\[string\]\$_.errorType -match '\^\[A-Za-z\]\{1,48\}\$'/u,
+  'allow only short parent cleanup exception type names');
+ assert.match(summary,/hresult = if \(\[string\]\$_.hresult -match '\^0x\[0-9A-Fa-f\]\{8\}\$'/u,
+  'forward only a formatted HRESULT');
+ assert.match(summary,/elapsedMs = if \(\$_.elapsedMs -is \[int\] -or \$_.elapsedMs -is \[long\]\) \{ \[Math\]::Max\(0, \[Math\]::Min\(600000/u,
+  'bound parent cleanup elapsed times before logging');
  assert.match(summary,/operation = if \(\$_.operation -in @\('engine\.close', 'observer\.close', 'peer\.close', 'native\.stop'\)\)/u,
   'allow only known cleanup operations');
  assert.match(summary,/errorType = if \(\[string\]\$_.errorType -match '\^\[A-Za-z\]\{1,48\}\$'/u,'allow only short exception type names');
@@ -461,7 +588,7 @@ test('Windows canary summary exposes bounded cleanup failure categories', async(
   'forward only known cleanup failure codes');
  assert.match(summary,/engineDriverExitCode = if \(\$_.engineDriverExitCode -is \[int\] -or \$_.engineDriverExitCode -is \[long\]\) \{ \[Math\]::Max\(-2147483648, \[Math\]::Min\(4294967295, \[long\]\$_.engineDriverExitCode\)\) \}/u,
   'forward only bounded numeric cleanup exit codes');
- assert.match(summary,/engineDriverStage = if \(\$_.engineDriverStage -in @\('codex-connect'.*'windows-socket-verification', 'engine-close-response', 'engine-close-process-exit'\)\) \{ \[string\]\$_.engineDriverStage \}/u,
+ assert.match(summary,/engineDriverStage = if \(\$_.engineDriverStage -in @\('codex-connect'.*'windows-socket-verification', 'engine-close-request', 'engine-close-ack', 'engine-close-process-exit'\)\) \{ \[string\]\$_.engineDriverStage \}/u,
   'forward only allowlisted cleanup startup stages');
  assert.doesNotMatch(summary,/\.Message|\.Exception|retainedFixture|\.Path|processPid|ownerPid/u,'do not print raw errors, runner paths, or process identifiers');
 });
@@ -506,7 +633,7 @@ test('Windows native proof failure details use only the existing bounded CI diag
  assert.match(source,/event:\s*'codex-native-proof-failure'/u);
 });
 test('the current signed Desktop backend is covered by every supported Codex probe', async()=>{
- const version='0.169.0-alpha.11.1';
+ const version='0.171.0-alpha.13';
  for(const file of ['../scripts/protocol-probe.py','../scripts/managed-protocol-probe.py','../scripts/shared-protocol-probe.py','../scripts/windows/ci-standard-user-canary.ps1']) {
   const source=await readFile(new URL(file,import.meta.url),'utf8');
   assert.ok(source.includes(version),`${file} must test the current signed Desktop backend`);
@@ -587,7 +714,7 @@ test('shared native gate records bounded request state without payloads on timeo
  const cancel=probe.indexOf("await engine.command('ingest', platform='telegram', eventId='cancel'");
  const afterCancel=probe.indexOf('await asyncio.wait_for(wait_records(before + 2), 25)',cancel);
  assert.ok(cancel>=0 && afterCancel>cancel,'bounded shell probe must wait for the request result');
- assert.match(probe.slice(cancel,afterCancel),/report\['cancellationRequestTimeout'\] = await held_request_evidence\(engine, peer, thread\)/u,'capture queue and request state before failing the shell timeout');
+ assert.match(probe.slice(cancel,afterCancel),/report\['cancellationRequestTimeout'\] = await held_request_evidence\(engine, peer, thread, event_id='cancel'\)/u,'capture queue and request state before failing the shell timeout');
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
  assert.match(canary,/if \(\$null -ne \$timeoutReport\.cancellationRequestTimeout\) \{\s*\$result \| Add-Member -Force -NotePropertyName cancellationRequestTimeout -NotePropertyValue \$timeoutReport\.cancellationRequestTimeout\s*\}/u,'forward the cancellation timeout snapshot into the Windows job failure report');
 });
@@ -655,13 +782,15 @@ test('Windows parent failure prints only bounded shared-gate counts and states',
   'observedTurnStarts','observedTurnCompletions','Write-Output']) {
   assert.ok(summary.includes(field),`print the bounded timeout field ${field}`);
  }
- assert.doesNotMatch(summary,/stderrTail|exception|payload|requestId|turnId|sharedReport/u,'never print raw errors, payloads, IDs, or the complete report');
+ assert.doesNotMatch(summary,/stderrTail|exception|payload|requestId|turnId|sharedReport(?!Available)/u,'never print raw errors, payloads, IDs, or the complete report');
 });
 test('shared Windows startup failure reports only an allowlisted driver stage', async()=>{
  const driver=await readFile(new URL('../scripts/probe-shared-codex.ts',import.meta.url),'utf8');
  const resolver=await readFile(new URL('../src/server/codex-shared.ts',import.meta.url),'utf8');
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ assert.ok(driver.includes('JSON.stringify({ action: command.action, stopped: true, runtimeProcessId: pid, backendAlive: alive(pid) })'),
+  'the close ACK must identify its command so a stale reply cannot be accepted');
  for(const stage of ['codex-connect','shared-codex-resolution','shared-codex-resolved','thread-catalog','engine-start','native-diagnostics','desktop-package-verification','ready'])
   assert.ok(driver.includes(`emitProbeStage('${stage}')`),`the shared driver must mark ${stage}`);
  assert.match(probe,/def safe_engine_driver_stage\(value\):[\s\S]{0,300}'codex-connect'[\s\S]*'shared-codex-resolution'[\s\S]*'shared-codex-resolved'[\s\S]*'native-diagnostics'[\s\S]*'desktop-package-verification'/u,
@@ -670,11 +799,7 @@ test('shared Windows startup failure reports only an allowlisted driver stage', 
   'the Windows receipt must allow the shared resolver completion stage');
  assert.match(probe,/safe_engine_driver_stage\(value\.get\('probeStage'\)\)/u,'consume only allowlisted progress messages before the first driver response');
  assert.match(probe,/engine_driver_stage/u,'EOF diagnostics must retain the last accepted stage');
- assert.match(canary,/engineDriverStage -in @\('codex-connect'.*'windows-socket-verification', 'engine-close-response', 'engine-close-process-exit'\)/u,'the Windows receipt must forward only allowlisted stages');
- for(const stage of ['engine-close-response','engine-close-process-exit']) {
-  assert.ok(probe.includes(`'${stage}'`),`the Python probe must retain ${stage}`);
-  assert.ok(canary.includes(`'${stage}'`),`the Windows receipt must retain ${stage}`);
- }
+ assert.match(canary,/engineDriverStage -in @\('codex-connect'.*'windows-socket-verification', 'engine-close-request', 'engine-close-ack', 'engine-close-process-exit'\)/u,'the Windows receipt must forward only allowlisted stages');
  for(const stage of ['windows-installation','windows-owner-status','windows-desktop-discovery','windows-desktop-selection','windows-package-preparation',
   'windows-package-verification','windows-version-command','windows-owner-start','windows-owner-receipt','windows-owner-executable','windows-socket-verification']) {
   assert.ok(resolver.includes(`reportWindowsSharedProbeStage(env, '${stage}')`),`the Windows resolver must mark ${stage}`);

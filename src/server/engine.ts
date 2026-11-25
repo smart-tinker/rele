@@ -17,7 +17,7 @@ import { ASYNC_QUESTION_METHOD, asyncQuestions, encodeAsyncAnswers, matchAsyncAn
 import { SourceControls, type ControlContext, type ControlView } from './source-control.js';
 import type { ControlCommand } from './channels/slack-control.js';
 
-export type CodexGateway = Pick<CodexClient, 'status' | 'isVerifiedVersion' | 'createThread' | 'setThreadName' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'steer' | 'findSteerReceipt' | 'interrupt' | 'backgroundTerminals' | 'terminateBackgroundTerminal' | 'findRequest' | 'retryOverloaded' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Partial<Pick<CodexClient, 'hasPendingRequest' | 'asyncQuestionState' | 'controlSnapshot' | 'controlModels' | 'readControlGoal' | 'updateControlGoal' | 'updateControlModel' | 'controlTurns' | 'controlTurnLocation' | 'controlTurnIndex'>> & Pick<EventEmitter, 'on' | 'off'>;
+export type CodexGateway = Pick<CodexClient, 'status' | 'isVerifiedVersion' | 'createThread' | 'setThreadName' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'steer' | 'findSteerReceipt' | 'interrupt' | 'backgroundTerminals' | 'terminateBackgroundTerminal' | 'findRequest' | 'retryOverloaded' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Partial<Pick<CodexClient, 'hasPendingRequest' | 'asyncQuestionState' | 'primeNativeGeneration' | 'controlSnapshot' | 'controlModels' | 'readControlGoal' | 'updateControlGoal' | 'updateControlModel' | 'controlTurns' | 'controlTurnLocation' | 'controlTurnIndex'>> & Pick<EventEmitter, 'on' | 'off'>;
 export interface EngineOptions {
   config: () => AppConfig;
   temporaryRoot: string;
@@ -616,7 +616,7 @@ export class Engine extends EventEmitter {
       : baseline.target !== state.target ? 'target-changed'
         : typeof baseline.serverGeneration !== 'string' ? 'generation-missing'
           : !/^[a-f0-9]{64}$/u.test(baseline.serverGeneration) ? 'generation-invalid'
-            : !Array.isArray(baseline.terminals) || baseline.terminals.some(entry => !terminalPair(entry)) ? 'terminals-invalid' : undefined;
+          : !Array.isArray(baseline.terminals) || baseline.terminals.some(entry => !terminalPair(entry)) ? 'terminals-invalid' : undefined;
     if (!baseline || baselineFailure) throw Object.assign(new Error('Исходный сервер или снимок команд не подтверждён. Отсутствие терминалов не доказывает завершение прежних процессов.'), {
       code: `terminal-baseline-${baselineFailure ?? 'missing'}`,
     });
@@ -627,7 +627,7 @@ export class Engine extends EventEmitter {
         throw new Error('Сервер Codex изменился или его поколение не подтверждено. Завершение прежних процессов не подтверждено.');
       }
     };
-    verifyServer(await client.backgroundTerminals(conversation.threadId));
+    verifyServer(await client.backgroundTerminals(conversation.threadId, { verifyStableGeneration: true }));
     this.store.setMeta(`cancel-cleanup:${id}`, JSON.stringify(state));
     const attempted = new Set((state.terminalAttempts ?? []).map(entry => JSON.stringify(entry))), deadline = performance.now() + 2000;
     do {
@@ -643,7 +643,7 @@ export class Engine extends EventEmitter {
         continue;
       }
       if (['running', 'completed', 'failed', 'interrupted'].includes(found.state)) {
-        const snapshot = await client.backgroundTerminals(conversation.threadId);
+        const snapshot = await client.backgroundTerminals(conversation.threadId, { verifyStableGeneration: true });
         verifyServer(snapshot);
         const fresh = snapshot.terminals.filter(entry => !baseline.terminals.some(old => old.itemId === entry.itemId && old.processId === entry.processId));
         for (const entry of fresh) {
@@ -666,7 +666,7 @@ export class Engine extends EventEmitter {
           continue;
         }
         if (['completed', 'failed', 'interrupted'].includes(found.state)) {
-          const after = await client.backgroundTerminals(conversation.threadId);
+          const after = await client.backgroundTerminals(conversation.threadId, { verifyStableGeneration: true });
           verifyServer(after);
           const latestItems = this.rememberCommandItems(id, []);
           const pendingStarts = latestItems.some(item => !latestItems.some(other => other.id === item.id && other.completed)
@@ -882,7 +882,6 @@ export class Engine extends EventEmitter {
     const work: Promise<unknown>[] = [this.deliver(), this.flushProgress(), this.flushApprovalUpdates(), this.retryPendingQuestions(), this.refreshAsyncQuestions(), this.sourceControls.recover()];
     if (!this.suspended) {
       await Promise.allSettled(this.store.listAutoLinkIntents().filter(intent => intent.status !== 'completed').map(intent => this.provision(intent)));
-      await this.slackSync.backfill();
     }
     if (this.stopped) { await Promise.allSettled(work); return; }
     if (this.codex.status().connected) {
@@ -1061,7 +1060,7 @@ export class Engine extends EventEmitter {
     try {
       for (const input of this.store.steeringInputs(parent.id)) if (input.state === 'sending' || input.state === 'uncertain') await this.reconcileSteering(input);
       if (this.store.steeringInputs(parent.id).some(input => input.state === 'sending' || input.state === 'uncertain')) return;
-      const stream = this.store.listSlackSyncStreams().find(row => row.conversationId === conversation.id && row.endpointId === parent.origin.endpointId && row.active && !row.paused);
+      const stream = this.store.listSlackSyncStreams().find(row => row.platform === 'telegram' && row.conversationId === conversation.id && row.endpointId === parent.origin.endpointId && row.active && !row.paused);
       const channel = this.channels[parent.origin.platform];
       const self = channel && this.ownIdentity(channel, parent.origin.platform).id;
       const entry = stream && this.store.listSlackSyncEntries(stream.id, { pending: true, limit: 100 }).find(row => {
@@ -1109,7 +1108,7 @@ export class Engine extends EventEmitter {
     try {
       const conversation = this.store.getConversation(conversationId)!;
       const queued = this.store.listPendingRequests().filter(row => row.conversationId === conversationId);
-      const blockedReason = 'Источник выключен. Включите его для проверки полного контекста или отмените принятый запрос.';
+      const blockedReason = 'Источник выключен. Включите его, чтобы продолжить принятый запрос, или отмените его.';
       const imageBlockedReason = 'Ожидается исходное разрешённое подключение Slack для передачи изображения.';
       for (const row of queued) {
         const channel = this.channels.slack;
@@ -1121,17 +1120,17 @@ export class Engine extends EventEmitter {
       const active = this.store.activeRequests().find(row => row.conversationId === conversationId && row.status !== 'queued' && !row.steeredInto);
       if (active) { await this.steerPending(active); return; }
       if (this.store.listAutoLinkIntents().some(intent => intent.status !== 'completed' && this.store.bindingForEndpoint(intent.endpointId)?.conversationId === conversationId)) return;
-      const hasContext = this.store.listSlackSyncStreams().some(stream => stream.conversationId === conversationId && stream.active && !stream.paused
+      const hasContext = this.store.listSlackSyncStreams().some(stream => stream.platform === 'telegram' && stream.conversationId === conversationId && stream.active && !stream.paused
         && this.store.hasPendingSlackSyncEntries(stream.id));
       if (!waiting && !hasContext && !this.initialMessages.hasPending(conversationId)) return;
       if (!await this.initialMessages.ensure(conversationId)) return;
       const client = this.codex;
       const cutoff = waiting ? waiting.origin.platform === 'slack' ? waiting.origin.messageId
         : `${Math.floor(Date.parse(waiting.createdAt) / 1000)}.${String(Date.parse(waiting.createdAt) % 1000).padStart(3, '0')}000` : undefined;
-      if (!await this.slackSync.drain(conversationId, cutoff)) {
-        const error = this.store.listSlackSyncStreams().find(stream => stream.conversationId === conversationId &&
+      if (!await this.slackSync.drain(conversationId, cutoff, 'telegram')) {
+        const error = this.store.listSlackSyncStreams().find(stream => stream.platform === 'telegram' && stream.conversationId === conversationId &&
           (stream.active || this.store.hasPendingSlackSyncEntries(stream.id, cutoff)) && stream.error)?.error
-          ?? 'Ожидается синхронизация полного контекста Slack. Запрос остаётся в очереди Rele.';
+          ?? 'Ожидается синхронизация контекста Telegram. Запрос остаётся в очереди Rele.';
         const current = waiting && this.store.getRequest(waiting.id);
         if (current?.status === 'queued' && current.error !== error) this.store.updateRequest(current.id, { error });
         return;
@@ -1966,6 +1965,7 @@ export class Engine extends EventEmitter {
   private connectionChanged(): void {
     if (this.stopped) return;
     const connected = this.codex.status().connected;
+    if (connected) this.codex.primeNativeGeneration?.();
     if (!connected && this.connected) {
       this.epoch = randomUUID(); this.completionRechecks.clear(); this.expireApprovals();
       this.ownedThreads.clear(); this.retryThreadAfter.clear(); this.progressReads.clear();
