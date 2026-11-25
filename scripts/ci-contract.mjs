@@ -18,7 +18,7 @@ export function packageNames(platform, version) {
  return (platform === 'linux' ? ['.deb','.tar.gz'] : ['-setup.exe','.zip']).flatMap(ext => [stem+ext,stem+ext+'.sha256']);
 }
 export function isPrereleaseVersion(version) {
- assert.match(version,/^\d+\.\d+\.\d+(?:-rc\.\d+)?$/u,'Only stable releases or immutable RC candidates are published by CI');
+ assert.match(version,/^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-rc\.(?:0|[1-9]\d*))?$/u,'Only stable releases or immutable RC candidates are published by CI');
  return version.includes('-rc.');
 }
 async function inventory(directory, platform, version) {
