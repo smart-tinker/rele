@@ -430,6 +430,8 @@ class EngineDriver:
                 assert result.get('backendAlive'), 'Closing Rele stopped the shared native backend'
                 self.startup_stage = 'engine-close-process-exit'
                 await asyncio.wait_for(self.process.wait(), 15)
+                if self.process.returncode == 0:
+                    self.startup_stage = 'engine-close-ack'
             except Exception as error:
                 error.engine_driver_stage = self.startup_stage
                 raise
