@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       release:
-        description: Create a draft RC from verified main packages
+        description: Prepare and verify an RC or stable draft; publication is separate, Latest follows accepted final bytes and explicit approval
         type: boolean
         default: false
 
@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   prepare_release:
-    name: Prepare unverified draft RC
+    name: Prepare unverified release draft
     if: github.event.repository.private == false && github.event_name == 'workflow_dispatch' && inputs.release && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 2
@@ -79,7 +79,7 @@ jobs:
         run: test "$VERIFY_RESULT:$RELEASE_RESULT" = "$EXPECTED_RESULTS"
 
   publish:
-    name: Verify draft RC packages
+    name: Finalize verified draft (unpublished)
     needs: [prepare_release, verify_release, gate]
     if: ${{ !cancelled() && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && inputs.release && github.ref == 'refs/heads/main' && needs.verify_release.result == 'success' && needs.gate.result == 'success' }}
     runs-on: ubuntu-24.04
