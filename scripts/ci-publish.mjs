@@ -11,7 +11,8 @@ function context(value) {
  return `/repos/${value.repository}`;
 }
 function body(candidate, verified=false) {
- return `Rele candidate ${candidate.commit}; run ${candidate.runId}; attempt ${candidate.attempt}. Verification ${verified?'passed':'pending'}.\nReal Desktop and messenger acceptance is still required.`;
+ const notes=candidate.version==='0.1.1-rc.20'?`\nRC20 source notes: https://github.com/${candidate.repository}/blob/${candidate.commit}/docs/0.1.1-rc.20.md`:'';
+ return `Rele candidate ${candidate.commit}; run ${candidate.runId}; attempt ${candidate.attempt}. Verification ${verified?'passed':'pending'}.${notes}\nReal Desktop and messenger acceptance is still required.`;
 }
 async function currentMain(api, candidate) {
  assert.equal((await api(`${context(candidate)}/git/ref/heads/main`)).object.sha,candidate.commit,'Main advanced; verify a new candidate');

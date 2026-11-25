@@ -54,10 +54,12 @@ export function controlModal(view: ControlView, context: ControlContext, selecte
     }
     if (!view.connected || !models.length || !model) submit = undefined; else submit = 'Сохранить';
   } else if (view.action === 'goal') {
-    if (snapshot?.goal && snapshot.goal.status !== 'complete') {
-      blocks.push(section(`В разговоре уже есть цель. Новая цель её не заменит.\n${snapshot.goal.objective}\nТокены: ${snapshot.goal.tokensUsed}${snapshot.goal.tokenBudget === null ? ' (без заданного лимита)' : ` / ${snapshot.goal.tokenBudget}`}; время: ${snapshot.goal.timeUsedSeconds} с.`)); submit = undefined;
-    } else if (view.goalLaunchUnavailable) { blocks.push(section(view.goalLaunchUnavailable)); submit = undefined; }
-    else if (!snapshot?.goalSupported) { blocks.push(section('Native Goals API не подтверждён для подключённого Codex. Цель не будет имитироваться обычным запросом.')); submit = undefined; }
+    if (view.connected && snapshot?.goalSupported && view.goalWriteUnavailable) blocks.push(section(view.goalWriteUnavailable));
+    if (view.goalLaunchUnavailable) blocks.push(section(view.goalLaunchUnavailable));
+    if (snapshot?.goal) {
+      blocks.push(section(`Native цель (${snapshot.goal.status}):\n${snapshot.goal.objective}\nТокены: ${snapshot.goal.tokensUsed}${snapshot.goal.tokenBudget === null ? ' (без заданного лимита)' : ` / ${snapshot.goal.tokenBudget}`}; время: ${snapshot.goal.timeUsedSeconds} с.`)); submit = undefined;
+    } else if (!snapshot?.goalSupported) { blocks.push(section('Native Goals API не подтверждён для подключённого Codex. Цель не будет имитироваться обычным запросом.')); submit = undefined; }
+    else if (view.goalLaunchUnavailable || view.goalWriteUnavailable) submit = undefined;
     else {
       for (const [id, label] of [['objective', 'Цель'], ['criterion', 'Критерий завершения']] as const) blocks.push({ type: 'input', block_id: id, label: plain(label), element: { type: 'plain_text_input', action_id: id, multiline: true, max_length: 3000 } });
       blocks.push({ type: 'input', block_id: 'budget', optional: true, label: plain('Лимит токенов (необязательно)'), element: { type: 'plain_text_input', action_id: 'budget', max_length: 13 } });
@@ -65,8 +67,9 @@ export function controlModal(view: ControlView, context: ControlContext, selecte
       submit = 'Создать цель';
     }
   } else if (view.action === 'stop') {
-    blocks.push(section(snapshot?.goal ? `Цель: ${snapshot.goal.objective}\nБудет запрошена native приостановка цели и остановка её подтверждённого текущего хода. Обычные запросы других ходов сохраняются.` : 'Действующей цели нет.'));
-    submit = snapshot?.goalSupported && snapshot.goal ? 'Остановить цель' : undefined;
+    blocks.push(section(snapshot?.goal ? `Цель: ${snapshot.goal.objective}\nОстановка из Slack не отправляется. Обычные запросы сохраняются.` : 'Действующей цели нет.'));
+    if (view.connected && snapshot?.goalSupported && view.goalWriteUnavailable) blocks.push(section(view.goalWriteUnavailable));
+    submit = !view.goalWriteUnavailable && snapshot?.goalSupported && snapshot.goal ? 'Остановить цель' : undefined;
   }
   return { type: 'modal', callback_id: CONTROL_VIEW, title: plain('Управление Rele'), close: plain('Закрыть'), notify_on_close: true,
     private_metadata: JSON.stringify({ id: view.id, context }), blocks: boundedBlocks(blocks), ...(submit ? { submit: plain(submit) } : {}) };
