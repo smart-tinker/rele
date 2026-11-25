@@ -428,11 +428,8 @@ class EngineDriver:
                             'ingest', 'wait', 'answer', 'resume', 'cancel', 'snapshot', 'findRequest'):
                         raise RuntimeError('Shared Engine driver returned an invalid close response')
                 assert result.get('backendAlive'), 'Closing Rele stopped the shared native backend'
-                try:
-                    await asyncio.wait_for(self.process.wait(), 15)
-                except TimeoutError:
-                    self.startup_stage = 'engine-close-process-exit'
-                    raise
+                self.startup_stage = 'engine-close-process-exit'
+                await asyncio.wait_for(self.process.wait(), 15)
             except Exception as error:
                 error.engine_driver_stage = self.startup_stage
                 raise
