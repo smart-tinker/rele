@@ -14,7 +14,7 @@ import { effectiveSharedCodexHome } from './codex-shared.js';
 import { requestInput } from './inbound-context.js';
 import { MessageToolValidationError } from '../shared/message-tool.js';
 import { ASYNC_QUESTION_METHOD, asyncQuestions, encodeAsyncAnswers, matchAsyncAnswer, parseAsyncAnswers } from './async-questions.js';
-import { SourceControls, type ControlContext, type ControlView } from './source-control.js';
+import { SourceControls, goalWriteUnavailable, type ControlContext, type ControlView } from './source-control.js';
 import type { ControlCommand } from './channels/slack-control.js';
 
 export type CodexGateway = Pick<CodexClient, 'status' | 'isVerifiedVersion' | 'createThread' | 'setThreadName' | 'injectContext' | 'subscribe' | 'releaseThread' | 'enqueue' | 'steer' | 'findSteerReceipt' | 'interrupt' | 'backgroundTerminals' | 'terminateBackgroundTerminal' | 'findRequest' | 'retryOverloaded' | 'respond' | 'rejectRequest' | 'deleteQueued' | 'startQueued'> & Partial<Pick<CodexClient, 'hasPendingRequest' | 'asyncQuestionState' | 'primeNativeGeneration' | 'controlSnapshot' | 'controlModels' | 'readControlGoal' | 'updateControlGoal' | 'updateControlModel' | 'controlTurns' | 'controlTurnLocation' | 'controlTurnIndex'>> & Pick<EventEmitter, 'on' | 'off'>;
@@ -121,7 +121,7 @@ export class Engine extends EventEmitter {
   control(context: ControlContext, command: ControlCommand): Promise<ControlView> {
     const task = command.kind === 'open' ? this.sourceControls.open(context)
       : command.kind === 'preview' && command.id && command.action ? this.sourceControls.preview(context, command.id, command.action)
-        : command.kind === 'submit' && command.id && command.input ? this.sourceControls.submit(context, command.id, command.input)
+        : command.kind === 'submit' && command.id && command.input ? this.sourceControls.submit(context, command.id, command.input, goalWriteUnavailable)
           : Promise.reject(new Error('Некорректное действие управления.'));
     this.track(task); return task;
   }

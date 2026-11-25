@@ -55,6 +55,12 @@ test('release package naming accepts only stable finals and immutable RC version
  ]);
  for(const invalid of ['0.1.1-rc','0.1.1-beta.1','v0.1.1'])assert.throws(()=>isPrereleaseVersion(invalid));
 });
+test('draft body links RC notes to the candidate version and commit',()=>fixture(async root=>{
+ const {prepareCandidate}=await import('../scripts/ci-publish.mjs');
+ const f=await releaseBackend(root), rc=await prepareCandidate(f.api,{...candidate,version:'0.1.1-rc.20'});
+ assert.ok(rc.body.includes(`https://github.com/owner/repo/blob/${sha}/docs/0.1.1-rc.20.md`));
+ assert.ok(rc.body.includes(`Rele candidate ${sha}; run ${run}; attempt ${attempt}.`));
+}));
 test('missing, skipped and failed required steps cannot pass', () => {
  assert.doesNotThrow(() => assertSteps({a:{outcome:'success',conclusion:'success'}}, ['a']));
  for (const outcome of ['skipped','failure','cancelled']) assert.throws(() => assertSteps({a:{outcome,conclusion:'success'}}, ['a']));
@@ -666,7 +672,7 @@ test('Windows canary summary exposes bounded cleanup failure categories', async(
   'forward only known cleanup failure codes');
  assert.match(summary,/engineDriverExitCode = if \(\$_.engineDriverExitCode -is \[int\] -or \$_.engineDriverExitCode -is \[long\]\) \{ \[Math\]::Max\(-2147483648, \[Math\]::Min\(4294967295, \[long\]\$_.engineDriverExitCode\)\) \}/u,
   'forward only bounded numeric cleanup exit codes');
- assert.match(summary,/engineDriverStage = if \(\$_.engineDriverStage -in @\('codex-connect'.*'windows-socket-verification', 'engine-close-request', 'engine-close-ack'\)\) \{ \[string\]\$_.engineDriverStage \}/u,
+ assert.match(summary,/engineDriverStage = if \(\$_.engineDriverStage -in @\('codex-connect'.*'windows-socket-verification', 'engine-close-request', 'engine-close-ack', 'engine-close-process-exit'\)\) \{ \[string\]\$_.engineDriverStage \}/u,
   'forward only allowlisted cleanup startup stages');
  assert.doesNotMatch(summary,/\.Message|\.Exception|retainedFixture|\.Path|processPid|ownerPid/u,'do not print raw errors, runner paths, or process identifiers');
 });
@@ -716,6 +722,34 @@ test('the current signed Desktop backend is covered by every supported Codex pro
   const source=await readFile(new URL(file,import.meta.url),'utf8');
   assert.ok(source.includes(version),`${file} must test the current signed Desktop backend`);
  }
+});
+test('supported Codex versions stay aligned across the Windows canary projections',async()=>{
+ const runtime=await readFile(new URL('../src/shared/codex-runtime.ts',import.meta.url),'utf8');
+ const primary=runtime.match(/export const SUPPORTED_CODEX_VERSION = '([^']+)'/u)?.[1];
+ const entries=runtime.match(/SUPPORTED_CODEX_VERSIONS: readonly string\[\] = \[SUPPORTED_CODEX_VERSION, ([^\]]+)\]/u)?.[1];
+ assert.ok(primary&&entries,'read the exact supported version policy');
+ const versions=[primary,...Array.from(entries.matchAll(/'([^']+)'/gu),match=>match[1])];
+ const listed=text=>Array.from(text.matchAll(/'([^']+)'/gu),match=>match[1]);
+ for(const [file,pattern] of [
+  ['../scripts/protocol-probe.py',/parser\.add_argument\('--expected-version'[\s\S]*?choices=(\[[^\]]+\])/u],
+  ['../scripts/managed-protocol-probe.py',/parser\.add_argument\('--expected-version'[\s\S]*?choices=(\[[^\]]+\])/u],
+  ['../scripts/shared-protocol-probe.py',/^VERSIONS = (\[[^\]]+\])/mu],
+ ]) {
+  const source=await readFile(new URL(file,import.meta.url),'utf8');
+  const values=source.match(pattern)?.[1];
+  assert.ok(values,`${file} must declare an exact version list`);
+  assert.deepEqual(listed(values),versions,`${file} must match the supported version policy`);
+ }
+ const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
+ const canonical=canary.match(/^\$script:CodexVersions = @\(([^)]*)\)$/mu)?.[1];
+ assert.ok(canonical,'use one canonical Windows canary version list');
+ assert.deepEqual(listed(canonical),versions,'the Windows canary must match the supported version policy');
+ assert.match(canary,/\$versions = \$script:CodexVersions/u,'gate selection must use the canonical list');
+ assert.match(canary,/\$marker\.prefixes = @\(\$script:CodexVersions \| ForEach-Object \{ Join-Path \$env:RUNNER_TEMP \('codex-probe-' \+ \$_\) \}\)/u,'ACL-provisioned native prefixes must project the canonical list');
+ assert.match(canary,/\$script:SharedReportNames = @\(\$script:CodexVersions \| ForEach-Object \{ 'shared-results-' \+ \$_ \+ '\.json' \}\) \+ @\('shared-results-actual-desktop\.json'\)/u,'report forwarding must project the canonical list');
+ assert.equal((canary.match(/foreach \(\$name in \$script:SharedReportNames\)/gu)??[]).length,1);
+ assert.match(canary,/\$installerReports = @\('installer-results\.json', 'installer-failure-results\.json', 'installer-native-cleanup-results\.json'\)/u);
+ assert.match(canary,/foreach \(\$name in \(\$installerReports \+ \$script:SharedReportNames\)\)/u,'cleanup must forward every supported-version report');
 });
 test('signed Desktop fixture defines complete inert MCP transports for its enable overrides', async()=>{
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
@@ -877,7 +911,7 @@ test('shared Windows startup failure reports only an allowlisted driver stage', 
   'the Windows receipt must allow the shared resolver completion stage');
  assert.match(probe,/safe_engine_driver_stage\(value\.get\('probeStage'\)\)/u,'consume only allowlisted progress messages before the first driver response');
  assert.match(probe,/engine_driver_stage/u,'EOF diagnostics must retain the last accepted stage');
- assert.match(canary,/engineDriverStage -in @\('codex-connect'.*'windows-socket-verification', 'engine-close-request', 'engine-close-ack'\)/u,'the Windows receipt must forward only allowlisted stages');
+ assert.match(canary,/engineDriverStage -in @\('codex-connect'.*'windows-socket-verification', 'engine-close-request', 'engine-close-ack', 'engine-close-process-exit'\)/u,'the Windows receipt must forward only allowlisted stages');
  for(const stage of ['windows-installation','windows-owner-status','windows-desktop-discovery','windows-desktop-selection','windows-package-preparation',
   'windows-package-verification','windows-version-command','windows-owner-start','windows-owner-receipt','windows-owner-executable','windows-socket-verification']) {
   assert.ok(resolver.includes(`reportWindowsSharedProbeStage(env, '${stage}')`),`the Windows resolver must mark ${stage}`);

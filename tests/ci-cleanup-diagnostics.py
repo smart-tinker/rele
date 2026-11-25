@@ -437,6 +437,100 @@ class CleanupDiagnostics(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_valid_engine_close_ack_then_process_exit_timeout_has_safe_phase(self):
+        helpers = load_helpers(self)
+
+        class Stdin:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, value):
+                self.writes.append(value)
+
+            async def drain(self):
+                return None
+
+        class Process:
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data(b'{"action":"close","stopped":true,"backendAlive":true}\n')
+                self.stdin = Stdin()
+                self.returncode = None
+                self.wait_calls = 0
+
+            async def wait(self):
+                self.wait_calls += 1
+                raise TimeoutError('private process wait detail')
+
+        async def run():
+            process = Process()
+            driver = helpers['EngineDriver'](process)
+            errors = []
+            await helpers['record_cleanup_error'](
+                errors, 'engine.close', 'engine-driver-process', driver.close, 101, 202)
+
+            self.assertEqual([json.loads(value)['action'] for value in process.stdin.writes], ['close'])
+            self.assertEqual(process.wait_calls, 1)
+            self.assertIsNone(process.returncode)
+            self.assertEqual(len(errors), 1)
+            cleanup = errors[0]
+            self.assertEqual(cleanup['errorType'], 'TimeoutError')
+            self.assertEqual(cleanup['engineDriverStage'], 'engine-close-process-exit')
+            self.assertLessEqual(cleanup['elapsedMs'], 600000)
+            self.assertEqual((cleanup['processPid'], cleanup['ownerPid']), (101, 202))
+            primary = RuntimeError('synthetic primary failure')
+            self.assertIsNone(helpers['cleanup_failure_message'](primary, errors))
+            report = helpers['public_console_report']({'result': 'failed', 'cleanupErrors': errors})
+            self.assertEqual(report['cleanupErrors'][0]['engineDriverStage'], 'engine-close-process-exit')
+            serialized = json.dumps(report)
+            for private in ('processPid', 'ownerPid', 'private process wait detail', 'synthetic primary failure'):
+                self.assertNotIn(private, serialized)
+
+        asyncio.run(run())
+
+    def test_engine_close_labels_nonzero_process_exit_after_valid_ack(self):
+        helpers = load_helpers(self)
+
+        class Stdin:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, value):
+                self.writes.append(value)
+
+            async def drain(self):
+                return None
+
+        class Process:
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data(b'{"action":"close","stopped":true,"backendAlive":true}\n')
+                self.stdin = Stdin()
+                self.returncode = None
+                self.wait_calls = 0
+
+            async def wait(self):
+                self.wait_calls += 1
+                self.returncode = 1
+                return self.returncode
+
+        async def run():
+            process = Process()
+            driver = helpers['EngineDriver'](process)
+            with self.assertRaises(AssertionError) as raised:
+                await driver.close()
+
+            self.assertEqual([json.loads(value)['action'] for value in process.stdin.writes], ['close'])
+            self.assertEqual(process.wait_calls, 1)
+            self.assertEqual(process.returncode, 1)
+            self.assertEqual(getattr(raised.exception, 'engine_driver_exit_code', None), 1)
+            self.assertEqual(
+                getattr(raised.exception, 'engine_driver_stage', None),
+                'engine-close-process-exit',
+            )
+
+        asyncio.run(run())
+
     def test_engine_close_fails_closed_without_a_close_ack(self):
         helpers = load_helpers(self)
 

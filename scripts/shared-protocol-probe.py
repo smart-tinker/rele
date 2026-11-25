@@ -27,7 +27,7 @@ import websockets
 from websockets.exceptions import ConnectionClosedError
 from websockets.protocol import State
 
-VERSIONS = ['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1', '0.169.0-alpha.11.1', '0.171.0-alpha.13']
+VERSIONS = ['0.163.0', '0.163.0-alpha.10.2', '0.163.0-alpha.11', '0.163.0-alpha.11.2', '0.164.0-alpha.11.1', '0.165.0-alpha.1.2', '0.166.0-alpha.5.1', '0.166.0-alpha.6', '0.167.0-alpha.3.2', '0.167.0-alpha.4.1', '0.169.0-alpha.11.1', '0.171.0-alpha.13', '0.171.0-alpha.13.2']
 REPO = Path(__file__).resolve().parent.parent
 NODE = shutil.which('node')
 DRIVER = REPO / 'scripts/probe-shared-codex.ts'
@@ -63,7 +63,7 @@ def safe_engine_driver_stage(value):
                               'windows-package-preparation', 'windows-package-verification',
                               'windows-version-command', 'windows-owner-start', 'windows-owner-receipt',
                               'windows-owner-executable', 'windows-socket-verification',
-                              'engine-close-request', 'engine-close-ack') else None
+                              'engine-close-request', 'engine-close-ack', 'engine-close-process-exit') else None
 
 
 def safe_failure_location(error):
@@ -428,7 +428,10 @@ class EngineDriver:
                             'ingest', 'wait', 'answer', 'resume', 'cancel', 'snapshot', 'findRequest'):
                         raise RuntimeError('Shared Engine driver returned an invalid close response')
                 assert result.get('backendAlive'), 'Closing Rele stopped the shared native backend'
+                self.startup_stage = 'engine-close-process-exit'
                 await asyncio.wait_for(self.process.wait(), 15)
+                if self.process.returncode == 0:
+                    self.startup_stage = 'engine-close-ack'
             except Exception as error:
                 error.engine_driver_stage = self.startup_stage
                 raise
