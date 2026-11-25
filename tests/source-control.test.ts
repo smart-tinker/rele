@@ -57,12 +57,21 @@ function fixture() {
     disconnect: () => { connected = false; }, changeGeneration: () => { generation = 'generation-2'; } };
 }
 
+async function seedPriorGoal(engine: Engine, f: ReturnType<typeof fixture>, objective = 'Finish') {
+  const form = await engine.control(context, { kind: 'open' }), input = { action: 'goal' as const, objective, criterion: 'Done' };
+  const goal: NativeGoal = { threadId: f.conversation.threadId, objective: `${objective}\nКритерий завершения: Done`, status: 'active', tokenBudget: null,
+    tokensUsed: 0, timeUsedSeconds: 0, createdAt: 100, updatedAt: 100 };
+  const key = `source-control:${form.id}`, receipt = JSON.parse(f.store.getMeta(key)!);
+  Object.assign(receipt, { state: 'applied', input, message: 'Native цель создана ранее.', goal, baselineTurns: [], turns: [], completedTurns: [], outbox: [], lastGeneration: receipt.generation });
+  f.store.setMeta(key, JSON.stringify(receipt)); f.goal = goal;
+  return form;
+}
+
 async function runningGoalEngine() {
   const f = fixture(), native = Object.assign(new EventEmitter(), f.native, { releaseThread: vi.fn(async () => {}) });
   const engine = new Engine(f.store, native as unknown as CodexGateway, { config: () => ({ ...defaultConfig, slack: { enabled: true } }), temporaryRoot: tmpdir(), redact: f.options.redact });
   engine.channels.slack = f.options.channel() as unknown as Channel;
-  const form = await engine.control(context, { kind: 'open' });
-  await engine.control(context, { kind: 'submit', id: form.id, input: { action: 'goal', objective: 'Finish', criterion: 'Done' } });
+  await seedPriorGoal(engine, f);
   const turn: ControlTurn = { id: 'goal-turn', status: 'inProgress', items: [] }; f.turns.push(turn);
   native.emit('notification', { method: 'thread/goal/updated', params: { threadId: 'native-thread', turnId: turn.id, goal: f.goal } }); await engine.settled();
   return { ...f, native, engine, turn, request: f.store.activeRequests()[0] };
@@ -118,7 +127,7 @@ describe('native Goal terminal receipts', () => {
       await expect(f.engine.cancel(f.request.id)).rejects.toThrow('меню');
       expect(f.store.getRequest(f.request.id)).toEqual(before);
       for (const key of ['cancel-requested', 'cancel-cleanup', 'request-terminal-baseline']) expect(f.store.getMeta(`${key}:${f.request.id}`)).toBeUndefined();
-      expect(f.mutations).toEqual(['resume', 'goal']);
+      expect(f.mutations).toEqual([]);
       expect(f.store.listDeliveries()).toEqual([]);
     } finally { await f.engine.stop(); }
   });
@@ -139,8 +148,7 @@ describe('personal Slack source controls', () => {
     const f = fixture(), native = Object.assign(new EventEmitter(), f.native);
     const engine = new Engine(f.store, native as unknown as CodexGateway, { config: () => ({ ...defaultConfig, slack: { enabled: true } }), temporaryRoot: tmpdir(), redact: f.options.redact });
     engine.channels.slack = f.options.channel() as unknown as Channel;
-    const opened = await engine.control(context, { kind: 'open' });
-    await engine.control(context, { kind: 'submit', id: opened.id, input: { action: 'goal', objective: 'Finish', criterion: 'Done' } });
+    await seedPriorGoal(engine, f);
     f.turns.push({ id: 'goal-turn', status: 'inProgress', items: [] });
     native.emit('notification', { method: 'thread/goal/updated', params: { threadId: 'native-thread', turnId: 'goal-turn', goal: f.goal } });
     await engine.settled();
@@ -149,7 +157,7 @@ describe('personal Slack source controls', () => {
     const approval = f.store.listApprovals()[0], request = approval && f.store.getRequest(approval.requestId);
     expect(approval).toMatchObject({ turnId: 'goal-turn', status: 'pending' });
     expect(request).toMatchObject({ turnId: 'goal-turn', origin: { accountId: context.accountId, threadId: context.threadId, senderId: context.senderId } });
-    expect(f.mutations).toEqual(['resume', 'goal']);
+    expect(f.mutations).toEqual([]);
     await engine.stop();
   });
 
@@ -407,8 +415,7 @@ describe('personal Slack source controls', () => {
     const f = fixture(), native = Object.assign(new EventEmitter(), f.native, { status: () => ({ connected: true, queueSupported: true }), steer: vi.fn() });
     const engine = new Engine(f.store, native as unknown as CodexGateway, { config: () => ({ ...defaultConfig, slack: { enabled: true } }), temporaryRoot: tmpdir(), redact: f.options.redact });
     engine.channels.slack = f.options.channel() as unknown as Channel;
-    const opened = await engine.control(context, { kind: 'open' });
-    await engine.control(context, { kind: 'submit', id: opened.id, input: { action: 'goal', objective: 'Finish', criterion: 'Done' } });
+    await seedPriorGoal(engine, f);
     f.turns.push({ id: 'goal-turn', status: 'inProgress', items: [] });
     native.emit('notification', { method: 'thread/goal/updated', params: { threadId: 'native-thread', turnId: 'goal-turn', goal: f.goal } }); await engine.settled();
     const request = f.store.ingest({ eventId: 'new-human-message', endpoint: f.endpoint, sender: { id: context.senderId, name: 'Alice', isBot: false }, messageId: '1000.3', text: 'A genuine new request', directMention: true }).request!;
@@ -458,7 +465,7 @@ describe('personal Slack source controls', () => {
       commentary: [{ id: 'goal-comment', text: 'Goal public comment' }], publicHistory: [{ step: { id: 'goal-comment', text: 'Goal public comment' } }] });
     const engine = new Engine(f.store, native as unknown as CodexGateway, { config: () => ({ ...defaultConfig, slack: { enabled: true } }), temporaryRoot: tmpdir(), redact: f.options.redact });
     engine.channels.slack = f.options.channel() as unknown as Channel;
-    const form = await engine.control(context, { kind: 'open' }); await engine.control(context, { kind: 'submit', id: form.id, input: { action: 'goal', objective: 'Finish', criterion: 'Done' } });
+    await seedPriorGoal(engine, f);
     f.turns.push({ id: 'goal-turn', status: 'inProgress', items: [] });
     native.emit('notification', { method: 'thread/goal/updated', params: { threadId: 'native-thread', turnId: 'goal-turn', goal: f.goal } }); await engine.settled();
     const request = f.store.activeRequests()[0]; await engine.reconcile(request.id);
@@ -473,7 +480,7 @@ describe('personal Slack source controls', () => {
     let managed = false; native.status = () => ({ connected: true, queueSupported: true, transport: managed ? 'managed' : 'shared' });
     const engine = new Engine(f.store, native as unknown as CodexGateway, { config: () => ({ ...defaultConfig, slack: { enabled: true } }), temporaryRoot: tmpdir(), redact: f.options.redact });
     engine.channels.slack = f.options.channel() as unknown as Channel;
-    const form = await engine.control(context, { kind: 'open' }); await engine.control(context, { kind: 'submit', id: form.id, input: { action: 'goal', objective: 'Finish', criterion: 'Done' } });
+    await seedPriorGoal(engine, f);
     managed = true;
     const turn: ControlTurn = { id: 'goal-turn', status: 'inProgress', items: [] }; f.turns.push(turn);
     native.emit('notification', { method: 'thread/goal/updated', params: { threadId: 'native-thread', turnId: 'goal-turn', goal: f.goal } }); await engine.settled();
@@ -544,11 +551,11 @@ describe('personal Slack source controls', () => {
     const f = fixture(), native = Object.assign(new EventEmitter(), f.native, { status: () => ({ connected: true, transport: 'shared' }), rejectRequest: vi.fn(async () => {}) });
     const engine = new Engine(f.store, native as unknown as CodexGateway, { config: () => ({ ...defaultConfig, slack: { enabled: true } }), temporaryRoot: tmpdir(), redact: f.options.redact });
     engine.channels.slack = f.options.channel() as unknown as Channel;
-    const form = await engine.control(context, { kind: 'open' }); await engine.control(context, { kind: 'submit', id: form.id, input: { action: 'goal', objective: 'Finish', criterion: 'Done' } });
+    await seedPriorGoal(engine, f);
     native.emit('request', { id: 'first-native-approval', method: 'item/commandExecution/requestApproval', params: { threadId: 'native-thread', turnId: 'not-linked-yet', itemId: 'command', command: 'PRIVATE NATIVE COMMAND' } }); await engine.settled();
     expect(native.rejectRequest).not.toHaveBeenCalled(); expect(f.store.listApprovals()).toEqual([]);
     expect(f.sent.map(row => row.body).join('\n')).not.toContain('PRIVATE NATIVE COMMAND');
-    expect(f.mutations).toEqual(['resume', 'goal']); await engine.stop();
+    expect(f.mutations).toEqual([]); await engine.stop();
   });
 
   it('quarantines colliding native Goal identities across two sources, including an event before ACK', async () => {

@@ -11,11 +11,13 @@ export interface ControlContext {
 }
 export type ControlSelection = 'status' | 'goal' | 'stop' | 'model';
 export interface ControlInput { action: ControlSelection; objective?: string; criterion?: string; tokenBudget?: number; model?: string; effort?: string }
+// shortcut: Slack Goal writes stay read-only until Codex binds upsert and pause to the checked Goal.
+export const goalWriteUnavailable = 'Безопасное изменение native-цели из Slack недоступно: поддерживаемые версии Codex не связывают запись цели с состоянием, показанным в Slack. Создание делает upsert, остановка меняет текущую цель; при гонке запись может заменить или приостановить другую цель.';
 export interface ControlView {
   id: string; sourceTitle: string; conversationTitle: string; nativeThreadId: string; action: ControlSelection;
   connected: boolean; snapshot?: NativeControlSnapshot; models?: ControlModel[]; boundSources: number;
   ownQueued: number; ownRunning: number; message?: string; finished?: boolean;
-  accessMode?: string; goalLaunchUnavailable?: string; goalDeliveryState?: 'tracking' | 'complete' | 'uncertain';
+  accessMode?: string; goalWriteUnavailable?: string; goalLaunchUnavailable?: string; goalDeliveryState?: 'tracking' | 'complete' | 'uncertain';
 }
 interface NativeControls {
   status(): { connected: boolean; transport?: string }; isVerifiedVersion(): boolean;
@@ -123,6 +125,7 @@ export class SourceControls {
     return { id: receipt.id, sourceTitle: source.endpoint.title, conversationTitle: source.conversation.name,
       nativeThreadId: receipt.threadId, action, connected, boundSources: source.conversation.bindings.length,
       accessMode: this.store.getSourceAccess(source.endpoint.id).mode,
+      goalWriteUnavailable,
       ...(native?.status().transport === 'managed' ? { goalLaunchUnavailable: managedGoalReason } : {}),
       ...(owner ? { goalDeliveryState: owner.deliveryUncertain || owner.outbox?.some(row => ['sending', 'uncertain'].includes(row.status))
         ? 'uncertain' as const : owner.goalClosed ? 'complete' as const : 'tracking' as const } : {}),
@@ -151,19 +154,25 @@ export class SourceControls {
     if (!['status', 'goal', 'stop', 'model'].includes(action)) throw new Error('Неизвестное действие.');
     return this.view(this.current(context, id), action);
   }
-  async submit(context: ControlContext, id: string, input: ControlInput): Promise<ControlView> {
+  async submit(context: ControlContext, id: string, input: ControlInput, unavailableGoalWrite?: string): Promise<ControlView> {
     const first = this.current(context, id, true);
     const previous = this.locks.get(first.threadId) ?? Promise.resolve();
-    const task = previous.catch(() => {}).then(() => this.apply(context, id, input));
+    const task = previous.catch(() => {}).then(() => this.apply(context, id, input, unavailableGoalWrite));
     this.locks.set(first.threadId, task);
     try { return await task; } finally { if (this.locks.get(first.threadId) === task) this.locks.delete(first.threadId); }
   }
-  private async apply(context: ControlContext, id: string, input: ControlInput): Promise<ControlView> {
+  private async apply(context: ControlContext, id: string, input: ControlInput, unavailableGoalWrite?: string): Promise<ControlView> {
     let receipt = this.current(context, id, true);
     if (!input || !['status', 'goal', 'stop', 'model'].includes(input.action)) throw new Error('Неизвестное действие.');
     if (input.action === 'status') return this.view(receipt);
     if (receipt.state !== 'open') {
       if (digest(receipt.input) !== digest(input)) throw new Error('Эта форма уже отправлена с другими значениями.');
+      return this.view(receipt, input.action);
+    }
+    if (unavailableGoalWrite && ['goal', 'stop'].includes(input.action)) {
+      receipt.state = 'refused'; receipt.input = structuredClone(input);
+      receipt.message = `Операция не отправлена: ${unavailableGoalWrite}`;
+      this.save(receipt);
       return this.view(receipt, input.action);
     }
     const native = this.native(), snapshot = await native.controlSnapshot(receipt.threadId);
