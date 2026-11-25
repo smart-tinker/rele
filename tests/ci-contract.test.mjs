@@ -4,13 +4,13 @@ import { mkdtemp, writeFile, rm, mkdir, symlink, readFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { assertSteps, writeBundle, verifyBundles } from '../scripts/ci-contract.mjs';
+import { assertSteps, isPrereleaseVersion, packageNames, writeBundle, verifyBundles } from '../scripts/ci-contract.mjs';
 import { lookupSharedNativeRequest, summarizeSharedNativeRequest } from '../scripts/shared-probe-diagnostics.mjs';
 const sha = 'a'.repeat(40), run = '123', attempt = '1', version = '0.1.2-rc.1';
 const candidate={repository:'owner/repo',version,commit:sha,runId:run,attempt};
-async function releaseBackend(root) {
+async function releaseBackend(root, candidateValue=candidate) {
  const {prepareCandidate,uploadPlatform}=await import('../scripts/ci-publish.mjs');
- const state={main:sha,tag:null,release:null,assets:[],bodies:new Map(),calls:[]};
+ const state={main:candidateValue.commit,tag:null,release:null,assets:[],bodies:new Map(),calls:[]};
  const api=async(route,options={})=>{
   state.calls.push({route,...options});
   if(options.upload) {
@@ -33,10 +33,28 @@ async function releaseBackend(root) {
   if(options.download)return state.bodies.get(Number(route.split('/').at(-1)));
   throw new Error('Unexpected API read '+route);
  };
- const prepared=async()=>prepareCandidate(api,candidate);
- const uploaded=async()=>{await prepared();await Promise.all(['linux','windows'].map(platform=>uploadPlatform(api,candidate,77,path.join(root,platform),platform)));};
+ const prepared=async()=>prepareCandidate(api,candidateValue);
+ const uploaded=async()=>{await prepared();await Promise.all(['linux','windows'].map(platform=>uploadPlatform(api,candidateValue,77,path.join(root,platform),platform)));};
  return {state,api,prepared,uploaded};
 }
+test('stable final version prepares as a non-prerelease draft through the fake API',async()=>{
+ const stable={...candidate,version:'0.1.1'},f=await releaseBackend('/unused',stable);
+ const result=await f.prepared();
+ assert.equal(result.tag_name,'v0.1.1');assert.equal(result.target_commitish,sha);assert.equal(result.draft,true);assert.equal(result.prerelease,false);
+ assert.equal(f.state.calls.filter(call=>call.method==='POST').length,1);
+});
+test('release package naming accepts only stable finals and immutable RC versions',()=>{
+ assert.equal(isPrereleaseVersion('0.1.2-rc.1'),true);assert.equal(isPrereleaseVersion('0.1.1'),false);
+ assert.deepEqual(packageNames('linux','0.1.1'),[
+  'rele-0.1.1-linux-x64.deb','rele-0.1.1-linux-x64.deb.sha256',
+  'rele-0.1.1-linux-x64.tar.gz','rele-0.1.1-linux-x64.tar.gz.sha256',
+ ]);
+ assert.deepEqual(packageNames('windows','0.1.1'),[
+  'rele-0.1.1-windows-x64-setup.exe','rele-0.1.1-windows-x64-setup.exe.sha256',
+  'rele-0.1.1-windows-x64.zip','rele-0.1.1-windows-x64.zip.sha256',
+ ]);
+ for(const invalid of ['0.1.1-rc','0.1.1-beta.1','v0.1.1'])assert.throws(()=>isPrereleaseVersion(invalid));
+});
 test('missing, skipped and failed required steps cannot pass', () => {
  assert.doesNotThrow(() => assertSteps({a:{outcome:'success',conclusion:'success'}}, ['a']));
  for (const outcome of ['skipped','failure','cancelled']) assert.throws(() => assertSteps({a:{outcome,conclusion:'success'}}, ['a']));
@@ -48,15 +66,15 @@ test('required-step failures report every failed outcome', () => {
   browser_install:{outcome:'skipped',conclusion:'skipped'},
  }, ['browser_install','standard_user']), /Required steps did not pass: browser_install=skipped, standard_user=failure/u);
 });
-async function fixture(fn) {
+async function fixture(fn, fixtureVersion=version) {
  const root=await mkdtemp(path.join(tmpdir(),'rele-ci-'));
  try {
   for(const platform of ['linux','windows']) {
    const release=path.join(root,platform);await mkdir(release);
-   const stem=`rele-${version}-${platform}-x64`;
+   const stem=`rele-${fixtureVersion}-${platform}-x64`;
    const exts=platform==='linux'?['.deb','.tar.gz']:['-setup.exe','.zip'];
    for(const ext of exts){const name=stem+ext;const data=Buffer.from(name);await writeFile(path.join(release,name),data);await writeFile(path.join(release,name+'.sha256'),createHash('sha256').update(data).digest('hex')+'  '+name+'\n');}
-   await writeBundle(release,platform,version,sha,run,attempt);
+   await writeBundle(release,platform,fixtureVersion,sha,run,attempt);
   }
   await fn(root);
  } finally {await rm(root,{recursive:true,force:true});}
@@ -136,6 +154,66 @@ test('publisher finalizes a prepared draft without replacing packages or deletin
  assert.equal(f.state.assets.length,11);assert.equal(f.state.calls.filter(call=>call.upload).length,11);
  assert.ok(f.state.calls.every(call=>call.method!=='DELETE' && !call.route.includes('/actions/')));
 }));
+test('stable version uploads and verifies exact platform assets while remaining a draft',()=>fixture(async root=>{
+ const stable={...candidate,version:'0.1.1'},f=await releaseBackend(root,stable);
+ const {downloadCandidate,publishCandidate,uploadPlatform}=await import('../scripts/ci-publish.mjs');
+ const prepared=await f.prepared();assert.equal(prepared.draft,true);assert.equal(prepared.prerelease,false);
+ await Promise.all(['linux','windows'].map(platform=>uploadPlatform(f.api,stable,77,path.join(root,platform),platform)));
+ const incoming=path.join(root,'incoming');await downloadCandidate(f.api,stable,77,incoming);
+ const bundle=await verifyBundles(incoming,stable.version,sha,run,attempt);
+ const before=f.state.calls.length,result=await publishCandidate(f.api,bundle,stable,77);
+ assert.equal(result.draft,true);assert.equal(result.prerelease,false);assert.match(result.body,/Verification passed/u);
+ assert.deepEqual(f.state.assets.map(asset=>asset.name).sort(),[
+  ...['linux','windows'].flatMap(platform=>[
+   ...packageNames(platform,stable.version),`${platform}-evidence.json`,
+  ]),'verification.json',
+ ].sort());
+ const writes=f.state.calls.slice(before).filter(call=>call.method);
+ assert.deepEqual(writes.map(call=>call.method),['POST','PATCH']);
+ assert.deepEqual(writes.at(-1).body,{name:'Rele 0.1.1',draft:true,prerelease:false,
+  body:`Rele candidate ${sha}; run ${run}; attempt ${attempt}. Verification passed.\nReal Desktop and messenger acceptance is still required.`});
+},'0.1.1'));
+test('stable source, tag, version, release-kind and asset changes fail before upload or finalization',()=>fixture(async root=>{
+ const stable={...candidate,version:'0.1.1'};
+ const {publishCandidate,uploadPlatform}=await import('../scripts/ci-publish.mjs');
+ for(const mutate of [
+  f=>{f.state.main='b'.repeat(40);},
+  f=>{f.state.tag={object:{type:'commit',sha}};},
+  f=>{f.state.release={tag_name:'v0.1.1',draft:true};},
+ ]) {
+  const f=await releaseBackend(root,stable);mutate(f);
+  await assert.rejects(f.prepared());assert.ok(f.state.calls.every(call=>!call.method));
+ }
+ const uploadMutations=[
+  f=>{f.state.main='b'.repeat(40);},
+  f=>{f.state.tag={object:{type:'commit',sha:'b'.repeat(40)}};},
+  f=>{f.state.release.tag_name='v0.1.2';},
+  f=>{f.state.release.target_commitish='b'.repeat(40);},
+  f=>{f.state.release.prerelease=true;},
+ ];
+ for(const mutate of uploadMutations) {
+  const f=await releaseBackend(root,stable);await f.prepared();mutate(f);
+  const writes=f.state.calls.filter(call=>call.method).length;
+  await assert.rejects(uploadPlatform(f.api,stable,77,path.join(root,'linux'),'linux'));
+  assert.equal(f.state.assets.length,0);assert.equal(f.state.calls.filter(call=>call.method).length,writes);
+ }
+ const f=await releaseBackend(root,stable);await f.uploaded();
+ const bundle=await verifyBundles(root,stable.version,sha,run,attempt);
+ const finalMutations=[
+  [()=>{f.state.main='b'.repeat(40);},()=>{f.state.main=sha;}],
+  [()=>{f.state.tag={object:{type:'commit',sha:'b'.repeat(40)}};},()=>{f.state.tag=null;}],
+  [()=>{f.state.release.tag_name='v0.1.2';},()=>{f.state.release.tag_name='v0.1.1';}],
+  [()=>{f.state.release.target_commitish='b'.repeat(40);},()=>{f.state.release.target_commitish=sha;}],
+  [()=>{f.state.release.draft=false;},()=>{f.state.release.draft=true;}],
+  [()=>{f.state.release.prerelease=true;},()=>{f.state.release.prerelease=false;}],
+  [()=>{f.state.assets[0].digest='sha256:'+'0'.repeat(64);},()=>{f.state.assets[0].digest='sha256:'+createHash('sha256').update(f.state.bodies.get(f.state.assets[0].id)).digest('hex');}],
+ ];
+ for(const [mutate,restore] of finalMutations) {
+  const writes=f.state.calls.filter(call=>call.method).length;mutate(f);
+  await assert.rejects(publishCandidate(f.api,bundle,stable,77));
+  assert.equal(f.state.calls.filter(call=>call.method).length,writes);restore(f);
+ }
+},'0.1.1'));
 test('draft identity and source/run/attempt changes stop uploads before any asset write',()=>fixture(async root=>{
  const {uploadPlatform}=await import('../scripts/ci-publish.mjs');
  for(const patch of [{id:78},{draft:false},{prerelease:false},{target_commitish:'b'.repeat(40)},{tag_name:'v0.1.2-rc.99'},

@@ -2,11 +2,11 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { packageNames, PLATFORM_LIMIT, verifyPlatformBundle } from './ci-contract.mjs';
+import { isPrereleaseVersion, packageNames, PLATFORM_LIMIT, verifyPlatformBundle } from './ci-contract.mjs';
 
 function context(value) {
  assert.match(value.repository,/^[\w.-]+\/[\w.-]+$/u);
- assert.match(value.version,/^\d+\.\d+\.\d+-rc\.\d+$/u);assert.match(value.commit,/^[a-f0-9]{40}$/u);
+ isPrereleaseVersion(value.version);assert.match(value.commit,/^[a-f0-9]{40}$/u);
  assert.match(value.runId,/^[1-9]\d*$/u);assert.match(value.attempt,/^[1-9]\d*$/u);
  return `/repos/${value.repository}`;
 }
@@ -18,7 +18,7 @@ async function currentMain(api, candidate) {
 }
 function draft(release, candidate, releaseId, verified=false) {
  assert.ok(Number.isSafeInteger(releaseId) && releaseId>0,'Invalid draft release ID');
- assert.equal(release?.id,releaseId);assert.equal(release.draft,true,'Candidate must remain a draft');assert.equal(release.prerelease,true);
+ assert.equal(release?.id,releaseId);assert.equal(release.draft,true,'Candidate must remain a draft');assert.equal(release.prerelease,isPrereleaseVersion(candidate.version),'Release kind changed');
  assert.equal(release.tag_name,`v${candidate.version}`);assert.equal(release.target_commitish,candidate.commit);
  assert.equal(release.body,body(candidate,verified),'Draft source/run/attempt or verification state changed');
  return release;
@@ -64,7 +64,7 @@ export async function prepareCandidate(api, candidate) {
   if(releases.length<100)break;
  }
  await currentMain(api,candidate);
- const release=await api(`${base}/releases`,{method:'POST',body:{tag_name:`v${candidate.version}`,target_commitish:candidate.commit,name:`Rele ${candidate.version} (verification pending)`,draft:true,prerelease:true,body:body(candidate)}});
+ const release=await api(`${base}/releases`,{method:'POST',body:{tag_name:`v${candidate.version}`,target_commitish:candidate.commit,name:`Rele ${candidate.version} (verification pending)`,draft:true,prerelease:isPrereleaseVersion(candidate.version),body:body(candidate)}});
  return draft(release,candidate,release?.id);
 }
 export async function uploadPlatform(api, candidate, releaseId, directory, platform) {
@@ -105,7 +105,7 @@ export async function publishCandidate(api, bundle, candidate, releaseId) {
  const data=Buffer.from(JSON.stringify(bundle.evidence,null,2)+'\n');
  await checkedDraft(api,candidate,releaseId);await upload(api,base,releaseId,'verification.json',data);
  await checkedDraft(api,candidate,releaseId);
- const patch={name:`Rele ${candidate.version}`,draft:true,prerelease:true,body:body(candidate,true)};
+ const patch={name:`Rele ${candidate.version}`,draft:true,prerelease:isPrereleaseVersion(candidate.version),body:body(candidate,true)};
  draft(await api(`${base}/releases/${releaseId}`,{method:'PATCH',body:patch}),candidate,releaseId,true);
  const result=draft(await api(`${base}/releases/${releaseId}`),candidate,releaseId,true);
  const finalAssets=await api(`${base}/releases/${releaseId}/assets?per_page=100`);
