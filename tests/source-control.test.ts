@@ -173,6 +173,43 @@ describe('personal Slack source controls', () => {
     expect(f.store.listRequests()).toEqual([]);
   });
 
+  it('blocks Goal and Stop at the Engine submit boundary while preserving reads and prior outcomes', async () => {
+    const f = fixture(), native = Object.assign(new EventEmitter(), f.native);
+    const engine = new Engine(f.store, native as unknown as CodexGateway, { config: () => ({ ...defaultConfig, slack: { enabled: true } }), temporaryRoot: tmpdir(), redact: f.options.redact });
+    engine.channels.slack = f.options.channel() as unknown as Channel;
+    try {
+      const prior = await f.controls.open(context), input = { action: 'goal' as const, objective: 'Previously accepted', criterion: 'Done' };
+      await f.controls.submit(context, prior.id, input);
+      f.mutations.splice(0);
+      const replay = await engine.control(context, { kind: 'submit', id: prior.id, input });
+      expect(replay.message).toContain('Native цель создана');
+      expect(f.mutations).toEqual([]);
+
+      f.goal = null;
+      const create = await engine.control(context, { kind: 'open' });
+      const goalView = await engine.control(context, { kind: 'preview', id: create.id, action: 'goal' });
+      expect(goalView.goalWriteUnavailable).toContain('поддерживаемые версии Codex');
+      const refusedCreate = await engine.control(context, { kind: 'submit', id: create.id, input });
+      expect(refusedCreate.message).toContain(goalView.goalWriteUnavailable);
+      expect(f.mutations).toEqual([]);
+      expect(f.goal?.objective).toContain('Previously accepted');
+
+      const shown = { threadId: 'native-thread', objective: 'Goal shown in Slack', status: 'active' as const, tokenBudget: null,
+        tokensUsed: 0, timeUsedSeconds: 0, createdAt: 100, updatedAt: 100 };
+      f.goal = shown;
+      const stopForm = await engine.control(context, { kind: 'open' });
+      const stopView = await engine.control(context, { kind: 'preview', id: stopForm.id, action: 'stop' });
+      expect(stopView.snapshot?.goal).toEqual(shown);
+      const replacement = { ...shown, objective: 'Goal changed in Desktop', createdAt: 101, updatedAt: 101 };
+      f.goal = replacement;
+      const refusedStop = await engine.control(context, { kind: 'submit', id: stopForm.id, input: { action: 'stop' } });
+      expect(refusedStop.message).toContain(goalView.goalWriteUnavailable);
+      expect(f.goal).toEqual(replacement);
+      expect(f.mutations).toEqual([]);
+      expect(f.store.listRequests()).toEqual([]);
+    } finally { await engine.stop(); }
+  });
+
   it('does not show a settled Goal from the previous conversation after a source rebind', async () => {
     const f = fixture(), form = await f.controls.open(context);
     await f.controls.submit(context, form.id, { action: 'goal', objective: 'Finish old work', criterion: 'Done' });
