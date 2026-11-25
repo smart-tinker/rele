@@ -53,7 +53,10 @@ test('release package naming accepts only stable finals and immutable RC version
   'rele-0.1.1-windows-x64-setup.exe','rele-0.1.1-windows-x64-setup.exe.sha256',
   'rele-0.1.1-windows-x64.zip','rele-0.1.1-windows-x64.zip.sha256',
  ]);
- for(const invalid of ['0.1.1-rc','0.1.1-beta.1','v0.1.1'])assert.throws(()=>isPrereleaseVersion(invalid));
+ for(const invalid of [
+  '0.1.1-rc','0.1.1-beta.1','v0.1.1',
+  '01.1.1','0.01.1','0.1.01','0.1.1-rc.01',
+ ])assert.throws(()=>isPrereleaseVersion(invalid));
 });
 test('draft body links RC notes to the candidate version and commit',()=>fixture(async root=>{
  const {prepareCandidate}=await import('../scripts/ci-publish.mjs');
