@@ -6,6 +6,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { assertSteps, isPrereleaseVersion, packageNames, writeBundle, verifyBundles } from '../scripts/ci-contract.mjs';
 import { lookupSharedNativeRequest, summarizeSharedNativeRequest } from '../scripts/shared-probe-diagnostics.mjs';
+import { formatOwnerControlFailure, parseOwnerControlFailureOutput } from '../scripts/windows/owner-control-diagnostics.mjs';
 const sha = 'a'.repeat(40), run = '123', attempt = '1', version = '0.1.2-rc.1';
 const candidate={repository:'owner/repo',version,commit:sha,runId:run,attempt};
 async function releaseBackend(root, candidateValue=candidate) {
@@ -1057,4 +1058,22 @@ test('RC20 notes report #26 closed without recovering its historical cause', asy
  assert.ok(diagnostic.includes('UNKNOWN / unrecoverable'), 'preserve the unrecoverable boundary');
  assert.match(diagnostic, /первопричина\s+не установлена/u, 'do not claim a root cause');
  assert.doesNotMatch(diagnostic, /#35|#36|#44227151928/u, 'do not attribute unrelated later traces to #26');
+});
+
+test('Windows owner-control diagnostics extract only allowlisted fields from synthetic child output', () => {
+ const error = new Error('synthetic private output'); error.name = 'AssertionError';
+ const marker = formatOwnerControlFailure({ phase: 'wait-task-recovery', error, cleanupConfirmed: false });
+ assert.equal(marker, 'RELE_CI_OWNER_CONTROL_FAILURE phase=wait-task-recovery errorType=assertion cleanup=unconfirmed');
+ assert.deepEqual(parseOwnerControlFailureOutput(['ordinary progress', marker].join('\n')), { phase: 'wait-task-recovery', errorType: 'assertion', cleanup: 'unconfirmed' });
+ assert.doesNotMatch(marker, /synthetic private output/u);
+ assert.equal(parseOwnerControlFailureOutput('RELE_CI_OWNER_CONTROL_FAILURE phase=private errorType=private cleanup=unconfirmed'), undefined);
+ const unknown = formatOwnerControlFailure({ phase: 'private-phase', error: new Error('private'), cleanupConfirmed: false });
+ assert.equal(unknown, 'RELE_CI_OWNER_CONTROL_FAILURE phase=unknown errorType=error cleanup=unconfirmed');
+});
+
+test('Windows canary captures owner-control diagnostics before deleting its fixture', async () => {
+ const canary = await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1', import.meta.url), 'utf8');
+ const diagnosticRead = canary.indexOf('$parsed = & $marker.node $parser $stdout');
+ const fixtureRemoval = canary.indexOf('Remove-Item -LiteralPath $FixtureRoot -Recurse -Force');
+ assert.ok(diagnosticRead >= 0 && fixtureRemoval > diagnosticRead, 'read the bounded child marker while its fixture output still exists');
 });
