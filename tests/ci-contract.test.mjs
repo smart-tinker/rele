@@ -1045,3 +1045,16 @@ test('fixture cleanup skips a reused host PID and still drains its exact Task', 
  assert.match(cleanup,/if \(\$task\.State -notin @\(1,3\) -or \$task\.GetInstances\(0\)\.Count -ne 0\) \{ throw/u,
   'cleanup must retain the fixture if its exact Task still has an instance');
 });
+
+test('RC20 notes report #26 closed without recovering its historical cause', async () => {
+ const notes = await readFile(new URL('../docs/0.1.1-rc.20.md', import.meta.url), 'utf8');
+ const diagnostic = notes.match(/\\[Issue #26\\][\\s\\S]*?(?=\\n\\n|$)/u)?.[0] ?? '';
+ assert.match(diagnostic, /\\[Issue #26\\]\\([^)]+\\) закрыта/u);
+ assert.doesNotMatch(diagnostic, /оста[её]тся открытым|remains open/iu);
+ assert.ok(diagnostic.includes('#31') && diagnostic.includes('45703040279'), 'link closure to the merged diagnostic PR and successful post-merge CI');
+ assert.ok(diagnostic.includes('#43375287426') && diagnostic.includes('`TimeoutError()`'), 'retain the original run and its only recorded aggregate error');
+ for (const field of ['операция', 'длительность', 'процесс', 'причина']) assert.ok(diagnostic.includes(field), `mark historical ${field} unknown`);
+ assert.ok(diagnostic.includes('UNKNOWN / unrecoverable'), 'preserve the unrecoverable boundary');
+ assert.ok(diagnostic.includes('первопричина не установлена'), 'do not claim a root cause');
+ assert.doesNotMatch(diagnostic, /#35|#36|#44227151928/u, 'do not attribute unrelated later traces to #26');
+});
