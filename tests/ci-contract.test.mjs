@@ -1077,3 +1077,26 @@ test('Windows canary captures owner-control diagnostics before deleting its fixt
  const fixtureRemoval = canary.indexOf('Remove-Item -LiteralPath $FixtureRoot -Recurse -Force');
  assert.ok(diagnosticRead >= 0 && fixtureRemoval > diagnosticRead, 'read the bounded child marker while its fixture output still exists');
 });
+
+test('Slack controls guide keeps current Goal write restrictions explicit', async () => {
+ const guide = await readFile(new URL('../docs/SLACK-CONTROLS.md', import.meta.url), 'utf8');
+ assert.match(guide,/Создание и остановка целей из Slack отключены во всех режимах/u);
+ assert.match(guide,/https:\/\/github\.com\/openai\/codex\/issues\/63955/u);
+ assert.doesNotMatch(guide,/Запуск поддерживается в общем подключении/u);
+ assert.doesNotMatch(guide,/чтение\/приостановка существующей цели остаются доступны/u);
+ assert.doesNotMatch(guide,/Остановка сохраняет native `paused`/u);
+});
+
+test('native Goal docs preserve the issue #1 Slack write boundary', async () => {
+ const slack = await readFile(new URL('../docs/SLACK-CONTROLS.md', import.meta.url), 'utf8');
+ const native = await readFile(new URL('../docs/NATIVE-GOAL-CONTRACT.md', import.meta.url), 'utf8');
+ assert.doesNotMatch(native,/адресная приостановка сохраняются/u);
+ const disabled = /Создание и остановка целей из Slack\s+отключены во всех режимах/u;
+ assert.match(slack,disabled); assert.match(native,disabled);
+ assert.match(slack,/https:\/\/github\.com\/openai\/codex\/issues\/63955/u);
+ assert.match(native,/https:\/\/github\.com\/openai\/codex\/issues\/63955/u);
+ assert.match(slack,/отклоняет submit до native RPC/u);
+ assert.match(native,/отклоняет Slack Goal submit до native mutation RPC/u);
+ assert.match(slack,/не закрывает\s+issue #1/u);
+ assert.match(native,/Issue #1\s+остаётся открытым/u);
+});
