@@ -1086,3 +1086,15 @@ test('Slack controls guide keeps current Goal write restrictions explicit', asyn
  assert.doesNotMatch(guide,/чтение\/приостановка существующей цели остаются доступны/u);
  assert.doesNotMatch(guide,/Остановка сохраняет native `paused`/u);
 });
+
+test('native Goal docs preserve the issue #1 Slack write boundary', async () => {
+ const slack = await readFile(new URL('../docs/SLACK-CONTROLS.md', import.meta.url), 'utf8');
+ const native = await readFile(new URL('../docs/NATIVE-GOAL-CONTRACT.md', import.meta.url), 'utf8');
+ assert.doesNotMatch(native,/адресная приостановка сохраняются/u);
+ const disabled = /Создание и остановка целей из Slack отключены во всех режимах/u;
+ assert.match(slack,disabled); assert.match(native,disabled);
+ assert.match(slack,/https:\/\/github\.com\/openai\/codex\/issues\/63955/u);
+ assert.match(native,/https:\/\/github\.com\/openai\/codex\/issues\/63955/u);
+ assert.match(slack,/не закрывает\s+issue #1/u);
+ assert.match(native,/Issue #1 остаётся открытым/u);
+});
