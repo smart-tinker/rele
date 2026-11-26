@@ -11,17 +11,20 @@ workflows выполняют [CodeQL](../.github/workflows/codeql.yml) и
 ```mermaid
 flowchart TD
   PR[Draft PR / ready PR / main] --> V[Reusable verify.yml]
-  V --> L[Ubuntu 24.04]
-  V --> W[Windows 2025]
-  M[Manual release из main] --> P0[Ubuntu: создать непроверенный draft]
+  V --> LINUX[Ubuntu 24.04]
+  V --> WINDOWS[Windows 2025]
+  M[Manual draft из main] --> P0[Ubuntu: непроверенный draft RC или stable]
   P0 --> V
   PR --> Q[CodeQL: Ubuntu]
-  PR -->|Только PR| R[Dependency review: Ubuntu]
-  L --> G[CI gate: обе ОС успешны]
-  W --> G
-  G -->|Только manual release из main| P[Ubuntu: проверить draft assets, attestations и SHA]
-  P --> D[Draft RC: те же проверенные пакеты]
-  D --> A[Отдельная приёмка установленного приложения]
+  PR -->|Только PR| DEP[Dependency review: Ubuntu]
+  LINUX --> G[CI gate: обе ОС успешны]
+  WINDOWS --> G
+  G -->|Только manual draft из main| P[Ubuntu: проверить assets, attestations и SHA]
+  P --> D[Verified draft: RC или stable, ещё не опубликован]
+  D -->|RC: отдельное разрешение| RC_PUBLISH[Публикация RC prerelease]
+  RC_PUBLISH --> RC_ACCEPT[Отдельная приёмка установленного RC]
+  D -->|Stable: RC принят; приёмка точных финальных байтов| STABLE_PUBLISH[Отдельная публикация stable]
+  STABLE_PUBLISH --> LATEST[Latest только после приёмки и отдельной рекомендации]
 ```
 
 | Режим | Runner-ы на событие | Что выполняется |
@@ -32,7 +35,7 @@ flowchart TD
 | Ручной dispatch с `release: false` | 2 matrix, затем CI gate на Ubuntu | Полный набор без передачи пакетов и публикации |
 | Windows, полный режим | Windows matrix job | Заблокированные файлы при cleanup, Desktop backend, owner/pipe, installer/native shared под обычным пользователем |
 | Linux, полный режим | Ubuntu matrix job | Debian/systemd lifecycle, native shared/recovery, voice с запрещёнными network syscalls |
-| Ручной release из main | 1 Ubuntu подготовки → 2 matrix → CI gate → 1 Ubuntu финализации | Непроверенный draft → полный набор → attestation и прямая загрузка пакетов в draft → проверка скачанных assets/attestations/SHA/commit/run → проверенный draft без пересборки |
+| Ручной `release: true` из main | 1 Ubuntu подготовки → 2 matrix → CI gate → 1 Ubuntu финализации | Непроверенный draft RC или stable → полный набор → attestation и прямая загрузка пакетов → проверка скачанных assets/attestations/SHA/commit/run → проверенный, всё ещё неопубликованный draft |
 | CodeQL по расписанию | 1 Ubuntu | Еженедельный анализ JavaScript/TypeScript и Python |
 
 В одной matrix одновременно работают максимум два runner-а. Независимые security
@@ -81,10 +84,14 @@ runner не нужен. Для диагностики можно запуска�
 Actions storage, quota approval или последующего удаления transfers нет.
 
 Ручной `release: true` разрешён только из public `main`. Подготовительный Ubuntu
-job проверяет текущий SHA, новый `X.Y.Z-rc.N` и отсутствие занятого git-тега или
-Release, включая drafts. Он создаёт непроверенный draft с pinned SHA/run/attempt
-и передаёт его ID двум OS jobs. Это ещё не готовый RC: до финализации в названии
-и описании явно указана незавершённая проверка.
+job принимает версию RC `X.Y.Z-rc.N` или финальную stable `X.Y.Z`, проверяет
+текущий SHA и отсутствие занятого git-тега или Release, включая drafts. Он создаёт
+непроверенный draft с pinned SHA/run/attempt и передаёт его ID двум OS jobs.
+Оба вида остаются `draft=true`; RC получает `prerelease=true`, stable —
+`prerelease=false`. Перед stable dispatch оператор должен иметь принятие RC и
+отдельное разрешение на этот переход: workflow проверяет байты и происхождение,
+но не заменяет процессное решение о приёмке или публикации. До финализации в
+названии и описании явно указана незавершённая проверка.
 
 Каждая ОС после всех своих обязательных проверок формирует комплект из двух
 пакетов, двух `.sha256` и `evidence.json`. Сохраняется локальный предел 100 MiB
@@ -105,8 +112,19 @@ SHA/run/attempt. Перед финальными записями повторн
 Финализатор один раз добавляет сводный `verification.json`, обновляет описание и
 повторно читает итоговые флаги и inventory. Пакеты повторно не загружаются и не
 пересобираются. Итог содержит одиннадцать assets; Release остаётся
-`draft=true, prerelease=true`. Новый сводный JSON сам не является attested build
-artifact, его исходные OS-отчёты проверены отдельно.
+draft остаётся неопубликованным: `draft=true`, `prerelease=true` для RC или
+`prerelease=false` для stable. Финализатор не публикует Release и не выбирает
+Latest. Новый сводный JSON сам не является attested build artifact, его исходные
+OS-отчёты проверены отдельно.
+
+Публикация — отдельный переход после проверки draft и разрешения владельца.
+Проверенный RC публикуется как `draft=false, prerelease=true`, затем проходит
+приёмку установленного RC. Для stable сначала принимаются именно готовые финальные
+байты из draft на целевых стендах; пересборка после этой проверки недопустима.
+Только после принятия этих байтов и отдельного разрешения stable публикуется как
+`draft=false, prerelease=false`. Latest не назначается автоматически: оператор
+явно указывает `make_latest=true` только для отдельно рекомендованной stable после
+приёмки её финальных байтов; иначе оставляет `make_latest=false`.
 
 Обычный reusable caller имеет только `contents: read` и `actions: read`.
 Только release caller получает `contents: write`, `id-token: write` и
@@ -127,5 +145,7 @@ artifact, его исходные OS-отчёты проверены отдел�
 Hosted runs исполняют Windows Desktop fixture и standard-user canary; ограничения
 времени для каждой ОС задаются в `timeout-minutes` workflow. Каждый результат
 относится только к своему SHA; `in_progress`, `skipped` или failure не доказывают
-успешный обязательный gate. CI не заменяет acceptance установленного пакета;
-release dispatch не разрешает публикацию stable или раскатку.
+успешный обязательный gate. CI не заменяет acceptance установленного пакета.
+Release dispatch проверяет и финализирует draft, но не публикует RC/stable,
+не назначает Latest и не разрешает rollout; для каждого перехода требуется
+отдельное решение.
