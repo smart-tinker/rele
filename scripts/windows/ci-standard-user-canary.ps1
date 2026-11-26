@@ -280,7 +280,7 @@ $fixtureParent = if ($StandaloneShared -and $Phase -eq 'Shared') { $standaloneRo
 $FixtureRoot = Join-Path $fixtureParent ('rc-' + $Nonce.Substring(0, 8))
 if (Test-Path -LiteralPath $FixtureRoot) { throw 'Fixture directory already exists.' }
 New-Item -ItemType Directory -Path $FixtureRoot | Out-Null
-$user = $null; $child = $null; $credential = $null; $password = $null; $rdp = $null; $sharedOutcome = $null; $gatesDeadline = $null; $parentStage = 'setup'
+$user = $null; $child = $null; $credential = $null; $password = $null; $rdp = $null; $sharedOutcome = $null; $gatesDeadline = $null; $parentStage = 'setup'; $ownerControlFailure = @{ available = $false; value = $null }
 $installerChildStarted = $false; $installerCleanupConfirmed = $false
 $rdpSettingsChanged = $false; $serviceStartupChanged = $false; $serviceStarted = $false
 $operationalLogWasEnabled = $null; $operationalLogChanged = $false; $rdpClientLogWasEnabled = $null; $rdpClientLogChanged = $false
@@ -616,6 +616,21 @@ try {
                 $allowed = @('Windows installer smoke: an unknown startup script is preserved', 'Windows installer smoke: a previous portable process is not killed', 'Windows installer smoke: foreign Desktop settings are preserved without blocking installation', 'Windows installer smoke: the Codex wrapper preserves argv, profile, data and raw bytes', 'Windows installer smoke: launcher restart', 'Windows installer smoke: same-version upgrade with backup', 'Windows installer smoke: owned Desktop settings restore and later foreign changes survive uninstall', 'Windows installer smoke: uninstall preserves data', 'Windows installer cleanup: desktop-environment', 'Windows installer cleanup: held-adapter', 'Windows installer cleanup: native-daemon', 'Windows installer cleanup: files', 'Windows installer cleanup: complete')
                 Get-Content -LiteralPath $stdout -Tail 64 | Where-Object { $_ -in $allowed -or $_ -cmatch '^RELE_CI_STAGE=[a-z0-9.-]{1,96}$' } | Select-Object -Last 32 | ForEach-Object { $installerProgress.Add([string]$_) }
             }
+                 if ($result -and $result.phase -eq 'Installer' -and $result.stage -eq 'owner-control' -and (Test-Path -LiteralPath $stdout -PathType Leaf)) {
+                     try {
+                         $parser = Join-Path $sourceRoot 'scripts\windows\owner-control-diagnostics.mjs'
+                         $parsed = & $marker.node $parser $stdout 2>$null
+                         if ($LASTEXITCODE -eq 0 -and $parsed) {
+                             $failure = ($parsed | Out-String).Trim() | ConvertFrom-Json
+                             if ($failure.phase -is [string] -and $failure.phase -in @('preflight', 'status-missing', 'start-initial', 'status-live', 'native-initialize', 'legacy-task-fixture', 'start-repair-active', 'stage-gui-successor', 'reject-unknown-successor-action', 'status-before-native-crash', 'crash-own-native', 'wait-task-recovery', 'promote-cold-successor', 'verify-recovered-native', 'cleanup-after-recovery', 'status-after-stop', 'foreign-port-refusal', 'cleanup-final', 'unknown') -and
+                                 $failure.errorType -is [string] -and $failure.errorType -in @('assertion', 'error', 'type', 'range', 'reference', 'syntax', 'timeout', 'aggregate', 'other') -and
+                                 $failure.cleanup -is [string] -and $failure.cleanup -in @('passed', 'unconfirmed')) {
+                                 $ownerControlFailure.value = [ordered]@{ phase = [string]$failure.phase; errorType = [string]$failure.errorType; cleanup = [string]$failure.cleanup }
+                                 $ownerControlFailure.available = $true
+                             }
+                         }
+                     } catch { }
+                 }
         } },
         { if ($retainedSharedFixtures.Count -eq 0) { Remove-Item -LiteralPath $FixtureRoot -Recurse -Force } }
     )) {
@@ -646,21 +661,6 @@ try {
         if ($cleanupFailures.Count -ne 0) { $result.result = 'failed'; $result | Add-Member -NotePropertyName cleanupErrors -NotePropertyValue $cleanupFailures }
         $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $publishedResult -Encoding UTF8
         if ($RunGates -and $result.result -ne 'passed') {
-            $ownerControlFailure = $null
-            if ($result.phase -eq 'Installer' -and $result.stage -eq 'owner-control') {
-                try {
-                    $parser = Join-Path $sourceRoot 'scripts\windows\owner-control-diagnostics.mjs'
-                    $parsed = & $marker.node $parser (Join-Path $FixtureRoot 'stdout.log') 2>$null
-                    if ($LASTEXITCODE -eq 0 -and $parsed) {
-                        $failure = ($parsed | Out-String).Trim() | ConvertFrom-Json
-                        if ($failure.phase -is [string] -and $failure.phase -in @('preflight', 'status-missing', 'start-initial', 'status-live', 'native-initialize', 'legacy-task-fixture', 'start-repair-active', 'stage-gui-successor', 'reject-unknown-successor-action', 'status-before-native-crash', 'crash-own-native', 'wait-task-recovery', 'promote-cold-successor', 'verify-recovered-native', 'cleanup-after-recovery', 'status-after-stop', 'foreign-port-refusal', 'cleanup-final', 'unknown') -and
-                            $failure.errorType -is [string] -and $failure.errorType -in @('assertion', 'error', 'type', 'range', 'reference', 'syntax', 'timeout', 'aggregate', 'other') -and
-                            $failure.cleanup -is [string] -and $failure.cleanup -in @('passed', 'unconfirmed')) {
-                            $ownerControlFailure = [ordered]@{ phase = [string]$failure.phase; errorType = [string]$failure.errorType; cleanup = [string]$failure.cleanup }
-                        }
-                    }
-                } catch { }
-            }
             $sharedDiagnosticName = 'shared-results-actual-desktop.json'
             if ([string]$result.stage -match '^shared-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)$') { $sharedDiagnosticName = 'shared-results-' + $Matches[1] + '.json' }
             $sharedDiagnosticPath = Join-Path $sourceRoot $sharedDiagnosticName
@@ -669,8 +669,8 @@ try {
             $parentStage = if ($parentStage -in @('shared', 'rdp-session', 'installer')) { $parentStage } else { 'unknown' }
             $summary = [ordered]@{ stage = $parentStage; parentStage = $parentStage; childReceiptAvailable = $result.phase -eq 'Installer'; childStage = $childStage; reportAvailable = $false; sharedReportAvailable = $false }
             if ($result.phase -eq 'Installer' -and $result.stage -eq 'owner-control') {
-                $summary.ownerControlFailureAvailable = $null -ne $ownerControlFailure
-                if ($ownerControlFailure) { $summary.ownerControlFailure = $ownerControlFailure }
+                $summary.ownerControlFailureAvailable = [bool]$ownerControlFailure.available
+                if ($ownerControlFailure.available) { $summary.ownerControlFailure = $ownerControlFailure.value }
             }
             if ($result.cleanupErrors) {
                 $summary.canaryCleanupErrors = @($result.cleanupErrors | Select-Object -Last 8 | ForEach-Object { [ordered]@{
