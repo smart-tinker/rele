@@ -646,6 +646,21 @@ try {
         if ($cleanupFailures.Count -ne 0) { $result.result = 'failed'; $result | Add-Member -NotePropertyName cleanupErrors -NotePropertyValue $cleanupFailures }
         $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $publishedResult -Encoding UTF8
         if ($RunGates -and $result.result -ne 'passed') {
+            $ownerControlFailure = $null
+            if ($result.phase -eq 'Installer' -and $result.stage -eq 'owner-control') {
+                try {
+                    $parser = Join-Path $sourceRoot 'scripts\windows\owner-control-diagnostics.mjs'
+                    $parsed = & $marker.node $parser (Join-Path $FixtureRoot 'stdout.log') 2>$null
+                    if ($LASTEXITCODE -eq 0 -and $parsed) {
+                        $failure = ($parsed | Out-String).Trim() | ConvertFrom-Json
+                        if ($failure.phase -is [string] -and $failure.phase -in @('preflight', 'status-missing', 'start-initial', 'status-live', 'native-initialize', 'legacy-task-fixture', 'start-repair-active', 'stage-gui-successor', 'reject-unknown-successor-action', 'status-before-native-crash', 'crash-own-native', 'wait-task-recovery', 'promote-cold-successor', 'verify-recovered-native', 'cleanup-after-recovery', 'status-after-stop', 'foreign-port-refusal', 'cleanup-final', 'unknown') -and
+                            $failure.errorType -is [string] -and $failure.errorType -in @('assertion', 'error', 'type', 'range', 'reference', 'syntax', 'timeout', 'aggregate', 'other') -and
+                            $failure.cleanup -is [string] -and $failure.cleanup -in @('passed', 'unconfirmed')) {
+                            $ownerControlFailure = [ordered]@{ phase = [string]$failure.phase; errorType = [string]$failure.errorType; cleanup = [string]$failure.cleanup }
+                        }
+                    }
+                } catch { }
+            }
             $sharedDiagnosticName = 'shared-results-actual-desktop.json'
             if ([string]$result.stage -match '^shared-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)$') { $sharedDiagnosticName = 'shared-results-' + $Matches[1] + '.json' }
             $sharedDiagnosticPath = Join-Path $sourceRoot $sharedDiagnosticName
@@ -654,20 +669,8 @@ try {
             $parentStage = if ($parentStage -in @('shared', 'rdp-session', 'installer')) { $parentStage } else { 'unknown' }
             $summary = [ordered]@{ stage = $parentStage; parentStage = $parentStage; childReceiptAvailable = $result.phase -eq 'Installer'; childStage = $childStage; reportAvailable = $false; sharedReportAvailable = $false }
             if ($result.phase -eq 'Installer' -and $result.stage -eq 'owner-control') {
-                $summary.ownerControlFailureAvailable = $false
-                try {
-                    $parser = Join-Path $sourceRoot 'scripts\windows\owner-control-diagnostics.mjs'
-                    $parsed = & $marker.node $parser (Join-Path $FixtureRoot 'stdout.log') 2>$null
-                    if ($LASTEXITCODE -eq 0 -and $parsed) {
-                        $ownerControlFailure = ($parsed | Out-String).Trim() | ConvertFrom-Json
-                        if ($ownerControlFailure.phase -in @('preflight', 'status-missing', 'start-initial', 'status-live', 'native-initialize', 'legacy-task-fixture', 'start-repair-active', 'stage-gui-successor', 'reject-unknown-successor-action', 'status-before-native-crash', 'crash-own-native', 'wait-task-recovery', 'promote-cold-successor', 'verify-recovered-native', 'cleanup-after-recovery', 'status-after-stop', 'foreign-port-refusal', 'cleanup-final', 'unknown') -and
-                            $ownerControlFailure.errorType -in @('assertion', 'error', 'type', 'range', 'reference', 'syntax', 'timeout', 'aggregate', 'other') -and
-                            $ownerControlFailure.cleanup -in @('passed', 'unconfirmed')) {
-                            $summary.ownerControlFailureAvailable = $true
-                            $summary.ownerControlFailure = [ordered]@{ phase = [string]$ownerControlFailure.phase; errorType = [string]$ownerControlFailure.errorType; cleanup = [string]$ownerControlFailure.cleanup }
-                        }
-                    }
-                } catch { }
+                $summary.ownerControlFailureAvailable = $null -ne $ownerControlFailure
+                if ($ownerControlFailure) { $summary.ownerControlFailure = $ownerControlFailure }
             }
             if ($result.cleanupErrors) {
                 $summary.canaryCleanupErrors = @($result.cleanupErrors | Select-Object -Last 8 | ForEach-Object { [ordered]@{

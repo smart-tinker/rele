@@ -1064,7 +1064,7 @@ test('Windows owner-control diagnostics extract only allowlisted fields from syn
  const error = new Error('synthetic private output'); error.name = 'AssertionError';
  const marker = formatOwnerControlFailure({ phase: 'wait-task-recovery', error, cleanupConfirmed: false });
  assert.equal(marker, 'RELE_CI_OWNER_CONTROL_FAILURE phase=wait-task-recovery errorType=assertion cleanup=unconfirmed');
- assert.deepEqual(parseOwnerControlFailureOutput(`ordinary progress\\n${marker}\\n`), { phase: 'wait-task-recovery', errorType: 'assertion', cleanup: 'unconfirmed' });
+ assert.deepEqual(parseOwnerControlFailureOutput(['ordinary progress', marker].join('\n')), { phase: 'wait-task-recovery', errorType: 'assertion', cleanup: 'unconfirmed' });
  assert.doesNotMatch(marker, /synthetic private output/u);
  assert.equal(parseOwnerControlFailureOutput('RELE_CI_OWNER_CONTROL_FAILURE phase=private errorType=private cleanup=unconfirmed'), undefined);
  const unknown = formatOwnerControlFailure({ phase: 'private-phase', error: new Error('private'), cleanupConfirmed: false });
