@@ -1048,8 +1048,8 @@ test('fixture cleanup skips a reused host PID and still drains its exact Task', 
 
 test('RC20 notes report #26 closed without recovering its historical cause', async () => {
  const notes = await readFile(new URL('../docs/0.1.1-rc.20.md', import.meta.url), 'utf8');
- const diagnostic = notes.match(/\\[Issue #26\\][\\s\\S]*?(?=\\n\\n|$)/u)?.[0] ?? '';
- assert.match(diagnostic, /\\[Issue #26\\]\\([^)]+\\) закрыта/u);
+ const diagnostic = notes.match(/\[Issue #26\][\s\S]*?(?=\n\n|$)/u)?.[0] ?? '';
+ assert.match(diagnostic, /\[Issue #26\]\([^)]+\) закрыта/u);
  assert.doesNotMatch(diagnostic, /оста[её]тся открытым|remains open/iu);
  assert.ok(diagnostic.includes('#31') && diagnostic.includes('45703040279'), 'link closure to the merged diagnostic PR and successful post-merge CI');
  assert.ok(diagnostic.includes('#43375287426') && diagnostic.includes('`TimeoutError()`'), 'retain the original run and its only recorded aggregate error');
