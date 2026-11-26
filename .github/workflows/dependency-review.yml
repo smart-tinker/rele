@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/dependency-review-action@907a6e9569212033966bc0b69d32473b046dd66b # inspected upstream commit, 2026-10-16
+      - uses: actions/dependency-review-action@789feb0d345fabae66e2f42aa6c3e49ff814c35a # inspected upstream commit, 2026-10-16
         with:
           fail-on-severity: moderate
           comment-summary-in-pr: never
