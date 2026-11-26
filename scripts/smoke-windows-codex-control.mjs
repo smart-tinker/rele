@@ -10,6 +10,7 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { removeInstallerFixture, stopInstallerCodex } from './installer-codex-fixture.mjs';
+import { formatOwnerControlFailure } from './windows/owner-control-diagnostics.mjs';
 
 if (process.platform !== 'win32' || process.env.CI !== 'true') throw new Error('Use only an isolated Windows fixture.');
 assert.ok(process.env.RELE_TEST_CODEX_EXE && path.isAbsolute(process.env.RELE_TEST_CODEX_EXE), 'Provide the installed Desktop native executable.');
@@ -489,6 +490,7 @@ finally {
   }
 }
 if (failure) {
+  console.log(formatOwnerControlFailure({ phase: failurePhase || phase, error: failure, cleanupConfirmed }));
   console.error(JSON.stringify({ result: 'failed', cleanup: cleanupConfirmed ? 'passed' : 'unconfirmed',
     phase: failurePhase || phase, controllerCalls, error: failure.message, ...(recoveryDiagnostics ? { recovery: recoveryDiagnostics } : {}),
     ...(cleanupConfirmed ? {} : { retainedFixture: temporary }) }));

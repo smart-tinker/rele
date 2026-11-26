@@ -6,7 +6,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { assertSteps, isPrereleaseVersion, packageNames, writeBundle, verifyBundles } from '../scripts/ci-contract.mjs';
 import { lookupSharedNativeRequest, summarizeSharedNativeRequest } from '../scripts/shared-probe-diagnostics.mjs';
-import { formatOwnerControlFailure, parseOwnerControlFailureMarker } from '../scripts/windows/owner-control-diagnostics.mjs';
+import { formatOwnerControlFailure, parseOwnerControlFailureOutput } from '../scripts/windows/owner-control-diagnostics.mjs';
 const sha = 'a'.repeat(40), run = '123', attempt = '1', version = '0.1.2-rc.1';
 const candidate={repository:'owner/repo',version,commit:sha,runId:run,attempt};
 async function releaseBackend(root, candidateValue=candidate) {
@@ -1060,11 +1060,13 @@ test('RC20 notes report #26 closed without recovering its historical cause', asy
  assert.doesNotMatch(diagnostic, /#35|#36|#44227151928/u, 'do not attribute unrelated later traces to #26');
 });
 
-test('Windows owner-control failure diagnostics expose only bounded phase and error type', () => {
+test('Windows owner-control diagnostics extract only allowlisted fields from synthetic child output', () => {
  const error = new Error('synthetic private output'); error.name = 'AssertionError';
  const marker = formatOwnerControlFailure({ phase: 'wait-task-recovery', error, cleanupConfirmed: false });
  assert.equal(marker, 'RELE_CI_OWNER_CONTROL_FAILURE phase=wait-task-recovery errorType=assertion cleanup=unconfirmed');
- assert.deepEqual(parseOwnerControlFailureMarker(marker), { phase: 'wait-task-recovery', errorType: 'assertion', cleanup: 'unconfirmed' });
+ assert.deepEqual(parseOwnerControlFailureOutput(`ordinary progress\\n${marker}\\n`), { phase: 'wait-task-recovery', errorType: 'assertion', cleanup: 'unconfirmed' });
  assert.doesNotMatch(marker, /synthetic private output/u);
- assert.equal(parseOwnerControlFailureMarker('RELE_CI_OWNER_CONTROL_FAILURE phase=private errorType=private cleanup=unconfirmed'), undefined);
+ assert.equal(parseOwnerControlFailureOutput('RELE_CI_OWNER_CONTROL_FAILURE phase=private errorType=private cleanup=unconfirmed'), undefined);
+ const unknown = formatOwnerControlFailure({ phase: 'private-phase', error: new Error('private'), cleanupConfirmed: false });
+ assert.equal(unknown, 'RELE_CI_OWNER_CONTROL_FAILURE phase=unknown errorType=error cleanup=unconfirmed');
 });

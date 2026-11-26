@@ -653,6 +653,22 @@ try {
             if ($result.phase -eq 'Installer' -and ($result.stage -in @('token', 'interactive-token', 'owner-control', 'owner-primitive', 'native-cleanup', 'desktop-appx-registration', 'shared-actual-desktop', 'installer', 'complete') -or [string]$result.stage -match '^shared-\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$')) { $childStage = [string]$result.stage }
             $parentStage = if ($parentStage -in @('shared', 'rdp-session', 'installer')) { $parentStage } else { 'unknown' }
             $summary = [ordered]@{ stage = $parentStage; parentStage = $parentStage; childReceiptAvailable = $result.phase -eq 'Installer'; childStage = $childStage; reportAvailable = $false; sharedReportAvailable = $false }
+            if ($result.phase -eq 'Installer' -and $result.stage -eq 'owner-control') {
+                $summary.ownerControlFailureAvailable = $false
+                try {
+                    $parser = Join-Path $sourceRoot 'scripts\windows\owner-control-diagnostics.mjs'
+                    $parsed = & $marker.node $parser (Join-Path $FixtureRoot 'stdout.log') 2>$null
+                    if ($LASTEXITCODE -eq 0 -and $parsed) {
+                        $ownerControlFailure = ($parsed | Out-String).Trim() | ConvertFrom-Json
+                        if ($ownerControlFailure.phase -in @('preflight', 'status-missing', 'start-initial', 'status-live', 'native-initialize', 'legacy-task-fixture', 'start-repair-active', 'stage-gui-successor', 'reject-unknown-successor-action', 'status-before-native-crash', 'crash-own-native', 'wait-task-recovery', 'promote-cold-successor', 'verify-recovered-native', 'cleanup-after-recovery', 'status-after-stop', 'foreign-port-refusal', 'cleanup-final', 'unknown') -and
+                            $ownerControlFailure.errorType -in @('assertion', 'error', 'type', 'range', 'reference', 'syntax', 'timeout', 'aggregate', 'other') -and
+                            $ownerControlFailure.cleanup -in @('passed', 'unconfirmed')) {
+                            $summary.ownerControlFailureAvailable = $true
+                            $summary.ownerControlFailure = [ordered]@{ phase = [string]$ownerControlFailure.phase; errorType = [string]$ownerControlFailure.errorType; cleanup = [string]$ownerControlFailure.cleanup }
+                        }
+                    }
+                } catch { }
+            }
             if ($result.cleanupErrors) {
                 $summary.canaryCleanupErrors = @($result.cleanupErrors | Select-Object -Last 8 | ForEach-Object { [ordered]@{
                     step = if ($_.step -in @('retained-shared-report', 'child', 'rdp-session', 'rdp-setting', 'redirector-stop', 'redirector-startup', 'service-stop', 'service-startup', 'task-diagnostic-channel', 'rdp-diagnostic-channel', 'task', 'profile', 'user', 'reports', 'fixture')) { [string]$_.step } else { 'other' }
