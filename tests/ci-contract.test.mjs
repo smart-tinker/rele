@@ -1070,3 +1070,10 @@ test('Windows owner-control diagnostics extract only allowlisted fields from syn
  const unknown = formatOwnerControlFailure({ phase: 'private-phase', error: new Error('private'), cleanupConfirmed: false });
  assert.equal(unknown, 'RELE_CI_OWNER_CONTROL_FAILURE phase=unknown errorType=error cleanup=unconfirmed');
 });
+
+test('Windows canary captures owner-control diagnostics before deleting its fixture', async () => {
+ const canary = await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1', import.meta.url), 'utf8');
+ const diagnosticRead = canary.indexOf('owner-control-diagnostics.mjs');
+ const fixtureRemoval = canary.indexOf('Remove-Item -LiteralPath $FixtureRoot -Recurse -Force');
+ assert.ok(diagnosticRead >= 0 && fixtureRemoval > diagnosticRead, 'read the bounded child marker while its fixture output still exists');
+});
