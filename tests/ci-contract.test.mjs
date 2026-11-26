@@ -1055,6 +1055,6 @@ test('RC20 notes report #26 closed without recovering its historical cause', asy
  assert.ok(diagnostic.includes('#43375287426') && diagnostic.includes('`TimeoutError()`'), 'retain the original run and its only recorded aggregate error');
  for (const field of ['операция', 'длительность', 'процесс', 'причина']) assert.ok(diagnostic.includes(field), `mark historical ${field} unknown`);
  assert.ok(diagnostic.includes('UNKNOWN / unrecoverable'), 'preserve the unrecoverable boundary');
- assert.ok(diagnostic.includes('первопричина не установлена'), 'do not claim a root cause');
+ assert.match(diagnostic, /первопричина\s+не установлена/u, 'do not claim a root cause');
  assert.doesNotMatch(diagnostic, /#35|#36|#44227151928/u, 'do not attribute unrelated later traces to #26');
 });
