@@ -134,9 +134,10 @@ evidence автоматически. CI run и его `verification.json` под
   signer workflow `verify.yml`, source SHA/main ref и GitHub-hosted runner origin.
   Уникальные remote имена OS-отчётов при скачивании возвращаются в локальное
   `evidence.json` без изменения подписанных байтов.
-- CI bundle/publisher принимают только RC, связывают обе ОС с одним SHA/run/attempt,
-  проверяют файлы и SHA256, отклоняют занятые tag/release и изменившийся `main`.
-  Ручной `release: true` из `main` оставляет `draft=true, prerelease=true`.
+- CI bundle/publisher принимают immutable RC и финальную stable-версию, связывают
+  обе ОС с одним SHA/run/attempt, проверяют файлы и SHA256, отклоняют занятые
+  tag/release и изменившийся `main`. Ручной `release: true` из `main` оставляет
+  `draft=true`; `prerelease=true` для RC и `prerelease=false` для stable.
   После скачивания и проверки десяти исходных assets финализатор добавляет
   сводный `verification.json`, отмечает draft проверенным и делает readback.
   Пакеты повторно не загружаются и не пересобираются.
@@ -144,11 +145,12 @@ evidence автоматически. CI run и его `verification.json` под
   Старые данные, теги и Releases не меняются. Неопределённый ACK, частичный upload
   или ошибка проверки оставляют draft для сверки; существующие assets не
   перезаписываются, шаги автоматически не повторяются.
-- Автоматическая публикация RC/stable, назначение Latest и проверка native-приёмки
-  не реализованы. Publisher задаёт `target_commitish`, но не делает независимый
-  readback реального tag commit после публикации. Это обязательные операторские
-  проверки, а их автоматизация — отдельная задача. Неподдерживаемые stable-команды
-  или обход RC guard не используются.
+- Публичная публикация RC/stable, назначение Latest и проверка native-приёмки
+  не реализованы: publisher только проверяет и финализирует draft. Он задаёт
+  `target_commitish`, но не делает независимый readback реального tag commit после
+  публикации. Это обязательные операторские проверки. Stable draft не разрешает
+  публичный stable или Latest; отдельные решения и gates из таблицы выше остаются
+  обязательными, обход RC guard не используется.
 
 ## Полномочия и остановка
 
