@@ -24,7 +24,7 @@ async function releaseBackend(root, candidateValue=candidate) {
    assert.ok(!state.release,'Cannot replace an existing draft');
    state.release={id:77,html_url:'https://github.com/owner/repo/releases/77',...options.body};return {...state.release};
   }
-  if(options.method==='PATCH') {state.release={...state.release,...options.body};return {...state.release};}
+  if(options.method==='PATCH') {state.release={...state.release,...options.body};if(!Object.hasOwn(options.body,'tag_name'))state.release.tag_name='untagged-caa67e6adcadbda752fc';return {...state.release};}
   assert.ok(!options.method || options.method==='GET','Deletion is forbidden');
   if(route.endsWith('/git/ref/heads/main'))return {object:{sha:state.main}};
   if(route.includes('/git/ref/tags/'))return state.tag;
@@ -155,7 +155,7 @@ test('publisher finalizes a prepared draft without replacing packages or deletin
  }
  const before=f.state.calls.length;
  const result=await publishCandidate(f.api,await verifyBundles(incoming,version,sha,run,attempt),candidate,77);
- assert.equal(result.id,77);assert.equal(result.draft,true);assert.equal(result.prerelease,true);
+ assert.equal(result.id,77);assert.equal(result.tag_name,`v${candidate.version}`);assert.equal(result.draft,true);assert.equal(result.prerelease,true);
  assert.match(result.body,/Verification passed/u);
  const writes=f.state.calls.slice(before).filter(call=>call.method);
  assert.deepEqual(writes.map(item=>[item.method,item.upload?new URL('https://uploads.github.com'+item.route).searchParams.get('name'):item.route]),[
@@ -172,7 +172,7 @@ test('stable version uploads and verifies exact platform assets while remaining 
  const incoming=path.join(root,'incoming');await downloadCandidate(f.api,stable,77,incoming);
  const bundle=await verifyBundles(incoming,stable.version,sha,run,attempt);
  const before=f.state.calls.length,result=await publishCandidate(f.api,bundle,stable,77);
- assert.equal(result.draft,true);assert.equal(result.prerelease,false);assert.match(result.body,/Verification passed/u);
+ assert.equal(result.tag_name,'v0.1.1');assert.equal(result.draft,true);assert.equal(result.prerelease,false);assert.match(result.body,/Verification passed/u);
  assert.deepEqual(f.state.assets.map(asset=>asset.name).sort(),[
   ...['linux','windows'].flatMap(platform=>[
    ...packageNames(platform,stable.version),`${platform}-evidence.json`,
@@ -180,7 +180,7 @@ test('stable version uploads and verifies exact platform assets while remaining 
  ].sort());
  const writes=f.state.calls.slice(before).filter(call=>call.method);
  assert.deepEqual(writes.map(call=>call.method),['POST','PATCH']);
- assert.deepEqual(writes.at(-1).body,{name:'Rele 0.1.1',draft:true,prerelease:false,
+ assert.deepEqual(writes.at(-1).body,{name:'Rele 0.1.1',tag_name:'v0.1.1',draft:true,prerelease:false,
   body:`Rele candidate ${sha}; run ${run}; attempt ${attempt}. Verification passed.\nReal Desktop and messenger acceptance is still required.`});
 },'0.1.1'));
 test('stable source, tag, version, release-kind and asset changes fail before upload or finalization',()=>fixture(async root=>{
