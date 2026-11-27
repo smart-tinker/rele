@@ -1071,6 +1071,25 @@ test('Windows owner-control diagnostics extract only allowlisted fields from syn
  assert.equal(unknown, 'RELE_CI_OWNER_CONTROL_FAILURE phase=unknown errorType=error cleanup=unconfirmed');
 });
 
+test('Windows owner-control diagnostics distinguish status timeout from exhausted exit retries', () => {
+ const timeout = Object.assign(new Error('private timeout details'), { code: 'ETIMEDOUT' });
+ const timeoutMarker = formatOwnerControlFailure({
+  phase: 'wait-task-recovery', error: timeout, cleanupConfirmed: true,
+  controllerCalls: [{ phase: 'wait-task-recovery', command: 'codex-status', errorCode: 'ETIMEDOUT', durationMs: 60000 }],
+  recoveryStatusErrors: 0
+ });
+ const exitMarker = formatOwnerControlFailure({
+  phase: 'wait-task-recovery', error: new Error('private exit details'), cleanupConfirmed: true,
+  controllerCalls: [{ phase: 'wait-task-recovery', command: 'codex-status', exitCode: 1, durationMs: 20 }],
+  recoveryStatusErrors: 3
+ });
+ assert.deepEqual([parseOwnerControlFailureOutput(timeoutMarker), parseOwnerControlFailureOutput(exitMarker)], [
+  { phase: 'wait-task-recovery', errorType: 'error', cleanup: 'passed', outcome: 'codex-status-timeout' },
+  { phase: 'wait-task-recovery', errorType: 'error', cleanup: 'passed', outcome: 'codex-status-exit-retries-exhausted' }
+ ]);
+ assert.doesNotMatch(timeoutMarker + exitMarker, /private timeout details|private exit details|ETIMEDOUT|exitCode/u);
+});
+
 test('Windows canary captures owner-control diagnostics before deleting its fixture', async () => {
  const canary = await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1', import.meta.url), 'utf8');
  const diagnosticRead = canary.indexOf('$parsed = & $marker.node $parser $stdout');
