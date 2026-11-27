@@ -39,6 +39,7 @@ let result;
 let failure;
 let cleanupConfirmed = false;
 let recoveryDiagnostics;
+let recoveryStatusErrors = 0;
 let phase = 'preflight';
 let failurePhase;
 const controllerCalls = [];
@@ -340,7 +341,6 @@ try {
   const recoveryStartedAt = Date.now();
   await exited(killed.nativePid); await exited(killed.hostPid);
   let recovered;
-  let recoveryStatusErrors = 0;
   let lastRecoveryError = '';
   phase = 'wait-task-recovery';
   while (Date.now() - recoveryStartedAt < 90_000) {
