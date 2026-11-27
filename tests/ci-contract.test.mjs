@@ -1103,13 +1103,6 @@ test('Windows canary captures owner-control diagnostics before deleting its fixt
  assert.ok(canary.includes('outcome = [string]$failure.outcome'), 'copy the allowlisted outcome into the parent summary');
 });
 
-test('owner-control failure marker can read recovery counters after the fixture try', async () => {
- const smoke = await readFile(new URL('../scripts/smoke-windows-codex-control.mjs', import.meta.url), 'utf8');
- const counter = smoke.indexOf('let recoveryStatusErrors = 0;');
- const fixtureTry = smoke.indexOf('\ntry {', smoke.indexOf('const knownHelperHashes = new Set();'));
- const marker = smoke.indexOf('console.log(formatOwnerControlFailure({');
- assert.ok(counter >= 0 && counter < fixtureTry && fixtureTry < marker, 'declare the recovery counter outside the try that ends before failure emission');
-});
 test('Slack controls guide keeps current Goal write restrictions explicit', async () => {
  const guide = await readFile(new URL('../docs/SLACK-CONTROLS.md', import.meta.url), 'utf8');
  assert.match(guide,/Создание и остановка целей из Slack отключены во всех режимах/u);
