@@ -624,8 +624,9 @@ try {
                              $failure = ($parsed | Out-String).Trim() | ConvertFrom-Json
                              if ($failure.phase -is [string] -and $failure.phase -in @('preflight', 'status-missing', 'start-initial', 'status-live', 'native-initialize', 'legacy-task-fixture', 'start-repair-active', 'stage-gui-successor', 'reject-unknown-successor-action', 'status-before-native-crash', 'crash-own-native', 'wait-task-recovery', 'promote-cold-successor', 'verify-recovered-native', 'cleanup-after-recovery', 'status-after-stop', 'foreign-port-refusal', 'cleanup-final', 'unknown') -and
                                  $failure.errorType -is [string] -and $failure.errorType -in @('assertion', 'error', 'type', 'range', 'reference', 'syntax', 'timeout', 'aggregate', 'other') -and
+                                 $failure.outcome -is [string] -and $failure.outcome -in @('codex-status-timeout', 'codex-status-exit-retries-exhausted', 'other') -and
                                  $failure.cleanup -is [string] -and $failure.cleanup -in @('passed', 'unconfirmed')) {
-                                 $ownerControlFailure.value = [ordered]@{ phase = [string]$failure.phase; errorType = [string]$failure.errorType; cleanup = [string]$failure.cleanup }
+                                 $ownerControlFailure.value = [ordered]@{ phase = [string]$failure.phase; errorType = [string]$failure.errorType; cleanup = [string]$failure.cleanup; outcome = [string]$failure.outcome }
                                  $ownerControlFailure.available = $true
                              }
                          }

@@ -490,7 +490,8 @@ finally {
   }
 }
 if (failure) {
-  console.log(formatOwnerControlFailure({ phase: failurePhase || phase, error: failure, cleanupConfirmed }));
+  console.log(formatOwnerControlFailure({ phase: failurePhase || phase, error: failure, cleanupConfirmed, controllerCalls,
+    recoveryStatusErrors, recoveryWindowExpired: recoveryDiagnostics !== undefined }));
   console.error(JSON.stringify({ result: 'failed', cleanup: cleanupConfirmed ? 'passed' : 'unconfirmed',
     phase: failurePhase || phase, controllerCalls, error: failure.message, ...(recoveryDiagnostics ? { recovery: recoveryDiagnostics } : {}),
     ...(cleanupConfirmed ? {} : { retainedFixture: temporary }) }));
