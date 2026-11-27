@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 24059)
-Total output lines: 1121
-
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { mkdtemp, writeFile, rm, mkdir, symlink, readFile } from 'node:fs/promises';
@@ -621,7 +618,10 @@ test('Windows canary timeout reports bounded native RPC and driver stages', asyn
 test('shared-gate failures expose only a bounded probe function and line', async()=>{
  const probe=await readFile(new URL('../scripts/shared-protocol-probe.py',import.meta.url),'utf8');
  const canary=await readFile(new URL('../scripts/windows/ci-standard-user-canary.ps1',import.meta.url),'utf8');
- …59 tokens truncated…error\):/u,'capture the last source frame from the shared probe');
+ const start=canary.indexOf('$summary = [ordered]@{ stage =');
+ const end=canary.indexOf("Write-Output ('Windows canary bounded diagnostic:",start);
+ const summary=canary.slice(start,end);
+ assert.match(probe,/def safe_failure_location\(error\):/u,'capture the last source frame from the shared probe');
  assert.match(probe,/failure_location = safe_failure_location\(error\)[\s\S]{0,120}report\['failureLocation'\] = failure_location/u,'retain the bounded location in the local failure report');
  assert.ok(start>=0&&end>start,'Windows canary must emit a bounded shared-gate diagnostic');
  assert.match(summary,/failureLocation[\s\S]*function[\s\S]*line/u,'forward only the probe function and line');
