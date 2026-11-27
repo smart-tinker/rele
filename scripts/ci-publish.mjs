@@ -106,7 +106,7 @@ export async function publishCandidate(api, bundle, candidate, releaseId) {
  const data=Buffer.from(JSON.stringify(bundle.evidence,null,2)+'\n');
  await checkedDraft(api,candidate,releaseId);await upload(api,base,releaseId,'verification.json',data);
  await checkedDraft(api,candidate,releaseId);
- const patch={name:`Rele ${candidate.version}`,draft:true,prerelease:isPrereleaseVersion(candidate.version),body:body(candidate,true)};
+ const patch={name:`Rele ${candidate.version}`,tag_name:`v${candidate.version}`,draft:true,prerelease:isPrereleaseVersion(candidate.version),body:body(candidate,true)};
  draft(await api(`${base}/releases/${releaseId}`,{method:'PATCH',body:patch}),candidate,releaseId,true);
  const result=draft(await api(`${base}/releases/${releaseId}`),candidate,releaseId,true);
  const finalAssets=await api(`${base}/releases/${releaseId}/assets?per_page=100`);
