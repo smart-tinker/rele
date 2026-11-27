@@ -1063,12 +1063,35 @@ test('RC20 notes report #26 closed without recovering its historical cause', asy
 test('Windows owner-control diagnostics extract only allowlisted fields from synthetic child output', () => {
  const error = new Error('synthetic private output'); error.name = 'AssertionError';
  const marker = formatOwnerControlFailure({ phase: 'wait-task-recovery', error, cleanupConfirmed: false });
- assert.equal(marker, 'RELE_CI_OWNER_CONTROL_FAILURE phase=wait-task-recovery errorType=assertion cleanup=unconfirmed');
- assert.deepEqual(parseOwnerControlFailureOutput(['ordinary progress', marker].join('\n')), { phase: 'wait-task-recovery', errorType: 'assertion', cleanup: 'unconfirmed' });
+ assert.equal(marker, 'RELE_CI_OWNER_CONTROL_FAILURE phase=wait-task-recovery errorType=assertion cleanup=unconfirmed outcome=other');
+ assert.deepEqual(parseOwnerControlFailureOutput(['ordinary progress', marker].join('\n')), { phase: 'wait-task-recovery', errorType: 'assertion', cleanup: 'unconfirmed', outcome: 'other' });
  assert.doesNotMatch(marker, /synthetic private output/u);
- assert.equal(parseOwnerControlFailureOutput('RELE_CI_OWNER_CONTROL_FAILURE phase=private errorType=private cleanup=unconfirmed'), undefined);
+ assert.equal(parseOwnerControlFailureOutput('RELE_CI_OWNER_CONTROL_FAILURE phase=private errorType=private cleanup=unconfirmed outcome=private'), undefined);
+ assert.equal(parseOwnerControlFailureOutput('RELE_CI_OWNER_CONTROL_FAILURE phase=wait-task-recovery errorType=error cleanup=passed outcome=private'), undefined);
  const unknown = formatOwnerControlFailure({ phase: 'private-phase', error: new Error('private'), cleanupConfirmed: false });
- assert.equal(unknown, 'RELE_CI_OWNER_CONTROL_FAILURE phase=unknown errorType=error cleanup=unconfirmed');
+ assert.equal(unknown, 'RELE_CI_OWNER_CONTROL_FAILURE phase=unknown errorType=error cleanup=unconfirmed outcome=other');
+});
+
+test('Windows owner-control diagnostics distinguish status timeout from exhausted exit retries', () => {
+ const timeout = Object.assign(new Error('private timeout details'), { code: 'ETIMEDOUT' });
+ const privateArgs = ['C:\\Synthetic\\Fixture', '--synthetic-secret'];
+ const timeoutMarker = formatOwnerControlFailure({
+  phase: 'wait-task-recovery', error: timeout, cleanupConfirmed: true,
+  controllerCalls: [{ phase: 'wait-task-recovery', command: 'codex-status', errorCode: 'ETIMEDOUT', durationMs: 60000, args: privateArgs, errorReceipt: 'private timeout output' }],
+  recoveryStatusErrors: 0, recoveryWindowExpired: false
+ });
+ const exitCalls = Array.from({ length: 3 }, () => ({
+  phase: 'wait-task-recovery', command: 'codex-status', exitCode: 1, durationMs: 20, args: privateArgs, errorReceipt: 'private exit output'
+ }));
+ const exitMarker = formatOwnerControlFailure({
+  phase: 'wait-task-recovery', error: new Error('private exit details'), cleanupConfirmed: true,
+  controllerCalls: exitCalls, recoveryStatusErrors: exitCalls.length, recoveryWindowExpired: true
+ });
+ assert.deepEqual([parseOwnerControlFailureOutput(timeoutMarker), parseOwnerControlFailureOutput(exitMarker)], [
+  { phase: 'wait-task-recovery', errorType: 'error', cleanup: 'passed', outcome: 'codex-status-timeout' },
+  { phase: 'wait-task-recovery', errorType: 'error', cleanup: 'passed', outcome: 'codex-status-exit-retries-exhausted' }
+ ]);
+ assert.doesNotMatch(timeoutMarker + exitMarker, /private timeout details|private exit details|ETIMEDOUT|exitCode|private timeout output|private exit output|Synthetic|synthetic-secret/u);
 });
 
 test('Windows canary captures owner-control diagnostics before deleting its fixture', async () => {
@@ -1076,6 +1099,8 @@ test('Windows canary captures owner-control diagnostics before deleting its fixt
  const diagnosticRead = canary.indexOf('$parsed = & $marker.node $parser $stdout');
  const fixtureRemoval = canary.indexOf('Remove-Item -LiteralPath $FixtureRoot -Recurse -Force');
  assert.ok(diagnosticRead >= 0 && fixtureRemoval > diagnosticRead, 'read the bounded child marker while its fixture output still exists');
+ assert.ok(canary.includes("$failure.outcome -is [string] -and $failure.outcome -in @('codex-status-timeout', 'codex-status-exit-retries-exhausted', 'other')"), 'allow only bounded recovery outcomes');
+ assert.ok(canary.includes('outcome = [string]$failure.outcome'), 'copy the allowlisted outcome into the parent summary');
 });
 
 test('Slack controls guide keeps current Goal write restrictions explicit', async () => {

@@ -39,6 +39,7 @@ let result;
 let failure;
 let cleanupConfirmed = false;
 let recoveryDiagnostics;
+let recoveryStatusErrors = 0;
 let phase = 'preflight';
 let failurePhase;
 const controllerCalls = [];
@@ -340,7 +341,6 @@ try {
   const recoveryStartedAt = Date.now();
   await exited(killed.nativePid); await exited(killed.hostPid);
   let recovered;
-  let recoveryStatusErrors = 0;
   let lastRecoveryError = '';
   phase = 'wait-task-recovery';
   while (Date.now() - recoveryStartedAt < 90_000) {
@@ -490,7 +490,8 @@ finally {
   }
 }
 if (failure) {
-  console.log(formatOwnerControlFailure({ phase: failurePhase || phase, error: failure, cleanupConfirmed }));
+  console.log(formatOwnerControlFailure({ phase: failurePhase || phase, error: failure, cleanupConfirmed, controllerCalls,
+    recoveryStatusErrors, recoveryWindowExpired: recoveryDiagnostics !== undefined }));
   console.error(JSON.stringify({ result: 'failed', cleanup: cleanupConfirmed ? 'passed' : 'unconfirmed',
     phase: failurePhase || phase, controllerCalls, error: failure.message, ...(recoveryDiagnostics ? { recovery: recoveryDiagnostics } : {}),
     ...(cleanupConfirmed ? {} : { retainedFixture: temporary }) }));
